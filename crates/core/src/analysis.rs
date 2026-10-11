@@ -482,6 +482,20 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     candidates.dedup();
     let strings = candidates.par_iter().filter_map(|&addr| string_at(image, addr)).collect();
 
+    // A function that is a single jump forwards to its target; an export name on such a thunk
+    // is really the target's name.
+    let thunk_target = |f: &Function| match f.controls.as_slice() {
+        [Control { flow: Flow::Jump(target), .. }] if f.instructions == 1 => Some(*target),
+        _ => None,
+    };
+    let mut names: HashMap<u64, String> =
+        image.symbol_names.iter().map(|(&addr, symbol)| (addr, crate::names::display_name(symbol))).collect();
+    for function in &functions {
+        if let (Some(target), Some(name)) = (thunk_target(function), names.get(&function.start).cloned()) {
+            names.entry(target).or_insert(name);
+        }
+    }
+
     Analysis {
         data_refs: discovery.data_refs.iter().map(|&(from, to)| DataRef { from, to }).collect(),
         strings,
@@ -493,10 +507,10 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                 addr: f.start,
                 ranges: vec![(f.start, f.end)],
                 noreturn: noreturn.contains(&f.start),
-                thunk: false,
+                thunk: thunk_target(f).is_some(),
                 origin: discovery.starts[&f.start],
                 fragment_of: fragment_of.get(&f.start).copied(),
-                name: image.symbol_names.get(&f.start).map(|symbol| crate::names::display_name(symbol)),
+                name: names.get(&f.start).cloned(),
             })
             .collect(),
         noreturn_calls,
