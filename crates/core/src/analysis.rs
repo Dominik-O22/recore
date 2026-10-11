@@ -419,8 +419,33 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         extents.sort_unstable();
         let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots };
 
+        // A compiler emits nothing after a call it knows will not return: the call is followed
+        // by a trap, or ends the function. Padding after a call proves nothing, since an
+        // aligned loop head can follow a call that returns. One such call site settles it for the
+        // callee, even when the callee's own code has a return in it, as some C runtime exit
+        // functions do. Only an extent that unwind information vouches for counts as "ends
+        // the function": an extent inferred from layout may stop short at a wrong boundary.
+        let terminal_callees: HashSet<u64> = functions
+            .par_iter()
+            .chain(&chunks)
+            .flat_map_iter(|f| {
+                let has_frame = frame_end.contains_key(&f.start);
+                f.controls.iter().filter_map(move |control| {
+                    let Flow::Call(target) = control.flow else { return None };
+                    let ends_function = control.next == f.end && has_frame;
+                    // Read the bytes themselves: a trap that pads the end of a function has
+                    // been trimmed from its extent.
+                    let trap_follows = || {
+                        let insn = A::decode(image.bytes_from(control.next)?, control.next).next()?.insn?;
+                        Some(A::flow(&insn, &A::State::default()) == Some(Flow::Halt))
+                    };
+                    (ends_function || trap_follows() == Some(true)).then_some(target)
+                })
+            })
+            .collect();
+
         // Least fixpoint: a function joins the set once no path through it can return.
-        let mut noreturn: HashSet<u64> = HashSet::new();
+        let mut noreturn: HashSet<u64> = terminal_callees.into_iter().filter(|target| starts.binary_search(target).is_ok()).collect();
         loop {
             let added: Vec<u64> = functions
                 .par_iter()
