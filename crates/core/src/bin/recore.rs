@@ -76,6 +76,11 @@ fn matches(text: &str, pattern: &Option<String>) -> bool {
 }
 
 fn main() -> Result<()> {
+    // Output is often piped into `head` or `grep -m`; end quietly when the reader goes away.
+    // SAFETY: restoring the default disposition for a signal before any thread starts.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     match Cli::parse().command {
         Command::Summary { binary } => {
             let start = Instant::now();

@@ -486,6 +486,7 @@ dependencies = [
  "clap",
  "gimli",
  "iced-x86",
+ "libc",
  "object",
  "rayon",
  "serde",
