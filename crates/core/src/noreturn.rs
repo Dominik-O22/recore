@@ -37,6 +37,7 @@ const NAMES: &[&str] = &[
 const WINDOWS_NAMES: &[&str] = &[
     "ExitProcess",
     "ExitThread",
+    "FreeLibraryAndExitThread",
     "FatalExit",
     "RaiseFailFastException",
     "_CxxThrowException",
@@ -54,5 +55,5 @@ pub fn is_noreturn_import(name: &str) -> bool {
         || WINDOWS_NAMES.contains(&name)
         || (name.starts_with("_ZSt") && name.contains("__throw_"))
         // The Microsoft STL's throw helpers: `std::_Xlength_error`, `std::_Xbad_alloc` and so on.
-        || (name.starts_with("?_X") && name.contains("@std@@YAX"))
+        || ((name.starts_with("?_X") || name.starts_with("?_Throw_")) && name.contains("@std@@YAX"))
 }

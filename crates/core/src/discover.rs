@@ -359,11 +359,15 @@ impl<A: Arch> Explorer<'_, A> {
     /// something that is not itself an entry point stays within one function, so every weak
     /// entry point it crosses is not real. Typical case: an aligned loop head that follows a call.
     fn demote_crossed_starts(&mut self) -> bool {
-        // A code pointer in data that is not function-aligned may be a label, as in a table of
-        // computed-goto targets, so it is only weak evidence.
+        // A code pointer in data may be a label and not a function: a computed-goto target, or
+        // an exception filter or handler block, which Windows scope tables point at. A jump
+        // across it within one function shows which.
+        // Where the format is known to do that, any such pointer is weak evidence; elsewhere
+        // only one that is not function-aligned.
+        let labels_in_data = self.image.data_in_code;
         let is_weak = |addr: u64, origin: &Origin| match origin {
             Origin::TailCall | Origin::GapAligned | Origin::GapEndbr => true,
-            Origin::DataPointer => addr % A::FUNCTION_ALIGN != 0,
+            Origin::DataPointer => labels_in_data || addr % A::FUNCTION_ALIGN != 0,
             _ => false,
         };
         let mut demoted = BTreeSet::new();
