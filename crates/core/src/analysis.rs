@@ -111,6 +111,8 @@ struct Program<'a> {
     controls: Vec<Control>,
     /// Function entry addresses, sorted.
     starts: &'a [u64],
+    /// Each function's `[start, end)`, in the same order as `starts`.
+    extents: Vec<(u64, u64)>,
     imports: &'a Imports<'a>,
     tables: &'a HashMap<u64, &'a [u64]>,
 }
@@ -118,6 +120,12 @@ struct Program<'a> {
 impl Program<'_> {
     fn is_start(&self, addr: u64) -> bool {
         self.starts.binary_search(&addr).is_ok()
+    }
+
+    /// Whether `addr` lies inside some function's extent.
+    fn is_covered(&self, addr: u64) -> bool {
+        let index = self.extents.partition_point(|&(start, _)| start <= addr);
+        index > 0 && addr < self.extents[index - 1].1
     }
 
     /// The first function entry after `addr`.
@@ -150,10 +158,17 @@ fn walk(function: &Function, noreturn: &HashSet<u64>, program: &Program) -> Walk
         let mut run_start = addr;
         loop {
             let Some(control) = controls.get(index).filter(|c| c.addr < boundary) else {
-                // Fell through to the next function's entry, or off the end of the code.
+                // Ran off the end of a function, which only code that never returns does, or
+                // into code that no function's extent covers, such as a linker veneer. The
+                // second kind carries on somewhere this walk cannot see, so it may return.
                 if in_extent(run_start) {
                     result.reach_end = function.end;
                     result.reached.push((run_start, function.end));
+                }
+                // `run_start == addr` means nothing was decoded on the way: the jump itself
+                // landed outside known code.
+                if run_start == addr && !program.is_covered(addr) {
+                    result.may_return = true;
                 }
                 break;
             };
@@ -279,7 +294,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
         let mut controls: Vec<Control> = functions.iter().flat_map(|f| f.controls.iter().copied()).collect();
         controls.sort_unstable_by_key(|c| c.addr);
-        let program = Program { controls, starts: &starts, imports: &imports, tables: &tables };
+        let extents = functions.iter().map(|f| (f.start, f.end)).collect();
+        let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables };
 
         // Least fixpoint: a function joins the set once no path through it can return.
         let mut noreturn: HashSet<u64> = HashSet::new();
