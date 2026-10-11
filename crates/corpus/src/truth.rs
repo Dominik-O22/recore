@@ -4,9 +4,13 @@
 //! that never return, and a linear decode inside each known function range gives the true
 //! instruction boundaries and call sites. Symbols, DWARF and the classification of calls are
 //! shared; only that decode is per architecture (x86-64 and AArch64).
+//!
+//! PE images take their functions from a PDB instead (see [`pe`]) and share the classification.
 
 mod aarch64;
-mod x86_64;
+pub mod pe;
+pub mod pe_facts;
+mod x86;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -23,6 +27,10 @@ pub struct Function {
     /// Compiler-split cold or partial fragment (`foo.cold`, `foo.part.0`), not a real entry point.
     pub fragment: bool,
     pub noreturn: bool,
+    /// PE only: a lone `jmp` to an import or to another function (import thunk, incremental-link
+    /// thunk). Always also `fragment`, so scoring neither demands nor penalises reporting it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thunk: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -57,6 +65,7 @@ fn is_zero(value: &u64) -> bool {
 }
 
 /// Where a call instruction goes, as far as the decode alone can tell.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Callee {
     Direct(u64),
     /// Through the GOT-style slot at this address.
@@ -212,10 +221,82 @@ fn is_mapping_symbol(name: &str) -> bool {
     ["$x", "$d"].iter().any(|prefix| name == *prefix || name.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.')))
 }
 
+/// How a call's target is judged to never return.
+struct Callees<'a> {
+    /// Entry addresses of functions in the binary that never return.
+    noreturn_addrs: &'a HashSet<u64>,
+    /// Stub address to the import slot it jumps through.
+    stubs: &'a HashMap<u64, u64>,
+    /// Import slot address to imported name.
+    slots: &'a HashMap<u64, String>,
+    is_noreturn_import: &'a dyn Fn(&str) -> bool,
+    /// Whether calls through an import slot take part in widening terminal calls. PE code reaches
+    /// most imports that way; ELF truth has always widened direct calls only.
+    widen_slots: bool,
+}
+
+/// The decode of every function, with its calls classified.
+#[derive(Default)]
+struct Classified {
+    instructions: u64,
+    undecodable_bytes: u64,
+    data_bytes: u64,
+    noreturn_calls: Vec<u64>,
+    terminal_calls: Vec<u64>,
+    noreturn_imports: BTreeSet<String>,
+}
+
+/// Sums the scans of all functions and classifies their calls.
+fn classify(scans: impl Iterator<Item = Scan>, callees: &Callees) -> Classified {
+    let mut out = Classified::default();
+    let mut noreturn_import = |slot: &u64| match callees.slots.get(slot) {
+        Some(name) if (callees.is_noreturn_import)(name) => {
+            out.noreturn_imports.insert(name.clone());
+            true
+        }
+        _ => false,
+    };
+    let mut widened: Vec<(u64, Callee)> = Vec::new();
+    for scan in scans {
+        out.instructions += scan.instructions;
+        out.undecodable_bytes += scan.undecodable_bytes;
+        out.data_bytes += scan.data_bytes;
+        out.terminal_calls.extend(scan.final_call);
+        for (at, callee) in scan.calls {
+            let target_noreturn = match callee {
+                Callee::Direct(target) => {
+                    widened.push((at, callee));
+                    callees.noreturn_addrs.contains(&target) || callees.stubs.get(&target).is_some_and(&mut noreturn_import)
+                }
+                Callee::Slot(slot) => {
+                    if callees.widen_slots {
+                        widened.push((at, callee));
+                    }
+                    noreturn_import(&slot)
+                }
+            };
+            if target_noreturn {
+                out.noreturn_calls.push(at);
+            }
+        }
+    }
+    // Widen from the calls that end a function to every call of the same callee.
+    let ends_function: HashSet<u64> = out.terminal_calls.iter().copied().collect();
+    let terminal_callees: HashSet<Callee> =
+        widened.iter().filter(|(at, _)| ends_function.contains(at)).map(|&(_, callee)| callee).collect();
+    out.terminal_calls
+        .extend(widened.iter().filter(|(at, callee)| terminal_callees.contains(callee) && !ends_function.contains(at)).map(|&(at, _)| at));
+    out.terminal_calls.sort_unstable();
+    out
+}
+
 pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     let binary_data = std::fs::read(binary_path).with_context(|| format!("reading {binary_path:?}"))?;
-    let debug_data = std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?;
     let binary = object::File::parse(&*binary_data)?;
+    if binary.format() == object::BinaryFormat::Pe {
+        return pe::extract(binary_path, &binary_data, debug_path);
+    }
+    let debug_data = std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?;
     let debug = object::File::parse(&*debug_data)?;
     let architecture = binary.architecture();
     if !matches!(architecture, Architecture::X86_64 | Architecture::Aarch64) {
@@ -246,6 +327,7 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
             size: symbol.size(),
             fragment: is_fragment(&name),
             noreturn: noreturn.addrs.contains(&symbol.address()) || noreturn.names.contains(&name),
+            thunk: false,
             name,
         };
         match by_addr.get(&function.addr) {
@@ -263,58 +345,26 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
         Architecture::Aarch64 => (aarch64::plt_stubs(&binary), aarch64::data_ranges(&binary, &debug)),
         _ => Default::default(),
     };
-    let mut noreturn_imports: BTreeSet<String> = BTreeSet::new();
-    let mut noreturn_import = |slot: &u64| match slots.get(slot) {
-        Some(name) if !is_conditionally_noreturn(name) && (noreturn.declared.contains(name) || is_runtime_noreturn(name)) => {
-            noreturn_imports.insert(name.clone());
-            true
-        }
-        _ => false,
-    };
-    let mut noreturn_calls = Vec::new();
-    let mut terminal_calls = Vec::new();
-    let mut direct_calls: Vec<(u64, u64)> = Vec::new();
-    let (mut instructions, mut undecodable_bytes, mut data_bytes) = (0u64, 0u64, 0u64);
-
-    for function in by_addr.values() {
-        let Some(section) = exec_sections
+    let scans = by_addr.values().filter_map(|function| {
+        let section = exec_sections
             .iter()
-            .find(|s| function.addr >= s.address() && function.addr + function.size <= s.address() + s.size())
-        else {
-            continue;
-        };
-        let Ok(section_data) = section.data() else { continue };
+            .find(|s| function.addr >= s.address() && function.addr + function.size <= s.address() + s.size())?;
+        let section_data = section.data().ok()?;
         let offset = (function.addr - section.address()) as usize;
         let bytes = &section_data[offset..offset + function.size as usize];
-        let scan = match architecture {
+        Some(match architecture {
             Architecture::Aarch64 => aarch64::scan(bytes, function.addr, &data),
-            _ => x86_64::scan(bytes, function.addr),
-        };
-        instructions += scan.instructions;
-        undecodable_bytes += scan.undecodable_bytes;
-        data_bytes += scan.data_bytes;
-        terminal_calls.extend(scan.final_call);
-        for (at, callee) in scan.calls {
-            let target_noreturn = match callee {
-                Callee::Direct(target) => {
-                    direct_calls.push((at, target));
-                    noreturn_addrs.contains(&target) || stubs.get(&target).is_some_and(&mut noreturn_import)
-                }
-                Callee::Slot(slot) => noreturn_import(&slot),
-            };
-            if target_noreturn {
-                noreturn_calls.push(at);
-            }
-        }
-    }
-    // Widen from the calls that end a function to every call of the same callee.
-    let ends_function: HashSet<u64> = terminal_calls.iter().copied().collect();
-    let terminal_callees: HashSet<u64> =
-        direct_calls.iter().filter(|(at, _)| ends_function.contains(at)).map(|&(_, target)| target).collect();
-    terminal_calls.extend(
-        direct_calls.iter().filter(|(at, target)| terminal_callees.contains(target) && !ends_function.contains(at)).map(|&(at, _)| at),
-    );
-    terminal_calls.sort_unstable();
+            _ => x86::scan(bytes, function.addr, 64),
+        })
+    });
+    let callees = Callees {
+        noreturn_addrs: &noreturn_addrs,
+        stubs: &stubs,
+        slots: &slots,
+        is_noreturn_import: &|name| !is_conditionally_noreturn(name) && (noreturn.declared.contains(name) || is_runtime_noreturn(name)),
+        widen_slots: false,
+    };
+    let calls = classify(scans, &callees);
 
     let text = exec_sections
         .iter()
@@ -327,11 +377,11 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
         name: binary_path.file_name().unwrap().to_string_lossy().into_owned(),
         exec,
         functions: by_addr.into_values().collect(),
-        instructions,
-        noreturn_calls,
-        terminal_calls,
-        noreturn_imports: noreturn_imports.into_iter().collect(),
-        undecodable_bytes,
-        data_bytes,
+        instructions: calls.instructions,
+        noreturn_calls: calls.noreturn_calls,
+        terminal_calls: calls.terminal_calls,
+        noreturn_imports: calls.noreturn_imports.into_iter().collect(),
+        undecodable_bytes: calls.undecodable_bytes,
+        data_bytes: calls.data_bytes,
     })
 }

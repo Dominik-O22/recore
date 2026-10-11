@@ -25,6 +25,12 @@ enum Command {
     Truth,
     /// Writes `jumptables/<name>.json` for every binary whose debug file lists its jump tables.
     Jumptables,
+    /// Prints measurements over a PE corpus: exception directory, imports, jump tables, padding.
+    PeFacts {
+        /// Print the counters of each binary as well as the totals.
+        #[arg(long)]
+        detail: bool,
+    },
     /// Scores one or more analyzer output directories against the truth.
     Score {
         /// Directories of `<name>.json` analysis files, e.g. `corpus/ghidra`.
@@ -41,6 +47,12 @@ fn binaries(corpus: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// The debug file of a binary: `<name>.pdb` for a PE image, `<name>.debug` otherwise.
+fn debug_file(corpus: &Path, name: &str) -> PathBuf {
+    let pdb = corpus.join("debug").join(format!("{name}.pdb"));
+    if pdb.exists() { pdb } else { corpus.join("debug").join(format!("{name}.debug")) }
+}
+
 fn run_truth(corpus: &Path) -> Result<()> {
     let out_dir = corpus.join("truth");
     std::fs::create_dir_all(&out_dir)?;
@@ -48,8 +60,7 @@ fn run_truth(corpus: &Path) -> Result<()> {
         .par_iter()
         .map(|binary| {
             let name = binary.file_name().unwrap().to_string_lossy().into_owned();
-            let debug = corpus.join("debug").join(format!("{name}.debug"));
-            let truth = truth::extract(binary, &debug);
+            let truth = truth::extract(binary, &debug_file(corpus, &name));
             (name, truth)
         })
         .collect();
@@ -73,6 +84,35 @@ fn run_truth(corpus: &Path) -> Result<()> {
     Ok(())
 }
 
+fn run_pe_facts(corpus: &Path, detail: bool) -> Result<()> {
+    let results: Vec<_> = binaries(corpus)?
+        .par_iter()
+        .map(|binary| {
+            let name = binary.file_name().unwrap().to_string_lossy().into_owned();
+            let facts = truth::pe_facts::facts(binary, &debug_file(corpus, &name));
+            (name, facts)
+        })
+        .collect();
+    let mut total = truth::pe_facts::Facts::default();
+    let print = |label: &str, facts: &truth::pe_facts::Facts| {
+        println!("== {label}");
+        facts.0.iter().for_each(|(key, n)| println!("{n:12}  {key}"));
+    };
+    for (name, facts) in results {
+        match facts {
+            Ok(facts) => {
+                total.merge(&facts);
+                if detail {
+                    print(&name, &facts);
+                }
+            }
+            Err(error) => eprintln!("skip {name}: {error:#}"),
+        }
+    }
+    print(&corpus.display().to_string(), &total);
+    Ok(())
+}
+
 fn run_jumptables(corpus: &Path) -> Result<()> {
     let out_dir = corpus.join("jumptables");
     std::fs::create_dir_all(&out_dir)?;
@@ -80,8 +120,7 @@ fn run_jumptables(corpus: &Path) -> Result<()> {
         .par_iter()
         .map(|binary| {
             let name = binary.file_name().unwrap().to_string_lossy().into_owned();
-            let debug = corpus.join("debug").join(format!("{name}.debug"));
-            let extracted = jumptables::extract(binary, &debug);
+            let extracted = jumptables::extract(binary, &debug_file(corpus, &name));
             (name, extracted)
         })
         .collect();
@@ -106,7 +145,7 @@ fn run_jumptables(corpus: &Path) -> Result<()> {
                 written += 1;
                 std::fs::write(out_dir.join(format!("{name}.json")), serde_json::to_vec(&extracted.truth)?)?;
             }
-            // Not built by corpus/jt, so the compiler left no jump-table metadata.
+            // Nothing lists this binary's jump tables: no compiler metadata, no tables in `.text`.
             Ok(None) => {}
             Err(error) => eprintln!("skip {name}: {error:#}"),
         }
@@ -172,6 +211,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Truth => run_truth(&cli.corpus),
         Command::Jumptables => run_jumptables(&cli.corpus),
+        Command::PeFacts { detail } => run_pe_facts(&cli.corpus, detail),
         Command::Score { dirs, detail } => dirs.iter().try_for_each(|dir| run_score(&cli.corpus, dir, detail)),
     }
 }

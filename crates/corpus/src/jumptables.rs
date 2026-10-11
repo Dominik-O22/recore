@@ -9,14 +9,21 @@
 //!
 //! Nothing is guessed: a table whose targets are not instruction boundaries of one function, or
 //! whose dispatch the dataflow cannot follow, is rejected with a reason.
+//!
+//! PE images get the same truth from two other sources, see [`extract_pe`]. Programs built by
+//! `corpus/build_pe.py` carry the same clang metadata in a sidecar file. MSVC leaves no metadata,
+//! but its tables sit in `.text` inside the function, each at a PDB data symbol and named by the
+//! dispatch that reads it, so the image and its PDB list them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register};
-use object::{Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind};
+use object::{BinaryFormat, Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind};
 use serde::{Deserialize, Serialize};
+
+use crate::truth::pe::Image;
 
 const META_SECTION: &str = ".llvm_jump_table_sizes";
 const ENTRY_SIZE: u64 = 4;
@@ -76,6 +83,8 @@ enum Value {
     Entry(usize),
     /// Entry plus base: a case address.
     Target(usize),
+    /// The image base, which MSVC adds to the RVAs its x86-64 tables hold.
+    ImageBase,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -88,7 +97,16 @@ enum Loc {
 /// Locations with a known value. Absent means unknown.
 type State = HashMap<Loc, Value>;
 
-const CALLER_SAVED: [Register; 9] = [
+/// What the dispatch dataflow needs to know about the binary's platform.
+#[derive(Clone, Copy)]
+struct Platform {
+    /// Registers a call may overwrite.
+    caller_saved: &'static [Register],
+    /// The image base, for images whose tables hold RVAs.
+    image_base: Option<u64>,
+}
+
+const SYSV_CALLER_SAVED: &[Register] = &[
     Register::RAX,
     Register::RCX,
     Register::RDX,
@@ -99,6 +117,10 @@ const CALLER_SAVED: [Register; 9] = [
     Register::R10,
     Register::R11,
 ];
+
+/// The Windows x64 convention keeps `rsi` and `rdi` across calls.
+const WIN64_CALLER_SAVED: &[Register] =
+    &[Register::RAX, Register::RCX, Register::RDX, Register::R8, Register::R9, Register::R10, Register::R11];
 
 fn is_frame(register: Register) -> bool {
     matches!(register, Register::RSP | Register::RBP)
@@ -120,10 +142,23 @@ fn operand(instr: &Instruction, op: u32) -> Option<Loc> {
 }
 
 /// The value `instr` leaves in its destination, given the state before it.
-fn defines(instr: &Instruction, state: &State, by_addr: &HashMap<u64, usize>) -> Option<(Loc, Value)> {
+fn defines(instr: &Instruction, state: &State, by_addr: &HashMap<u64, usize>, image_base: Option<u64>) -> Option<(Loc, Value)> {
     let value = |op| operand(instr, op).and_then(|loc| state.get(&loc).copied());
     let value = match instr.mnemonic() {
+        Mnemonic::Lea if instr.is_ip_rel_memory_operand() && Some(instr.ip_rel_memory_address()) == image_base => Value::ImageBase,
         Mnemonic::Lea if instr.is_ip_rel_memory_operand() => Value::Base(*by_addr.get(&instr.ip_rel_memory_address())?),
+        // The MSVC entry load, `mov ecx, dword ptr [rdx + rax*4 + table_rva]` with the image base
+        // in `rdx`. It writes a 32-bit register, which zero-extends into the full one.
+        Mnemonic::Mov
+            if instr.op1_kind() == OpKind::Memory
+                && instr.memory_index_scale() == ENTRY_SIZE as u32
+                && instr.memory_index() != Register::None
+                && state.get(&Loc::Reg(instr.memory_base())) == Some(&Value::ImageBase) =>
+        {
+            let table = by_addr.get(&image_base?.wrapping_add(instr.memory_displacement64()))?;
+            let dest = instr.op0_register();
+            return dest.is_gpr32().then(|| (Loc::Reg(dest.full_register()), Value::Entry(*table)));
+        }
         // The entry load. A displacement is accepted: it is a folded `case - lowest` bias.
         Mnemonic::Movsxd if instr.op1_kind() == OpKind::Memory && instr.memory_index_scale() == ENTRY_SIZE as u32 => {
             match state.get(&Loc::Reg(instr.memory_base())) {
@@ -133,6 +168,7 @@ fn defines(instr: &Instruction, state: &State, by_addr: &HashMap<u64, usize>) ->
         }
         Mnemonic::Add => match (value(0)?, value(1)?) {
             (Value::Entry(a), Value::Base(b)) | (Value::Base(a), Value::Entry(b)) if a == b => Value::Target(a),
+            (Value::Entry(a), Value::ImageBase) | (Value::ImageBase, Value::Entry(a)) => Value::Target(a),
             _ => return None,
         },
         Mnemonic::Mov => value(1)?,
@@ -142,8 +178,14 @@ fn defines(instr: &Instruction, state: &State, by_addr: &HashMap<u64, usize>) ->
 }
 
 /// Applies `instr` to `state`: forgets everything it overwrites, then records what it defines.
-fn transfer(instr: &Instruction, state: &mut State, info: &mut InstructionInfoFactory, by_addr: &HashMap<u64, usize>) {
-    let defined = defines(instr, state, by_addr);
+fn transfer(
+    instr: &Instruction,
+    state: &mut State,
+    info: &mut InstructionInfoFactory,
+    by_addr: &HashMap<u64, usize>,
+    platform: Platform,
+) {
+    let defined = defines(instr, state, by_addr, platform.image_base);
     let writes = |access| matches!(access, OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite);
     let is_call = matches!(instr.flow_control(), FlowControl::Call | FlowControl::IndirectCall);
     let used = info.info(instr);
@@ -160,7 +202,7 @@ fn transfer(instr: &Instruction, state: &mut State, info: &mut InstructionInfoFa
         }
     }
     if is_call {
-        CALLER_SAVED.iter().for_each(|&register| {
+        platform.caller_saved.iter().for_each(|&register| {
             state.remove(&Loc::Reg(register));
         });
     }
@@ -175,7 +217,7 @@ fn transfer(instr: &Instruction, state: &mut State, info: &mut InstructionInfoFa
 /// so a jump is attributed only when every path the analysis sees reaches it with the same table.
 /// Edges out of an indirect jump exist only once that jump is attributed; callers must therefore
 /// discard the result unless every table found its jump, or an unseen edge could hide a conflict.
-fn dispatches(instrs: &[Instruction], tables: &[Table]) -> BTreeMap<u64, usize> {
+fn dispatches(instrs: &[Instruction], tables: &[Table], platform: Platform) -> BTreeMap<u64, usize> {
     let by_addr: HashMap<u64, usize> = tables.iter().enumerate().map(|(index, table)| (table.addr, index)).collect();
     let index_of: HashMap<u64, usize> = instrs.iter().enumerate().map(|(index, instr)| (instr.ip(), index)).collect();
     let mut info = InstructionInfoFactory::new();
@@ -204,7 +246,7 @@ fn dispatches(instrs: &[Instruction], tables: &[Table]) -> BTreeMap<u64, usize> 
             FlowControl::Return | FlowControl::Interrupt | FlowControl::Exception => {}
             _ => successors.push(index + 1),
         }
-        transfer(instr, &mut state, &mut info, &by_addr);
+        transfer(instr, &mut state, &mut info, &by_addr, platform);
 
         for successor in successors.into_iter().filter(|&s| s < instrs.len()) {
             let changed = match &mut entry[successor] {
@@ -238,40 +280,141 @@ fn functions(debug: &object::File) -> Vec<(u64, u64)> {
     functions
 }
 
-/// Derives jump-table truth for one binary, or `None` if its debug file carries no metadata.
+/// How a table entry encodes its target.
+#[derive(Clone, Copy)]
+enum Encoding {
+    /// Signed 32-bit offset from the table's own address: clang on x86-64.
+    Relative,
+    /// 32-bit address: every i386 compiler.
+    Absolute,
+    /// 32-bit RVA, to be added to this image base: MSVC on x86-64.
+    Rva(u64),
+}
+
+/// The tables a binary is said to have, and access to what is needed to check them.
+struct Source<'a> {
+    /// `(table address, entry count)`.
+    listed: Vec<(u64, u64)>,
+    /// Function ranges `(start, size)`, sorted, one per address.
+    functions: Vec<(u64, u64)>,
+    bitness: u32,
+    encoding: Encoding,
+    /// Set where the dispatch has to be followed by dataflow, which is all x86-64 code. An
+    /// i386 dispatch names its table in the jump itself.
+    platform: Option<Platform>,
+    /// The bytes of a table at `(address, size)`.
+    table: Box<dyn Fn(u64, u64) -> Option<&'a [u8]> + 'a>,
+    /// The code of the function at `(start, size)` as `(address, bytes)` pieces, without the
+    /// data MSVC keeps inside a function's length.
+    code: Box<dyn Fn(u64, u64) -> Option<Vec<(u64, &'a [u8])>> + 'a>,
+}
+
+/// The i386 dispatch names its table outright: `jmp dword ptr [index*4 + table]`.
+fn direct_dispatches(instrs: &[Instruction], tables: &[Table]) -> BTreeMap<u64, usize> {
+    let by_addr: HashMap<u64, usize> = tables.iter().enumerate().map(|(index, table)| (table.addr, index)).collect();
+    instrs
+        .iter()
+        .filter(|instr| instr.flow_control() == FlowControl::IndirectBranch && instr.op0_kind() == OpKind::Memory)
+        .filter(|instr| instr.memory_base() == Register::None && instr.memory_index_scale() == ENTRY_SIZE as u32)
+        .filter_map(|instr| Some((instr.ip(), *by_addr.get(&instr.memory_displacement64())?)))
+        .collect()
+}
+
+/// Derives jump-table truth for one binary, or `None` if nothing lists its jump tables.
 pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Option<Extracted>> {
     let binary_data = std::fs::read(binary_path).with_context(|| format!("reading {binary_path:?}"))?;
-    let debug_data = std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?;
     let binary = object::File::parse(&*binary_data)?;
+    let name = binary_path.file_name().unwrap().to_string_lossy().into_owned();
+    if binary.format() == BinaryFormat::Pe {
+        return extract_pe(name, &binary_data, debug_path);
+    }
+    let debug_data = std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?;
     let debug = object::File::parse(&*debug_data)?;
 
     let Some(meta) = debug.section_by_name(META_SECTION) else { return Ok(None) };
-    let meta = meta.data()?;
-    ensure!(meta.len() % 16 == 0, "{META_SECTION} is not a whole number of (address, count) pairs");
-    let u64_at = |offset: usize| u64::from_le_bytes(meta[offset..offset + 8].try_into().unwrap());
-    let listed: Vec<(u64, u64)> = (0..meta.len()).step_by(16).map(|offset| (u64_at(offset), u64_at(offset + 8))).collect();
+    let data_sections: Vec<_> = binary.sections().filter(|s| s.kind() == SectionKind::ReadOnlyData).collect();
+    let text_sections: Vec<_> = binary.sections().filter(|s| s.kind() == SectionKind::Text).collect();
+    let source = Source {
+        listed: listed(meta.data()?, 8)?,
+        functions: functions(&debug),
+        bitness: 64,
+        encoding: Encoding::Relative,
+        platform: Some(Platform { caller_saved: SYSV_CALLER_SAVED, image_base: None }),
+        table: Box::new(move |addr, size| data_sections.iter().find_map(|s| s.data_range(addr, size).ok().flatten())),
+        code: Box::new(move |start, size| {
+            let bytes = text_sections.iter().find_map(|s| s.data_range(start, size).ok().flatten())?;
+            Some(vec![(start, bytes)])
+        }),
+    };
+    Ok(Some(derive(name, &source)))
+}
 
-    let functions = functions(&debug);
+/// Reads the compiler's `(table address, entry count)` pairs of `width`-byte integers.
+fn listed(meta: &[u8], width: usize) -> Result<Vec<(u64, u64)>> {
+    ensure!(meta.len() % (2 * width) == 0, "{META_SECTION} is not a whole number of (address, count) pairs");
+    let int = |bytes: &[u8]| bytes.iter().rev().fold(0u64, |value, &byte| value << 8 | u64::from(byte));
+    Ok(meta.chunks_exact(2 * width).map(|pair| (int(&pair[..width]), int(&pair[width..]))).collect())
+}
+
+/// Jump-table truth for a PE image.
+///
+/// With a `<debug file>.jumptables` sidecar, the tables are the ones clang listed in it. Without
+/// one they are the tables the image and its PDB show, which is how MSVC output gets truth; see
+/// [`Image::switch_tables`]. Images where that finds nothing give `None`.
+fn extract_pe(name: String, binary_data: &[u8], pdb_path: &Path) -> Result<Option<Extracted>> {
+    let image = Image::load(binary_data, pdb_path)?;
+    let image = &image;
+    let sidecar = std::fs::read(pdb_path.with_extension("jumptables")).ok();
+    let (listed, encoding) = match &sidecar {
+        Some(meta) if image.bitness == 64 => (listed(meta, 8)?, Encoding::Relative),
+        Some(meta) => (listed(meta, 4)?, Encoding::Absolute),
+        None if image.bitness == 64 => (image.switch_tables(), Encoding::Rva(image.base)),
+        None => (image.switch_tables(), Encoding::Absolute),
+    };
+    if listed.is_empty() {
+        return Ok(None);
+    }
+    let functions = image.functions.values().filter(|function| function.size > 0 && !function.thunk).map(|function| (function.addr, function.size)).collect();
+    let source = Source {
+        listed,
+        functions,
+        bitness: image.bitness,
+        encoding,
+        platform: (image.bitness == 64).then_some(Platform { caller_saved: WIN64_CALLER_SAVED, image_base: Some(image.base) }),
+        table: Box::new(|addr, size| image.bytes(addr, size)),
+        code: Box::new(|start, size| image.code_ranges(start, start + size).into_iter().map(|(start, end)| Some((start, image.bytes(start, end - start)?))).collect()),
+    };
+    Ok(Some(derive(name, &source)))
+}
+
+/// Checks every listed table and finds the jump that reads it.
+fn derive(name: String, source: &Source) -> Extracted {
+    let Source { listed, functions, .. } = source;
     let function_of = |addr: u64| {
         let index = functions.partition_point(|&(start, _)| start <= addr).checked_sub(1)?;
         (addr < functions[index].0 + functions[index].1).then_some(index)
     };
-    let data_sections: Vec<_> = binary.sections().filter(|s| s.kind() == SectionKind::ReadOnlyData).collect();
-    let text_sections: Vec<_> = binary.sections().filter(|s| s.kind() == SectionKind::Text).collect();
 
     let mut rejected = Vec::new();
     // Tables grouped by the function their targets lie in.
     let mut by_function: BTreeMap<usize, Vec<Table>> = BTreeMap::new();
-    for &(addr, count) in &listed {
+    for &(addr, count) in listed {
         let read = || -> Result<(usize, Table), String> {
             let bytes = count
                 .checked_mul(ENTRY_SIZE)
                 .filter(|&size| size > 0)
-                .and_then(|size| data_sections.iter().find_map(|s| s.data_range(addr, size).ok().flatten()))
+                .and_then(|size| (source.table)(addr, size))
                 .ok_or_else(|| format!("{count} entries are not inside a read-only data section"))?;
             let mut targets: BTreeSet<u64> = bytes
                 .chunks_exact(ENTRY_SIZE as usize)
-                .map(|entry| addr.wrapping_add_signed(i32::from_le_bytes(entry.try_into().unwrap()).into()))
+                .map(|entry| {
+                    let entry = i32::from_le_bytes(entry.try_into().unwrap());
+                    match source.encoding {
+                        Encoding::Relative => addr.wrapping_add_signed(entry.into()),
+                        Encoding::Absolute => u64::from(entry as u32),
+                        Encoding::Rva(base) => base + u64::from(entry as u32),
+                    }
+                })
                 .collect();
             // The lowest target is real code even when unreachable entries point past the end.
             let function = function_of(*targets.first().unwrap()).ok_or("first target is outside every function")?;
@@ -294,12 +437,13 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Option<Extracted
         let mut reject_all = |reason: &str| {
             rejected.extend(candidates.iter().map(|table| Rejected { table: table.addr, reason: format!("function {start:#x}: {reason}") }));
         };
-        let Some(bytes) = text_sections.iter().find_map(|s| s.data_range(start, size).ok().flatten()) else {
+        let Some(pieces) = (source.code)(start, size) else {
             reject_all("not inside an executable section");
             continue;
         };
-        let instrs: Vec<Instruction> = Decoder::with_ip(64, bytes, start, DecoderOptions::NONE).into_iter().collect();
-        if instrs.iter().any(Instruction::is_invalid) {
+        let instrs: Vec<Instruction> =
+            pieces.iter().flat_map(|&(addr, bytes)| Decoder::with_ip(source.bitness, bytes, addr, DecoderOptions::NONE)).collect();
+        if instrs.is_empty() || instrs.iter().any(Instruction::is_invalid) {
             reject_all("does not decode cleanly");
             continue;
         }
@@ -308,7 +452,10 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Option<Extracted
             reject_all(&format!("target {stray:#x} is not an instruction boundary"));
             continue;
         }
-        let jumps = dispatches(&instrs, &candidates);
+        let jumps = match source.platform {
+            Some(platform) => dispatches(&instrs, &candidates, platform),
+            None => direct_dispatches(&instrs, &candidates),
+        };
         // An unattributed table means control-flow edges the dataflow never saw, so its other
         // conclusions about this function are not trusted either.
         let unused: Vec<String> = (0..candidates.len())
@@ -328,7 +475,5 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Option<Extracted
     }
     tables.sort_unstable_by_key(|table| table.jump);
     rejected.sort_unstable_by_key(|r| r.table);
-
-    let name = binary_path.file_name().unwrap().to_string_lossy().into_owned();
-    Ok(Some(Extracted { truth: JumpTables { name, tables }, listed: listed.len(), rejected }))
+    Extracted { truth: JumpTables { name, tables }, listed: listed.len(), rejected }
 }

@@ -9,6 +9,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 gimli = "0.34.0"
 iced-x86 = "1.21.0"
 object = { version = "0.40.0", features = ["compression"] }
+pdb2 = "0.10.2"
 rayon = "1.12.0"
 recore = { version = "0.1.0", path = "../core" }
 serde = { version = "1.0.229", features = ["derive"] }
