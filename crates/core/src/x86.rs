@@ -54,6 +54,29 @@ impl<const BITS: u32> Arch for X86<BITS> {
         opens_landing_pad(insn)
     }
 
+    fn opens_function(first: &Instruction, second: Option<&Instruction>) -> bool {
+        opens_function(first, second)
+    }
+
+    /// The frame pointer is callee-saved, so a function must save it and set it before
+    /// addressing anything through it. Code that reads through it straight away is running in
+    /// some other function's frame.
+    fn borrows_frame(insns: &[Instruction]) -> bool {
+        for instr in insns {
+            if instr.op_kinds().any(|kind| kind == OpKind::Memory) && instr.memory_base().full_register() == Register::RBP {
+                return true;
+            }
+            let writes_frame_pointer = instr.op0_kind() == OpKind::Register
+                && instr.op0_register().full_register() == Register::RBP
+                && !matches!(instr.mnemonic(), Mnemonic::Push | Mnemonic::Cmp | Mnemonic::Test);
+            // Any control flow, or saving the frame pointer, ends the part worth judging.
+            if writes_frame_pointer || instr.mnemonic() == Mnemonic::Push || instr.flow_control() != FlowControl::Next {
+                return false;
+            }
+        }
+        false
+    }
+
     fn step(state: &mut State, insn: &Instruction) {
         state.step(insn);
     }
@@ -171,4 +194,25 @@ fn opens_landing_pad(after_endbr: &Instruction) -> bool {
         && after_endbr.op1_kind() == OpKind::Register
         && after_endbr.op1_register().full_register() == Register::RAX;
     reads_rax || after_endbr.flow_control() == FlowControl::UnconditionalBranch
+}
+
+/// The usual ways compiled x86 functions begin: `push ebp; mov ebp, esp`, the hot-patch
+/// `mov edi, edi`, reserving stack with `sub esp, N`, or saving callee-saved registers.
+fn opens_function(first: &Instruction, second: Option<&Instruction>) -> bool {
+    let register = |instr: &Instruction, operand: u32| {
+        (instr.op_kind(operand) == OpKind::Register).then(|| instr.op_register(operand).full_register())
+    };
+    let is_callee_saved = |reg: Option<Register>| matches!(reg, Some(Register::RBX | Register::RSI | Register::RDI | Register::RBP));
+    let reserves_stack = |instr: &Instruction| instr.mnemonic() == Mnemonic::Sub && register(instr, 0) == Some(Register::RSP);
+    let saves = |instr: &Instruction| instr.mnemonic() == Mnemonic::Push && is_callee_saved(register(instr, 0));
+
+    match first.mnemonic() {
+        Mnemonic::Mov => register(first, 0) == Some(Register::RDI) && register(first, 1) == Some(Register::RDI),
+        Mnemonic::Sub => reserves_stack(first),
+        Mnemonic::Push if register(first, 0) == Some(Register::RBP) => second.is_some_and(|next| {
+            next.mnemonic() == Mnemonic::Mov && register(next, 0) == Some(Register::RBP) && register(next, 1) == Some(Register::RSP)
+        }),
+        Mnemonic::Push if saves(first) => second.is_some_and(|next| saves(next) || reserves_stack(next)),
+        _ => false,
+    }
 }

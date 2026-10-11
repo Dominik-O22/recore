@@ -82,6 +82,18 @@ pub trait Arch: 'static {
     /// `endbr64` or `bti c`.
     fn is_entry_marker(insn: &Self::Insn) -> bool;
 
+    /// Whether two consecutive instructions look like the opening of a function: setting up a
+    /// frame or saving registers. Used where neither alignment nor padding settles it.
+    fn opens_function(_first: &Self::Insn, _second: Option<&Self::Insn>) -> bool {
+        false
+    }
+
+    /// Whether code beginning with `insns` uses a stack frame it did not set up, which marks a
+    /// block inside a function, such as an exception filter or handler, and not a function.
+    fn borrows_frame(_insns: &[Self::Insn]) -> bool {
+        false
+    }
+
     /// Whether the first real instruction of a block shows it is an exception landing pad.
     fn opens_landing_pad(insn: &Self::Insn) -> bool;
 

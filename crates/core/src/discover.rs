@@ -407,6 +407,31 @@ impl<A: Arch> Explorer<'_, A> {
         }
     }
 
+    /// Removes entry points whose code runs in another function's stack frame. Windows scope
+    /// tables point at exception filters and handlers, and functions call their own `finally`
+    /// blocks; all of these sit inside the function they belong to.
+    fn demote_frame_borrowers(&mut self) {
+        /// How many instructions decide it. A function sets up its frame within the first few.
+        const PROBE: usize = 4;
+        if !self.image.data_in_code {
+            return;
+        }
+        let borrowers: Vec<u64> = self
+            .starts
+            .iter()
+            .filter(|(_, origin)| !matches!(origin, Origin::Frame | Origin::Export | Origin::Thunk))
+            .map(|(&addr, _)| addr)
+            .filter(|&addr| {
+                let Some(bytes) = self.image.bytes_from(addr) else { return false };
+                let insns: Vec<A::Insn> = A::decode(bytes, addr).take(PROBE).map_while(|d| d.insn).collect();
+                A::borrows_frame(&insns)
+            })
+            .collect();
+        for addr in borrowers {
+            self.starts.remove(&addr);
+        }
+    }
+
     /// Finds code that nothing referenced. Code following padding at an aligned address, or
     /// opening with an entry marker, starts a function. Other unreached code continues the
     /// function before it, such as switch cases behind an unresolved indirect jump.
@@ -448,17 +473,23 @@ impl<A: Arch> Explorer<'_, A> {
                 }
                 let aligned = addr % A::FUNCTION_ALIGN == 0;
                 let marked = A::is_entry_marker(&insn);
+                let next = decoder.next().and_then(|d| d.insn);
                 // An entry marker right after other code may open a landing pad at the end of a
                 // function.
-                let landing_pad = marked
-                    && !skipped_padding
-                    && decoder.next().and_then(|d| d.insn).is_some_and(|next| A::opens_landing_pad(&next));
-                let is_start = aligned && (skipped_padding || marked) && !landing_pad && !self.inside_frame(addr);
-                // Where data sits among the code, unreached bytes are only trusted to be
-                // instructions when they look like a function: behind padding, aligned, and
-                // not a relocated pointer, which would be a jump-table entry.
-                if self.image.data_in_code && (!is_start || !skipped_padding || self.pointer_slots.contains_key(&addr)) {
-                    continue;
+                let landing_pad = marked && !skipped_padding && next.as_ref().is_some_and(A::opens_landing_pad);
+                let mut is_start = aligned && (skipped_padding || marked) && !landing_pad && !self.inside_frame(addr);
+                if self.image.data_in_code {
+                    // Where data sits among the code, unreached bytes are only trusted to be
+                    // instructions when they look like a function: aligned behind padding, or
+                    // opening like one behind padding or a terminator. A relocated pointer
+                    // here is a jump-table entry.
+                    let offset = (addr - section.addr) as usize;
+                    let after_break = skipped_padding || self.regions[index].follows_break[offset];
+                    let opens = after_break && A::opens_function(&insn, next.as_ref());
+                    is_start = (is_start && skipped_padding || opens) && !self.inside_frame(addr);
+                    if !is_start || self.pointer_slots.contains_key(&addr) {
+                        continue;
+                    }
                 }
                 if is_start {
                     self.add_start(addr, if marked { Origin::GapEndbr } else { Origin::GapAligned });
@@ -561,6 +592,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], known_length
 
     explorer.demote_case_targets();
     while explorer.demote_crossed_starts() {}
+    explorer.demote_frame_borrowers();
 
     explorer
 }
