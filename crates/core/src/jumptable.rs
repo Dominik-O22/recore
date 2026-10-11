@@ -22,6 +22,9 @@ use iced_x86::{ConditionCode, Instruction, Mnemonic, OpKind, Register};
 use crate::arch::Table;
 use crate::image::Image;
 
+/// How many spilled values are tracked per path.
+const SPILL_SLOTS: usize = 4;
+
 /// Upper bound on entries when no bounds check is found.
 const MAX_ENTRIES: usize = 4096;
 
@@ -46,6 +49,8 @@ enum Value {
 #[derive(Clone, Copy, Default)]
 pub struct State {
     registers: [Value; 16],
+    /// Table values spilled to the stack, as `(offset from rsp, value)`.
+    spills: [(u64, Value); SPILL_SLOTS],
     /// Register and immediate of a `cmp` whose flags the next instruction may branch on.
     compare: Option<(usize, u64)>,
 }
@@ -85,6 +90,23 @@ impl State {
         self.compare = None;
         let dest = (instr.op0_kind() == OpKind::Register).then(|| instr.op0_register());
         let source = (instr.op1_kind() == OpKind::Register).then(|| instr.op1_register());
+
+        // Anything that moves the stack pointer shifts every spill offset.
+        let moves_stack = matches!(instr.mnemonic(), Mnemonic::Push | Mnemonic::Pop)
+            || dest.is_some_and(|d| d.full_register() == Register::RSP);
+        if moves_stack {
+            self.spills = Default::default();
+        }
+        if instr.mnemonic() == Mnemonic::Mov {
+            if let (Some(offset), Some(source)) = (stack_slot(instr, 0), source) {
+                self.spill(offset, self.get(source));
+                return;
+            }
+            if let (Some(offset), Some(dest)) = (stack_slot(instr, 1), dest.and_then(index_of)) {
+                self.registers[dest] = self.spilled(offset);
+                return;
+            }
+        }
 
         let value = match instr.mnemonic() {
             Mnemonic::Cmp => {
@@ -168,6 +190,24 @@ impl State {
         }
     }
 
+    /// Remembers a table value stored to the stack, or forgets the slot if it is overwritten
+    /// with anything else.
+    fn spill(&mut self, offset: u64, value: Value) {
+        let keep = matches!(value, Value::Base(_) | Value::Entry { .. } | Value::Target { .. } | Value::Pointer { .. });
+        match (self.spills.iter().position(|(at, v)| *at == offset && *v != Value::Unknown), keep) {
+            (Some(slot), _) => self.spills[slot] = (offset, value),
+            (None, true) => {
+                self.spills.rotate_right(1);
+                self.spills[0] = (offset, value);
+            }
+            (None, false) => {}
+        }
+    }
+
+    fn spilled(&self, offset: u64) -> Value {
+        self.spills.iter().find(|(at, _)| *at == offset).map_or(Value::Unknown, |&(_, value)| value)
+    }
+
     /// The table address in a `[base + index*8]` operand whose base register holds one.
     fn absolute_table(&self, instr: &Instruction) -> Option<u64> {
         if instr.memory_index() == Register::None || instr.memory_displacement64() != 0 {
@@ -222,6 +262,7 @@ impl State {
         let value = match jump.op0_kind() {
             OpKind::Register => self.get(jump.op0_register()),
             // `jmp [base + index*8]` dispatches through absolute pointers directly.
+            OpKind::Memory if stack_slot(jump, 0).is_some() => stack_slot(jump, 0).map_or(Value::Unknown, |at| self.spilled(at)),
             OpKind::Memory if jump.memory_index_scale() == 8 => {
                 self.absolute_table(jump).map_or(Value::Unknown, |table| Value::Pointer { table })
             }
@@ -260,6 +301,12 @@ fn read_relative(image: &Image, table: u64, max_index: Option<u64>, is_target: &
         entries.push(target);
     }
     (!entries.is_empty()).then_some(Table { address: table, entry_size: 4, entries, bounded: max_index.is_some() })
+}
+
+/// The offset of a plain `[rsp + disp]` memory operand in position `operand`.
+fn stack_slot(instr: &Instruction, operand: u32) -> Option<u64> {
+    (instr.op_kind(operand) == OpKind::Memory && instr.memory_base() == Register::RSP && instr.memory_index() == Register::None)
+        .then(|| instr.memory_displacement64())
 }
 
 fn is_immediate(kind: OpKind) -> bool {

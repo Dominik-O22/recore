@@ -66,6 +66,8 @@ struct Explorer<'a, A: Arch> {
     data_refs: BTreeSet<u64>,
     /// Slot address to target for every pointer a relative relocation stores in data.
     pointer_slots: HashMap<u64, u64>,
+    /// Entry counts of tables that have no bounds check, learned from an earlier pass.
+    known_lengths: HashMap<u64, usize>,
     /// `[start, end)` ranges from `.eh_frame`. Nothing strictly inside one becomes an entry point.
     frames: &'a [(u64, u64)],
 }
@@ -180,6 +182,7 @@ impl<A: Arch> Explorer<'_, A> {
                         let resolved = A::resolve_table(&state, self.image, &self.pointer_slots, &insn, &|target| {
                             self.is_case_target(jump, target)
                         });
+                        let resolved = resolved.map(|table| self.apply_known_length(table));
                         match resolved {
                             Some(table) => self.accept_table(jump, table, A::after_jump(state, &insn), trusted),
                             None => {
@@ -202,6 +205,29 @@ impl<A: Arch> Explorer<'_, A> {
                 }
             }
         }
+    }
+
+    /// Cuts a table without a bounds check to the length an earlier pass worked out for it.
+    fn apply_known_length(&self, mut table: Table) -> Table {
+        if let (false, Some(&length)) = (table.bounded, self.known_lengths.get(&table.address)) {
+            table.entries.truncate(length);
+            table.bounded = true;
+        }
+        table
+    }
+
+    /// The length of each table that has no bounds check but is followed by another data
+    /// address the code refers to. Tables are laid out back to back, so that address ends it.
+    fn learned_lengths(&self) -> HashMap<u64, usize> {
+        self.tables
+            .iter()
+            .filter(|(_, table)| !table.bounded)
+            .filter_map(|(_, table)| {
+                let next = self.data_refs.range(table.address + 1..).next()?;
+                let length = ((next - table.address) / table.entry_size) as usize;
+                (length <= table.entries.len()).then_some((table.address, length))
+            })
+            .collect()
     }
 
     /// Records a resolved table and queues its cases.
@@ -234,6 +260,7 @@ impl<A: Arch> Explorer<'_, A> {
                         self.is_case_target(jump, target)
                     });
                     if let Some(table) = resolved {
+                        let table = self.apply_known_length(table);
                         self.accept_table(jump, table, A::after_jump(state, &insn), true);
                     }
                     return;
@@ -425,6 +452,28 @@ pub fn is_function_section(section: &Section) -> bool {
 }
 
 pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
+    // A table with no bounds check is read until something implausible, which can run into the
+    // next table and send decoding to addresses that are not code. The first pass learns where
+    // such tables really end; the second starts clean with that knowledge.
+    let first = explore::<A>(image, frames, HashMap::new());
+    let lengths = first.learned_lengths();
+    let explorer = if lengths.is_empty() { first } else { explore::<A>(image, frames, lengths) };
+
+    // An entry point is only real if its first bytes decoded.
+    let starts = explorer
+        .starts
+        .iter()
+        .map(|(&addr, &origin)| (addr, origin))
+        .filter(|&(addr, _)| {
+            explorer
+                .region_index(addr)
+                .is_some_and(|i| explorer.regions[i].is_instruction[(addr - explorer.regions[i].section.addr) as usize])
+        })
+        .collect();
+    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced }
+}
+
+fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], known_lengths: HashMap<u64, usize>) -> Explorer<'a, A> {
     let regions = image
         .sections
         .iter()
@@ -447,6 +496,7 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
         unresolved: BTreeSet::new(),
         data_refs: BTreeSet::new(),
         pointer_slots: image.relative_targets.iter().copied().collect(),
+        known_lengths,
         frames,
     };
 
@@ -472,16 +522,5 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
     explorer.demote_case_targets();
     while explorer.demote_crossed_starts() {}
 
-    // An entry point is only real if its first bytes decoded.
-    let starts = explorer
-        .starts
-        .iter()
-        .map(|(&addr, &origin)| (addr, origin))
-        .filter(|&(addr, _)| {
-            explorer
-                .region_index(addr)
-                .is_some_and(|i| explorer.regions[i].is_instruction[(addr - explorer.regions[i].section.addr) as usize])
-        })
-        .collect();
-    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced }
+    explorer
 }
