@@ -27,6 +27,8 @@ pub struct Discovery {
     /// Addresses something calls, takes the address of, exports, or points to from data. A
     /// frame that none of these reach is a split-off piece of another function.
     pub referenced: HashSet<u64>,
+    /// `(instruction, address)` for each data address an instruction materialises.
+    pub data_refs: Vec<(u64, u64)>,
 }
 
 /// An address to decode from.
@@ -64,6 +66,8 @@ struct Explorer<'a, A: Arch> {
     unresolved: BTreeSet<u64>,
     /// Data addresses computed by `lea`. The next one after a table bounds its length.
     data_refs: BTreeSet<u64>,
+    /// `(instruction, address)` for each data address an instruction materialises.
+    data_ref_sites: Vec<(u64, u64)>,
     /// Slot address to target for every pointer a relative relocation stores in data.
     pointer_slots: HashMap<u64, u64>,
     /// Every value a relocation stores, for telling addresses from look-alike constants.
@@ -158,6 +162,7 @@ impl<A: Arch> Explorer<'_, A> {
                             self.add_start(target, Origin::AddressTaken);
                         } else {
                             self.data_refs.insert(target);
+                            self.data_ref_sites.push((decoded.addr, target));
                         }
                     }
                     A::step(&mut state, &insn);
@@ -468,7 +473,7 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
     // such tables really end; the second starts clean with that knowledge.
     let first = explore::<A>(image, frames, HashMap::new());
     let lengths = first.learned_lengths();
-    let explorer = if lengths.is_empty() { first } else { explore::<A>(image, frames, lengths) };
+    let mut explorer = if lengths.is_empty() { first } else { explore::<A>(image, frames, lengths) };
 
     // An entry point is only real if its first bytes decoded.
     let starts = explorer
@@ -481,7 +486,10 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
                 .is_some_and(|i| explorer.regions[i].is_instruction[(addr - explorer.regions[i].section.addr) as usize])
         })
         .collect();
-    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced }
+    let mut data_refs = std::mem::take(&mut explorer.data_ref_sites);
+    data_refs.sort_unstable();
+    data_refs.dedup();
+    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs }
 }
 
 fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], known_lengths: HashMap<u64, usize>) -> Explorer<'a, A> {
@@ -506,6 +514,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], known_length
         tables: Vec::new(),
         unresolved: BTreeSet::new(),
         data_refs: BTreeSet::new(),
+        data_ref_sites: Vec::new(),
         pointer_slots: image.relative_targets.iter().copied().collect(),
         pointer_values: image.relative_targets.iter().map(|&(_, value)| value).collect(),
         known_lengths,

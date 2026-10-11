@@ -12,6 +12,7 @@ pub mod jumptable;
 pub mod noreturn;
 pub mod pe;
 pub mod report;
+pub mod strings;
 pub mod x86;
 
 pub use analysis::analyze;

@@ -12,7 +12,8 @@ use crate::arch::{Arch, Flow};
 use crate::discover::{discover, is_function_section};
 use crate::image::{Image, Machine};
 use crate::noreturn::is_noreturn_import;
-use crate::report::{AnalyzedFunction, Analysis, CallSite, CallTarget, Import, Origin};
+use crate::report::{AnalyzedFunction, Analysis, CallSite, CallTarget, DataRef, Import, Origin};
+use crate::strings::string_at;
 
 #[derive(Debug, Clone, Copy)]
 struct Control {
@@ -466,7 +467,16 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         .collect();
     import_list.sort_unstable_by_key(|import| import.slot);
 
+    // Strings sit where code points, or where a pointer in data points.
+    let mut candidates: Vec<u64> =
+        discovery.data_refs.iter().map(|&(_, to)| to).chain(image.relative_targets.iter().map(|&(_, to)| to)).collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    let strings = candidates.par_iter().filter_map(|&addr| string_at(image, addr)).collect();
+
     Analysis {
+        data_refs: discovery.data_refs.iter().map(|&(from, to)| DataRef { from, to }).collect(),
+        strings,
         name: image.name.clone(),
         instructions: functions.iter().map(|f| f.instructions).sum(),
         functions: functions

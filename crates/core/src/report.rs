@@ -81,6 +81,25 @@ pub struct Import {
     pub noreturn: bool,
 }
 
+/// A text string found in the image's data.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StringLiteral {
+    pub addr: u64,
+    pub text: String,
+    /// Stored as UTF-16, as Windows APIs with a `W` suffix take.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wide: bool,
+}
+
+/// An instruction that takes the address of data.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct DataRef {
+    /// Address of the instruction.
+    pub from: u64,
+    /// The data address it refers to.
+    pub to: u64,
+}
+
 /// An indirect jump resolved to the code addresses it can reach.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JumpTable {
@@ -106,4 +125,10 @@ pub struct Analysis {
     /// Imported functions that the code refers to.
     #[serde(default)]
     pub imports: Vec<Import>,
+    /// Data addresses that code takes, sorted by instruction.
+    #[serde(default)]
+    pub data_refs: Vec<DataRef>,
+    /// Strings at addresses the code or relocated pointers refer to, sorted by address.
+    #[serde(default)]
+    pub strings: Vec<StringLiteral>,
 }
