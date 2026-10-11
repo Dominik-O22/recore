@@ -6,16 +6,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use iced_x86::{Decoder, DecoderOptions, Instruction};
-
+use crate::arch::{Arch, Flow, Table};
 use crate::image::{Image, Section};
 use crate::noreturn::is_noreturn_import;
-use crate::jumptable::{State, Table};
 use crate::report::{JumpTable, Origin};
-use crate::x86::{classify, is_endbr, is_padding, lea_target, opens_landing_pad, Flow};
-
-/// Typical function alignment for GCC, Clang and rustc at `-O2`.
-pub const FUNCTION_ALIGN: u64 = 16;
 
 /// One executable section and which of its bytes begin a decoded instruction.
 struct Region<'a> {
@@ -35,7 +29,7 @@ pub struct Discovery {
     pub referenced: HashSet<u64>,
 }
 
-struct Explorer<'a> {
+struct Explorer<'a, A: Arch> {
     image: &'a Image,
     regions: Vec<Region<'a>>,
     starts: BTreeMap<u64, Origin>,
@@ -43,7 +37,7 @@ struct Explorer<'a> {
     /// Direct jumps as `(from, to)`, kept to recognise tail calls afterwards.
     jumps: Vec<(u64, u64)>,
     /// Addresses still to decode, each with the register state on arrival.
-    pending: Vec<(u64, State)>,
+    pending: Vec<(u64, A::State)>,
     /// Resolved tables with the jump that uses each.
     tables: Vec<(u64, Table)>,
     /// Data addresses computed by `lea`. The next one after a table bounds its length.
@@ -54,7 +48,7 @@ struct Explorer<'a> {
     frames: &'a [(u64, u64)],
 }
 
-impl<'a> Explorer<'a> {
+impl<A: Arch> Explorer<'_, A> {
     fn region_index(&self, addr: u64) -> Option<usize> {
         self.regions.iter().position(|r| r.section.contains(addr))
     }
@@ -70,7 +64,7 @@ impl<'a> Explorer<'a> {
         }
         if self.region_index(addr).is_some() && !self.inside_frame(addr) && !self.starts.contains_key(&addr) {
             self.starts.insert(addr, origin);
-            self.pending.push((addr, State::default()));
+            self.pending.push((addr, A::State::default()));
         }
     }
 
@@ -105,35 +99,31 @@ impl<'a> Explorer<'a> {
 
     /// Decodes from every pending address until control flow ends or reaches known code.
     fn drain(&mut self) {
-        let mut instr = Instruction::default();
         while let Some((start, mut state)) = self.pending.pop() {
             let Some(index) = self.region_index(start) else { continue };
             let section = self.regions[index].section;
-            let mut decoder =
-                Decoder::with_ip(64, &section.data[(start - section.addr) as usize..], start, DecoderOptions::NONE);
             let mut after_call = false;
-            while decoder.can_decode() {
-                let offset = (decoder.ip() - section.addr) as usize;
+            for decoded in A::decode(&section.data[(start - section.addr) as usize..], start) {
+                let offset = (decoded.addr - section.addr) as usize;
                 if std::mem::replace(&mut self.regions[index].is_instruction[offset], true) {
                     break;
                 }
-                decoder.decode_out(&mut instr);
                 // Padding straight after a call means the call does not return: compilers pad
                 // between functions, not after a call that falls through.
-                if instr.is_invalid() || (after_call && is_padding(&instr)) {
+                let Some(insn) = decoded.insn.filter(|insn| !(after_call && A::is_padding(insn))) else {
                     self.regions[index].is_instruction[offset] = false;
                     break;
-                }
+                };
                 after_call = false;
-                let Some(flow) = classify(&instr) else {
-                    if let Some(target) = lea_target(&instr) {
+                let Some(flow) = A::flow(&insn, &state) else {
+                    if let Some(target) = A::address_taken(&insn, &state) {
                         if self.region_index(target).is_some() {
                             self.add_start(target, Origin::AddressTaken);
                         } else {
                             self.data_refs.insert(target);
                         }
                     }
-                    state.step(&instr);
+                    A::step(&mut state, &insn);
                     continue;
                 };
                 let ends_flow = match flow {
@@ -143,23 +133,24 @@ impl<'a> Explorer<'a> {
                     }
                     Flow::CallIndirect(_) => self.import_never_returns(flow),
                     Flow::Jump(target) => {
-                        self.jumps.push((instr.ip(), target));
+                        self.jumps.push((decoded.addr, target));
                         self.pending.push((target, state));
                         true
                     }
                     Flow::Branch(target) => {
-                        let (taken, fallthrough) = state.branch(&instr);
-                        self.jumps.push((instr.ip(), target));
+                        let (taken, fallthrough) = A::branch(state, &insn);
+                        self.jumps.push((decoded.addr, target));
                         self.pending.push((target, taken));
                         state = fallthrough;
                         false
                     }
                     Flow::JumpIndirect(None) => {
-                        let jump = instr.ip();
-                        let resolved =
-                            state.resolve(self.image, &self.pointer_slots, &instr, |target| self.is_case_target(jump, target));
+                        let jump = decoded.addr;
+                        let resolved = A::resolve_table(&state, self.image, &self.pointer_slots, &insn, &|target| {
+                            self.is_case_target(jump, target)
+                        });
                         if let Some(table) = resolved {
-                            let at_case = state.after_jump(&instr);
+                            let at_case = A::after_jump(state, &insn);
                             let function_end = self.frame_end(jump);
                             // An entry equal to the function's end marks a case proven unreachable.
                             self.pending.extend(
@@ -172,13 +163,13 @@ impl<'a> Explorer<'a> {
                     Flow::JumpIndirect(Some(_)) | Flow::Return | Flow::Halt => true,
                 };
                 if ends_flow {
-                    if let Some(flag) = self.regions[index].follows_break.get_mut((instr.next_ip() - section.addr) as usize) {
+                    if let Some(flag) = self.regions[index].follows_break.get_mut((decoded.next_addr() - section.addr) as usize) {
                         *flag = true;
                     }
                     break;
                 }
                 if matches!(flow, Flow::Call(_) | Flow::CallIndirect(_)) {
-                    state.step(&instr);
+                    A::step(&mut state, &insn);
                     after_call = true;
                 }
             }
@@ -195,7 +186,7 @@ impl<'a> Explorer<'a> {
                 let mut count = table.entries.len();
                 if !table.bounded {
                     if let Some(&next) = self.data_refs.range(table.address + 1..).next() {
-                        count = count.min(((next - table.address) / 4) as usize);
+                        count = count.min(((next - table.address) / table.entry_size) as usize);
                     }
                 }
                 let function_end = self.frame_end(*jump);
@@ -217,19 +208,11 @@ impl<'a> Explorer<'a> {
         let region = &self.regions[index];
         let offset = (addr - region.section.addr) as usize;
         // Padding between functions is shorter than one alignment unit.
-        let earliest = offset.saturating_sub(FUNCTION_ALIGN as usize - 1);
+        let earliest = offset.saturating_sub(A::FUNCTION_ALIGN as usize - 1);
         let Some(break_at) = (earliest..=offset).rev().find(|&o| region.follows_break[o]) else {
             return false;
         };
-        let mut decoder = Decoder::with_ip(64, &region.section.data[break_at..offset], 0, DecoderOptions::NONE);
-        let mut instr = Instruction::default();
-        while decoder.can_decode() {
-            decoder.decode_out(&mut instr);
-            if instr.is_invalid() || !is_padding(&instr) {
-                return false;
-            }
-        }
-        true
+        A::decode(&region.section.data[break_at..offset], 0).all(|decoded| decoded.insn.is_some_and(|insn| A::is_padding(&insn)))
     }
 
     /// Marks a jump target as an entry point when the jump is a tail call: it leaves the function
@@ -247,7 +230,7 @@ impl<'a> Explorer<'a> {
             .collect();
         let mut promoted = Vec::new();
         for &(from, to) in &self.jumps {
-            if to == from || to % FUNCTION_ALIGN != 0 || self.starts.contains_key(&to) {
+            if to == from || to % A::FUNCTION_ALIGN != 0 || self.starts.contains_key(&to) {
                 continue;
             }
             let (low, high) = if to < from { (to, from) } else { (from, to) };
@@ -269,7 +252,7 @@ impl<'a> Explorer<'a> {
         // computed-goto targets, so it is only weak evidence.
         let is_weak = |addr: u64, origin: &Origin| match origin {
             Origin::TailCall | Origin::GapAligned | Origin::GapEndbr => true,
-            Origin::DataPointer => addr % FUNCTION_ALIGN != 0,
+            Origin::DataPointer => addr % A::FUNCTION_ALIGN != 0,
             _ => false,
         };
         let mut demoted = BTreeSet::new();
@@ -310,61 +293,55 @@ impl<'a> Explorer<'a> {
     }
 
     /// Finds code that nothing referenced. Code following padding at an aligned address, or
-    /// opening with `endbr64`, starts a function. Other unreached code continues the function
-    /// before it, such as switch cases behind an unresolved indirect jump.
+    /// opening with an entry marker, starts a function. Other unreached code continues the
+    /// function before it, such as switch cases behind an unresolved indirect jump.
     fn fill_gaps(&mut self) -> bool {
         let mut found = false;
-        let mut instr = Instruction::default();
         for index in 0..self.regions.len() {
             let section = self.regions[index].section;
             let mut offset = 0;
             while offset < section.data.len() {
+                let addr = section.addr + offset as u64;
                 if self.regions[index].is_instruction[offset] {
                     // Skip the whole instruction, not only its first byte.
-                    let mut decoder =
-                        Decoder::with_ip(64, &section.data[offset..], section.addr + offset as u64, DecoderOptions::NONE);
-                    decoder.decode_out(&mut instr);
-                    offset += instr.len().max(1);
+                    offset += A::decode(&section.data[offset..], addr).next().map_or(1, |d| usize::from(d.len.max(1)));
                     continue;
                 }
                 // An unreached stretch: step over padding to the first real instruction.
-                let mut decoder =
-                    Decoder::with_ip(64, &section.data[offset..], section.addr + offset as u64, DecoderOptions::NONE);
+                let mut decoder = A::decode(&section.data[offset..], addr);
                 let mut skipped_padding = false;
                 let mut candidate = None;
-                while decoder.can_decode() {
-                    let at = (decoder.ip() - section.addr) as usize;
-                    if self.regions[index].is_instruction[at] {
+                let mut scanned_to = addr;
+                for decoded in decoder.by_ref() {
+                    if self.regions[index].is_instruction[(decoded.addr - section.addr) as usize] {
                         break;
                     }
-                    decoder.decode_out(&mut instr);
-                    if instr.is_invalid() {
-                        break;
-                    }
-                    if is_padding(&instr) {
+                    scanned_to = decoded.next_addr();
+                    let Some(insn) = decoded.insn else { break };
+                    if A::is_padding(&insn) {
                         skipped_padding = true;
                         continue;
                     }
-                    candidate = Some(instr.ip());
+                    candidate = Some((decoded.addr, insn));
                     break;
                 }
-                offset = (decoder.ip() - section.addr) as usize;
-                let Some(addr) = candidate else { continue };
+                // Always make progress, even past bytes that do not decode.
+                offset = ((scanned_to - section.addr) as usize).max(offset + 1);
+                let Some((addr, insn)) = candidate else { continue };
                 if skipped_padding {
                     self.regions[index].follows_break[(addr - section.addr) as usize] = true;
                 }
-                let aligned = addr % FUNCTION_ALIGN == 0;
-                let endbr = is_endbr(&instr);
-                // An `endbr64` right after other code may be a landing pad at the end of a function.
-                let landing_pad = endbr && !skipped_padding && {
-                    let mut next = Instruction::default();
-                    decoder.decode_out(&mut next);
-                    !next.is_invalid() && opens_landing_pad(&next)
-                };
-                if aligned && (skipped_padding || endbr) && !landing_pad && !self.inside_frame(addr) {
-                    self.add_start(addr, if endbr { Origin::GapEndbr } else { Origin::GapAligned });
+                let aligned = addr % A::FUNCTION_ALIGN == 0;
+                let marked = A::is_entry_marker(&insn);
+                // An entry marker right after other code may open a landing pad at the end of a
+                // function.
+                let landing_pad = marked
+                    && !skipped_padding
+                    && decoder.next().and_then(|d| d.insn).is_some_and(|next| A::opens_landing_pad(&next));
+                if aligned && (skipped_padding || marked) && !landing_pad && !self.inside_frame(addr) {
+                    self.add_start(addr, if marked { Origin::GapEndbr } else { Origin::GapAligned });
                 } else {
-                    self.pending.push((addr, State::default()));
+                    self.pending.push((addr, A::State::default()));
                 }
                 found = true;
                 self.drain();
@@ -379,7 +356,7 @@ pub fn is_function_section(section: &Section) -> bool {
     section.executable && !section.name.starts_with(".plt")
 }
 
-pub fn discover(image: &Image, frames: &[(u64, u64)]) -> Discovery {
+pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
     let regions = image
         .sections
         .iter()
@@ -390,7 +367,7 @@ pub fn discover(image: &Image, frames: &[(u64, u64)]) -> Discovery {
             follows_break: vec![false; section.data.len()],
         })
         .collect();
-    let mut explorer = Explorer {
+    let mut explorer: Explorer<A> = Explorer {
         image,
         regions,
         starts: BTreeMap::new(),

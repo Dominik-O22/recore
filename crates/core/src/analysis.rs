@@ -6,14 +6,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction};
 use rayon::prelude::*;
 
-use crate::discover::{discover, is_function_section, FUNCTION_ALIGN};
-use crate::image::Image;
+use crate::arch::{Arch, Flow};
+use crate::discover::{discover, is_function_section};
+use crate::image::{Image, Machine};
 use crate::noreturn::is_noreturn_import;
 use crate::report::{AnalyzedFunction, Analysis, CallSite, CallTarget, Import, Origin};
-use crate::x86::{classify, is_endbr, is_padding, opens_landing_pad, Flow};
 
 #[derive(Debug, Clone, Copy)]
 struct Control {
@@ -33,26 +32,28 @@ struct Function {
 
 /// Decodes `[start, end)` linearly and keeps its control-flow instructions. With `trim`, `end` is
 /// only an upper bound and the function ends before any trailing padding.
-fn decode(image: &Image, start: u64, end: u64, trim: bool) -> Function {
+fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool) -> Function {
     let mut function = Function { start, end, controls: Vec::new(), instructions: 0 };
     let Some(bytes) = image.bytes_from(start) else {
         return function;
     };
     let bytes = &bytes[..bytes.len().min((end - start) as usize)];
-    let mut decoder = Decoder::with_ip(64, bytes, start, DecoderOptions::NONE);
-    let mut instr = Instruction::default();
+    let mut state = A::State::default();
     let mut body_end = start;
-    while decoder.can_decode() {
-        decoder.decode_out(&mut instr);
-        if instr.is_invalid() {
-            continue;
-        }
+    for decoded in A::decode(bytes, start) {
+        let Some(insn) = decoded.insn else { continue };
         function.instructions += 1;
-        if !is_padding(&instr) {
-            body_end = instr.next_ip();
+        if !A::is_padding(&insn) {
+            body_end = decoded.next_addr();
         }
-        if let Some(flow) = classify(&instr) {
-            function.controls.push(Control { addr: instr.ip(), next: instr.next_ip(), flow });
+        match A::flow(&insn, &state) {
+            Some(flow) => {
+                function.controls.push(Control { addr: decoded.addr, next: decoded.next_addr(), flow });
+                // The state only matters for resolving slots, so a fresh one after any control
+                // transfer is enough for a linear pass.
+                state = A::State::default();
+            }
+            None => A::step(&mut state, &insn),
         }
     }
     if trim {
@@ -70,27 +71,8 @@ struct Imports<'a> {
 }
 
 impl<'a> Imports<'a> {
-    fn new(image: &'a Image) -> Self {
-        let mut stubs = HashMap::new();
-        for section in image.sections.iter().filter(|s| s.executable && s.name.starts_with(".plt")) {
-            let mut decoder = Decoder::with_ip(64, &section.data, section.addr, DecoderOptions::NONE);
-            let mut stub_start = section.addr;
-            let mut instr = Instruction::default();
-            while decoder.can_decode() {
-                decoder.decode_out(&mut instr);
-                if instr.flow_control() == FlowControl::IndirectBranch && instr.is_ip_rel_memory_operand() {
-                    let slot = instr.ip_rel_memory_address();
-                    if image.import_slots.contains_key(&slot) {
-                        stubs.insert(stub_start, slot);
-                    }
-                }
-                // Stubs are padded to 16 bytes; the next one starts at the next boundary.
-                if instr.next_ip() % 16 == 0 {
-                    stub_start = instr.next_ip();
-                }
-            }
-        }
-        Imports { image, stubs }
+    fn new<A: Arch>(image: &'a Image) -> Self {
+        Imports { image, stubs: A::plt_stubs(image) }
     }
 
     /// The import behind a slot address, if the slot is one.
@@ -242,33 +224,30 @@ fn walk(function: &Function, noreturn: &HashSet<u64>, program: &Program) -> Walk
 /// The first real instruction in `[from, end)` after any padding, unless it opens an exception
 /// landing pad. Landing pads are reached by the unwinder, not by control flow, so unreached
 /// code that starts with one still belongs to the function before it.
-fn next_function_start(image: &Image, from: u64, end: u64) -> Option<u64> {
+fn next_function_start<A: Arch>(image: &Image, from: u64, end: u64) -> Option<u64> {
     let bytes = image.bytes_from(from)?;
     let bytes = &bytes[..bytes.len().min((end.checked_sub(from)?) as usize)];
-    let mut decoder = Decoder::with_ip(64, bytes, from, DecoderOptions::NONE);
-    let mut instr = Instruction::default();
-    while decoder.can_decode() {
-        decoder.decode_out(&mut instr);
-        if instr.is_invalid() {
-            return None;
-        }
-        if is_padding(&instr) {
-            continue;
-        }
-        let start = instr.ip();
-        let mut first = instr;
-        if is_endbr(&first) && decoder.can_decode() {
-            decoder.decode_out(&mut first);
-        }
-        // Landing pads sit at arbitrary offsets; a function that starts flush against the
-        // previous one, with no padding to mark the boundary, still starts aligned.
-        return (start % FUNCTION_ALIGN == 0 && !opens_landing_pad(&first)).then_some(start);
+    let mut decoder = A::decode(bytes, from).skip_while(|d| d.insn.as_ref().is_some_and(A::is_padding));
+    let first = decoder.next()?;
+    let mut insn = first.insn?;
+    if A::is_entry_marker(&insn) {
+        insn = decoder.next()?.insn?;
     }
-    None
+    // Landing pads sit at arbitrary offsets; a function that starts flush against the previous
+    // one, with no padding to mark the boundary, still starts aligned.
+    (first.addr % A::FUNCTION_ALIGN == 0 && !A::opens_landing_pad(&insn)).then_some(first.addr)
 }
 
+/// Analyzes a loaded image with the support for its architecture.
 pub fn analyze(image: &Image) -> Analysis {
-    let imports = Imports::new(image);
+    match image.machine {
+        Machine::X86_64 => analyze_with::<crate::x86::X86>(image),
+        Machine::Aarch64 => analyze_with::<crate::arm64::Arm64>(image),
+    }
+}
+
+fn analyze_with<A: Arch>(image: &Image) -> Analysis {
+    let imports = Imports::new::<A>(image);
     let frames: Vec<(u64, u64)> = image
         .frames
         .iter()
@@ -277,7 +256,7 @@ pub fn analyze(image: &Image) -> Analysis {
         .collect();
     let frame_end: HashMap<u64, u64> = frames.iter().copied().collect();
 
-    let mut discovery = discover(image, &frames);
+    let mut discovery = discover::<A>(image, &frames);
     let tables: HashMap<u64, &[u64]> = discovery.jump_tables.iter().map(|t| (t.jump, t.targets.as_slice())).collect();
 
     let (starts, functions, noreturn) = loop {
@@ -286,11 +265,11 @@ pub fn analyze(image: &Image) -> Analysis {
             .par_iter()
             .enumerate()
             .map(|(index, &start)| match frame_end.get(&start) {
-                Some(&end) => decode(image, start, end, false),
+                Some(&end) => decode::<A>(image, start, end, false),
                 None => {
                     let section_end = image.section_at(start).map_or(start, |s| s.end());
                     let bound = starts.get(index + 1).copied().unwrap_or(section_end).min(section_end);
-                    decode(image, start, bound, true)
+                    decode::<A>(image, start, bound, true)
                 }
             })
             .collect();
@@ -323,7 +302,7 @@ pub fn analyze(image: &Image) -> Analysis {
             .filter_map(|f| {
                 let reached = walk(f, &noreturn, &program);
                 (reached.complete && reached.reach_end < f.end)
-                    .then(|| next_function_start(image, reached.reach_end, f.end))
+                    .then(|| next_function_start::<A>(image, reached.reach_end, f.end))
                     .flatten()
             })
             .collect();

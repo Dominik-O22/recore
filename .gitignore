@@ -8,3 +8,8 @@ corpus/ghidra-*/
 corpus/recore*/
 corpus/jumptables/
 corpus/jt/src/
+corpus-arm64/pkgs/
+corpus-arm64/bin/
+corpus-arm64/debug/
+corpus-arm64/truth/
+corpus-arm64/recore*/

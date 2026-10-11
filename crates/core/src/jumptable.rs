@@ -1,4 +1,4 @@
-//! Jump-table recovery for switch dispatch.
+//! Jump-table recovery for x86-64 switch dispatch.
 //!
 //! Position-independent x86-64 code dispatches a dense switch like this:
 //!
@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 use iced_x86::{ConditionCode, Instruction, Mnemonic, OpKind, Register};
 
+use crate::arch::Table;
 use crate::image::Image;
 
 /// Upper bound on entries when no bounds check is found.
@@ -47,16 +48,6 @@ pub struct State {
     registers: [Value; 16],
     /// Register and immediate of a `cmp` whose flags the next instruction may branch on.
     compare: Option<(usize, u64)>,
-}
-
-/// A jump table as read from the image.
-pub struct Table {
-    pub address: u64,
-    /// Targets in table order, one per entry.
-    pub entries: Vec<u64>,
-    /// Whether a bounds check fixed the entry count. Otherwise `entries` runs to the first value
-    /// that is not a plausible target and may overshoot into the next table.
-    pub bounded: bool,
 }
 
 fn index_of(register: Register) -> Option<usize> {
@@ -226,7 +217,7 @@ impl State {
         image: &Image,
         pointer_slots: &HashMap<u64, u64>,
         jump: &Instruction,
-        is_target: impl Fn(u64) -> bool,
+        is_target: &dyn Fn(u64) -> bool,
     ) -> Option<Table> {
         let value = match jump.op0_kind() {
             OpKind::Register => self.get(jump.op0_register()),
@@ -244,7 +235,7 @@ impl State {
                     .map_while(|i| pointer_slots.get(&(table + 8 * i)).copied())
                     .take_while(|&target| is_target(target))
                     .collect();
-                (!entries.is_empty()).then_some(Table { address: table, entries, bounded: true })
+                (!entries.is_empty()).then_some(Table { address: table, entry_size: 8, entries, bounded: true })
             }
             _ => None,
         }
@@ -252,7 +243,7 @@ impl State {
 }
 
 /// Reads a table of 4-byte offsets relative to the table's own address.
-fn read_relative(image: &Image, table: u64, max_index: Option<u64>, is_target: impl Fn(u64) -> bool) -> Option<Table> {
+fn read_relative(image: &Image, table: u64, max_index: Option<u64>, is_target: &dyn Fn(u64) -> bool) -> Option<Table> {
     let bytes = image.bytes_from(table)?;
     let limit = max_index.map_or(MAX_ENTRIES, |max| (max as usize).saturating_add(1).min(MAX_ENTRIES));
     let mut entries = Vec::new();
@@ -268,7 +259,7 @@ fn read_relative(image: &Image, table: u64, max_index: Option<u64>, is_target: i
         }
         entries.push(target);
     }
-    (!entries.is_empty()).then_some(Table { address: table, entries, bounded: max_index.is_some() })
+    (!entries.is_empty()).then_some(Table { address: table, entry_size: 4, entries, bounded: max_index.is_some() })
 }
 
 fn is_immediate(kind: OpKind) -> bool {

@@ -26,8 +26,16 @@ impl Section {
     }
 }
 
+/// The instruction set an image is built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Machine {
+    X86_64,
+    Aarch64,
+}
+
 pub struct Image {
     pub name: String,
+    pub machine: Machine,
     pub entry: u64,
     /// Loaded sections, sorted by address.
     pub sections: Vec<Section>,
@@ -99,7 +107,14 @@ impl Image {
 
         let frames = file.section_by_name(".eh_frame").map(|s| parse_frames(&s)).unwrap_or_default();
 
+        let machine = match file.architecture() {
+            object::Architecture::X86_64 => Machine::X86_64,
+            object::Architecture::Aarch64 => Machine::Aarch64,
+            other => anyhow::bail!("unsupported architecture {other:?}"),
+        };
+
         Ok(Image {
+            machine,
             name: path.file_name().unwrap().to_string_lossy().into_owned(),
             entry: file.entry(),
             sections,

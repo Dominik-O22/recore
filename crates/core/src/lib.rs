@@ -4,6 +4,8 @@
 //! `report` defines the JSON shape that every analyzer's output is reduced to for scoring.
 
 pub mod analysis;
+pub mod arch;
+pub mod arm64;
 pub mod discover;
 pub mod image;
 pub mod jumptable;
