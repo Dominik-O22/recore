@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::arch::{Arch, Flow, Table};
-use crate::image::{Image, Section};
+use crate::image::{Image, Machine, Section};
 use crate::noreturn::is_noreturn_import;
 use crate::report::{JumpTable, Origin};
 
@@ -478,11 +478,22 @@ impl<A: Arch> Explorer<'_, A> {
         for index in 0..self.regions.len() {
             let section = self.regions[index].section;
             let mut offset = 0;
+            // Offset just past the last data seen, or the section start: code beginning
+            // exactly there follows a break even without padding in between.
+            let mut after_data = 0;
             while offset < section.data.len() {
                 let addr = section.addr + offset as u64;
                 if self.regions[index].is_instruction[offset] {
                     // Skip the whole instruction, not only its first byte.
                     offset += A::decode(&section.data[offset..], addr).next().map_or(1, |d| usize::from(d.len.max(1)));
+                    continue;
+                }
+                // Relocated pointers in a code section are a jump table. Step over the whole
+                // table; what follows it cannot be fallen into.
+                if self.image.data_in_code && self.pointer_slots.contains_key(&addr) {
+                    let pointer_size = if self.image.machine == Machine::X86 { 4 } else { 8 };
+                    offset += pointer_size;
+                    after_data = offset;
                     continue;
                 }
                 // An unreached stretch: step over padding to the first real instruction.
@@ -522,9 +533,12 @@ impl<A: Arch> Explorer<'_, A> {
                     // opening like one behind padding or a terminator. A relocated pointer
                     // here is a jump-table entry.
                     let offset = (addr - section.addr) as usize;
-                    let after_break = skipped_padding || self.regions[index].follows_break[offset];
+                    let after_break = skipped_padding || self.regions[index].follows_break[offset] || offset == after_data;
                     let opens = after_break && A::opens_function(&insn, next.as_ref());
-                    is_start = (is_start && skipped_padding || opens) && !self.inside_frame(addr);
+                    // After a table, alignment alone proves little: a byte table or more of the
+                    // same function may follow. The start of the section is different.
+                    let aligned_after_break = aligned && (skipped_padding || offset == 0);
+                    is_start = (aligned_after_break || opens) && !self.inside_frame(addr);
                     if self.pointer_slots.contains_key(&addr) {
                         continue;
                     }
