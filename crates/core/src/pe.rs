@@ -79,23 +79,43 @@ pub fn load<Pe: ImageNtHeaders>(data: &[u8], sections: &[Section]) -> Result<Met
         })
         .collect();
 
-    // Each entry is three RVAs: begin, end, unwind information.
-    let frames = sections
-        .iter()
-        .find(|s| s.name == ".pdata")
-        .map(|pdata| {
-            let rva = |bytes: &[u8]| u64::from(u32::from_le_bytes(bytes.try_into().unwrap()));
-            let mut frames: Vec<(u64, u64)> = pdata
-                .data
-                .chunks_exact(12)
-                .map(|entry| (base + rva(&entry[0..4]), base + rva(&entry[4..8])))
-                .filter(|&(start, end)| start != base && end > start)
-                .collect();
-            frames.sort_unstable();
-            frames.dedup();
-            frames
-        })
-        .unwrap_or_default();
+    let frames = sections.iter().find(|s| s.name == ".pdata").map(|pdata| function_frames(pdata, sections, base)).unwrap_or_default();
 
     Ok(Metadata { import_slots, relative_targets, exports, frames })
+}
+
+/// Function extents from the exception directory. Each entry is three RVAs: begin, end, and
+/// unwind information.
+///
+/// One function can have several entries: the compiler gives a region its own entry, chained to
+/// the function's main one, when it sets up more of the frame there. Chained entries are not
+/// functions, so they are folded into the entry before them.
+fn function_frames(pdata: &Section, sections: &[Section], base: u64) -> Vec<(u64, u64)> {
+    /// `UNW_FLAG_CHAININFO`: this entry continues the function described by another.
+    const CHAINED: u8 = 0x4;
+    let rva = |bytes: &[u8]| u64::from(u32::from_le_bytes(bytes.try_into().unwrap()));
+    let is_chained = |unwind: u64| {
+        let section = sections.iter().find(|s| s.contains(unwind));
+        // The first byte holds the version in its low three bits and the flags above them.
+        section.and_then(|s| s.data.get((unwind - s.addr) as usize)).is_some_and(|&first| first >> 3 & CHAINED != 0)
+    };
+
+    let mut entries: Vec<(u64, u64, bool)> = pdata
+        .data
+        .chunks_exact(12)
+        .map(|entry| (base + rva(&entry[0..4]), base + rva(&entry[4..8]), is_chained(base + rva(&entry[8..12]))))
+        .filter(|&(start, end, _)| start != base && end > start)
+        .collect();
+    entries.sort_unstable();
+    entries.dedup();
+
+    let mut frames: Vec<(u64, u64)> = Vec::with_capacity(entries.len());
+    for (start, end, chained) in entries {
+        match frames.last_mut() {
+            Some(last) if chained && start <= last.1 => last.1 = last.1.max(end),
+            // A chained entry placed away from its function is a separate piece of code.
+            _ => frames.push((start, end)),
+        }
+    }
+    frames
 }

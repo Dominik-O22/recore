@@ -4,7 +4,7 @@
 # Skips binaries whose JSON already exists, so it can be re-run after an interruption.
 set -uo pipefail
 GHIDRA="$1"; OUT="$(realpath -m "$2")"; JOBS="${3:-4}"; EXTRA="${4:-}"
-HERE="$(cd "$(dirname "$0")" && pwd)"; CORPUS="$HERE/../corpus"
+HERE="$(cd "$(dirname "$0")" && pwd)"; CORPUS="${CORPUS:-$HERE/../corpus}"
 mkdir -p "$OUT/logs" "$OUT/proj"
 
 one() {
