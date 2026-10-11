@@ -82,6 +82,12 @@ pub trait Arch: 'static {
         None
     }
 
+    /// The fixed address of data `insn` reads or writes directly, as opposed to taking its
+    /// address: a global variable or a constant table.
+    fn memory_reference(_insn: &Self::Insn) -> Option<u64> {
+        None
+    }
+
     /// Filler the toolchain inserts between functions.
     fn is_padding(insn: &Self::Insn) -> bool;
 

@@ -29,6 +29,9 @@ enum Command {
     /// Shows one function: its extent, what it calls, who calls it, and the strings it uses.
     /// `addr` is any address inside it, in hex.
     Function { binary: PathBuf, addr: String },
+    /// Lists what refers to an address: callers if it is a function, otherwise the
+    /// instructions that read, write or take the address of that data. `addr` is in hex.
+    Xrefs { binary: PathBuf, addr: String },
     /// Analyzes every file in a directory, writing `<out>/<name>.json`.
     Corpus {
         bin_dir: PathBuf,
@@ -119,6 +122,19 @@ fn main() -> Result<()> {
             for import in loaded.analysis.imports.iter().filter(|i| matches(&i.name, &pattern)) {
                 let sites = loaded.analysis.calls.iter().filter(|c| c.target == CallTarget::Import(import.slot)).map(|c| c.at);
                 println!("{} called by: {}", import.name, loaded.users(sites));
+            }
+        }
+        Command::Xrefs { binary, addr } => {
+            let loaded = Loaded::new(&binary)?;
+            let addr = u64::from_str_radix(addr.trim_start_matches("0x"), 16)?;
+            let calls = loaded.analysis.calls.iter().filter(|c| c.target == CallTarget::Function(addr));
+            for call in calls {
+                let from = loaded.function_containing(call.at).map_or_else(|| "?".into(), |entry| loaded.label(entry));
+                println!("{:#x} in {from} {}", call.at, if call.tail { "tail-calls it" } else { "calls it" });
+            }
+            for reference in loaded.analysis.data_refs.iter().filter(|r| r.to == addr) {
+                let from = loaded.function_containing(reference.from).map_or_else(|| "?".into(), |entry| loaded.label(entry));
+                println!("{:#x} in {from} refers to it", reference.from);
             }
         }
         Command::Function { binary, addr } => {

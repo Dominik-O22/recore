@@ -27,8 +27,9 @@ pub struct Discovery {
     /// Addresses something calls, takes the address of, exports, or points to from data. A
     /// frame that none of these reach is a split-off piece of another function.
     pub referenced: HashSet<u64>,
-    /// `(instruction, address)` for each data address an instruction materialises.
-    pub data_refs: Vec<(u64, u64)>,
+    /// `(instruction, address, accessed)` for each data address an instruction refers to:
+    /// `accessed` when it reads or writes there, otherwise it takes the address.
+    pub data_refs: Vec<(u64, u64, bool)>,
 }
 
 /// An address to decode from.
@@ -69,8 +70,8 @@ struct Explorer<'a, A: Arch> {
     unresolved: BTreeSet<u64>,
     /// Data addresses computed by `lea`. The next one after a table bounds its length.
     data_refs: BTreeSet<u64>,
-    /// `(instruction, address)` for each data address an instruction materialises.
-    data_ref_sites: Vec<(u64, u64)>,
+    /// `(instruction, address, accessed)` for each data address an instruction refers to.
+    data_ref_sites: Vec<(u64, u64, bool)>,
     /// Slot address to target for every pointer a relative relocation stores in data.
     pointer_slots: HashMap<u64, u64>,
     /// Every value a relocation stores, for telling addresses from look-alike constants.
@@ -173,6 +174,13 @@ impl<A: Arch> Explorer<'_, A> {
                             self.data_refs.insert(data);
                         }
                     }
+                    let accessed = A::memory_reference(&insn)
+                        .filter(|_| !speculative)
+                        .filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target))
+                        .filter(|&target| self.image.section_at(target).is_some_and(|s| !s.executable));
+                    if let Some(target) = accessed {
+                        self.data_ref_sites.push((decoded.addr, target, true));
+                    }
                     let taken = A::address_taken(&insn, &state)
                         .filter(|_| !speculative)
                         .filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
@@ -181,7 +189,7 @@ impl<A: Arch> Explorer<'_, A> {
                             self.add_start(target, Origin::AddressTaken);
                         } else {
                             self.data_refs.insert(target);
-                            self.data_ref_sites.push((decoded.addr, target));
+                            self.data_ref_sites.push((decoded.addr, target, false));
                         }
                     }
                     A::step(&mut state, &insn);

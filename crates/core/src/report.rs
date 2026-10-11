@@ -97,13 +97,16 @@ pub struct StringLiteral {
     pub wide: bool,
 }
 
-/// An instruction that takes the address of data.
+/// An instruction that refers to data at a fixed address.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct DataRef {
     /// Address of the instruction.
     pub from: u64,
     /// The data address it refers to.
     pub to: u64,
+    /// The instruction reads or writes the data. Otherwise it only takes its address.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub access: bool,
 }
 
 /// An indirect jump resolved to the code addresses it can reach.

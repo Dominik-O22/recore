@@ -484,7 +484,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     import_list.sort_unstable_by_key(|import| import.slot);
 
     // Strings sit where code points, or where a pointer in data points.
-    let from_code: HashSet<u64> = discovery.data_refs.iter().map(|&(_, to)| to).collect();
+    // A string is used by taking its address, so only those references count as evidence.
+    let from_code: HashSet<u64> = discovery.data_refs.iter().filter(|r| !r.2).map(|&(_, to, _)| to).collect();
     let mut candidates: Vec<u64> = from_code.iter().copied().chain(image.relative_targets.iter().map(|&(_, to)| to)).collect();
     candidates.sort_unstable();
     candidates.dedup();
@@ -505,7 +506,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     }
 
     Analysis {
-        data_refs: discovery.data_refs.iter().map(|&(from, to)| DataRef { from, to }).collect(),
+        data_refs: discovery.data_refs.iter().map(|&(from, to, access)| DataRef { from, to, access }).collect(),
         strings,
         name: image.name.clone(),
         instructions: functions.iter().map(|f| f.instructions).sum(),

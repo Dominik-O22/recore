@@ -66,6 +66,18 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         state.based_address(insn)
     }
 
+    /// A RIP-relative operand in 64-bit code; in 32-bit code a displacement, which the caller
+    /// checks against relocations since any constant offset looks the same.
+    fn memory_reference(insn: &Instruction) -> Option<u64> {
+        if !insn.op_kinds().any(|kind| kind == OpKind::Memory) || insn.mnemonic() == Mnemonic::Lea {
+            return None;
+        }
+        if insn.is_ip_rel_memory_operand() {
+            return Some(insn.ip_rel_memory_address());
+        }
+        (BITS == 32 && insn.memory_displacement64() != 0).then(|| insn.memory_displacement64())
+    }
+
     fn is_padding(insn: &Instruction) -> bool {
         is_padding(insn)
     }
