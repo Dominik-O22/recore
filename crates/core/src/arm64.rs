@@ -378,12 +378,22 @@ impl Arch for Arm64 {
     fn resolve_table(
         state: &State,
         image: &Image,
-        _pointer_slots: &HashMap<u64, u64>,
+        pointer_slots: &HashMap<u64, u64>,
         jump: &Insn,
         is_target: &dyn Fn(u64) -> bool,
     ) -> Option<Table> {
-        let Value::Target { table, size, signed, max_index, base, shift } = state.registers[jump.rn()] else {
-            return None;
+        let (table, size, signed, max_index, base, shift) = match state.registers[jump.rn()] {
+            Value::Target { table, size, signed, max_index, base, shift } => (table, size, signed, max_index, base, shift),
+            // A 64-bit entry jumped to as it is: a table of absolute code pointers, as computed
+            // goto uses. It runs for as long as consecutive slots hold relocated code pointers.
+            Value::Entry { table, size: 8, .. } => {
+                let entries: Vec<u64> = (0..MAX_ENTRIES as u64)
+                    .map_while(|i| pointer_slots.get(&(table + 8 * i)).copied())
+                    .take_while(|&target| is_target(target))
+                    .collect();
+                return (!entries.is_empty()).then_some(Table { address: table, entry_size: 8, entries, bounded: true });
+            }
+            _ => return None,
         };
         let bytes = image.bytes_from(table)?;
         let limit = max_index.map_or(MAX_ENTRIES, |max| (max as usize).saturating_add(1).min(MAX_ENTRIES));
