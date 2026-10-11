@@ -1,4 +1,4 @@
-//! x86-64 support on top of the iced decoder.
+//! x86 support, 64-bit and 32-bit, on top of the iced decoder.
 
 use std::collections::HashMap;
 
@@ -8,18 +8,24 @@ use crate::arch::{Arch, Decoded, Flow, Table};
 use crate::image::Image;
 use crate::jumptable::State;
 
-pub struct X86;
+/// x86 in 64-bit or 32-bit mode. The two differ in how code refers to addresses: 64-bit code
+/// is RIP-relative, 32-bit code embeds absolute addresses that the loader relocates.
+pub struct X86<const BITS: u32>;
 
-impl Arch for X86 {
+pub type X86_64 = X86<64>;
+pub type X86_32 = X86<32>;
+
+impl<const BITS: u32> Arch for X86<BITS> {
     type Insn = Instruction;
     type State = State;
 
     /// GCC, Clang and rustc all align functions to 16 bytes at `-O2`.
     const FUNCTION_ALIGN: u64 = 16;
     const ALIGNMENT_IS_EVIDENCE: bool = true;
+    const ADDRESSES_ARE_RELOCATED: bool = BITS == 32;
 
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Instruction>> {
-        let mut decoder = Decoder::with_ip(64, bytes, addr, DecoderOptions::NONE);
+        let mut decoder = Decoder::with_ip(BITS, bytes, addr, DecoderOptions::NONE);
         std::iter::from_fn(move || {
             decoder.can_decode().then(|| {
                 let instr = decoder.decode();
@@ -33,7 +39,7 @@ impl Arch for X86 {
     }
 
     fn address_taken(insn: &Instruction, _: &State) -> Option<u64> {
-        lea_target(insn)
+        if BITS == 64 { lea_target(insn) } else { immediate_address(insn) }
     }
 
     fn is_padding(insn: &Instruction) -> bool {
@@ -67,7 +73,7 @@ impl Arch for X86 {
         jump: &Instruction,
         is_target: &dyn Fn(u64) -> bool,
     ) -> Option<Table> {
-        state.resolve(image, pointer_slots, jump, is_target)
+        state.resolve(image, pointer_slots, jump, is_target, u64::from(BITS / 8))
     }
 
     fn plt_stubs(image: &Image) -> HashMap<u64, u64> {
@@ -110,8 +116,28 @@ fn classify(instr: &Instruction) -> Option<Flow> {
     }
 }
 
+/// The address of the memory slot an indirect call or jump reads its target from, when the
+/// operand names one outright: RIP-relative in 64-bit code, a bare absolute address in 32-bit.
 fn rip_slot(instr: &Instruction) -> Option<u64> {
-    instr.is_ip_rel_memory_operand().then(|| instr.ip_rel_memory_address())
+    if instr.is_ip_rel_memory_operand() {
+        return Some(instr.ip_rel_memory_address());
+    }
+    let absolute = instr.op0_kind() == OpKind::Memory
+        && instr.memory_base() == Register::None
+        && instr.memory_index() == Register::None
+        && instr.code_size() == iced_x86::CodeSize::Code32;
+    absolute.then(|| instr.memory_displacement64())
+}
+
+/// The 32-bit immediate of `push imm32` or `mov dest, imm32`, which is how 32-bit code takes
+/// an address. Whether it really is an address is for the caller to check against relocations.
+fn immediate_address(instr: &Instruction) -> Option<u64> {
+    let operand = match instr.mnemonic() {
+        Mnemonic::Push => 0,
+        Mnemonic::Mov => 1,
+        _ => return None,
+    };
+    (instr.op_kind(operand) == OpKind::Immediate32).then(|| u64::from(instr.immediate32()))
 }
 
 /// The address a `lea reg, [rip+disp]` computes, which is how position-independent code takes

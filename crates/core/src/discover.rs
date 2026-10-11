@@ -66,6 +66,8 @@ struct Explorer<'a, A: Arch> {
     data_refs: BTreeSet<u64>,
     /// Slot address to target for every pointer a relative relocation stores in data.
     pointer_slots: HashMap<u64, u64>,
+    /// Every value a relocation stores, for telling addresses from look-alike constants.
+    pointer_values: HashSet<u64>,
     /// Entry counts of tables that have no bounds check, learned from an earlier pass.
     known_lengths: HashMap<u64, usize>,
     /// `[start, end)` ranges from `.eh_frame`. Nothing strictly inside one becomes an entry point.
@@ -149,7 +151,9 @@ impl<A: Arch> Explorer<'_, A> {
                 };
                 after_call = false;
                 let Some(flow) = A::flow(&insn, &state) else {
-                    if let Some(target) = A::address_taken(&insn, &state) {
+                    let taken = A::address_taken(&insn, &state)
+                        .filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
+                    if let Some(target) = taken {
                         if self.region_index(target).is_some() {
                             self.add_start(target, Origin::AddressTaken);
                         } else {
@@ -391,10 +395,6 @@ impl<A: Arch> Explorer<'_, A> {
     /// opening with an entry marker, starts a function. Other unreached code continues the
     /// function before it, such as switch cases behind an unresolved indirect jump.
     fn fill_gaps(&mut self) -> bool {
-        // Where data sits among the code, unreached bytes may not be instructions at all.
-        if self.image.data_in_code {
-            return false;
-        }
         let mut found = false;
         for index in 0..self.regions.len() {
             let section = self.regions[index].section;
@@ -437,7 +437,14 @@ impl<A: Arch> Explorer<'_, A> {
                 let landing_pad = marked
                     && !skipped_padding
                     && decoder.next().and_then(|d| d.insn).is_some_and(|next| A::opens_landing_pad(&next));
-                if aligned && (skipped_padding || marked) && !landing_pad && !self.inside_frame(addr) {
+                let is_start = aligned && (skipped_padding || marked) && !landing_pad && !self.inside_frame(addr);
+                // Where data sits among the code, unreached bytes are only trusted to be
+                // instructions when they look like a function: behind padding, aligned, and
+                // not a relocated pointer, which would be a jump-table entry.
+                if self.image.data_in_code && (!is_start || !skipped_padding || self.pointer_slots.contains_key(&addr)) {
+                    continue;
+                }
+                if is_start {
                     self.add_start(addr, if marked { Origin::GapEndbr } else { Origin::GapAligned });
                 } else {
                     self.pending.push(Pending::entry(addr));
@@ -500,6 +507,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], known_length
         unresolved: BTreeSet::new(),
         data_refs: BTreeSet::new(),
         pointer_slots: image.relative_targets.iter().copied().collect(),
+        pointer_values: image.relative_targets.iter().map(|&(_, value)| value).collect(),
         known_lengths,
         frames,
     };

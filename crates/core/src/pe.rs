@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use object::read::pe::{Import, PeFile64};
+use object::read::pe::{ImageNtHeaders, Import, PeFile};
 use object::{LittleEndian as LE, Object};
 
 use crate::image::Section;
@@ -13,16 +13,18 @@ use crate::image::Section;
 pub struct Metadata {
     /// Import address table slot to the name of the function the loader binds there.
     pub import_slots: HashMap<u64, String>,
-    /// `(slot, value)` for every 64-bit pointer the loader would rebase.
+    /// `(slot, value)` for every pointer the loader would rebase.
     pub relative_targets: Vec<(u64, u64)>,
     pub exports: Vec<u64>,
     /// `[start, end)` of every `RUNTIME_FUNCTION` in the exception directory.
     pub frames: Vec<(u64, u64)>,
 }
 
-pub fn load(data: &[u8], sections: &[Section]) -> Result<Metadata> {
-    let pe = PeFile64::parse(data)?;
+/// Loads the metadata of a 32-bit (`ImageNtHeaders32`) or 64-bit (`ImageNtHeaders64`) image.
+pub fn load<Pe: ImageNtHeaders>(data: &[u8], sections: &[Section]) -> Result<Metadata> {
+    let pe = PeFile::<Pe>::parse(data)?;
     let base = pe.relative_address_base();
+    let pointer_size = std::mem::size_of::<Pe::ImageThunkData>() as u64;
 
     let mut import_slots = HashMap::new();
     if let Some(table) = pe.import_table()? {
@@ -37,28 +39,34 @@ pub fn load(data: &[u8], sections: &[Section]) -> Result<Metadata> {
             };
             let mut thunks = table.thunks(lookup)?;
             let mut index = 0u64;
-            while let Some(thunk) = thunks.next::<object::pe::ImageNtHeaders64>()? {
-                if let Ok(Import::Name(_, name)) = table.import::<object::pe::ImageNtHeaders64>(thunk) {
-                    import_slots.insert(base + slots + 8 * index, String::from_utf8_lossy(name).into_owned());
+            while let Some(thunk) = thunks.next::<Pe>()? {
+                if let Ok(Import::Name(_, name)) = table.import::<Pe>(thunk) {
+                    import_slots.insert(base + slots + pointer_size * index, String::from_utf8_lossy(name).into_owned());
                 }
                 index += 1;
             }
         }
     }
 
-    let read_word = |addr: u64| {
+    // The value at a relocated slot: a pointer of the image's own width.
+    let read_pointer = |addr: u64, size: usize| {
         let section = sections.iter().find(|s| s.contains(addr))?;
-        let bytes = section.data.get((addr - section.addr) as usize..)?.get(..8)?;
-        Some(u64::from_le_bytes(bytes.try_into().unwrap()))
+        let bytes = section.data.get((addr - section.addr) as usize..)?.get(..size)?;
+        let mut raw = [0u8; 8];
+        raw[..size].copy_from_slice(bytes);
+        Some(u64::from_le_bytes(raw))
     };
     let mut relative_targets = Vec::new();
     if let Some(mut blocks) = pe.data_directories().relocation_blocks(data, &pe.section_table())? {
         while let Some(block) = blocks.next()? {
             for relocation in block {
-                if relocation.typ == object::pe::IMAGE_REL_BASED_DIR64 {
-                    let slot = base + u64::from(relocation.virtual_address);
-                    relative_targets.extend(read_word(slot).map(|value| (slot, value)));
-                }
+                let size = match relocation.typ {
+                    object::pe::IMAGE_REL_BASED_DIR64 => 8,
+                    object::pe::IMAGE_REL_BASED_HIGHLOW => 4,
+                    _ => continue,
+                };
+                let slot = base + u64::from(relocation.virtual_address);
+                relative_targets.extend(read_pointer(slot, size).map(|value| (slot, value)));
             }
         }
     }

@@ -29,6 +29,8 @@ impl Section {
 /// The instruction set an image is built for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Machine {
+    /// 32-bit x86.
+    X86,
     X86_64,
     Aarch64,
 }
@@ -79,13 +81,18 @@ impl Image {
 
         let is_pe = file.format() == object::BinaryFormat::Pe;
         let (import_slots, relative_targets, exports, frames) = if is_pe {
-            let pe = crate::pe::load(&data, &sections)?;
+            let pe = if file.is_64() {
+                crate::pe::load::<object::pe::ImageNtHeaders64>(&data, &sections)?
+            } else {
+                crate::pe::load::<object::pe::ImageNtHeaders32>(&data, &sections)?
+            };
             (pe.import_slots, pe.relative_targets, pe.exports, pe.frames)
         } else {
             elf_metadata(&file, &sections)
         };
 
         let machine = match file.architecture() {
+            object::Architecture::I386 => Machine::X86,
             object::Architecture::X86_64 => Machine::X86_64,
             object::Architecture::Aarch64 => Machine::Aarch64,
             other => anyhow::bail!("unsupported architecture {other:?}"),

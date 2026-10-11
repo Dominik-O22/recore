@@ -60,6 +60,11 @@ pub trait Arch: 'static {
     /// sitting on an aligned address is likelier to be a function than a block inside one.
     const ALIGNMENT_IS_EVIDENCE: bool;
 
+    /// Whether code embeds absolute addresses that the loader relocates. If so, a value only
+    /// counts as an address when some relocation carries it, which rules out constants that
+    /// merely look like one.
+    const ADDRESSES_ARE_RELOCATED: bool = false;
+
     /// Decodes consecutive instructions from `bytes`, which are loaded at `addr`.
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Self::Insn>>;
 

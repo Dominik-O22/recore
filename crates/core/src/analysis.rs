@@ -296,7 +296,8 @@ fn next_function_start<A: Arch>(image: &Image, from: u64, end: u64) -> Option<u6
 /// Analyzes a loaded image with the support for its architecture.
 pub fn analyze(image: &Image) -> Analysis {
     match image.machine {
-        Machine::X86_64 => analyze_with::<crate::x86::X86>(image),
+        Machine::X86_64 => analyze_with::<crate::x86::X86_64>(image),
+        Machine::X86 => analyze_with::<crate::x86::X86_32>(image),
         Machine::Aarch64 => analyze_with::<crate::arm64::Arm64>(image),
     }
 }

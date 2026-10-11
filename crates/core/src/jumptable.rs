@@ -38,9 +38,11 @@ enum Value {
     /// An index proven to be at most this value by an unsigned bounds check.
     Bounded(u64),
     /// A sign-extended entry loaded from a table, with the index bound if known.
-    Entry { table: u64, max_index: Option<u64> },
+    /// `anchor` is the address the entry is an offset from: the table itself in GCC and Clang
+    /// output, the image base in MSVC output.
+    Entry { table: u64, anchor: u64, max_index: Option<u64> },
     /// Entry plus base: the jump target.
-    Target { table: u64, max_index: Option<u64> },
+    Target { table: u64, anchor: u64, max_index: Option<u64> },
     /// A code pointer loaded from a table of absolute addresses, as computed goto uses.
     Pointer { table: u64 },
 }
@@ -119,6 +121,10 @@ impl State {
             Mnemonic::Lea if instr.is_ip_rel_memory_operand() => Value::Base(instr.ip_rel_memory_address()),
             // A 32-bit move zero-extends, which keeps an unsigned bound intact.
             Mnemonic::Mov if source.is_some() => source.map_or(Value::Unknown, |s| self.get(s)),
+            // MSVC loads the 32-bit entry with a plain `mov`.
+            Mnemonic::Mov if instr.op1_kind() == OpKind::Memory && instr.memory_index_scale() == 4 && instr.op0_register().is_gpr32() => {
+                self.load(instr)
+            }
             Mnemonic::Mov if instr.op1_kind() == OpKind::Memory && instr.memory_index_scale() == 8 => {
                 match self.absolute_table(instr) {
                     Some(table) => Value::Pointer { table },
@@ -127,11 +133,11 @@ impl State {
             }
             Mnemonic::Movsxd if instr.op1_kind() == OpKind::Memory => self.load(instr),
             Mnemonic::Add => match (dest.map(|d| self.get(d)), source.map(|s| self.get(s))) {
-                (Some(Value::Entry { table, max_index }), Some(Value::Base(base)))
-                | (Some(Value::Base(base)), Some(Value::Entry { table, max_index }))
-                    if table == base =>
+                (Some(Value::Entry { table, anchor, max_index }), Some(Value::Base(base)))
+                | (Some(Value::Base(base)), Some(Value::Entry { table, anchor, max_index }))
+                    if anchor == base =>
                 {
-                    Value::Target { table, max_index }
+                    Value::Target { table, anchor, max_index }
                 }
                 _ => Value::Unknown,
             },
@@ -173,18 +179,20 @@ impl State {
         }
     }
 
-    /// The value produced by `movsxd reg, [base + index*4]`.
+    /// The value produced by loading a 4-byte entry from `[base + index*4 + offset]`. With no
+    /// offset the base is the table. With one, the base is the image base and the offset is
+    /// the table's address relative to it, which is how MSVC addresses its tables.
     fn load(&self, instr: &Instruction) -> Value {
-        if instr.memory_index_scale() != 4 || instr.memory_displacement64() != 0 {
+        if instr.memory_index_scale() != 4 || instr.memory_index() == Register::None {
             return Value::Unknown;
         }
         match self.get(instr.memory_base()) {
-            Value::Base(table) => {
+            Value::Base(anchor) => {
                 let max_index = match self.get(instr.memory_index()) {
                     Value::Bounded(max) => Some(max),
                     _ => None,
                 };
-                Value::Entry { table, max_index }
+                Value::Entry { table: anchor.wrapping_add(instr.memory_displacement64()), anchor, max_index }
             }
             _ => Value::Unknown,
         }
@@ -258,9 +266,20 @@ impl State {
         pointer_slots: &HashMap<u64, u64>,
         jump: &Instruction,
         is_target: &dyn Fn(u64) -> bool,
+        pointer_size: u64,
     ) -> Option<Table> {
         let value = match jump.op0_kind() {
             OpKind::Register => self.get(jump.op0_register()),
+            // `jmp [index*4 + table]`: 32-bit code indexes a table of absolute addresses that
+            // sits at a fixed address, usually right after the function.
+            OpKind::Memory
+                if jump.memory_base() == Register::None
+                    && jump.memory_index() != Register::None
+                    && u64::from(jump.memory_index_scale()) == pointer_size
+                    && jump.memory_displacement64() != 0 =>
+            {
+                Value::Pointer { table: jump.memory_displacement64() }
+            }
             // `jmp [base + index*8]` dispatches through absolute pointers directly.
             OpKind::Memory if stack_slot(jump, 0).is_some() => stack_slot(jump, 0).map_or(Value::Unknown, |at| self.spilled(at)),
             OpKind::Memory if jump.memory_index_scale() == 8 => {
@@ -269,28 +288,28 @@ impl State {
             _ => Value::Unknown,
         };
         match value {
-            Value::Target { table, max_index } => read_relative(image, table, max_index, is_target),
+            Value::Target { table, anchor, max_index } => read_relative(image, table, anchor, max_index, is_target),
             Value::Pointer { table } => {
                 // The table runs for as long as consecutive slots hold relocated code pointers.
                 let entries: Vec<u64> = (0..MAX_ENTRIES as u64)
-                    .map_while(|i| pointer_slots.get(&(table + 8 * i)).copied())
+                    .map_while(|i| pointer_slots.get(&(table + pointer_size * i)).copied())
                     .take_while(|&target| is_target(target))
                     .collect();
-                (!entries.is_empty()).then_some(Table { address: table, entry_size: 8, entries, bounded: true })
+                (!entries.is_empty()).then_some(Table { address: table, entry_size: pointer_size, entries, bounded: true })
             }
             _ => None,
         }
     }
 }
 
-/// Reads a table of 4-byte offsets relative to the table's own address.
-fn read_relative(image: &Image, table: u64, max_index: Option<u64>, is_target: &dyn Fn(u64) -> bool) -> Option<Table> {
+/// Reads a table of 4-byte offsets relative to `anchor`.
+fn read_relative(image: &Image, table: u64, anchor: u64, max_index: Option<u64>, is_target: &dyn Fn(u64) -> bool) -> Option<Table> {
     let bytes = image.bytes_from(table)?;
     let limit = max_index.map_or(MAX_ENTRIES, |max| (max as usize).saturating_add(1).min(MAX_ENTRIES));
     let mut entries = Vec::new();
     for entry in bytes.chunks_exact(4).take(limit) {
         let offset = i32::from_le_bytes(entry.try_into().unwrap());
-        let target = table.wrapping_add_signed(offset as i64);
+        let target = anchor.wrapping_add_signed(offset as i64);
         if !is_target(target) {
             // A bounded table with an impossible entry is a misread, not a short table.
             if max_index.is_some() {
