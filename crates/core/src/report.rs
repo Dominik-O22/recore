@@ -67,6 +67,9 @@ pub struct CallSite {
     /// A jump used as a call: the callee returns to this function's caller.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tail: bool,
+    /// The tail call is a conditional jump, so execution may also carry on past it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conditional: bool,
 }
 
 /// A function provided by another library, reached through a slot the loader fills in.

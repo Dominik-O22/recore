@@ -115,6 +115,9 @@ struct Program<'a> {
     extents: Vec<(u64, u64)>,
     imports: &'a Imports<'a>,
     tables: &'a HashMap<u64, &'a [u64]>,
+    /// Slot address to target for pointers the loader relocates. A call through such a slot
+    /// goes to a function in this image, not to an import.
+    pointer_slots: &'a HashMap<u64, u64>,
 }
 
 impl Program<'_> {
@@ -145,6 +148,14 @@ fn walk(function: &Function, noreturn: &HashSet<u64>, program: &Program) -> Walk
     let target_returns = |target: u64| match imports.stub(target) {
         Some(name) => !is_noreturn_import(name),
         None => !noreturn.contains(&target),
+    };
+
+    // What a call or jump through a slot reaches: an import, a local function through a
+    // relocated pointer, or something unknown that is assumed to return.
+    let slot_returns = |slot: Option<u64>| match (imports.slot(slot), slot.and_then(|s| program.pointer_slots.get(&s))) {
+        (Some(name), _) => !is_noreturn_import(name),
+        (None, Some(&target)) => !noreturn.contains(&target),
+        (None, None) => true,
     };
 
     let mut result = Walk { may_return: false, reach_end: function.start, complete: true, reached: Vec::new() };
@@ -213,7 +224,7 @@ fn walk(function: &Function, noreturn: &HashSet<u64>, program: &Program) -> Walk
                     break;
                 }
                 Flow::JumpIndirect(slot) => {
-                    if !imports.slot(slot).is_some_and(is_noreturn_import) {
+                    if slot_returns(slot) {
                         result.may_return = true;
                     }
                     break;
@@ -224,7 +235,7 @@ fn walk(function: &Function, noreturn: &HashSet<u64>, program: &Program) -> Walk
                     }
                 }
                 Flow::CallIndirect(slot) => {
-                    if imports.slot(slot).is_some_and(is_noreturn_import) {
+                    if !slot_returns(slot) {
                         break;
                     }
                 }
@@ -303,6 +314,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     let mut discovery = discover::<A>(image, &frames);
     let tables: HashMap<u64, &[u64]> = discovery.jump_tables.iter().map(|t| (t.jump, t.targets.as_slice())).collect();
 
+    let pointer_slots: HashMap<u64, u64> = image.relative_targets.iter().copied().collect();
+
     let (starts, functions, noreturn) = loop {
         let starts: Vec<u64> = discovery.starts.keys().copied().collect();
         let functions: Vec<Function> = starts
@@ -324,7 +337,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         let mut controls: Vec<Control> = functions.iter().flat_map(|f| f.controls.iter().copied()).collect();
         controls.sort_unstable_by_key(|c| c.addr);
         let extents = functions.iter().map(|f| (f.start, f.end)).collect();
-        let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables };
+        let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots };
 
         // Least fixpoint: a function joins the set once no path through it can return.
         let mut noreturn: HashSet<u64> = HashSet::new();
@@ -404,6 +417,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             let fragment_of = &fragment_of;
             let noreturn = &noreturn;
             let imports = &imports;
+            let pointer_slots = &pointer_slots;
             function.controls.iter().filter_map(move |control| {
                 let local = |target: u64, tail: bool| {
                     // Moving between a function and its own fragment is ordinary control flow.
@@ -415,16 +429,20 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                 let import = |slot: u64, tail: bool| {
                     imports.slot(Some(slot)).map(|name| (CallTarget::Import(slot), is_noreturn_import(name), tail))
                 };
+                // A slot holds either an import or a relocated pointer to a local function.
+                let through_slot =
+                    |slot: u64, tail: bool| import(slot, tail).or_else(|| local(*pointer_slots.get(&slot)?, tail));
                 let (target, noreturn, tail) = match control.flow {
                     Flow::Call(target) => imports.stub_slot(target).and_then(|slot| import(slot, false)).or_else(|| local(target, false)),
-                    Flow::CallIndirect(Some(slot)) => import(slot, false),
+                    Flow::CallIndirect(Some(slot)) => through_slot(slot, false),
                     Flow::Jump(target) | Flow::Branch(target) if leaves(function, target) => {
                         imports.stub_slot(target).and_then(|slot| import(slot, true)).or_else(|| local(target, true))
                     }
-                    Flow::JumpIndirect(Some(slot)) => import(slot, true),
+                    Flow::JumpIndirect(Some(slot)) => through_slot(slot, true),
                     _ => None,
                 }?;
-                Some(CallSite { at: control.addr, target, noreturn, tail })
+                let conditional = matches!(control.flow, Flow::Branch(_));
+                Some(CallSite { at: control.addr, target, noreturn, tail, conditional })
             })
         })
         .collect();
