@@ -43,6 +43,12 @@ enum Value {
     Entry { table: u64, anchor: u64, max_index: Option<u64> },
     /// Entry plus base: the jump target.
     Target { table: u64, anchor: u64, max_index: Option<u64> },
+    /// An entry loaded through a base register whose value is not known. If the same register
+    /// is then added to it, the register holds the image base: that is the only way MSVC forms
+    /// a jump target, and it often sets the base far from the dispatch.
+    BasedEntry { base_register: usize, table_offset: u64, max_index: Option<u64> },
+    /// A `BasedEntry` plus its base register.
+    BasedTarget { table_offset: u64, max_index: Option<u64> },
     /// A code pointer loaded from a table of absolute addresses, as computed goto uses.
     Pointer { table: u64, max_index: Option<u64> },
 }
@@ -122,6 +128,11 @@ impl State {
             }
             Mnemonic::Movsxd if instr.op1_kind() == OpKind::Memory => self.load(instr),
             Mnemonic::Add => match (dest.map(|d| self.get(d)), source.map(|s| self.get(s))) {
+                (Some(Value::BasedEntry { base_register, table_offset, max_index }), _)
+                    if source.and_then(index_of) == Some(base_register) =>
+                {
+                    Value::BasedTarget { table_offset, max_index }
+                }
                 (Some(Value::Entry { table, anchor, max_index }), Some(Value::Base(base)))
                 | (Some(Value::Base(base)), Some(Value::Entry { table, anchor, max_index }))
                     if anchor == base =>
@@ -177,20 +188,26 @@ impl State {
         }
         match self.get(instr.memory_base()) {
             Value::Base(anchor) => {
-                let max_index = match self.get(instr.memory_index()) {
-                    Value::Bounded(max) => Some(max),
-                    _ => None,
-                };
+                let max_index = self.bound_of(instr.memory_index());
                 Value::Entry { table: anchor.wrapping_add(instr.memory_displacement64()), anchor, max_index }
             }
-            _ => Value::Unknown,
+            // An unknown base with a non-zero offset: possibly the image base.
+            _ => match (index_of(instr.memory_base()), instr.memory_displacement64()) {
+                (Some(base_register), table_offset) if table_offset != 0 => {
+                    Value::BasedEntry { base_register, table_offset, max_index: self.bound_of(instr.memory_index()) }
+                }
+                _ => Value::Unknown,
+            },
         }
     }
 
     /// Remembers a table value stored to the stack, or forgets the slot if it is overwritten
     /// with anything else.
     fn spill(&mut self, offset: u64, value: Value) {
-        let keep = matches!(value, Value::Base(_) | Value::Entry { .. } | Value::Target { .. } | Value::Pointer { .. });
+        let keep = matches!(
+            value,
+            Value::Base(_) | Value::Entry { .. } | Value::Target { .. } | Value::BasedTarget { .. } | Value::Pointer { .. }
+        );
         match (self.spills.iter().position(|(at, v)| *at == offset && *v != Value::Unknown), keep) {
             (Some(slot), _) => self.spills[slot] = (offset, value),
             (None, true) => {
@@ -203,6 +220,18 @@ impl State {
 
     fn spilled(&self, offset: u64) -> Value {
         self.spills.iter().find(|(at, _)| *at == offset).map_or(Value::Unknown, |&(_, value)| value)
+    }
+
+    /// The base and address of a `[base + index + offset]` operand whose base register holds a
+    /// known address: how MSVC reaches its jump tables and the byte tables that index them.
+    pub fn based_address(&self, instr: &Instruction) -> Option<(u64, u64)> {
+        let has_memory = instr.op_kinds().any(|kind| kind == OpKind::Memory);
+        match self.get(instr.memory_base()) {
+            Value::Base(base) if has_memory && instr.memory_displacement64() != 0 => {
+                Some((base, base.wrapping_add(instr.memory_displacement64())))
+            }
+            _ => None,
+        }
     }
 
     /// The largest value an index register can hold, when a bounds check established one.
@@ -287,6 +316,10 @@ impl State {
             _ => Value::Unknown,
         };
         match value {
+            // Only images that have a base to be relative to.
+            Value::BasedTarget { table_offset, max_index } if image.base != 0 => {
+                read_relative(image, image.base.wrapping_add(table_offset), image.base, max_index, is_target)
+            }
             Value::Target { table, anchor, max_index } => {
                 read_relative(image, table, anchor, max_index, if max_index.is_some() { is_code } else { is_target })
             }

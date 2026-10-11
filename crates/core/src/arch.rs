@@ -75,6 +75,13 @@ pub trait Arch: 'static {
     /// address of a function or of data.
     fn address_taken(insn: &Self::Insn, state: &Self::State) -> Option<u64>;
 
+    /// Data that `insn` reads at an offset from a base register whose value is tracked, as
+    /// `(base, address)`. When the base is the image base this is how a table is reached, which
+    /// tells where the table before it ends. Never treated as code.
+    fn based_data_address(_insn: &Self::Insn, _state: &Self::State) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Filler the toolchain inserts between functions.
     fn is_padding(insn: &Self::Insn) -> bool;
 

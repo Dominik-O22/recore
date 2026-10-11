@@ -39,11 +39,14 @@ struct Pending<A: Arch> {
     /// False when the path here went through a jump table of unknown length, whose trailing
     /// entries may not be real. Such a path can decode code but must not be used as evidence.
     trusted: bool,
+    /// The bytes here are only presumed to be code. What decoding them finds may resolve a
+    /// jump table but creates no entry points.
+    speculative: bool,
 }
 
 impl<A: Arch> Pending<A> {
     fn entry(addr: u64) -> Self {
-        Pending { addr, state: A::State::default(), trusted: true }
+        Pending { addr, state: A::State::default(), trusted: true, speculative: false }
     }
 }
 
@@ -125,6 +128,11 @@ impl<A: Arch> Explorer<'_, A> {
     /// inside the same frame when unwind information covers the jump. The frame's end address is
     /// allowed because compilers use it to fill cases they proved unreachable.
     fn is_case_target(&self, jump: u64, target: u64) -> bool {
+        // Windows unwind entries describe pieces of functions, so a case in another entry is
+        // normal there and the frame says nothing.
+        if self.image.data_in_code {
+            return self.is_case_code(target);
+        }
         match self.frame_of(jump) {
             // The end address itself is not code, so it carries no marker.
             Some((_, end)) if target == end => true,
@@ -140,7 +148,7 @@ impl<A: Arch> Explorer<'_, A> {
 
     /// Decodes from every pending address until control flow ends or reaches known code.
     fn drain(&mut self) {
-        while let Some(Pending { addr: start, mut state, trusted }) = self.pending.pop().or_else(|| self.deferred.pop()) {
+        while let Some(Pending { addr: start, mut state, trusted, speculative }) = self.pending.pop().or_else(|| self.deferred.pop()) {
             let Some(index) = self.region_index(start) else { continue };
             let section = self.regions[index].section;
             let mut after_call = false;
@@ -160,7 +168,13 @@ impl<A: Arch> Explorer<'_, A> {
                 };
                 after_call = false;
                 let Some(flow) = A::flow(&insn, &state) else {
+                    if let Some((base, data)) = A::based_data_address(&insn, &state) {
+                        if self.image.base != 0 && base == self.image.base {
+                            self.data_refs.insert(data);
+                        }
+                    }
                     let taken = A::address_taken(&insn, &state)
+                        .filter(|_| !speculative)
                         .filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
                     if let Some(target) = taken {
                         if self.region_index(target).is_some() {
@@ -175,7 +189,9 @@ impl<A: Arch> Explorer<'_, A> {
                 };
                 let ends_flow = match flow {
                     Flow::Call(target) => {
-                        self.add_start(target, Origin::Call);
+                        if !speculative {
+                            self.add_start(target, Origin::Call);
+                        }
                         false
                     }
                     Flow::CallIndirect(_) => self.import_never_returns(flow),
@@ -185,14 +201,18 @@ impl<A: Arch> Explorer<'_, A> {
                         true
                     }
                     Flow::Jump(target) => {
-                        self.jumps.push((decoded.addr, target));
-                        self.queue(Pending { addr: target, state, trusted });
+                        if !speculative {
+                            self.jumps.push((decoded.addr, target));
+                        }
+                        self.queue(Pending { addr: target, state, trusted, speculative });
                         true
                     }
                     Flow::Branch(target) => {
                         let (taken, fallthrough) = A::branch(state, &insn);
-                        self.jumps.push((decoded.addr, target));
-                        self.queue(Pending { addr: target, state: taken, trusted });
+                        if !speculative {
+                            self.jumps.push((decoded.addr, target));
+                        }
+                        self.queue(Pending { addr: target, state: taken, trusted, speculative });
                         state = fallthrough;
                         false
                     }
@@ -203,7 +223,7 @@ impl<A: Arch> Explorer<'_, A> {
                         }, &|target| self.is_case_code(target));
                         let resolved = resolved.map(|table| self.apply_known_length(table));
                         match resolved {
-                            Some(table) => self.accept_table(jump, table, A::after_jump(state, &insn), trusted),
+                            Some(table) => self.accept_table(jump, table, A::after_jump(state, &insn), trusted, speculative),
                             None => {
                                 self.unresolved.insert(jump);
                             }
@@ -250,13 +270,13 @@ impl<A: Arch> Explorer<'_, A> {
     }
 
     /// Records a resolved table and queues its cases.
-    fn accept_table(&mut self, jump: u64, table: Table, at_case: A::State, trusted: bool) {
+    fn accept_table(&mut self, jump: u64, table: Table, at_case: A::State, trusted: bool, speculative: bool) {
         let function_end = self.frame_end(jump);
         let trusted = trusted && table.bounded;
         // An entry equal to the function's end marks a case proven unreachable.
         let queue = if trusted { &mut self.pending } else { &mut self.deferred };
         queue.extend(
-            table.entries.iter().filter(|&&target| Some(target) != function_end).map(|&addr| Pending { addr, state: at_case, trusted }),
+            table.entries.iter().filter(|&&target| Some(target) != function_end).map(|&addr| Pending { addr, state: at_case, trusted, speculative }),
         );
         self.unresolved.remove(&jump);
         // Tables sit back to back, so each table's address ends the one before it.
@@ -282,7 +302,7 @@ impl<A: Arch> Explorer<'_, A> {
                     }, &|target| self.is_case_code(target));
                     if let Some(table) = resolved {
                         let table = self.apply_known_length(table);
-                        self.accept_table(jump, table, A::after_jump(state, &insn), true);
+                        self.accept_table(jump, table, A::after_jump(state, &insn), true, false);
                     }
                     return;
                 }
@@ -437,6 +457,11 @@ impl<A: Arch> Explorer<'_, A> {
         }
     }
 
+    /// Whether `addr` lies in the entries of a resolved jump table.
+    fn in_table(&self, addr: u64) -> bool {
+        self.tables.iter().any(|(_, table)| addr >= table.address && addr < table.address + table.entry_size * table.entries.len() as u64)
+    }
+
     /// Finds code that nothing referenced. Code following padding at an aligned address, or
     /// opening with an entry marker, starts a function. Other unreached code continues the
     /// function before it, such as switch cases behind an unresolved indirect jump.
@@ -492,7 +517,18 @@ impl<A: Arch> Explorer<'_, A> {
                     let after_break = skipped_padding || self.regions[index].follows_break[offset];
                     let opens = after_break && A::opens_function(&insn, next.as_ref());
                     is_start = (is_start && skipped_padding || opens) && !self.inside_frame(addr);
-                    if !is_start || self.pointer_slots.contains_key(&addr) {
+                    if self.pointer_slots.contains_key(&addr) {
+                        continue;
+                    }
+                    if !is_start {
+                        // Inside an unwind entry the bytes belong to a function, so they are
+                        // worth decoding to resolve what they dispatch to, without taking
+                        // anything they call or refer to as evidence.
+                        if self.frame_of(addr).is_some() && !self.in_table(addr) {
+                            self.deferred.push(Pending { addr, state: A::State::default(), trusted: false, speculative: true });
+                            found = true;
+                            self.drain();
+                        }
                         continue;
                     }
                 }

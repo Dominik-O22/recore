@@ -62,6 +62,10 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         if BITS == 64 { lea_target(insn) } else { immediate_address(insn) }
     }
 
+    fn based_data_address(insn: &Instruction, state: &State) -> Option<(u64, u64)> {
+        state.based_address(insn)
+    }
+
     fn is_padding(insn: &Instruction) -> bool {
         is_padding(insn)
     }

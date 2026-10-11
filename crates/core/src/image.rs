@@ -38,6 +38,9 @@ pub enum Machine {
 pub struct Image {
     pub name: String,
     pub machine: Machine,
+    /// The address the image is linked to load at. PE images express many addresses as offsets
+    /// from it. Zero for ELF, which uses plain addresses.
+    pub base: u64,
     /// The image is built with branch target identification (AArch64 BTI), so every address an
     /// indirect branch may reach starts with a marker instruction.
     pub branch_targets_marked: bool,
@@ -119,6 +122,7 @@ impl Image {
             .unwrap_or_default();
 
         Ok(Image {
+            base: if is_pe { file.relative_address_base() } else { 0 },
             symbol_names,
             machine,
             branch_targets_marked,
