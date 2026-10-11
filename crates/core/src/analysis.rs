@@ -224,12 +224,23 @@ pub fn analyze(image: &Image) -> Analysis {
             }
         }
     }
+    let by_start: HashMap<u64, &Function> = functions.iter().map(|f| (f.start, f)).collect();
+    // A piece of another function either jumps back into the middle of its owner or never
+    // returns. A real function that is only ever tail-called from one place does neither.
+    let behaves_like_fragment = |piece: &Function, owner: &Function| {
+        let rejoins_owner = piece.controls.iter().any(|control| match control.flow {
+            Flow::Jump(target) | Flow::Branch(target) => target > owner.start && target < owner.end,
+            _ => false,
+        });
+        rejoins_owner || !piece.controls.iter().any(|control| control.flow == Flow::Return)
+    };
     let fragment_of: HashMap<u64, u64> = jumped_from
         .iter()
         .filter(|&(target, sources)| {
             !discovery.referenced.contains(target)
                 && discovery.starts[target] == Origin::Frame
                 && sources.iter().all(|&source| source == sources[0])
+                && behaves_like_fragment(by_start[target], by_start[&sources[0]])
         })
         .map(|(&target, sources)| (target, sources[0]))
         .collect();
