@@ -35,8 +35,16 @@ pub enum Machine {
     Aarch64,
 }
 
+/// The container an image came in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Elf,
+    Pe,
+}
+
 pub struct Image {
     pub name: String,
+    pub format: Format,
     pub machine: Machine,
     /// The address the image is linked to load at. PE images express many addresses as offsets
     /// from it. Zero for ELF, which uses plain addresses.
@@ -122,6 +130,7 @@ impl Image {
             .unwrap_or_default();
 
         Ok(Image {
+            format: if is_pe { Format::Pe } else { Format::Elf },
             base: if is_pe { file.relative_address_base() } else { 0 },
             symbol_names,
             machine,

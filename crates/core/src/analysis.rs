@@ -418,7 +418,11 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         .iter()
         .filter(|&(target, sources)| {
             !discovery.referenced.contains(target)
-                && discovery.starts[target] == Origin::Frame
+                // An entry point known only from layout or from the jump itself.
+                && matches!(
+                    discovery.starts[target],
+                    Origin::Frame | Origin::TailCall | Origin::GapAligned | Origin::GapEndbr | Origin::Unreachable
+                )
                 && sources.iter().all(|&source| source == sources[0])
                 && behaves_like_fragment(by_start[target], by_start[&sources[0]])
         })
@@ -480,11 +484,11 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     import_list.sort_unstable_by_key(|import| import.slot);
 
     // Strings sit where code points, or where a pointer in data points.
-    let mut candidates: Vec<u64> =
-        discovery.data_refs.iter().map(|&(_, to)| to).chain(image.relative_targets.iter().map(|&(_, to)| to)).collect();
+    let from_code: HashSet<u64> = discovery.data_refs.iter().map(|&(_, to)| to).collect();
+    let mut candidates: Vec<u64> = from_code.iter().copied().chain(image.relative_targets.iter().map(|&(_, to)| to)).collect();
     candidates.sort_unstable();
     candidates.dedup();
-    let strings = candidates.par_iter().filter_map(|&addr| string_at(image, addr)).collect();
+    let strings = candidates.par_iter().filter_map(|&addr| string_at(image, addr, from_code.contains(&addr))).collect();
 
     // A function that is a single jump forwards to its target; an export name on such a thunk
     // is really the target's name.

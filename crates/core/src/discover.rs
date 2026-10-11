@@ -92,7 +92,7 @@ impl<A: Arch> Explorer<'_, A> {
     }
 
     fn add_start(&mut self, addr: u64, origin: Origin) {
-        if matches!(origin, Origin::Call | Origin::AddressTaken | Origin::DataPointer | Origin::Export) {
+        if matches!(origin, Origin::Call | Origin::AddressTaken | Origin::DataPointer | Origin::Export | Origin::Thunk) {
             self.referenced.insert(addr);
         }
         if self.region_index(addr).is_some() && !self.inside_frame(addr) && !self.starts.contains_key(&addr) {
