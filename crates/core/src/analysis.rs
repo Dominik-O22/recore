@@ -283,6 +283,61 @@ fn code_end<A: Arch>(image: &Image, start: u64, bound: u64, tables: &HashMap<u64
     bound
 }
 
+/// Sorts ranges and joins the ones that touch or overlap.
+fn merge(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// The parts of sorted, disjoint `a` that also lie in sorted, disjoint `b`.
+fn intersect(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let (mut i, mut j, mut out) = (0, 0, Vec::new());
+    while i < a.len() && j < b.len() {
+        let (start, end) = (a[i].0.max(b[j].0), a[i].1.min(b[j].1));
+        if start < end {
+            out.push((start, end));
+        }
+        if a[i].1 < b[j].1 { i += 1 } else { j += 1 }
+    }
+    out
+}
+
+/// The parts of sorted, disjoint `code` that no range in `covered` contains.
+fn uncovered(code: &[(u64, u64)], covered: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let covered = merge(covered.to_vec());
+    let mut out = Vec::new();
+    let mut j = 0;
+    for &(mut start, end) in code {
+        while j < covered.len() && covered[j].1 <= start {
+            j += 1;
+        }
+        let mut k = j;
+        while start < end {
+            match covered.get(k) {
+                Some(&(c_start, c_end)) if c_start < end => {
+                    if c_start > start {
+                        out.push((start, c_start));
+                    }
+                    start = start.max(c_end);
+                    k += 1;
+                }
+                _ => {
+                    out.push((start, end));
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The first real instruction in `[from, end)` after any padding, unless it opens an exception
 /// landing pad. Landing pads are reached by the unwinder, not by control flow, so unreached
 /// code that starts with one still belongs to the function before it.
@@ -330,7 +385,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
     let pointer_slots: HashMap<u64, u64> = image.relative_targets.iter().copied().collect();
 
-    let (starts, functions, noreturn) = loop {
+    let (starts, functions, chunks, noreturn) = loop {
         let starts: Vec<u64> = discovery.starts.keys().copied().collect();
         let functions: Vec<Function> = starts
             .par_iter()
@@ -348,9 +403,20 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             })
             .collect();
 
-        let mut controls: Vec<Control> = functions.iter().flat_map(|f| f.controls.iter().copied()).collect();
+        // Where function extents are tight, code that a function reaches by a jump can lie
+        // outside every extent: a cold block placed elsewhere, or a shared exit. Those chunks
+        // are decoded too, so that a function can be followed into them.
+        let chunks: Vec<Function> = if image.data_in_code {
+            let covered: Vec<(u64, u64)> = functions.iter().map(|f| (f.start, f.end)).collect();
+            uncovered(&discovery.code, &covered).into_iter().map(|(start, end)| decode::<A>(image, start, end, false)).collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut controls: Vec<Control> = functions.iter().chain(&chunks).flat_map(|f| f.controls.iter().copied()).collect();
         controls.sort_unstable_by_key(|c| c.addr);
-        let extents = functions.iter().map(|f| (f.start, f.end)).collect();
+        let mut extents: Vec<(u64, u64)> = functions.iter().chain(&chunks).map(|f| (f.start, f.end)).collect();
+        extents.sort_unstable();
         let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots };
 
         // Least fixpoint: a function joins the set once no path through it can return.
@@ -382,11 +448,32 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             })
             .collect();
         if splits.is_empty() {
-            break (starts, functions, noreturn);
+            break (starts, functions, chunks, noreturn);
         }
         for addr in splits {
             discovery.starts.entry(addr).or_insert(Origin::Unreachable);
         }
+    };
+
+    // The chunks each function reaches become further ranges of its body.
+    let chunk_ranges: Vec<(u64, u64)> = chunks.iter().map(|c| (c.start, c.end)).collect();
+    let extra_ranges: HashMap<u64, Vec<(u64, u64)>> = if chunks.is_empty() {
+        HashMap::new()
+    } else {
+        let mut controls: Vec<Control> = functions.iter().chain(&chunks).flat_map(|f| f.controls.iter().copied()).collect();
+        controls.sort_unstable_by_key(|c| c.addr);
+        let mut extents: Vec<(u64, u64)> = functions.iter().chain(&chunks).map(|f| (f.start, f.end)).collect();
+        extents.sort_unstable();
+        let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots };
+        functions
+            .par_iter()
+            .filter_map(|f| {
+                let reached = walk(f, &noreturn, &program);
+                let outside: Vec<(u64, u64)> = reached.reached.iter().copied().filter(|&(start, end)| end > start && (start < f.start || start >= f.end)).collect();
+                let extra = intersect(&merge(outside), &chunk_ranges);
+                (!extra.is_empty()).then_some((f.start, extra))
+            })
+            .collect()
     };
 
     let is_start = |addr: u64| starts.binary_search(&addr).is_ok();
@@ -429,8 +516,10 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         .map(|(&target, sources)| (target, sources[0]))
         .collect();
 
-    let mut calls: Vec<CallSite> = functions
+    let pieces: Vec<&Function> = functions.iter().chain(&chunks).collect();
+    let mut calls: Vec<CallSite> = pieces
         .par_iter()
+        .copied()
         .flat_map_iter(|function| {
             let fragment_of = &fragment_of;
             let noreturn = &noreturn;
@@ -509,12 +598,12 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         data_refs: discovery.data_refs.iter().map(|&(from, to, access)| DataRef { from, to, access }).collect(),
         strings,
         name: image.name.clone(),
-        instructions: functions.iter().map(|f| f.instructions).sum(),
+        instructions: functions.iter().chain(&chunks).map(|f| f.instructions).sum(),
         functions: functions
             .iter()
             .map(|f| AnalyzedFunction {
                 addr: f.start,
-                ranges: vec![(f.start, f.end)],
+                ranges: std::iter::once((f.start, f.end)).chain(extra_ranges.get(&f.start).into_iter().flatten().copied()).collect(),
                 noreturn: noreturn.contains(&f.start),
                 thunk: thunk_target(f).is_some(),
                 origin: discovery.starts[&f.start],

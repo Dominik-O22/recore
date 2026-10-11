@@ -30,6 +30,8 @@ pub struct Discovery {
     /// `(instruction, address, accessed)` for each data address an instruction refers to:
     /// `accessed` when it reads or writes there, otherwise it takes the address.
     pub data_refs: Vec<(u64, u64, bool)>,
+    /// Every stretch of decoded instructions, as sorted `[start, end)` ranges.
+    pub code: Vec<(u64, u64)>,
 }
 
 /// An address to decode from.
@@ -470,6 +472,29 @@ impl<A: Arch> Explorer<'_, A> {
         self.tables.iter().any(|(_, table)| addr >= table.address && addr < table.address + table.entry_size * table.entries.len() as u64)
     }
 
+    /// Every stretch of decoded instructions, merged where one runs straight into the next.
+    fn code_ranges(&self) -> Vec<(u64, u64)> {
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for region in &self.regions {
+            let section = region.section;
+            let mut offset = 0;
+            while offset < section.data.len() {
+                if !region.is_instruction[offset] {
+                    offset += 1;
+                    continue;
+                }
+                let addr = section.addr + offset as u64;
+                let len = A::decode(&section.data[offset..], addr).next().map_or(1, |d| u64::from(d.len.max(1)));
+                match ranges.last_mut() {
+                    Some(last) if last.1 == addr => last.1 = addr + len,
+                    _ => ranges.push((addr, addr + len)),
+                }
+                offset += len as usize;
+            }
+        }
+        ranges
+    }
+
     /// Finds code that nothing referenced. Code following padding at an aligned address, or
     /// opening with an entry marker, starts a function. Other unreached code continues the
     /// function before it, such as switch cases behind an unresolved indirect jump.
@@ -594,7 +619,8 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
     let mut data_refs = std::mem::take(&mut explorer.data_ref_sites);
     data_refs.sort_unstable();
     data_refs.dedup();
-    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs }
+    let code = explorer.code_ranges();
+    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, code }
 }
 
 fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], known_lengths: HashMap<u64, usize>) -> Explorer<'a, A> {
