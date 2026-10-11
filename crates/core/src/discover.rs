@@ -525,7 +525,15 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], known_length
         .iter()
         .map(|&(start, _)| (start, Origin::Frame))
         .chain(image.exports.iter().chain([&image.entry]).map(|&addr| (addr, Origin::Export)))
-        .chain(image.relative_targets.iter().map(|&(_, target)| (target, Origin::DataPointer)));
+        // A relocated pointer that itself sits in a code section is an operand of an
+        // instruction, which decoding will find, or a jump-table entry, which is a label.
+        .chain(
+            image
+                .relative_targets
+                .iter()
+                .filter(|&&(slot, _)| !image.is_code(slot))
+                .map(|&(_, target)| (target, Origin::DataPointer)),
+        );
     for (seed, origin) in seeds {
         explorer.add_start(seed, origin);
     }
