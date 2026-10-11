@@ -48,6 +48,8 @@ pub struct Image {
     pub import_slots: HashMap<u64, String>,
     /// Exported function addresses from the dynamic symbol table.
     pub exports: Vec<u64>,
+    /// Names the image itself carries for addresses in it: exports, as written in the file.
+    pub symbol_names: HashMap<u64, String>,
     /// `[start, end)` of every frame description entry in `.eh_frame`.
     pub frames: Vec<(u64, u64)>,
     /// Pointers stored in data by relative relocations, as `(slot address, target)`. Targets in
@@ -101,7 +103,23 @@ impl Image {
         let branch_targets_marked = machine == Machine::Aarch64
             && file.section_by_name(".note.gnu.property").and_then(|s| s.uncompressed_data().ok()).is_some_and(|d| has_bti(&d));
 
+        let symbol_names = file
+            .exports()
+            .map(|exports| {
+                exports
+                    .filter_map(|export| export.ok())
+                    .filter_map(|export| match (export.target(), export.name()) {
+                        (object::ExportTarget::Address { address }, object::NameOrOrdinal::Name(name)) => {
+                            Some((address, String::from_utf8_lossy(name).into_owned()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(Image {
+            symbol_names,
             machine,
             branch_targets_marked,
             name: path.file_name().unwrap().to_string_lossy().into_owned(),

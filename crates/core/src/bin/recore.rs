@@ -60,10 +60,19 @@ impl Loaded {
         function.ranges.iter().any(|&(start, end)| addr >= start && addr < end).then_some(function.addr)
     }
 
-    /// Distinct functions containing the given instruction addresses, as hex.
+    /// A function as `address` or `address(name)`.
+    fn label(&self, entry: u64) -> String {
+        let name = self.analysis.functions.binary_search_by_key(&entry, |f| f.addr).ok().and_then(|i| self.analysis.functions[i].name.as_ref());
+        match name {
+            Some(name) => format!("{entry:#x}({name})"),
+            None => format!("{entry:#x}"),
+        }
+    }
+
+    /// Distinct functions containing the given instruction addresses.
     fn users(&self, sites: impl Iterator<Item = u64>) -> String {
         let users: BTreeSet<u64> = sites.filter_map(|site| self.function_containing(site)).collect();
-        users.iter().map(|addr| format!("{addr:#x}")).collect::<Vec<_>>().join(" ")
+        users.iter().map(|&entry| self.label(entry)).collect::<Vec<_>>().join(" ")
     }
 
     fn import_name(&self, slot: u64) -> &str {
@@ -118,13 +127,13 @@ fn main() -> Result<()> {
             let entry = loaded.function_containing(addr).ok_or_else(|| anyhow::anyhow!("no function contains {addr:#x}"))?;
             let function = loaded.analysis.functions.iter().find(|f| f.addr == entry).unwrap();
             let inside = |at: u64| function.ranges.iter().any(|&(start, end)| at >= start && at < end);
-            println!("function {entry:#x}, extent {:x?}{}", function.ranges, if function.noreturn { ", never returns" } else { "" });
+            println!("function {}, extent {:x?}{}", loaded.label(entry), function.ranges, if function.noreturn { ", never returns" } else { "" });
 
             let callers = loaded.analysis.calls.iter().filter(|c| c.target == CallTarget::Function(entry)).map(|c| c.at);
             println!("called by: {}", loaded.users(callers));
             for call in loaded.analysis.calls.iter().filter(|c| inside(c.at)) {
                 let target = match call.target {
-                    CallTarget::Function(target) => format!("{target:#x}"),
+                    CallTarget::Function(target) => loaded.label(target),
                     CallTarget::Import(slot) => loaded.import_name(slot).to_string(),
                 };
                 println!("  {:#x} {} {target}", call.at, if call.tail { "tail-calls" } else { "calls" });

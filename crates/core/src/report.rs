@@ -14,6 +14,9 @@ pub struct AnalyzedFunction {
     /// How the entry point was found, for diagnosing false starts.
     #[serde(default)]
     pub origin: Origin,
+    /// The function's name when the image carries one, demangled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Set when this is not a function of its own but a compiler-split piece of another, such as
     /// a `.cold` section holding its unlikely paths. The value is the owning function's entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -496,6 +496,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                 thunk: false,
                 origin: discovery.starts[&f.start],
                 fragment_of: fragment_of.get(&f.start).copied(),
+                name: image.symbol_names.get(&f.start).map(|symbol| crate::names::display_name(symbol)),
             })
             .collect(),
         noreturn_calls,
