@@ -34,6 +34,11 @@ pub struct Truth {
     pub instructions: u64,
     /// Addresses of call instructions whose target never returns.
     pub noreturn_calls: Vec<u64>,
+    /// Calls whose callee the compiler demonstrably treated as non-returning, whether or not the
+    /// debug info says so: somewhere a call to that callee is the last instruction of a function,
+    /// with nothing emitted after it. Lists every call to such a callee.
+    #[serde(default)]
+    pub terminal_calls: Vec<u64>,
     /// Imported function names that never return, according to DWARF.
     pub noreturn_imports: Vec<String>,
     /// Bytes inside function ranges that did not decode. Non-zero means data in code.
@@ -206,6 +211,8 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     let slots = import_slots(&binary);
     let mut noreturn_imports: BTreeSet<String> = BTreeSet::new();
     let mut noreturn_calls = Vec::new();
+    let mut terminal_calls = Vec::new();
+    let mut direct_calls: Vec<(u64, u64)> = Vec::new();
     let mut instructions = 0u64;
     let mut undecodable_bytes = 0u64;
 
@@ -220,6 +227,7 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
         let offset = (function.addr - section.address()) as usize;
         let bytes = &data[offset..offset + function.size as usize];
         let mut decoder = Decoder::with_ip(64, bytes, function.addr, DecoderOptions::NONE);
+        let mut last_real: Option<(u64, bool)> = None;
         while decoder.can_decode() {
             let instr = decoder.decode();
             if instr.is_invalid() {
@@ -227,6 +235,13 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
                 continue;
             }
             instructions += 1;
+            if !matches!(instr.mnemonic(), iced_x86::Mnemonic::Nop | iced_x86::Mnemonic::Int3) {
+                let is_call = matches!(instr.flow_control(), FlowControl::Call | FlowControl::IndirectCall);
+                last_real = Some((instr.ip(), is_call));
+            }
+            if instr.flow_control() == FlowControl::Call {
+                direct_calls.push((instr.ip(), instr.near_branch_target()));
+            }
             let target_noreturn = match instr.flow_control() {
                 FlowControl::Call => noreturn_addrs.contains(&instr.near_branch_target()),
                 FlowControl::IndirectCall if instr.is_ip_rel_memory_operand() => {
@@ -247,7 +262,18 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
                 noreturn_calls.push(instr.ip());
             }
         }
+        if let Some((addr, true)) = last_real {
+            terminal_calls.push(addr);
+        }
     }
+    // Widen from the calls that end a function to every call of the same callee.
+    let ends_function: HashSet<u64> = terminal_calls.iter().copied().collect();
+    let terminal_callees: HashSet<u64> =
+        direct_calls.iter().filter(|(at, _)| ends_function.contains(at)).map(|&(_, target)| target).collect();
+    terminal_calls.extend(
+        direct_calls.iter().filter(|(at, target)| terminal_callees.contains(target) && !ends_function.contains(at)).map(|&(at, _)| at),
+    );
+    terminal_calls.sort_unstable();
 
     let text = exec_sections
         .iter()
@@ -262,6 +288,7 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
         functions: by_addr.into_values().collect(),
         instructions,
         noreturn_calls,
+        terminal_calls,
         noreturn_imports: noreturn_imports.into_iter().collect(),
         undecodable_bytes,
     })

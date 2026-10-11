@@ -138,7 +138,7 @@ fn run_score(corpus: &Path, dir: &Path, detail: bool) -> Result<()> {
     rows.iter().for_each(|(_, s)| total += *s);
     let line = |label: &str, s: &score::Score| {
         println!(
-            "{label:28} starts {}/{} (+{} outside)  recall {:5.1}%  precision {:5.1}%  F1 {:5.1}%  mid-func {:5}  in-cold {:6}  run-on {:5}  noreturn {:5.1}% (+{} extra)  coverage {:5.1}%  jump tables {}/{} exact (missing {}, extra {}, unresolved {})",
+            "{label:28} starts {}/{} (+{} outside)  recall {:5.1}%  precision {:5.1}%  F1 {:5.1}%  mid-func {:5}  in-cold {:6}  run-on {:5}  noreturn {:5.1}% (+{} extra, {} corroborated)  coverage {:5.1}%  jump tables {}/{} exact (missing {}, extra {}, unresolved {})",
             s.found,
             s.truth_functions,
             s.outside,
@@ -150,6 +150,7 @@ fn run_score(corpus: &Path, dir: &Path, detail: bool) -> Result<()> {
             s.run_on,
             100.0 * s.noreturn_recall(),
             s.extra_noreturn_calls,
+            s.extra_noreturn_at_end,
             100.0 * s.coverage(),
             s.exact_tables,
             s.truth_tables,

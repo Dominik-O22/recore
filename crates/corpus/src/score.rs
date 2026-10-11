@@ -30,6 +30,8 @@ pub struct Score {
     pub found_noreturn_calls: u64,
     /// Calls marked non-returning that truth does not list.
     pub extra_noreturn_calls: u64,
+    /// The subset of those whose callee ends some function, which corroborates them.
+    pub extra_noreturn_at_end: u64,
     pub truth_bytes: u64,
     /// True function bytes covered by any reported function body.
     pub covered_bytes: u64,
@@ -56,6 +58,7 @@ impl AddAssign for Score {
         self.truth_noreturn_calls += o.truth_noreturn_calls;
         self.found_noreturn_calls += o.found_noreturn_calls;
         self.extra_noreturn_calls += o.extra_noreturn_calls;
+        self.extra_noreturn_at_end += o.extra_noreturn_at_end;
         self.truth_bytes += o.truth_bytes;
         self.covered_bytes += o.covered_bytes;
         self.truth_tables += o.truth_tables;
@@ -156,12 +159,16 @@ pub fn score(truth: &Truth, jump_tables: Option<&JumpTables>, analysis: &Analysi
     }
 
     let truth_calls: HashSet<u64> = truth.noreturn_calls.iter().copied().collect();
+    let terminal_calls: HashSet<u64> = truth.terminal_calls.iter().copied().collect();
     s.truth_noreturn_calls = truth_calls.len() as u64;
     for call in analysis.noreturn_calls.iter().filter(|&&addr| in_text(addr)).collect::<HashSet<_>>() {
         if truth_calls.contains(call) {
             s.found_noreturn_calls += 1;
         } else if inside_truth(*call) {
             s.extra_noreturn_calls += 1;
+            if terminal_calls.contains(call) {
+                s.extra_noreturn_at_end += 1;
+            }
         }
     }
 
