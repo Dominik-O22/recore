@@ -29,6 +29,22 @@ pub struct Discovery {
     pub referenced: HashSet<u64>,
 }
 
+/// An address to decode from.
+struct Pending<A: Arch> {
+    addr: u64,
+    /// Register state on arrival.
+    state: A::State,
+    /// False when the path here went through a jump table of unknown length, whose trailing
+    /// entries may not be real. Such a path can decode code but must not be used as evidence.
+    trusted: bool,
+}
+
+impl<A: Arch> Pending<A> {
+    fn entry(addr: u64) -> Self {
+        Pending { addr, state: A::State::default(), trusted: true }
+    }
+}
+
 struct Explorer<'a, A: Arch> {
     image: &'a Image,
     regions: Vec<Region<'a>>,
@@ -36,10 +52,16 @@ struct Explorer<'a, A: Arch> {
     referenced: HashSet<u64>,
     /// Direct jumps as `(from, to)`, kept to recognise tail calls afterwards.
     jumps: Vec<(u64, u64)>,
-    /// Addresses still to decode, each with the register state on arrival.
-    pending: Vec<(u64, A::State)>,
+    /// Addresses still to decode.
+    pending: Vec<Pending<A>>,
+    /// Untrusted addresses, decoded only once nothing trusted is left, so that a real path gets
+    /// to shared code first and with the right state.
+    deferred: Vec<Pending<A>>,
     /// Resolved tables with the jump that uses each.
     tables: Vec<(u64, Table)>,
+    /// Indirect jumps decoded without enough known state to resolve them. A later path that
+    /// arrives with more may still do so.
+    unresolved: BTreeSet<u64>,
     /// Data addresses computed by `lea`. The next one after a table bounds its length.
     data_refs: BTreeSet<u64>,
     /// Slot address to target for every pointer a relative relocation stores in data.
@@ -64,8 +86,12 @@ impl<A: Arch> Explorer<'_, A> {
         }
         if self.region_index(addr).is_some() && !self.inside_frame(addr) && !self.starts.contains_key(&addr) {
             self.starts.insert(addr, origin);
-            self.pending.push((addr, A::State::default()));
+            self.pending.push(Pending::entry(addr));
         }
+    }
+
+    fn queue(&mut self, pending: Pending<A>) {
+        if pending.trusted { self.pending.push(pending) } else { self.deferred.push(pending) }
     }
 
     /// Whether a call lands on an import that never returns, directly or through a PLT stub.
@@ -99,13 +125,16 @@ impl<A: Arch> Explorer<'_, A> {
 
     /// Decodes from every pending address until control flow ends or reaches known code.
     fn drain(&mut self) {
-        while let Some((start, mut state)) = self.pending.pop() {
+        while let Some(Pending { addr: start, mut state, trusted }) = self.pending.pop().or_else(|| self.deferred.pop()) {
             let Some(index) = self.region_index(start) else { continue };
             let section = self.regions[index].section;
             let mut after_call = false;
             for decoded in A::decode(&section.data[(start - section.addr) as usize..], start) {
                 let offset = (decoded.addr - section.addr) as usize;
                 if std::mem::replace(&mut self.regions[index].is_instruction[offset], true) {
+                    if trusted {
+                        self.retry_jump_ahead(index, decoded.addr, state);
+                    }
                     break;
                 }
                 // Padding straight after a call means the call does not return: compilers pad
@@ -134,13 +163,13 @@ impl<A: Arch> Explorer<'_, A> {
                     Flow::CallIndirect(_) => self.import_never_returns(flow),
                     Flow::Jump(target) => {
                         self.jumps.push((decoded.addr, target));
-                        self.pending.push((target, state));
+                        self.queue(Pending { addr: target, state, trusted });
                         true
                     }
                     Flow::Branch(target) => {
                         let (taken, fallthrough) = A::branch(state, &insn);
                         self.jumps.push((decoded.addr, target));
-                        self.pending.push((target, taken));
+                        self.queue(Pending { addr: target, state: taken, trusted });
                         state = fallthrough;
                         false
                     }
@@ -149,14 +178,11 @@ impl<A: Arch> Explorer<'_, A> {
                         let resolved = A::resolve_table(&state, self.image, &self.pointer_slots, &insn, &|target| {
                             self.is_case_target(jump, target)
                         });
-                        if let Some(table) = resolved {
-                            let at_case = A::after_jump(state, &insn);
-                            let function_end = self.frame_end(jump);
-                            // An entry equal to the function's end marks a case proven unreachable.
-                            self.pending.extend(
-                                table.entries.iter().filter(|&&target| Some(target) != function_end).map(|&target| (target, at_case)),
-                            );
-                            self.tables.push((jump, table));
+                        match resolved {
+                            Some(table) => self.accept_table(jump, table, A::after_jump(state, &insn), trusted),
+                            None => {
+                                self.unresolved.insert(jump);
+                            }
                         }
                         true
                     }
@@ -172,6 +198,46 @@ impl<A: Arch> Explorer<'_, A> {
                     A::step(&mut state, &insn);
                     after_call = true;
                 }
+            }
+        }
+    }
+
+    /// Records a resolved table and queues its cases.
+    fn accept_table(&mut self, jump: u64, table: Table, at_case: A::State, trusted: bool) {
+        let function_end = self.frame_end(jump);
+        let trusted = trusted && table.bounded;
+        // An entry equal to the function's end marks a case proven unreachable.
+        let queue = if trusted { &mut self.pending } else { &mut self.deferred };
+        queue.extend(
+            table.entries.iter().filter(|&&target| Some(target) != function_end).map(|&addr| Pending { addr, state: at_case, trusted }),
+        );
+        self.unresolved.remove(&jump);
+        self.tables.push((jump, table));
+    }
+
+    /// Called when a path runs into code that was already decoded. If an unresolved indirect
+    /// jump follows in a straight line, replays the instructions up to it with this path's
+    /// state, which may know the table that the first path to get there did not.
+    fn retry_jump_ahead(&mut self, index: usize, addr: u64, mut state: A::State) {
+        /// How far ahead a dispatch sequence can reasonably end.
+        const REACH: u64 = 96;
+        let Some(&jump) = self.unresolved.range(addr..addr + REACH).next() else { return };
+        let section = self.regions[index].section;
+        for decoded in A::decode(&section.data[(addr - section.addr) as usize..], addr) {
+            let Some(insn) = decoded.insn else { return };
+            match A::flow(&insn, &state) {
+                None => A::step(&mut state, &insn),
+                Some(Flow::JumpIndirect(None)) if decoded.addr == jump => {
+                    let resolved = A::resolve_table(&state, self.image, &self.pointer_slots, &insn, &|target| {
+                        self.is_case_target(jump, target)
+                    });
+                    if let Some(table) = resolved {
+                        self.accept_table(jump, table, A::after_jump(state, &insn), true);
+                    }
+                    return;
+                }
+                // Any other control flow before the jump means it is not a straight line.
+                Some(_) => return,
             }
         }
     }
@@ -341,7 +407,7 @@ impl<A: Arch> Explorer<'_, A> {
                 if aligned && (skipped_padding || marked) && !landing_pad && !self.inside_frame(addr) {
                     self.add_start(addr, if marked { Origin::GapEndbr } else { Origin::GapAligned });
                 } else {
-                    self.pending.push((addr, A::State::default()));
+                    self.pending.push(Pending::entry(addr));
                 }
                 found = true;
                 self.drain();
@@ -374,7 +440,9 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
         referenced: HashSet::new(),
         jumps: Vec::new(),
         pending: Vec::new(),
+        deferred: Vec::new(),
         tables: Vec::new(),
+        unresolved: BTreeSet::new(),
         data_refs: BTreeSet::new(),
         pointer_slots: image.relative_targets.iter().copied().collect(),
         frames,
