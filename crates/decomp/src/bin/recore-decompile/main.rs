@@ -26,10 +26,21 @@ struct WorkerOptions {
     /// Also write the C text to `<out-dir>/<name>.c`.
     #[arg(long)]
     emit_c: bool,
+    /// Where switch targets come from: recore's jump tables, the engine's own recovery, or
+    /// recore's for images that keep tables among the code (PE) and the engine's otherwise.
+    #[arg(long, value_enum, default_value = "auto")]
+    jump_tables: JumpTables,
     /// Address-space limit per child process, in GiB. Past it the engine's allocations fail and
     /// the function is reported as an error.
     #[arg(long, default_value_t = 4)]
     memory_gb: u64,
+}
+
+#[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
+enum JumpTables {
+    Auto,
+    Recore,
+    Engine,
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -68,6 +79,23 @@ enum Command {
         #[command(flatten)]
         worker: WorkerOptions,
     },
+    /// Prints the decompiled C of chosen functions of one binary.
+    Function {
+        binary: PathBuf,
+        /// Hex addresses, or names the image carries (exports and symbols).
+        functions: Vec<String>,
+        /// Decompile every function instead.
+        #[arg(long)]
+        all: bool,
+        /// Child processes for `--all`.
+        #[arg(long, default_value_t = std::thread::available_parallelism().map_or(1, usize::from))]
+        jobs: usize,
+        /// Wall-clock seconds one function may take.
+        #[arg(long, default_value_t = 30.0)]
+        timeout: f64,
+        #[command(flatten)]
+        worker: WorkerOptions,
+    },
     /// Compares the parameter counts of a `corpus` run with DWARF in `<debug-dir>/<name>.debug`.
     Params {
         out_dir: PathBuf,
@@ -91,6 +119,9 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Corpus { bin_dir, out_dir, jobs, timeout, shard, worker } => {
             run::corpus(&run::Config { bin_dir, out_dir, jobs, timeout: Duration::from_secs_f64(timeout), shard, worker })
+        }
+        Command::Function { binary, functions, all, jobs, timeout, worker } => {
+            run::functions(&binary, &functions, all, jobs, Duration::from_secs_f64(timeout), &worker)
         }
         Command::Params { out_dir, debug_dir, jobs, list } => params::compare(&out_dir, &debug_dir, jobs, list),
         Command::Worker { binary, options } => worker::run(&binary, &options),

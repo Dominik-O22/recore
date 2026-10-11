@@ -1,8 +1,8 @@
 //! Ghidra's decompiler engine as an in-process library, fed by recore instead of by Ghidra.
 //!
-//! A [`Session`] wraps one decompiler `Architecture` for x86-64 with the gcc compiler spec. It
-//! reads bytes from the sections it is given, never from a file, and learns from the caller what
-//! recore already knows: function starts, imports, functions that never return, tail calls and
+//! A [`Session`] wraps one decompiler `Architecture` for a [`Target`]. It reads bytes from the
+//! sections it is given, never from a file, and learns from the caller what recore already
+//! knows: function starts, names, imports, strings, functions that never return, tail calls and
 //! jump-table targets.
 //!
 //! A session is single-threaded but independent of every other session, so use one per thread.
@@ -12,6 +12,7 @@
 pub mod dwarf;
 pub mod facts;
 mod ffi;
+pub mod prototypes;
 
 // The engine is only reached through the shim, so name the crate to keep it in the link.
 extern crate ghidra_decompiler_sys;
@@ -33,8 +34,55 @@ pub struct Section<'a> {
     pub data: &'a [u8],
     /// The decompiler reads constants and jump tables only out of read-only memory.
     pub readonly: bool,
-    /// Holds instructions. [`Session::bound_flow`] hides code past a function's end, not data.
+    /// Holds instructions. While one function is decompiled, the entry points of all other
+    /// declared functions in such sections are hidden, so flow cannot leak into them.
     pub code: bool,
+}
+
+/// The processor and compiler conventions a session decompiles for. Each is one of Ghidra's
+/// language ids plus a compiler spec, which fixes pointer size, calling conventions and which
+/// side cleans up the stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// 32-bit x86 with Microsoft conventions: `__stdcall` by default, with `__cdecl`,
+    /// `__fastcall` and `__thiscall` recognised per function.
+    X86Windows,
+    /// 32-bit x86 with the System V conventions.
+    X86Gcc,
+    /// x86-64 with the Microsoft x64 convention.
+    X86_64Windows,
+    /// x86-64 with the System V convention.
+    X86_64Gcc,
+    Aarch64,
+}
+
+impl Target {
+    /// The target an image was built for. recore does not expose the file format, but only PE
+    /// images have `data_in_code` set, so that stands in for "Windows".
+    pub fn of(image: &Image) -> Target {
+        match (image.machine, image.data_in_code) {
+            (Machine::X86, true) => Target::X86Windows,
+            (Machine::X86, false) => Target::X86Gcc,
+            (Machine::X86_64, true) => Target::X86_64Windows,
+            (Machine::X86_64, false) => Target::X86_64Gcc,
+            (Machine::Aarch64, _) => Target::Aarch64,
+        }
+    }
+
+    /// Ghidra's `processor:endian:size:variant:compiler` id.
+    fn language(self) -> &'static CStr {
+        match self {
+            Target::X86Windows => c"x86:LE:32:default:windows",
+            Target::X86Gcc => c"x86:LE:32:default:gcc",
+            Target::X86_64Windows => c"x86:LE:64:default:windows",
+            Target::X86_64Gcc => c"x86:LE:64:default:gcc",
+            Target::Aarch64 => c"AARCH64:LE:64:v8A:default",
+        }
+    }
+
+    pub fn pointer_bytes(self) -> usize {
+        if matches!(self, Target::X86Windows | Target::X86Gcc) { 4 } else { 8 }
+    }
 }
 
 /// How far the engine takes a function. These are Ghidra's own "simplification styles".
@@ -115,7 +163,7 @@ fn check(call: impl FnOnce(*mut c_char, usize) -> bool) -> Result<()> {
 impl Session {
     /// Loads `sections` using the language files in `spec_dir`. The first session of the process
     /// decides the directory; later sessions reuse it.
-    pub fn new(spec_dir: &Path, sections: &[Section]) -> Result<Session> {
+    pub fn new(spec_dir: &Path, target: Target, sections: &[Section]) -> Result<Session> {
         let spec_dir = CString::new(spec_dir.as_os_str().as_encoded_bytes())?;
         let raw_sections: Vec<ffi::RdSection> = sections
             .iter()
@@ -124,24 +172,23 @@ impl Session {
         let mut raw = std::ptr::null_mut();
         check(|err, len| {
             // The shim copies the section bytes, so nothing borrowed outlives this call.
-            raw = unsafe { ffi::rd_session_new(spec_dir.as_ptr(), raw_sections.as_ptr(), raw_sections.len(), err, len) };
+            raw = unsafe { ffi::rd_session_new(spec_dir.as_ptr(), target.language().as_ptr(), raw_sections.as_ptr(), raw_sections.len(), err, len) };
             !raw.is_null()
         })?;
         Ok(Session { raw: NonNull::new(raw).expect("checked above") })
     }
 
     /// Loads a recore image as it looks after relocation, with the vendored language files, and
-    /// declares the imports its code calls.
+    /// declares the imports its code calls, with prototypes for the well-known ones.
     pub fn from_image(image: &Image, analysis: &Analysis) -> Result<Session> {
-        if image.machine != Machine::X86_64 {
-            bail!("only x86-64 is supported, {} is {:?}", image.name, image.machine);
-        }
+        let target = Target::of(image);
         let loaded = facts::loaded(image);
         let sections: Vec<Section> = loaded.iter().map(|l| Section { addr: l.addr, data: &l.data, readonly: l.constant, code: l.code }).collect();
-        let mut session = Session::new(&vendored_spec_dir(), &sections)?;
+        let mut session = Session::new(&vendored_spec_dir(), target, &sections)?;
         for import in &analysis.imports {
             session.add_import(import.slot, &import.name, import.noreturn)?;
         }
+        prototypes::declare(&mut session, target, analysis.imports.iter().map(|i| i.name.as_str()))?;
         Ok(session)
     }
 
@@ -152,10 +199,39 @@ impl Session {
         check(|err, len| unsafe { ffi::rd_add_import(self.raw.as_ptr(), slot, name.as_ptr(), noreturn.into(), err, len) != 0 })
     }
 
-    /// Declares a function start, so that calls to it resolve to a symbol. With `noreturn`, the
-    /// decompiler ends control flow after every call to it.
+    /// Declares a function start, so that calls to it resolve to a symbol and control flow from
+    /// other functions stops at it. With `noreturn`, flow also ends after every call to it.
     pub fn add_function(&mut self, addr: u64, noreturn: bool) -> Result<()> {
-        check(|err, len| unsafe { ffi::rd_add_function(self.raw.as_ptr(), addr, noreturn.into(), err, len) != 0 })
+        check(|err, len| unsafe { ffi::rd_add_function(self.raw.as_ptr(), addr, c"".as_ptr(), noreturn.into(), err, len) != 0 })
+    }
+
+    /// Declares the code at `addr` as a stub that only forwards to the import behind `slot`,
+    /// which must be declared: it takes the import's name, prototype and non-returning flag.
+    pub fn alias_import(&mut self, addr: u64, slot: u64) -> Result<()> {
+        check(|err, len| unsafe { ffi::rd_alias_import(self.raw.as_ptr(), addr, slot, err, len) != 0 })
+    }
+
+    /// Declares the function at `addr` under `name`. A function that is already declared keeps
+    /// the name it has, so name functions first.
+    pub fn name_function(&mut self, addr: u64, name: &str) -> Result<()> {
+        let name = CString::new(name)?;
+        check(|err, len| unsafe { ffi::rd_add_function(self.raw.as_ptr(), addr, name.as_ptr(), 0, err, len) != 0 })
+    }
+
+    /// Parses one C declaration with the engine's parser. `extern int f(char *s);` sets the
+    /// prototype of the already declared function `f`; `typedef` and `struct` add data types.
+    /// A calling convention goes before the return type: `extern __stdcall int f(void);`.
+    pub fn declare(&mut self, declaration: &str) -> Result<()> {
+        let declaration = CString::new(declaration)?;
+        check(|err, len| unsafe { ffi::rd_declare(self.raw.as_ptr(), declaration.as_ptr(), err, len) != 0 })
+    }
+
+    /// Declares the NUL-terminated string at `addr`, `chars` characters long without the
+    /// terminator. A pointer to it is then printed as a string literal, if it is in read-only
+    /// memory, or as the symbol `name` otherwise.
+    pub fn add_string(&mut self, addr: u64, name: &str, chars: usize, wide: bool) -> Result<()> {
+        let name = CString::new(name)?;
+        check(|err, len| unsafe { ffi::rd_add_string(self.raw.as_ptr(), addr, name.as_ptr(), chars + 1, wide.into(), err, len) != 0 })
     }
 
     /// Selects the pipeline that [`Session::decompile`] runs from now on.
@@ -168,17 +244,18 @@ impl Session {
         check(|err, len| unsafe { ffi::rd_set_style(self.raw.as_ptr(), name.as_ptr(), err, len) != 0 })
     }
 
-    /// Declares the functions in `facts` and applies the rest of it: where each function ends,
-    /// tail calls, and the imports behind indirect calls.
+    /// Declares the functions in `facts` and applies the rest of it: names, tail calls, and the
+    /// targets of calls through pointer slots.
     pub fn add_functions(&mut self, facts: &Facts) -> Result<()> {
+        // Names go first: a function keeps the name it is first declared under.
+        for &(addr, slot) in &facts.import_aliases {
+            self.alias_import(addr, slot)?;
+        }
+        for (function, name) in &facts.names {
+            self.name_function(*function, name)?;
+        }
         for &(function, noreturn) in &facts.functions {
             self.add_function(function, noreturn)?;
-        }
-        for &stub in &facts.noreturn_stubs {
-            self.add_function(stub, true)?;
-        }
-        for &(function, end) in &facts.ends {
-            self.bound_flow(function, end)?;
         }
         for &(function, jump) in &facts.tail_calls {
             self.override_tail_call(function, jump)?;
@@ -186,14 +263,21 @@ impl Session {
         for &(function, call, slot) in &facts.import_calls {
             self.override_import_call(function, call, slot)?;
         }
+        for &(function, call, target) in &facts.local_calls {
+            check(|err, len| unsafe { ffi::rd_override_call(self.raw.as_ptr(), function, call, target, err, len) != 0 })?;
+        }
         Ok(())
     }
 
-    /// Sets the address where `function` ends. The decompiler then stops, with a "bad
-    /// instruction" warning, at control flow that runs or jumps past it, instead of decompiling
-    /// whatever comes next as part of `function`.
-    pub fn bound_flow(&mut self, function: u64, end: u64) -> Result<()> {
-        check(|err, len| unsafe { ffi::rd_bound_flow(self.raw.as_ptr(), function, end, err, len) != 0 })
+    /// Declares the strings recore found, so that references to them print as literals.
+    pub fn add_strings(&mut self, analysis: &Analysis) -> Result<()> {
+        for string in &analysis.strings {
+            // Named in Ghidra's style: a readable prefix of the text, then the address.
+            let prefix: String = string.text.chars().take(16).map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+            let chars = if string.wide { string.text.encode_utf16().count() } else { string.text.len() };
+            self.add_string(string.addr, &format!("s_{prefix}_{:x}", string.addr), chars, string.wide)?;
+        }
+        Ok(())
     }
 
     /// States that the indirect call at `call` in `function` goes through the import slot

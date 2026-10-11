@@ -18,6 +18,7 @@ fn main() -> Result<()> {
     let analysis = recore::analyze(&image);
     let mut session = Session::from_image(&image, &analysis)?;
     session.add_functions(&Facts::derive(&image, &analysis))?;
+    session.add_strings(&analysis)?;
 
     // Spread the picks over the text section instead of taking the startup stubs at its head.
     let text = image.text().context("no .text")?;

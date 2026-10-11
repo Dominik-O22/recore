@@ -1,9 +1,9 @@
 //! Sessions over hand-assembled code, so the tests need no corpus binary.
 
-use recore_decomp::{Section, Session, vendored_spec_dir};
+use recore_decomp::{Section, Session, Target, vendored_spec_dir};
 
 fn session(code: &[u8]) -> Session {
-    Session::new(&vendored_spec_dir(), &[Section { addr: 0x1000, data: code, readonly: true, code: true }]).unwrap()
+    Session::new(&vendored_spec_dir(), Target::X86_64Gcc, &[Section { addr: 0x1000, data: code, readonly: true, code: true }]).unwrap()
 }
 
 #[test]
@@ -27,15 +27,38 @@ fn noreturn_callee_ends_flow() {
 }
 
 #[test]
-fn flow_stops_at_the_declared_end() {
-    // 0x1000: call 0x1010; 0x1005: mov eax, 7; ret. Without the bound, flow returns from the
-    // call into what could be the next function.
+fn flow_stops_at_another_function() {
+    // 0x1000: call 0x1010, then fall through into 0x1005: mov eax, 7; ret. 0x1010: ret.
     let mut code = vec![0xe8, 0x0b, 0x00, 0x00, 0x00, 0xb8, 0x07, 0x00, 0x00, 0x00, 0xc3];
     code.resize(0x10, 0x90);
     code.push(0xc3);
     assert!(!session(&code).decompile(0x1000).unwrap().bad_data);
 
-    let mut bounded = session(&code);
-    bounded.bound_flow(0x1000, 0x1005).unwrap();
-    assert!(bounded.decompile(0x1000).unwrap().bad_data);
+    let mut informed = session(&code);
+    informed.add_function(0x1005, false).unwrap();
+    assert!(informed.decompile(0x1000).unwrap().bad_data);
+    assert!(!informed.decompile(0x1005).unwrap().bad_data);
+}
+
+#[test]
+fn every_builtin_prototype_parses() {
+    use recore_decomp::prototypes;
+    for target in [Target::X86Windows, Target::X86_64Windows, Target::X86_64Gcc] {
+        let mut session = Session::new(&vendored_spec_dir(), target, &[Section { addr: 0x1000, data: &[0xc3], readonly: true, code: true }]).unwrap();
+        for (index, name) in prototypes::known().enumerate() {
+            session.add_import(0x2000 + 8 * index as u64, name, false).unwrap();
+        }
+        prototypes::declare(&mut session, target, prototypes::known()).unwrap();
+    }
+}
+
+#[test]
+fn stdcall_callee_cleanup_gives_stack_parameters() {
+    // 32-bit: mov eax, [esp+4]; add eax, [esp+8]; ret 8
+    let code = [0x8b, 0x44, 0x24, 0x04, 0x03, 0x44, 0x24, 0x08, 0xc2, 0x08, 0x00];
+    let mut session = Session::new(&vendored_spec_dir(), Target::X86Windows, &[Section { addr: 0x1000, data: &code, readonly: true, code: true }]).unwrap();
+    let function = session.decompile(0x1000).unwrap();
+    let storage: Vec<&str> = function.params.iter().map(|p| p.storage.as_str()).collect();
+    assert_eq!(storage, ["stack:0x4", "stack:0x8"]);
+    assert!(function.c_text.contains("param_1 + param_2"), "{}", function.c_text);
 }

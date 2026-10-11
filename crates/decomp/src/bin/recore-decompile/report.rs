@@ -25,6 +25,9 @@ pub struct FunctionRecord {
     /// Time inside the decompiler; for a timeout, the limit.
     pub ms: f64,
     pub params: usize,
+    /// Where each parameter lives: a register name or `stack:<offset>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage: Vec<String>,
     pub returns_value: bool,
     pub c_len: usize,
 }
@@ -32,7 +35,7 @@ pub struct FunctionRecord {
 impl FunctionRecord {
     /// A record for a function that produced no result.
     pub fn failed(addr: u64, status: Status, message: String, ms: f64) -> FunctionRecord {
-        FunctionRecord { addr, status, message: Some(message), ms, params: 0, returns_value: false, c_len: 0 }
+        FunctionRecord { addr, status, message: Some(message), ms, params: 0, storage: Vec::new(), returns_value: false, c_len: 0 }
     }
 }
 

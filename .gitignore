@@ -32,3 +32,5 @@ corpus-pe32/ghidra/
 corpus-pe/ghidra/
 corpus-pe/recore*/
 corpus-pe32/recore*/
+corpus-pe*/recore-decomp/
+corpus*/recore-decomp/

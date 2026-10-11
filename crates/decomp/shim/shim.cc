@@ -12,8 +12,10 @@
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <unordered_set>
 
 #include "funcdata.hh"
+#include "grammar.hh"
 #include "sleigh_arch.hh"
 
 using namespace ghidra;
@@ -79,11 +81,19 @@ class SectionImage : public LoadImage {
   }
 
  public:
+  string language;             // SLEIGH language and compiler id, such as x86:LE:32:default:windows
   AddrSpace *space = nullptr;  // the RAM space, known once the translator exists
-  // Code at or past this address reads as 0xff bytes, which do not decode. See rd_bound_flow.
-  uint64_t code_end = ~(uint64_t)0;
+  // While a function is being decompiled, every other function's entry reads as 0xff bytes,
+  // which decode on neither x86 nor AArch64. Flow that runs or jumps into another function is then cut off with a
+  // "bad instruction" warning instead of being followed. That happens after a call the engine
+  // does not know to be non-returning, and one such miss can chain through thousands of
+  // functions. The engine's own flow bounds (FlowInfo::setRange) cannot do this: a restart
+  // drops them, and a fall-through across the bound fails the function.
+  unordered_set<uint64_t> entries;  // every declared function start
+  uint64_t current = ~(uint64_t)0;  // the function being decompiled, or none
 
-  SectionImage(const RdSection *secs, size_t count) : LoadImage("recore") {
+  SectionImage(const string &lang, const RdSection *secs, size_t count)
+      : LoadImage("recore"), language(lang) {
     for (size_t i = 0; i < count; ++i)
       sections.push_back({secs[i].addr, vector<uint1>(secs[i].data, secs[i].data + secs[i].len),
                           secs[i].readonly != 0, secs[i].code != 0});
@@ -101,13 +111,15 @@ class SectionImage : public LoadImage {
       if (sec == nullptr) break;
       int4 count = (int4)min<uintb>(size - done, sec->end() - cur);
       memcpy(ptr + done, sec->data.data() + (cur - sec->addr), count);
-      if (sec->code && cur + count > code_end) {
-        int4 hidden = (int4)min<uintb>(count, cur + count - code_end);
-        memset(ptr + done + count - hidden, 0xff, hidden);
-      }
       done += count;
       cur += count;
     }
+    // The decoder asks for a window that starts at the instruction, so only a request starting
+    // exactly at an entry is an attempt to decode it; windows that merely overlap one are not.
+    const Section *first = find(addr.getOffset());
+    if (done > 0 && current != ~(uint64_t)0 && addr.getOffset() != current && first->code &&
+        entries.count(addr.getOffset()) != 0)
+      memset(ptr, 0xff, done);
     if (done == 0) {
       ostringstream msg;
       msg << "No bytes at 0x" << hex << addr.getOffset();
@@ -122,7 +134,7 @@ class SectionImage : public LoadImage {
       if (sec.readonly && !sec.data.empty()) list.insertRange(space, sec.addr, sec.end() - 1);
   }
 
-  string getArchType() const override { return "x86:LE:64:default:gcc"; }
+  string getArchType() const override { return language; }
   void adjustVma(long) override {}
 };
 
@@ -146,7 +158,7 @@ class SectionArchitecture : public SleighArchitecture {
 
  public:
   SectionArchitecture(SectionImage *img, ostream *errs)
-      : SleighArchitecture("recore", "x86:LE:64:default:gcc", errs), image(img) {}
+      : SleighArchitecture("recore", img->language, errs), image(img) {}
 
   // ~SleighArchitecture forgets the translator instead of freeing it, so the session does.
   const Translate *translator() const { return translate; }
@@ -188,7 +200,6 @@ struct RdSession {
   bool print_c = true;
   bool keep_prototypes = false;
   set<uint64_t> kept;  // functions whose prototype this session locked
-  map<uint64_t, uint64_t> flow_ends;  // function to the address its flow may not pass
 
   // Backing storage for the last RdDecompiled.
   string c_text, return_type;
@@ -198,7 +209,7 @@ struct RdSession {
   vector<size_t> jump_counts;
 
   // Imported functions have no code in the image, so each gets a made-up address outside it.
-  uint64_t next_external = 0xfff0000000000000;
+  uint64_t next_external = 0;  // set once the address space is known
   map<string, uint64_t> externals;  // import name to its made-up address
   map<uint64_t, uint64_t> slots;    // GOT slot to the made-up address of its import
 
@@ -209,13 +220,14 @@ struct RdSession {
 
   Address address(uint64_t offset) const { return Address(arch->getDefaultCodeSpace(), offset); }
 
-  Funcdata *function(uint64_t offset) {
+  // The function at `offset`, created if it is new: under `name`, or a generated name if empty.
+  Funcdata *function(uint64_t offset, string name = "") {
     Address addr = address(offset);
     Scope *global = arch->symboltab->getGlobalScope();
     Funcdata *fd = global->queryFunction(addr);
     if (fd != nullptr) return fd;
-    string name;
-    arch->nameFunction(addr, name);
+    if (name.empty()) arch->nameFunction(addr, name);
+    image->entries.insert(offset);
     return global->addFunction(addr, name)->getFunction();
   }
 };
@@ -224,8 +236,8 @@ extern "C" {
 
 // `spec_dir` holds the .ldefs/.pspec/.cspec/.sla files. The first session fixes it for the
 // whole process, because the engine caches its language list in static storage.
-RdSession *rd_session_new(const char *spec_dir, const RdSection *sections, size_t count, char *err,
-                          size_t errlen) {
+RdSession *rd_session_new(const char *spec_dir, const char *language, const RdSection *sections,
+                          size_t count, char *err, size_t errlen) {
   // Spec loading goes through bison parsers with global state and fills static tables.
   static mutex init_lock;
   static bool started = false;
@@ -241,12 +253,17 @@ RdSession *rd_session_new(const char *spec_dir, const RdSection *sections, size_
       SleighArchitecture::specpaths.addDir2Path(spec_dir);
       started = true;
     }
-    session->image = new SectionImage(sections, count);
+    session->image = new SectionImage(language, sections, count);
     session->arch = new SectionArchitecture(session->image, &session->messages);
     session->arch->init(session->store);
     // Use the contents of read-only memory as constants, as Ghidra does by default. This is
     // what turns a call through a pointer table into a call to a known function.
     session->arch->readonlypropagate = true;
+    // Every cut at another function's entry counts as a bad instruction, and a function with
+    // several conditional tail calls has several. The engine's default gives up at four.
+    session->arch->max_baddata = 32;
+    // The top megabyte of the address space, which no image occupies.
+    session->next_external = session->arch->getDefaultCodeSpace()->getHighest() & ~(uintb)0xfffff;
   });
   if (session->arch != nullptr) session->translator = session->arch->translator();
   if (ok) return session;
@@ -257,10 +274,12 @@ RdSession *rd_session_new(const char *spec_dir, const RdSection *sections, size_
 void rd_session_free(RdSession *session) { delete session; }
 
 // Declares a function start. Calls to it become calls to a known symbol, and with `noreturn`
-// flow stops after every call to it.
-int rd_add_function(RdSession *session, uint64_t addr, int noreturn, char *err, size_t errlen) {
+// flow stops after every call to it. A non-empty `name` is used if the function is new; the
+// engine keeps a function's name in more places than a rename reaches.
+int rd_add_function(RdSession *session, uint64_t addr, const char *name, int noreturn, char *err,
+                    size_t errlen) {
   return guarded(err, errlen, [&] {
-    Funcdata *fd = session->function(addr);
+    Funcdata *fd = session->function(addr, name);
     if (noreturn) fd->getFuncProto().setNoReturn(true);
   });
 }
@@ -282,6 +301,26 @@ int rd_add_import(RdSession *session, uint64_t slot, const char *name, int noret
     }
     global->addExternalRef(session->address(slot), session->address(found->second), "");
     session->slots[slot] = found->second;
+  });
+}
+
+// Declares that the code at `addr` only forwards to the import behind `slot`: a PLT stub or an
+// import thunk. It gets the import's name and, if one was declared, its prototype, so calls
+// to it read like calls to the import.
+int rd_alias_import(RdSession *session, uint64_t addr, uint64_t slot, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    auto found = session->slots.find(slot);
+    if (found == session->slots.end()) throw LowlevelError("no import declared at this slot");
+    Funcdata *import = session->function(found->second);
+    Funcdata *alias = session->function(addr, import->getName());
+    const FuncProto &proto = import->getFuncProto();
+    if (proto.isInputLocked()) {
+      PrototypePieces pieces;
+      proto.getPieces(pieces);
+      pieces.name = alias->getName();
+      alias->getFuncProto().setPieces(pieces);
+    }
+    if (proto.isNoReturn()) alias->getFuncProto().setNoReturn(true);
   });
 }
 
@@ -312,6 +351,42 @@ int rd_override_jump_table(RdSession *session, uint64_t function, uint64_t jump,
   });
 }
 
+// Tells the engine up front that the indirect call at `call` inside `function` reaches the
+// local function `target`, as when it goes through a relocated pointer slot.
+int rd_override_call(RdSession *session, uint64_t function, uint64_t call, uint64_t target, char *err,
+                     size_t errlen) {
+  return guarded(err, errlen, [&] {
+    session->function(function)->getOverride().insertDeindirect(session->address(call),
+                                                                session->address(target));
+  });
+}
+
+// Parses one C declaration with the engine's own parser. `extern` declarations set the prototype
+// of the function of that name, which must exist; `typedef` and struct declarations add types.
+int rd_declare(RdSession *session, const char *declaration, char *err, size_t errlen) {
+  static mutex parser_lock;  // the bison parser keeps its state in globals
+  lock_guard<mutex> guard(parser_lock);
+  return guarded(err, errlen, [&] {
+    istringstream text(declaration);
+    parse_C(session->arch, text);
+  });
+}
+
+// Declares a NUL-terminated string of `count` characters (terminator included) at `addr`, as a
+// global of type char[count], or wchar2[count] if `wide`. A pointer to read-only data typed this
+// way is printed as a string literal.
+int rd_add_string(RdSession *session, uint64_t addr, const char *name, size_t count, int wide,
+                  char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    Scope *global = arch->symboltab->getGlobalScope();
+    Address where = session->address(addr);
+    if (global->findAddr(where, Address()) != nullptr) return;  // already declared
+    Datatype *element = arch->types->getTypeChar(wide ? 2 : 1);
+    global->addSymbol(name, arch->types->getTypeArray(count, element), where, Address());
+  });
+}
+
 // Marks the jump at `jump` inside `function` as a tail call: a call followed by a return.
 // Without this the engine follows the jump and decompiles the target's body as part of
 // `function`. Only unconditional jumps can be overridden.
@@ -326,19 +401,6 @@ int rd_override_tail_call(RdSession *session, uint64_t function, uint64_t jump, 
 // With `keep` set, the parameters recovered by each successful rd_decompile are locked into the
 // function's symbol, so that later decompilations of its callers pass exactly those parameters.
 void rd_keep_prototypes(RdSession *session, int keep) { session->keep_prototypes = keep != 0; }
-
-// Sets the address where `function` ends. While it is decompiled, code past that address reads
-// as undecodable, so flow that runs or jumps there is cut off with a "bad instruction" warning
-// instead of being followed into whatever comes next. That happens after a call the engine
-// does not know to be non-returning, and one such miss can chain through thousands of
-// following functions. The engine's own flow bounds (FlowInfo::setRange) are not usable for
-// this: a restart drops them, and a fall-through across the bound fails the function.
-int rd_bound_flow(RdSession *session, uint64_t function, uint64_t end, char *err, size_t errlen) {
-  return guarded(err, errlen, [&] {
-    session->function(function);
-    session->flow_ends[function] = end;
-  });
-}
 
 // Selects the engine's root action: "decompile" (everything), "normalize" (stops before type
 // recovery and structuring; what Ghidra's switch analysis uses) or "paramid" (what Ghidra's
@@ -362,8 +424,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     }
     Action *root = arch->allacts.getCurrent();
     root->reset(*fd);
-    auto bound = session->flow_ends.find(addr);
-    if (bound != session->flow_ends.end()) session->image->code_end = bound->second;
+    session->image->current = addr;
     // Follows flow from the entry point, then runs the whole simplification pipeline.
     if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
 
@@ -438,7 +499,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       session->kept.insert(addr);
     }
   }
-  session->image->code_end = ~(uint64_t)0;
+  session->image->current = ~(uint64_t)0;
   // Drop the p-code, varnodes and inferred (unlocked) prototype: they are large, and a failed
   // run leaves them half built. Overrides and the function symbol itself are kept.
   if (fd != nullptr) guarded(nullptr, 0, [&] { arch->clearAnalysis(fd); });

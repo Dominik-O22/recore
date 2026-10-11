@@ -7,7 +7,7 @@ use std::time::Instant;
 use anyhow::Result;
 use recore_decomp::{Facts, Session};
 
-use crate::WorkerOptions;
+use crate::{JumpTables, WorkerOptions};
 use crate::report::{Event, FunctionRecord, Status};
 
 /// Caps the address space, so that a runaway function fails its allocations instead of pushing
@@ -25,6 +25,10 @@ pub fn run(binary: &Path, options: &WorkerOptions) -> Result<()> {
     let analysis = recore::analyze(&image);
     let mut session = Session::from_image(&image, &analysis)?;
     session.add_functions(&Facts::derive(&image, &analysis))?;
+    session.add_strings(&analysis)?;
+    if options.jump_tables == JumpTables::Recore || (options.jump_tables == JumpTables::Auto && image.data_in_code) {
+        session.override_jump_tables(&analysis)?;
+    }
     session.set_style(options.style.into())?;
 
     let mut out = std::io::stdout().lock();
@@ -47,6 +51,7 @@ pub fn run(binary: &Path, options: &WorkerOptions) -> Result<()> {
                     message: None,
                     ms,
                     params: function.param_count(),
+                    storage: function.params.iter().map(|p| p.storage.clone()).collect(),
                     returns_value: function.returns_value,
                     c_len: function.c_text.len(),
                 },

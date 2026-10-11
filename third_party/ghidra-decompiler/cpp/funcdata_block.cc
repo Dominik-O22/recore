@@ -699,6 +699,19 @@ void Funcdata::switchOverJumpTables(const FlowInfo &flow)
 {
   vector<JumpTable *>::iterator iter;
 
+  // recore: an override for an indirect jump that flow never reached has no BRANCHIND to attach
+  // to, and one the engine rejected and turned into a call is left with no addresses. Every
+  // later user of the table assumes both. Upstream rarely sees this because Ghidra only sends
+  // overrides for jumps it disassembled as part of the function.
+  vector<JumpTable *> linked;
+  for(iter=jumpvec.begin();iter!=jumpvec.end();++iter) {
+    if ((*iter)->getIndirectOp() != (PcodeOp *)0 && (*iter)->numEntries() != 0)
+      linked.push_back(*iter);
+    else
+      delete *iter;
+  }
+  jumpvec = linked;
+
   for(iter=jumpvec.begin();iter!=jumpvec.end();++iter)
     (*iter)->switchOver(flow);
 }

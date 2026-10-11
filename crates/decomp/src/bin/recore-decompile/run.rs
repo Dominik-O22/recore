@@ -88,7 +88,7 @@ pub fn corpus(config: &Config) -> Result<()> {
     let finished: Mutex<Vec<(String, Vec<FunctionRecord>)>> = Mutex::new(Vec::new());
     for_each(&shards, config.jobs, |(index, addrs)| {
         let path = binaries[*index].lock().unwrap().path.clone();
-        let (records, c_text) = run_shard(config, &path, addrs);
+        let (records, c_text) = run_shard(&config.worker, config.timeout, &path, addrs);
         let mut binary = binaries[*index].lock().unwrap();
         binary.records.extend(records);
         binary.c_text.extend(c_text);
@@ -142,13 +142,13 @@ fn finish(config: &Config, binary: &mut Binary) -> Result<Vec<FunctionRecord>> {
 /// Decompiles `addrs` in child processes. A child that dies or stalls costs only the function
 /// it was working on: that one is recorded as crashed or timed out, and a new child takes over
 /// the rest.
-fn run_shard(config: &Config, binary: &Path, addrs: &[u64]) -> (Vec<FunctionRecord>, Vec<(u64, String)>) {
+pub fn run_shard(worker: &WorkerOptions, timeout: Duration, binary: &Path, addrs: &[u64]) -> (Vec<FunctionRecord>, Vec<(u64, String)>) {
     let mut remaining: VecDeque<u64> = addrs.iter().copied().collect();
     let mut records = Vec::new();
     let mut c_texts = Vec::new();
     while !remaining.is_empty() {
         let before = remaining.len();
-        if let Err(error) = run_child(config, binary, &mut remaining, &mut records, &mut c_texts) {
+        if let Err(error) = run_child(worker, timeout, binary, &mut remaining, &mut records, &mut c_texts) {
             // The child never got as far as a function, so a new one would fail the same way.
             let message = format!("{error:#}");
             records.extend(remaining.drain(..).map(|addr| FunctionRecord::failed(addr, Status::Error, message.clone(), 0.0)));
@@ -161,16 +161,18 @@ fn run_shard(config: &Config, binary: &Path, addrs: &[u64]) -> (Vec<FunctionReco
 /// Runs one child over `remaining`, removing every address that got a record. Fails only when
 /// the child died or stalled with no function in flight.
 fn run_child(
-    config: &Config,
+    worker: &WorkerOptions,
+    timeout: Duration,
     binary: &Path,
     remaining: &mut VecDeque<u64>,
     records: &mut Vec<FunctionRecord>,
     c_texts: &mut Vec<(u64, String)>,
 ) -> Result<()> {
-    let style = config.worker.style.to_possible_value().expect("no skipped variants");
+    let style = worker.style.to_possible_value().expect("no skipped variants");
     let mut command = Command::new(std::env::current_exe()?);
-    command.arg("worker").arg(binary).args(["--style", style.get_name()]).args(["--memory-gb", &config.worker.memory_gb.to_string()]);
-    if config.worker.emit_c {
+    command.arg("worker").arg(binary).args(["--style", style.get_name()]).args(["--memory-gb", &worker.memory_gb.to_string()])
+        .args(["--jump-tables", worker.jump_tables.to_possible_value().expect("no skipped variants").get_name()]);
+    if worker.emit_c {
         command.arg("--emit-c");
     }
     let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("spawning worker")?;
@@ -201,7 +203,7 @@ fn run_child(
     let mut in_flight: Option<(u64, Instant)> = None;
     let mut waiting_since = Instant::now();
     let timed_out = loop {
-        let limit = if in_flight.is_some() { config.timeout } else { SETUP_LIMIT };
+        let limit = if in_flight.is_some() { timeout } else { SETUP_LIMIT };
         match events.recv_timeout(limit.saturating_sub(waiting_since.elapsed())) {
             Ok(Event::Start(addr)) => {
                 in_flight = Some((addr, Instant::now()));
@@ -229,7 +231,7 @@ fn run_child(
         return Ok(());
     }
     let how = match (timed_out, status.signal()) {
-        (true, _) => format!("no result after {:.0?}", config.timeout),
+        (true, _) => format!("no result after {timeout:.0?}"),
         (false, Some(signal)) => format!("killed by signal {signal}"),
         (false, None) => format!("exited with {status}"),
     };
@@ -280,4 +282,46 @@ fn print_summary(s: &Summary) {
     for slow in &s.slowest {
         println!("  {:>9.0}ms {:?} {} {:#x}", slow.ms, slow.status, slow.binary, slow.addr);
     }
+}
+
+/// Prints the C of chosen functions, or of all of them. Each argument is a hex address or a
+/// name the image carries for a function, mangled or demangled.
+pub fn functions(binary: &Path, wanted: &[String], all: bool, jobs: usize, timeout: Duration, worker: &WorkerOptions) -> Result<()> {
+    let worker = WorkerOptions { emit_c: true, ..worker.clone() };
+    let shards: Vec<Vec<u64>> = if all {
+        // Listing every function means analyzing here as well as in the children.
+        let functions = plan(binary)?.functions;
+        let count = jobs.clamp(1, functions.len().max(1));
+        (0..count).map(|i| functions.iter().copied().skip(i).step_by(count).collect()).collect()
+    } else {
+        // Loading without analyzing is enough to resolve names, and takes milliseconds.
+        let image = recore::Image::load(binary)?;
+        let resolve = |text: &String| {
+            let by_name = || image.symbol_names.iter().find(|(_, name)| *name == text || recore::names::display_name(name) == *text).map(|(&addr, _)| addr);
+            u64::from_str_radix(text.trim_start_matches("0x"), 16).ok().or_else(by_name).with_context(|| format!("{text} is neither a hex address nor a known name"))
+        };
+        vec![wanted.iter().map(resolve).collect::<Result<_>>()?]
+    };
+
+    let results: Mutex<Vec<(FunctionRecord, Option<String>)>> = Mutex::new(Vec::new());
+    for_each(&shards, jobs, |addrs| {
+        let (records, mut texts) = run_shard(&worker, timeout, binary, addrs);
+        let with_text = records.into_iter().map(|record| {
+            let text = texts.iter().position(|text| text.0 == record.addr).map(|index| texts.swap_remove(index).1);
+            (record, text)
+        });
+        results.lock().unwrap().extend(with_text);
+    });
+    let mut results = results.into_inner().unwrap();
+    // In the order asked for, or by address for a full dump.
+    let order = |addr: u64| shards[0].iter().position(|&a| a == addr).filter(|_| !all).map_or(addr, |index| index as u64);
+    results.sort_by_key(|(record, _)| order(record.addr));
+    let mut out = std::io::stdout().lock();
+    for (record, text) in &results {
+        match text {
+            Some(text) => writeln!(out, "// {:#x} ({:.0}ms){text}", record.addr, record.ms)?,
+            None => writeln!(out, "// {:#x}: {:?}: {}\n", record.addr, record.status, record.message.as_deref().unwrap_or(""))?,
+        }
+    }
+    Ok(())
 }
