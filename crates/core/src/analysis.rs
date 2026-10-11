@@ -9,11 +9,11 @@ use std::collections::{HashMap, HashSet};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction};
 use rayon::prelude::*;
 
-use crate::discover::{discover, is_function_section};
+use crate::discover::{discover, is_function_section, FUNCTION_ALIGN};
 use crate::image::Image;
 use crate::noreturn::is_noreturn_import;
 use crate::report::{AnalyzedFunction, Analysis, CallSite, CallTarget, Import, Origin};
-use crate::x86::{classify, is_padding, Flow};
+use crate::x86::{classify, is_endbr, is_padding, opens_landing_pad, Flow};
 
 #[derive(Debug, Clone, Copy)]
 struct Control {
@@ -109,50 +109,118 @@ impl<'a> Imports<'a> {
     }
 }
 
-/// Whether any path from the function's entry can return to its caller, given the functions
-/// currently known not to return. Unresolved indirect jumps count as possibly returning.
-fn may_return(function: &Function, noreturn: &HashSet<u64>, imports: &Imports) -> bool {
-    let controls = &function.controls;
-    let in_range = |addr: u64| addr >= function.start && addr < function.end;
+/// What following control flow from a function's entry finds.
+struct Walk {
+    /// Some path returns to the caller.
+    may_return: bool,
+    /// End of the highest code reached. Code in the range above it was never reached.
+    reach_end: u64,
+    /// False when an indirect jump could not be followed, so more may be reachable.
+    complete: bool,
+    /// The straight-line stretches of code that were reached, as `[start, end)`, sorted. May
+    /// extend outside the function's own extent.
+    reached: Vec<(u64, u64)>,
+}
+
+/// The whole program's control-flow instructions and function entries, for following a
+/// function's paths wherever they lead.
+struct Program<'a> {
+    /// Every function's control-flow instructions, sorted by address.
+    controls: Vec<Control>,
+    /// Function entry addresses, sorted.
+    starts: &'a [u64],
+    imports: &'a Imports<'a>,
+    tables: &'a HashMap<u64, &'a [u64]>,
+}
+
+impl Program<'_> {
+    fn is_start(&self, addr: u64) -> bool {
+        self.starts.binary_search(&addr).is_ok()
+    }
+
+    /// The first function entry after `addr`.
+    fn next_start(&self, addr: u64) -> u64 {
+        self.starts.get(self.starts.partition_point(|&start| start <= addr)).copied().unwrap_or(u64::MAX)
+    }
+}
+
+/// Follows every path from the function's entry until it returns, stops, or reaches another
+/// function's entry. A jump to code that is not an entry is followed even outside the function's
+/// own extent, which is how a function reaches its cold part when that sits elsewhere. An
+/// unresolved indirect jump counts as possibly returning.
+fn walk(function: &Function, noreturn: &HashSet<u64>, program: &Program) -> Walk {
+    let controls = &program.controls;
+    let imports = program.imports;
+    let in_extent = |addr: u64| addr >= function.start && addr < function.end;
     let target_returns = |target: u64| match imports.stub(target) {
         Some(name) => !is_noreturn_import(name),
         None => !noreturn.contains(&target),
     };
 
-    let mut visited = vec![false; controls.len()];
+    let mut result = Walk { may_return: false, reach_end: function.start, complete: true, reached: Vec::new() };
+    let mut visited: HashSet<usize> = HashSet::new();
     let mut pending = vec![function.start];
     while let Some(addr) = pending.pop() {
-        // Everything up to the next control instruction falls through.
+        // Everything up to the next control instruction falls through, unless another
+        // function's entry comes first.
         let mut index = controls.partition_point(|c| c.addr < addr);
+        let boundary = program.next_start(addr);
+        let mut run_start = addr;
         loop {
-            let Some(control) = controls.get(index) else {
-                break; // Ran off the end of the range.
+            let Some(control) = controls.get(index).filter(|c| c.addr < boundary) else {
+                // Fell through to the next function's entry, or off the end of the code.
+                if in_extent(run_start) {
+                    result.reach_end = function.end;
+                    result.reached.push((run_start, function.end));
+                }
+                break;
             };
-            if std::mem::replace(&mut visited[index], true) {
+            if !visited.insert(index) {
+                result.reached.push((run_start, control.addr));
                 break;
             }
+            result.reached.push((run_start, control.next));
+            run_start = control.next;
+            if in_extent(control.addr) {
+                result.reach_end = result.reach_end.max(control.next);
+            }
+            let mut leave = |target: u64, pending: &mut Vec<u64>| {
+                // A PLT stub or another function's entry is a tail call. Anything else is more
+                // of this function's own code.
+                let is_tail_call = imports.stub(target).is_some() || (target != function.start && program.is_start(target));
+                if !is_tail_call {
+                    pending.push(target);
+                } else if target_returns(target) {
+                    result.may_return = true;
+                }
+            };
             match control.flow {
-                Flow::Return => return true,
+                Flow::Return => {
+                    result.may_return = true;
+                    break;
+                }
                 Flow::Halt => break,
                 Flow::Jump(target) => {
-                    if in_range(target) {
-                        pending.push(target);
-                    } else if target_returns(target) {
-                        return true;
+                    leave(target, &mut pending);
+                    break;
+                }
+                Flow::Branch(target) => leave(target, &mut pending),
+                Flow::JumpIndirect(None) => {
+                    match program.tables.get(&control.addr) {
+                        Some(targets) => pending.extend(targets.iter().copied()),
+                        None => {
+                            result.may_return = true;
+                            result.complete = false;
+                        }
                     }
                     break;
                 }
-                Flow::Branch(target) => {
-                    if in_range(target) {
-                        pending.push(target);
-                    } else if target_returns(target) {
-                        return true;
+                Flow::JumpIndirect(slot) => {
+                    if !imports.slot(slot).is_some_and(is_noreturn_import) {
+                        result.may_return = true;
                     }
+                    break;
                 }
-                Flow::JumpIndirect(slot) => match imports.slot(slot) {
-                    Some(name) if is_noreturn_import(name) => break,
-                    _ => return true,
-                },
                 Flow::Call(target) => {
                     if !target_returns(target) {
                         break;
@@ -167,7 +235,36 @@ fn may_return(function: &Function, noreturn: &HashSet<u64>, imports: &Imports) -
             index += 1;
         }
     }
-    false
+    result.reached.sort_unstable();
+    result
+}
+
+/// The first real instruction in `[from, end)` after any padding, unless it opens an exception
+/// landing pad. Landing pads are reached by the unwinder, not by control flow, so unreached
+/// code that starts with one still belongs to the function before it.
+fn next_function_start(image: &Image, from: u64, end: u64) -> Option<u64> {
+    let bytes = image.bytes_from(from)?;
+    let bytes = &bytes[..bytes.len().min((end.checked_sub(from)?) as usize)];
+    let mut decoder = Decoder::with_ip(64, bytes, from, DecoderOptions::NONE);
+    let mut instr = Instruction::default();
+    while decoder.can_decode() {
+        decoder.decode_out(&mut instr);
+        if instr.is_invalid() {
+            return None;
+        }
+        if is_padding(&instr) {
+            continue;
+        }
+        let start = instr.ip();
+        let mut first = instr;
+        if is_endbr(&first) && decoder.can_decode() {
+            decoder.decode_out(&mut first);
+        }
+        // Landing pads sit at arbitrary offsets; a function that starts flush against the
+        // previous one, with no padding to mark the boundary, still starts aligned.
+        return (start % FUNCTION_ALIGN == 0 && !opens_landing_pad(&first)).then_some(start);
+    }
+    None
 }
 
 pub fn analyze(image: &Image) -> Analysis {
@@ -180,34 +277,63 @@ pub fn analyze(image: &Image) -> Analysis {
         .collect();
     let frame_end: HashMap<u64, u64> = frames.iter().copied().collect();
 
-    let discovery = discover(image, &frames);
-    let starts: Vec<u64> = discovery.starts.keys().copied().collect();
-    let functions: Vec<Function> = starts
-        .par_iter()
-        .enumerate()
-        .map(|(index, &start)| match frame_end.get(&start) {
-            Some(&end) => decode(image, start, end, false),
-            None => {
-                let section_end = image.section_at(start).map_or(start, |s| s.end());
-                let bound = starts.get(index + 1).copied().unwrap_or(section_end).min(section_end);
-                decode(image, start, bound, true)
-            }
-        })
-        .collect();
+    let mut discovery = discover(image, &frames);
+    let tables: HashMap<u64, &[u64]> = discovery.jump_tables.iter().map(|t| (t.jump, t.targets.as_slice())).collect();
 
-    // Least fixpoint: a function joins the set once no path through it can return.
-    let mut noreturn: HashSet<u64> = HashSet::new();
-    loop {
-        let added: Vec<u64> = functions
+    let (starts, functions, noreturn) = loop {
+        let starts: Vec<u64> = discovery.starts.keys().copied().collect();
+        let functions: Vec<Function> = starts
             .par_iter()
-            .filter(|f| !noreturn.contains(&f.start) && !may_return(f, &noreturn, &imports))
-            .map(|f| f.start)
+            .enumerate()
+            .map(|(index, &start)| match frame_end.get(&start) {
+                Some(&end) => decode(image, start, end, false),
+                None => {
+                    let section_end = image.section_at(start).map_or(start, |s| s.end());
+                    let bound = starts.get(index + 1).copied().unwrap_or(section_end).min(section_end);
+                    decode(image, start, bound, true)
+                }
+            })
             .collect();
-        if added.is_empty() {
-            break;
+
+        let mut controls: Vec<Control> = functions.iter().flat_map(|f| f.controls.iter().copied()).collect();
+        controls.sort_unstable_by_key(|c| c.addr);
+        let program = Program { controls, starts: &starts, imports: &imports, tables: &tables };
+
+        // Least fixpoint: a function joins the set once no path through it can return.
+        let mut noreturn: HashSet<u64> = HashSet::new();
+        loop {
+            let added: Vec<u64> = functions
+                .par_iter()
+                .filter(|f| !noreturn.contains(&f.start) && !walk(f, &noreturn, &program).may_return)
+                .map(|f| f.start)
+                .collect();
+            if added.is_empty() {
+                break;
+            }
+            noreturn.extend(added);
         }
-        noreturn.extend(added);
-    }
+
+        // Code in a function's extent that no path from its entry reaches belongs to a
+        // different function: it follows a call that never returns, and nothing else marked it
+        // as an entry point. Functions with a frame are left alone, since the frame already
+        // gives their extent.
+        let splits: Vec<u64> = functions
+            .par_iter()
+            .filter(|f| !frame_end.contains_key(&f.start))
+            .filter_map(|f| {
+                let reached = walk(f, &noreturn, &program);
+                (reached.complete && reached.reach_end < f.end)
+                    .then(|| next_function_start(image, reached.reach_end, f.end))
+                    .flatten()
+            })
+            .collect();
+        if splits.is_empty() {
+            break (starts, functions, noreturn);
+        }
+        for addr in splits {
+            discovery.starts.entry(addr).or_insert(Origin::Unreachable);
+        }
+    };
 
     let is_start = |addr: u64| starts.binary_search(&addr).is_ok();
     let leaves = |function: &Function, target: u64| target < function.start || target >= function.end;
@@ -309,7 +435,7 @@ pub fn analyze(image: &Image) -> Analysis {
             })
             .collect(),
         noreturn_calls,
-        jump_tables: discovery.jump_tables,
+        jump_tables: discovery.jump_tables.clone(),
         calls,
         imports: import_list,
     }

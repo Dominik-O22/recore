@@ -15,7 +15,7 @@ use crate::report::{JumpTable, Origin};
 use crate::x86::{classify, is_endbr, is_padding, lea_target, opens_landing_pad, Flow};
 
 /// Typical function alignment for GCC, Clang and rustc at `-O2`.
-const FUNCTION_ALIGN: u64 = 16;
+pub const FUNCTION_ALIGN: u64 = 16;
 
 /// One executable section and which of its bytes begin a decoded instruction.
 struct Region<'a> {

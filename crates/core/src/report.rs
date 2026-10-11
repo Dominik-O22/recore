@@ -41,6 +41,8 @@ pub enum Origin {
     GapAligned,
     /// Unreferenced code opening with `endbr64`.
     GapEndbr,
+    /// Code inside another function's extent that nothing in that function reaches.
+    Unreachable,
 }
 
 /// Where a call or tail call goes.
