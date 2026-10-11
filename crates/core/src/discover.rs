@@ -254,6 +254,8 @@ impl<A: Arch> Explorer<'_, A> {
             table.entries.iter().filter(|&&target| Some(target) != function_end).map(|&addr| Pending { addr, state: at_case, trusted }),
         );
         self.unresolved.remove(&jump);
+        // Tables sit back to back, so each table's address ends the one before it.
+        self.data_refs.insert(table.address);
         self.tables.push((jump, table));
     }
 

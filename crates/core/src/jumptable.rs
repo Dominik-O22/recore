@@ -44,7 +44,7 @@ enum Value {
     /// Entry plus base: the jump target.
     Target { table: u64, anchor: u64, max_index: Option<u64> },
     /// A code pointer loaded from a table of absolute addresses, as computed goto uses.
-    Pointer { table: u64 },
+    Pointer { table: u64, max_index: Option<u64> },
 }
 
 /// Register contents relevant to jump tables at one program point.
@@ -127,7 +127,7 @@ impl State {
             }
             Mnemonic::Mov if instr.op1_kind() == OpKind::Memory && instr.memory_index_scale() == 8 => {
                 match self.absolute_table(instr) {
-                    Some(table) => Value::Pointer { table },
+                    Some(table) => Value::Pointer { table, max_index: self.bound_of(instr.memory_index()) },
                     None => Value::Unknown,
                 }
             }
@@ -216,6 +216,14 @@ impl State {
         self.spills.iter().find(|(at, _)| *at == offset).map_or(Value::Unknown, |&(_, value)| value)
     }
 
+    /// The largest value an index register can hold, when a bounds check established one.
+    fn bound_of(&self, index: Register) -> Option<u64> {
+        match self.get(index) {
+            Value::Bounded(max) => Some(max),
+            _ => None,
+        }
+    }
+
     /// The table address in a `[base + index*8]` operand whose base register holds one.
     fn absolute_table(&self, instr: &Instruction) -> Option<u64> {
         if instr.memory_index() == Register::None || instr.memory_displacement64() != 0 {
@@ -278,24 +286,34 @@ impl State {
                     && u64::from(jump.memory_index_scale()) == pointer_size
                     && jump.memory_displacement64() != 0 =>
             {
-                Value::Pointer { table: jump.memory_displacement64() }
+                Value::Pointer { table: jump.memory_displacement64(), max_index: self.bound_of(jump.memory_index()) }
             }
             // `jmp [base + index*8]` dispatches through absolute pointers directly.
             OpKind::Memory if stack_slot(jump, 0).is_some() => stack_slot(jump, 0).map_or(Value::Unknown, |at| self.spilled(at)),
             OpKind::Memory if jump.memory_index_scale() == 8 => {
-                self.absolute_table(jump).map_or(Value::Unknown, |table| Value::Pointer { table })
+                self.absolute_table(jump)
+                    .map_or(Value::Unknown, |table| Value::Pointer { table, max_index: self.bound_of(jump.memory_index()) })
             }
             _ => Value::Unknown,
         };
         match value {
             Value::Target { table, anchor, max_index } => read_relative(image, table, anchor, max_index, is_target),
-            Value::Pointer { table } => {
-                // The table runs for as long as consecutive slots hold relocated code pointers.
-                let entries: Vec<u64> = (0..MAX_ENTRIES as u64)
+            Value::Pointer { table, max_index } => {
+                // Without a bounds check, the table runs for as long as consecutive slots hold
+                // relocated code pointers.
+                let limit = max_index.map_or(MAX_ENTRIES, |max| (max as usize).saturating_add(1).min(MAX_ENTRIES));
+                let entries: Vec<u64> = (0..limit as u64)
                     .map_while(|i| pointer_slots.get(&(table + pointer_size * i)).copied())
                     .take_while(|&target| is_target(target))
                     .collect();
-                (!entries.is_empty()).then_some(Table { address: table, entry_size: pointer_size, entries, bounded: true })
+                // A bounded table that stops short was misread.
+                let complete = max_index.is_none() || entries.len() == limit;
+                (!entries.is_empty() && complete).then_some(Table {
+                    address: table,
+                    entry_size: pointer_size,
+                    entries,
+                    bounded: max_index.is_some(),
+                })
             }
             _ => None,
         }
