@@ -36,6 +36,9 @@ pub enum Machine {
 pub struct Image {
     pub name: String,
     pub machine: Machine,
+    /// The image is built with branch target identification (AArch64 BTI), so every address an
+    /// indirect branch may reach starts with a marker instruction.
+    pub branch_targets_marked: bool,
     pub entry: u64,
     /// Loaded sections, sorted by address.
     pub sections: Vec<Section>,
@@ -113,8 +116,12 @@ impl Image {
             other => anyhow::bail!("unsupported architecture {other:?}"),
         };
 
+        let branch_targets_marked = machine == Machine::Aarch64
+            && file.section_by_name(".note.gnu.property").and_then(|s| s.uncompressed_data().ok()).is_some_and(|d| has_bti(&d));
+
         Ok(Image {
             machine,
+            branch_targets_marked,
             name: path.file_name().unwrap().to_string_lossy().into_owned(),
             entry: file.entry(),
             sections,
@@ -201,4 +208,24 @@ fn relr_slots(data: &[u8]) -> Vec<u64> {
         }
     }
     slots
+}
+
+/// Whether a `.note.gnu.property` section declares AArch64 branch target identification.
+fn has_bti(note: &[u8]) -> bool {
+    const AARCH64_FEATURE_1_AND: u32 = 0xC000_0000;
+    const FEATURE_1_BTI: u32 = 1;
+    let word = |at: usize| note.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    // Note header: name size, descriptor size, type, then the name padded to 4 bytes.
+    let (Some(name_size), Some(desc_size)) = (word(0), word(4)) else { return false };
+    let mut at = 12 + (name_size as usize).next_multiple_of(4);
+    let end = (at + desc_size as usize).min(note.len());
+    // The descriptor is a list of properties: type, data size, data padded to 8 bytes.
+    while at + 8 <= end {
+        let (Some(kind), Some(size)) = (word(at), word(at + 4)) else { return false };
+        if kind == AARCH64_FEATURE_1_AND {
+            return word(at + 8).is_some_and(|flags| flags & FEATURE_1_BTI != 0);
+        }
+        at += 8 + (size as usize).next_multiple_of(8);
+    }
+    false
 }

@@ -10,6 +10,9 @@ use std::collections::HashMap;
 use crate::arch::{Arch, Decoded, Flow, Table};
 use crate::image::Image;
 
+/// How many spilled values are tracked per path.
+const SPILL_SLOTS: usize = 4;
+
 /// Upper bound on entries when no bounds check is found.
 const MAX_ENTRIES: usize = 4096;
 
@@ -98,6 +101,20 @@ impl Insn {
         (self.word & 0xFFC0_0000 == 0xF940_0000).then(|| u64::from(self.word >> 10 & 0xFFF) * 8)
     }
 
+    /// 64-bit `str xt, [sp, #imm]`: the byte offset.
+    fn store_to_stack(self) -> Option<u64> {
+        (self.word & 0xFFC0_0000 == 0xF900_0000 && self.rn() == 31).then(|| u64::from(self.word >> 10 & 0xFFF) * 8)
+    }
+
+    /// `add sp, sp, #imm` / `sub sp, sp, #imm`, or a load or store that updates `sp`.
+    fn moves_stack_pointer(self) -> bool {
+        let adjusts = self.word & 0x7F00_0000 == 0x1100_0000 && self.rd() == 31 && self.rn() == 31 && self.word >> 31 == 1;
+        let is_memory = self.word >> 25 & 0b0101 == 0b0100;
+        let is_pair = self.word & 0x3A00_0000 == 0x2800_0000;
+        let writes_base = if is_pair { self.word >> 23 & 1 == 1 } else { self.word >> 24 & 1 == 0 && self.word >> 10 & 1 == 1 };
+        adjusts || (is_memory && writes_base && self.rn() == 31)
+    }
+
     /// `ldr`/`ldrb`/`ldrh`/`ldrsw`... `[xn, xm, extend]`: `(entry size, signed)`.
     fn indexed_load(self) -> Option<(u64, bool)> {
         // Load/store with register offset; the two `opc` bits select store, zero- or
@@ -141,6 +158,9 @@ enum Value {
 #[derive(Clone, Copy, Default)]
 pub struct State {
     registers: [Value; 32],
+    /// Values spilled to the stack, as `(offset from sp, value)`. GCC keeps a hoisted table
+    /// address in a stack slot across a loop.
+    spills: [(u64, Value); SPILL_SLOTS],
     /// Register and immediate of a `cmp` whose flags the next instruction may branch on.
     compare: Option<(usize, u64)>,
 }
@@ -166,6 +186,23 @@ impl State {
             }
             return;
         }
+        if let Some(offset) = insn.store_to_stack() {
+            // Remember addresses only: that is all a later dispatch needs back.
+            let value = self.registers[insn.rd()];
+            let slot = self.spills.iter().position(|(at, _)| *at == offset);
+            match (slot, matches!(value, Value::Addr(_))) {
+                (Some(slot), _) => self.spills[slot] = (offset, value),
+                (None, true) => {
+                    self.spills.rotate_right(1);
+                    self.spills[0] = (offset, value);
+                }
+                (None, false) => {}
+            }
+            return;
+        }
+        if insn.moves_stack_pointer() {
+            self.spills = Default::default();
+        }
         let value = if let Some((is_page, address)) = insn.pc_relative() {
             if is_page { Value::Page(address) } else { Value::Addr(address) }
         } else if let Some(immediate) = insn.add_immediate() {
@@ -175,6 +212,7 @@ impl State {
             }
         } else if let Some(offset) = insn.load_offset() {
             match self.registers[insn.rn()] {
+                _ if insn.rn() == 31 => self.spills.iter().find(|(at, _)| *at == offset).map_or(Value::Unknown, |&(_, value)| value),
                 Value::Page(base) | Value::Addr(base) => Value::Slot(base + offset),
                 _ => Value::Unknown,
             }
@@ -359,6 +397,14 @@ impl Arch for Arm64 {
             entries.push(target);
         }
         (!entries.is_empty()).then_some(Table { address: table, entry_size: size, entries, bounded: max_index.is_some() })
+    }
+
+    fn marked_jump_target(image: &Image, target: u64) -> Option<bool> {
+        if !image.branch_targets_marked {
+            return None;
+        }
+        let word = image.bytes_from(target)?.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))?;
+        Some(matches!(word, BTI_J | BTI_JC))
     }
 
     /// A PLT stub is `adrp x16, page; ldr x17, [x16, #offset]; add x16, ...; br x17`, optionally

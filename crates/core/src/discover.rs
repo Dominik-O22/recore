@@ -118,8 +118,10 @@ impl<A: Arch> Explorer<'_, A> {
     /// allowed because compilers use it to fill cases they proved unreachable.
     fn is_case_target(&self, jump: u64, target: u64) -> bool {
         match self.frame_of(jump) {
-            Some((start, end)) => target >= start && target <= end,
-            None => self.region_index(target).is_some(),
+            // The end address itself is not code, so it carries no marker.
+            Some((_, end)) if target == end => true,
+            Some((start, end)) => target >= start && target < end && A::marked_jump_target(self.image, target) != Some(false),
+            None => self.region_index(target).is_some() && A::marked_jump_target(self.image, target) != Some(false),
         }
     }
 

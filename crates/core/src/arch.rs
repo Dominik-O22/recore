@@ -96,6 +96,13 @@ pub trait Arch: 'static {
         is_target: &dyn Fn(u64) -> bool,
     ) -> Option<Table>;
 
+    /// Whether the code at `target` is marked as reachable by an indirect jump, when the image is
+    /// built so that every such target carries a marker. `None` when the image has no such marking,
+    /// so nothing can be concluded.
+    fn marked_jump_target(_image: &Image, _target: u64) -> Option<bool> {
+        None
+    }
+
     /// Maps each PLT stub's address to the slot it jumps through.
     fn plt_stubs(image: &Image) -> HashMap<u64, u64>;
 }
