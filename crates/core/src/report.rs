@@ -43,6 +43,9 @@ pub enum Origin {
     GapEndbr,
     /// Code inside another function's extent that nothing in that function reaches.
     Unreachable,
+    /// The target of a function that is nothing but a jump, such as an incremental-linking
+    /// thunk or an import stub.
+    Thunk,
 }
 
 /// Where a call or tail call goes.

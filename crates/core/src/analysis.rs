@@ -251,7 +251,7 @@ fn walk(function: &Function, noreturn: &HashSet<u64>, program: &Program) -> Walk
 /// Where the code of a function without a frame ends, for images that keep data among the
 /// code: the first unconditional terminator that no earlier forward branch jumps past. Decoding
 /// up to the next function instead would read a trailing jump table as instructions.
-fn code_end<A: Arch>(image: &Image, start: u64, bound: u64) -> u64 {
+fn code_end<A: Arch>(image: &Image, start: u64, bound: u64, tables: &HashMap<u64, &[u64]>) -> u64 {
     let Some(bytes) = image.bytes_from(start) else { return start };
     let bytes = &bytes[..bytes.len().min((bound - start) as usize)];
     let state = A::State::default();
@@ -264,6 +264,14 @@ fn code_end<A: Arch>(image: &Image, start: u64, bound: u64) -> u64 {
             }
             Some(Flow::Jump(target)) if target > decoded.addr && target < bound && decoded.next_addr() <= furthest_target => {
                 furthest_target = furthest_target.max(target);
+            }
+            // The cases of a resolved switch come after the jump that dispatches to them.
+            Some(Flow::JumpIndirect(None)) if tables.contains_key(&decoded.addr) => {
+                let cases = tables[&decoded.addr].iter().copied().filter(|&target| target > decoded.addr && target < bound);
+                furthest_target = furthest_target.max(cases.max().unwrap_or(furthest_target));
+                if decoded.next_addr() > furthest_target {
+                    return decoded.next_addr();
+                }
             }
             Some(Flow::Jump(_) | Flow::JumpIndirect(_) | Flow::Return | Flow::Halt) if decoded.next_addr() > furthest_target => {
                 return decoded.next_addr();
@@ -329,7 +337,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                     let section_end = image.section_at(start).map_or(start, |s| s.end());
                     let mut bound = starts.get(index + 1).copied().unwrap_or(section_end).min(section_end);
                     if image.data_in_code {
-                        bound = code_end::<A>(image, start, bound);
+                        bound = code_end::<A>(image, start, bound, &tables);
                     }
                     decode::<A>(image, start, bound, true)
                 }

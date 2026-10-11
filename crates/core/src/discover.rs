@@ -174,6 +174,11 @@ impl<A: Arch> Explorer<'_, A> {
                         false
                     }
                     Flow::CallIndirect(_) => self.import_never_returns(flow),
+                    // A function that is nothing but a jump forwards to another function.
+                    Flow::Jump(target) if decoded.addr == start && self.starts.contains_key(&start) => {
+                        self.add_start(target, Origin::Thunk);
+                        true
+                    }
                     Flow::Jump(target) => {
                         self.jumps.push((decoded.addr, target));
                         self.queue(Pending { addr: target, state, trusted });
