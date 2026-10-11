@@ -51,6 +51,9 @@ pub struct Image {
     /// Pointers stored in data by relative relocations, as `(slot address, target)`. Targets in
     /// code are function pointers or, in computed-goto tables, labels.
     pub relative_targets: Vec<(u64, u64)>,
+    /// Compilers for this format place jump tables and other data among the code, so bytes
+    /// that control flow never reaches cannot be assumed to be instructions.
+    pub data_in_code: bool,
 }
 
 impl Image {
@@ -74,41 +77,13 @@ impl Image {
             .collect();
         sections.sort_by_key(|s| s.addr);
 
-        let mut import_slots = HashMap::new();
-        let mut relative_targets = Vec::new();
-        if let Some(relocations) = file.dynamic_relocations() {
-            let dynsyms = file.dynamic_symbol_table();
-            for (addr, reloc) in relocations {
-                match reloc.target() {
-                    object::RelocationTarget::Symbol(index) => {
-                        let name = dynsyms.as_ref().and_then(|t| t.symbol_by_index(index).ok()).and_then(|s| s.name().ok());
-                        if let Some(name) = name.filter(|n| !n.is_empty()) {
-                            import_slots.insert(addr, name.to_string());
-                        }
-                    }
-                    object::RelocationTarget::Absolute => relative_targets.push((addr, reloc.addend() as u64)),
-                    _ => {}
-                }
-            }
-        }
-
-        // Packed relative relocations store the target in the relocated word itself.
-        if let Some(relr) = file.section_by_name(".relr.dyn").and_then(|s| s.uncompressed_data().ok()) {
-            let read_word = |addr: u64| {
-                let section = sections.iter().find(|s| s.contains(addr))?;
-                let bytes = section.data.get((addr - section.addr) as usize..)?.get(..8)?;
-                Some(u64::from_le_bytes(bytes.try_into().unwrap()))
-            };
-            relative_targets.extend(relr_slots(&relr).into_iter().filter_map(|slot| Some((slot, read_word(slot)?))));
-        }
-
-        let exports = file
-            .dynamic_symbols()
-            .filter(|s| s.kind() == SymbolKind::Text && s.address() != 0 && s.is_definition())
-            .map(|s| s.address())
-            .collect();
-
-        let frames = file.section_by_name(".eh_frame").map(|s| parse_frames(&s)).unwrap_or_default();
+        let is_pe = file.format() == object::BinaryFormat::Pe;
+        let (import_slots, relative_targets, exports, frames) = if is_pe {
+            let pe = crate::pe::load(&data, &sections)?;
+            (pe.import_slots, pe.relative_targets, pe.exports, pe.frames)
+        } else {
+            elf_metadata(&file, &sections)
+        };
 
         let machine = match file.architecture() {
             object::Architecture::X86_64 => Machine::X86_64,
@@ -129,6 +104,7 @@ impl Image {
             exports,
             frames,
             relative_targets,
+            data_in_code: is_pe,
         })
     }
 
@@ -150,6 +126,48 @@ impl Image {
     pub fn text(&self) -> Option<&Section> {
         self.sections.iter().find(|s| s.name == ".text")
     }
+}
+
+/// Imports, relocated pointers, exports and unwind frames of an ELF image.
+#[allow(clippy::type_complexity)]
+fn elf_metadata(file: &object::File, sections: &[Section]) -> (HashMap<u64, String>, Vec<(u64, u64)>, Vec<u64>, Vec<(u64, u64)>) {
+    let mut import_slots = HashMap::new();
+    let mut relative_targets = Vec::new();
+    if let Some(relocations) = file.dynamic_relocations() {
+        let dynsyms = file.dynamic_symbol_table();
+        for (addr, reloc) in relocations {
+            match reloc.target() {
+                object::RelocationTarget::Symbol(index) => {
+                    let name = dynsyms.as_ref().and_then(|t| t.symbol_by_index(index).ok()).and_then(|s| s.name().ok());
+                    if let Some(name) = name.filter(|n| !n.is_empty()) {
+                        import_slots.insert(addr, name.to_string());
+                    }
+                }
+                object::RelocationTarget::Absolute => relative_targets.push((addr, reloc.addend() as u64)),
+                _ => {}
+            }
+        }
+    }
+
+    // Packed relative relocations store the target in the relocated word itself.
+    if let Some(relr) = file.section_by_name(".relr.dyn").and_then(|s| s.uncompressed_data().ok()) {
+        let read_word = |addr: u64| {
+            let section = sections.iter().find(|s| s.contains(addr))?;
+            let bytes = section.data.get((addr - section.addr) as usize..)?.get(..8)?;
+            Some(u64::from_le_bytes(bytes.try_into().unwrap()))
+        };
+        relative_targets.extend(relr_slots(&relr).into_iter().filter_map(|slot| Some((slot, read_word(slot)?))));
+    }
+
+    let exports = file
+        .dynamic_symbols()
+        .filter(|s| s.kind() == SymbolKind::Text && s.address() != 0 && s.is_definition())
+        .map(|s| s.address())
+        .collect();
+
+    let frames = file.section_by_name(".eh_frame").map(|s| parse_frames(&s)).unwrap_or_default();
+
+    (import_slots, relative_targets, exports, frames)
 }
 
 /// Sections that are written only by the loader and protected afterwards (full RELRO).

@@ -33,7 +33,26 @@ const NAMES: &[&str] = &[
     "_ZSt21__glibcxx_assert_failPKciS0_S0_",
 ];
 
+/// Windows API and Microsoft C runtime functions that never return.
+const WINDOWS_NAMES: &[&str] = &[
+    "ExitProcess",
+    "ExitThread",
+    "FatalExit",
+    "RaiseFailFastException",
+    "_CxxThrowException",
+    "__std_terminate",
+    "terminate",
+    "?terminate@@YAXXZ",
+    "_invalid_parameter_noinfo_noreturn",
+    "__report_rangecheckfailure",
+    "__report_gsfailure",
+];
+
 pub fn is_noreturn_import(name: &str) -> bool {
     // libstdc++ helpers such as `std::__throw_bad_alloc()` mangle to `_ZSt<len>__throw_...`.
-    NAMES.contains(&name) || (name.starts_with("_ZSt") && name.contains("__throw_"))
+    NAMES.contains(&name)
+        || WINDOWS_NAMES.contains(&name)
+        || (name.starts_with("_ZSt") && name.contains("__throw_"))
+        // The Microsoft STL's throw helpers: `std::_Xlength_error`, `std::_Xbad_alloc` and so on.
+        || (name.starts_with("?_X") && name.contains("@std@@YAX"))
 }

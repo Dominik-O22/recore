@@ -391,6 +391,10 @@ impl<A: Arch> Explorer<'_, A> {
     /// opening with an entry marker, starts a function. Other unreached code continues the
     /// function before it, such as switch cases behind an unresolved indirect jump.
     fn fill_gaps(&mut self) -> bool {
+        // Where data sits among the code, unreached bytes may not be instructions at all.
+        if self.image.data_in_code {
+            return false;
+        }
         let mut found = false;
         for index in 0..self.regions.len() {
             let section = self.regions[index].section;

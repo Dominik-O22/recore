@@ -103,7 +103,10 @@ fn classify(instr: &Instruction) -> Option<Flow> {
         FlowControl::IndirectCall => Some(Flow::CallIndirect(rip_slot(instr))),
         FlowControl::Return => Some(Flow::Return),
         FlowControl::Exception => Some(Flow::Halt),
-        FlowControl::Interrupt => (instr.mnemonic() == Mnemonic::Int3).then_some(Flow::Halt),
+        // `int3`, and `int 0x29`, which is how Windows code fails fast.
+        FlowControl::Interrupt => {
+            (instr.mnemonic() == Mnemonic::Int3 || (instr.mnemonic() == Mnemonic::Int && instr.immediate8() == 0x29)).then_some(Flow::Halt)
+        }
     }
 }
 

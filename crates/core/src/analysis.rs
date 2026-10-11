@@ -236,6 +236,32 @@ fn walk(function: &Function, noreturn: &HashSet<u64>, program: &Program) -> Walk
     result
 }
 
+/// Where the code of a function without a frame ends, for images that keep data among the
+/// code: the first unconditional terminator that no earlier forward branch jumps past. Decoding
+/// up to the next function instead would read a trailing jump table as instructions.
+fn code_end<A: Arch>(image: &Image, start: u64, bound: u64) -> u64 {
+    let Some(bytes) = image.bytes_from(start) else { return start };
+    let bytes = &bytes[..bytes.len().min((bound - start) as usize)];
+    let state = A::State::default();
+    let mut furthest_target = start;
+    for decoded in A::decode(bytes, start) {
+        let Some(insn) = decoded.insn else { return decoded.addr };
+        match A::flow(&insn, &state) {
+            Some(Flow::Branch(target)) if target > decoded.addr && target < bound => {
+                furthest_target = furthest_target.max(target);
+            }
+            Some(Flow::Jump(target)) if target > decoded.addr && target < bound && decoded.next_addr() <= furthest_target => {
+                furthest_target = furthest_target.max(target);
+            }
+            Some(Flow::Jump(_) | Flow::JumpIndirect(_) | Flow::Return | Flow::Halt) if decoded.next_addr() > furthest_target => {
+                return decoded.next_addr();
+            }
+            _ => {}
+        }
+    }
+    bound
+}
+
 /// The first real instruction in `[from, end)` after any padding, unless it opens an exception
 /// landing pad. Landing pads are reached by the unwinder, not by control flow, so unreached
 /// code that starts with one still belongs to the function before it.
@@ -286,7 +312,10 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                 Some(&end) => decode::<A>(image, start, end, false),
                 None => {
                     let section_end = image.section_at(start).map_or(start, |s| s.end());
-                    let bound = starts.get(index + 1).copied().unwrap_or(section_end).min(section_end);
+                    let mut bound = starts.get(index + 1).copied().unwrap_or(section_end).min(section_end);
+                    if image.data_in_code {
+                        bound = code_end::<A>(image, start, bound);
+                    }
                     decode::<A>(image, start, bound, true)
                 }
             })
@@ -317,7 +346,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         // gives their extent.
         let splits: Vec<u64> = functions
             .par_iter()
-            .filter(|f| !frame_end.contains_key(&f.start))
+            .filter(|f| !frame_end.contains_key(&f.start) && !image.data_in_code)
             .filter_map(|f| {
                 let reached = walk(f, &noreturn, &program);
                 (reached.complete && reached.reach_end < f.end)
