@@ -133,6 +133,11 @@ impl<A: Arch> Explorer<'_, A> {
         }
     }
 
+    /// Whether `target` is code that an indirect jump may reach at all.
+    fn is_case_code(&self, target: u64) -> bool {
+        self.region_index(target).is_some() && A::marked_jump_target(self.image, target) != Some(false)
+    }
+
     /// Decodes from every pending address until control flow ends or reaches known code.
     fn drain(&mut self) {
         while let Some(Pending { addr: start, mut state, trusted }) = self.pending.pop().or_else(|| self.deferred.pop()) {
@@ -195,7 +200,7 @@ impl<A: Arch> Explorer<'_, A> {
                         let jump = decoded.addr;
                         let resolved = A::resolve_table(&state, self.image, &self.pointer_slots, &insn, &|target| {
                             self.is_case_target(jump, target)
-                        });
+                        }, &|target| self.is_case_code(target));
                         let resolved = resolved.map(|table| self.apply_known_length(table));
                         match resolved {
                             Some(table) => self.accept_table(jump, table, A::after_jump(state, &insn), trusted),
@@ -274,7 +279,7 @@ impl<A: Arch> Explorer<'_, A> {
                 Some(Flow::JumpIndirect(None)) if decoded.addr == jump => {
                     let resolved = A::resolve_table(&state, self.image, &self.pointer_slots, &insn, &|target| {
                         self.is_case_target(jump, target)
-                    });
+                    }, &|target| self.is_case_code(target));
                     if let Some(table) = resolved {
                         let table = self.apply_known_length(table);
                         self.accept_table(jump, table, A::after_jump(state, &insn), true);

@@ -381,6 +381,7 @@ impl Arch for Arm64 {
         pointer_slots: &HashMap<u64, u64>,
         jump: &Insn,
         is_target: &dyn Fn(u64) -> bool,
+        _is_code: &dyn Fn(u64) -> bool,
     ) -> Option<Table> {
         let (table, size, signed, max_index, base, shift) = match state.registers[jump.rn()] {
             Value::Target { table, size, signed, max_index, base, shift } => (table, size, signed, max_index, base, shift),

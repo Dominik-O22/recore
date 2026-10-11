@@ -107,14 +107,17 @@ pub trait Arch: 'static {
     fn after_jump(state: Self::State, jump: &Self::Insn) -> Self::State;
 
     /// Reads the table behind an indirect jump, if the state identifies one. `pointer_slots`
-    /// maps data slots holding relocated pointers to their targets, and `is_target` says whether
-    /// an address can be a case target of this jump.
+    /// maps data slots holding relocated pointers to their targets. `is_target` says whether an
+    /// address is a likely case target of this jump, which ends a table of unknown length;
+    /// `is_code` only says whether it is code at all, which is all a table of known length
+    /// needs, since its cases may sit in cold code far from the function.
     fn resolve_table(
         state: &Self::State,
         image: &Image,
         pointer_slots: &HashMap<u64, u64>,
         jump: &Self::Insn,
         is_target: &dyn Fn(u64) -> bool,
+        is_code: &dyn Fn(u64) -> bool,
     ) -> Option<Table>;
 
     /// Whether the code at `target` is marked as reachable by an indirect jump, when the image is

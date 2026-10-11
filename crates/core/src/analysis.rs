@@ -14,6 +14,7 @@ use crate::image::{Image, Machine};
 use crate::noreturn::is_noreturn_import;
 use crate::report::{AnalyzedFunction, Analysis, CallSite, CallTarget, DataRef, Import, Origin};
 use crate::strings::string_at;
+use crate::x86::X86;
 
 #[derive(Debug, Clone, Copy)]
 struct Control {
@@ -305,8 +306,11 @@ fn next_function_start<A: Arch>(image: &Image, from: u64, end: u64) -> Option<u6
 /// Analyzes a loaded image with the support for its architecture.
 pub fn analyze(image: &Image) -> Analysis {
     match image.machine {
-        Machine::X86_64 => analyze_with::<crate::x86::X86_64>(image),
-        Machine::X86 => analyze_with::<crate::x86::X86_32>(image),
+        // PE images follow the Windows calling convention, everything else System V.
+        Machine::X86_64 if image.data_in_code => analyze_with::<X86<64, true>>(image),
+        Machine::X86_64 => analyze_with::<X86<64, false>>(image),
+        Machine::X86 if image.data_in_code => analyze_with::<X86<32, true>>(image),
+        Machine::X86 => analyze_with::<X86<32, false>>(image),
         Machine::Aarch64 => analyze_with::<crate::arm64::Arm64>(image),
     }
 }

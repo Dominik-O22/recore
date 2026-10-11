@@ -62,18 +62,6 @@ fn index_of(register: Register) -> Option<usize> {
     full.is_gpr64().then(|| full.number())
 }
 
-const CALLER_SAVED: [Register; 9] = [
-    Register::RAX,
-    Register::RCX,
-    Register::RDX,
-    Register::RSI,
-    Register::RDI,
-    Register::R8,
-    Register::R9,
-    Register::R10,
-    Register::R11,
-];
-
 impl State {
     fn get(&self, register: Register) -> Value {
         index_of(register).map_or(Value::Unknown, |i| self.registers[i])
@@ -88,7 +76,8 @@ impl State {
     }
 
     /// Updates the state for one instruction that falls through.
-    pub fn step(&mut self, instr: &Instruction) {
+    /// `caller_saved` lists the registers a call may overwrite under the calling convention.
+    pub fn step(&mut self, instr: &Instruction, caller_saved: &[Register]) {
         self.compare = None;
         let dest = (instr.op0_kind() == OpKind::Register).then(|| instr.op0_register());
         let source = (instr.op1_kind() == OpKind::Register).then(|| instr.op1_register());
@@ -142,7 +131,7 @@ impl State {
                 _ => Value::Unknown,
             },
             Mnemonic::Call => {
-                self.clear(&CALLER_SAVED);
+                self.clear(caller_saved);
                 return;
             }
             Mnemonic::Mul | Mnemonic::Div | Mnemonic::Idiv | Mnemonic::Cdq | Mnemonic::Cqo | Mnemonic::Cwd | Mnemonic::Rdtsc => {
@@ -274,6 +263,7 @@ impl State {
         pointer_slots: &HashMap<u64, u64>,
         jump: &Instruction,
         is_target: &dyn Fn(u64) -> bool,
+        is_code: &dyn Fn(u64) -> bool,
         pointer_size: u64,
     ) -> Option<Table> {
         let value = match jump.op0_kind() {
@@ -297,14 +287,16 @@ impl State {
             _ => Value::Unknown,
         };
         match value {
-            Value::Target { table, anchor, max_index } => read_relative(image, table, anchor, max_index, is_target),
+            Value::Target { table, anchor, max_index } => {
+                read_relative(image, table, anchor, max_index, if max_index.is_some() { is_code } else { is_target })
+            }
             Value::Pointer { table, max_index } => {
                 // Without a bounds check, the table runs for as long as consecutive slots hold
                 // relocated code pointers.
                 let limit = max_index.map_or(MAX_ENTRIES, |max| (max as usize).saturating_add(1).min(MAX_ENTRIES));
                 let entries: Vec<u64> = (0..limit as u64)
                     .map_while(|i| pointer_slots.get(&(table + pointer_size * i)).copied())
-                    .take_while(|&target| is_target(target))
+                    .take_while(|&target| if max_index.is_some() { is_code(target) } else { is_target(target) })
                     .collect();
                 // A bounded table that stops short was misread.
                 let complete = max_index.is_none() || entries.len() == limit;

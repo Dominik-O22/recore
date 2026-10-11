@@ -8,14 +8,34 @@ use crate::arch::{Arch, Decoded, Flow, Table};
 use crate::image::Image;
 use crate::jumptable::State;
 
-/// x86 in 64-bit or 32-bit mode. The two differ in how code refers to addresses: 64-bit code
-/// is RIP-relative, 32-bit code embeds absolute addresses that the loader relocates.
-pub struct X86<const BITS: u32>;
+/// x86 in 64-bit or 32-bit mode, under the Windows or the System V calling convention.
+///
+/// The modes differ in how code refers to addresses: 64-bit code is RIP-relative, 32-bit code
+/// embeds absolute addresses that the loader relocates. The conventions differ in which
+/// registers survive a call, which decides whether a table base set before a call is still
+/// there after it.
+pub struct X86<const BITS: u32, const WINDOWS: bool>;
 
-pub type X86_64 = X86<64>;
-pub type X86_32 = X86<32>;
+impl<const BITS: u32, const WINDOWS: bool> X86<BITS, WINDOWS> {
+    /// Registers a call may overwrite.
+    const CALLER_SAVED: &'static [Register] = match (BITS, WINDOWS) {
+        (32, _) => &[Register::RAX, Register::RCX, Register::RDX],
+        (_, true) => &[Register::RAX, Register::RCX, Register::RDX, Register::R8, Register::R9, Register::R10, Register::R11],
+        (_, false) => &[
+            Register::RAX,
+            Register::RCX,
+            Register::RDX,
+            Register::RSI,
+            Register::RDI,
+            Register::R8,
+            Register::R9,
+            Register::R10,
+            Register::R11,
+        ],
+    };
+}
 
-impl<const BITS: u32> Arch for X86<BITS> {
+impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
     type Insn = Instruction;
     type State = State;
 
@@ -78,7 +98,7 @@ impl<const BITS: u32> Arch for X86<BITS> {
     }
 
     fn step(state: &mut State, insn: &Instruction) {
-        state.step(insn);
+        state.step(insn, Self::CALLER_SAVED);
     }
 
     fn branch(state: State, insn: &Instruction) -> (State, State) {
@@ -95,8 +115,9 @@ impl<const BITS: u32> Arch for X86<BITS> {
         pointer_slots: &HashMap<u64, u64>,
         jump: &Instruction,
         is_target: &dyn Fn(u64) -> bool,
+        is_code: &dyn Fn(u64) -> bool,
     ) -> Option<Table> {
-        state.resolve(image, pointer_slots, jump, is_target, u64::from(BITS / 8))
+        state.resolve(image, pointer_slots, jump, is_target, is_code, u64::from(BITS / 8))
     }
 
     fn plt_stubs(image: &Image) -> HashMap<u64, u64> {
