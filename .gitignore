@@ -1,0 +1,10 @@
+target/
+corpus/pkgs/
+corpus/bin/
+corpus/debug/
+corpus/truth/
+corpus/ghidra/
+corpus/ghidra-*/
+corpus/recore*/
+corpus/jumptables/
+corpus/jt/src/

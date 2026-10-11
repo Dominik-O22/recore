@@ -1,0 +1,44 @@
+# Arch packages whose executables form the corpus. One name per line.
+# C
+coreutils
+bash
+grep
+sed
+gawk
+findutils
+tar
+gzip
+xz
+zstd
+curl
+openssh
+git
+sqlite
+make
+diffutils
+less
+nano
+tmux
+htop
+jq
+lua
+zsh
+binutils
+openssl
+rsync
+wget
+file
+# C++
+ninja
+cmake
+re2c
+gperf
+fish
+# Rust
+ripgrep
+fd
+bat
+eza
+hyperfine
+# Go
+fzf
