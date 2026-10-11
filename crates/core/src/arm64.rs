@@ -287,7 +287,10 @@ impl Arch for Arm64 {
     type Insn = Insn;
     type State = State;
 
-    const FUNCTION_ALIGN: u64 = 16;
+    /// GCC packs AArch64 functions back to back at instruction alignment unless tuned for a
+    /// specific core, so alignment says nothing about where a function starts.
+    const FUNCTION_ALIGN: u64 = 4;
+    const ALIGNMENT_IS_EVIDENCE: bool = false;
 
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> {
         bytes.chunks_exact(4).zip((addr..).step_by(4)).map(|(chunk, addr)| {

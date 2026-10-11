@@ -56,6 +56,10 @@ pub trait Arch: 'static {
     /// Usual alignment of function entry points in optimised compiler output.
     const FUNCTION_ALIGN: u64;
 
+    /// Whether that alignment is coarser than a single instruction, so that unreferenced code
+    /// sitting on an aligned address is likelier to be a function than a block inside one.
+    const ALIGNMENT_IS_EVIDENCE: bool;
+
     /// Decodes consecutive instructions from `bytes`, which are loaded at `addr`.
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Self::Insn>>;
 

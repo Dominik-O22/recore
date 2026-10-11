@@ -16,6 +16,7 @@ impl Arch for X86 {
 
     /// GCC, Clang and rustc all align functions to 16 bytes at `-O2`.
     const FUNCTION_ALIGN: u64 = 16;
+    const ALIGNMENT_IS_EVIDENCE: bool = true;
 
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Instruction>> {
         let mut decoder = Decoder::with_ip(64, bytes, addr, DecoderOptions::NONE);

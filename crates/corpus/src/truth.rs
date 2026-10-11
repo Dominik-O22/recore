@@ -2,14 +2,17 @@
 //!
 //! The debug file's symbol table gives every function's start and size, DWARF marks functions
 //! that never return, and a linear decode inside each known function range gives the true
-//! instruction boundaries and call sites.
+//! instruction boundaries and call sites. Symbols, DWARF and the classification of calls are
+//! shared; only that decode is per architecture (x86-64 and AArch64).
+
+mod aarch64;
+mod x86_64;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-use anyhow::{Context, Result};
-use iced_x86::{Decoder, DecoderOptions, FlowControl};
-use object::{Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, SectionKind, SymbolKind};
+use anyhow::{Context, Result, bail};
+use object::{Architecture, Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, SectionKind, SymbolKind};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -43,6 +46,33 @@ pub struct Truth {
     pub noreturn_imports: Vec<String>,
     /// Bytes inside function ranges that did not decode. Non-zero means data in code.
     pub undecodable_bytes: u64,
+    /// Bytes inside function ranges that Arm mapping symbols (`$d`) mark as literal data. They are
+    /// not decoded and count neither as instructions nor as undecodable.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub data_bytes: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Where a call instruction goes, as far as the decode alone can tell.
+enum Callee {
+    Direct(u64),
+    /// Through the GOT-style slot at this address.
+    Slot(u64),
+}
+
+/// The architecture-specific linear decode of one function body.
+#[derive(Default)]
+struct Scan {
+    instructions: u64,
+    undecodable_bytes: u64,
+    data_bytes: u64,
+    /// Calls with a known callee, in address order.
+    calls: Vec<(u64, Callee)>,
+    /// The call that is the function's last instruction, padding aside.
+    final_call: Option<u64>,
 }
 
 /// Names and addresses of functions DWARF marks `DW_AT_noreturn`.
@@ -122,10 +152,11 @@ fn dwarf_noreturn(debug: &object::File) -> Result<NoReturn> {
 }
 
 fn is_fragment(name: &str) -> bool {
-    [".cold", ".part.", ".isra.", ".constprop.", ".lto_priv."]
-        .iter()
-        .any(|marker| name.contains(marker))
-        && (name.contains(".cold") || name.contains(".part."))
+    // The AArch64 linker moves an instruction hit by Cortex-A53 erratum 843419 into a veneer
+    // named `e843419@...`: a piece of some function, reached and left by a plain branch.
+    name.starts_with("e843419@")
+        || [".cold", ".part.", ".isra.", ".constprop.", ".lto_priv."].iter().any(|marker| name.contains(marker))
+            && (name.contains(".cold") || name.contains(".part."))
 }
 
 /// glibc's `error` returns when its status argument is zero, but gnulib declares a noreturn overload.
@@ -137,6 +168,12 @@ fn is_conditionally_noreturn(name: &str) -> bool {
 /// calls itself and no declaration exists in the debug info.
 fn is_runtime_noreturn(name: &str) -> bool {
     const NAMES: &[&str] = &[
+        // The C library declares these noreturn, but Debian moves shared declarations out of
+        // each debug file with dwz, so DWARF cannot be relied on for them.
+        "exit",
+        "_exit",
+        "abort",
+        "__assert_fail",
         "__stack_chk_fail",
         "__cxa_throw",
         "__cxa_rethrow",
@@ -170,11 +207,20 @@ fn import_slots(binary: &object::File) -> HashMap<u64, String> {
     slots
 }
 
+/// Arm mapping symbols (`$x`, `$d`, `$x.123`) mark code and data runs; they are not functions.
+fn is_mapping_symbol(name: &str) -> bool {
+    ["$x", "$d"].iter().any(|prefix| name == *prefix || name.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.')))
+}
+
 pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     let binary_data = std::fs::read(binary_path).with_context(|| format!("reading {binary_path:?}"))?;
     let debug_data = std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?;
     let binary = object::File::parse(&*binary_data)?;
     let debug = object::File::parse(&*debug_data)?;
+    let architecture = binary.architecture();
+    if !matches!(architecture, Architecture::X86_64 | Architecture::Aarch64) {
+        bail!("unsupported architecture {architecture:?}");
+    }
 
     let exec_sections: Vec<_> = binary.sections().filter(|s| s.kind() == SectionKind::Text && s.size() > 0).collect();
     let exec: Vec<(u64, u64)> = exec_sections.iter().map(|s| (s.address(), s.address() + s.size())).collect();
@@ -192,6 +238,9 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
             continue;
         }
         let name = symbol.name().unwrap_or("").to_string();
+        if is_mapping_symbol(&name) {
+            continue;
+        }
         let function = Function {
             addr: symbol.address(),
             size: symbol.size(),
@@ -209,12 +258,23 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     let noreturn_addrs: HashSet<u64> = by_addr.values().filter(|f| f.noreturn).map(|f| f.addr).collect();
 
     let slots = import_slots(&binary);
+    // AArch64 reaches imports by a direct call to a PLT stub; x86-64 truth does not resolve stubs.
+    let (stubs, data) = match architecture {
+        Architecture::Aarch64 => (aarch64::plt_stubs(&binary), aarch64::data_ranges(&binary, &debug)),
+        _ => Default::default(),
+    };
     let mut noreturn_imports: BTreeSet<String> = BTreeSet::new();
+    let mut noreturn_import = |slot: &u64| match slots.get(slot) {
+        Some(name) if !is_conditionally_noreturn(name) && (noreturn.declared.contains(name) || is_runtime_noreturn(name)) => {
+            noreturn_imports.insert(name.clone());
+            true
+        }
+        _ => false,
+    };
     let mut noreturn_calls = Vec::new();
     let mut terminal_calls = Vec::new();
     let mut direct_calls: Vec<(u64, u64)> = Vec::new();
-    let mut instructions = 0u64;
-    let mut undecodable_bytes = 0u64;
+    let (mut instructions, mut undecodable_bytes, mut data_bytes) = (0u64, 0u64, 0u64);
 
     for function in by_addr.values() {
         let Some(section) = exec_sections
@@ -223,47 +283,28 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
         else {
             continue;
         };
-        let Ok(data) = section.data() else { continue };
+        let Ok(section_data) = section.data() else { continue };
         let offset = (function.addr - section.address()) as usize;
-        let bytes = &data[offset..offset + function.size as usize];
-        let mut decoder = Decoder::with_ip(64, bytes, function.addr, DecoderOptions::NONE);
-        let mut last_real: Option<(u64, bool)> = None;
-        while decoder.can_decode() {
-            let instr = decoder.decode();
-            if instr.is_invalid() {
-                undecodable_bytes += instr.len().max(1) as u64;
-                continue;
-            }
-            instructions += 1;
-            if !matches!(instr.mnemonic(), iced_x86::Mnemonic::Nop | iced_x86::Mnemonic::Int3) {
-                let is_call = matches!(instr.flow_control(), FlowControl::Call | FlowControl::IndirectCall);
-                last_real = Some((instr.ip(), is_call));
-            }
-            if instr.flow_control() == FlowControl::Call {
-                direct_calls.push((instr.ip(), instr.near_branch_target()));
-            }
-            let target_noreturn = match instr.flow_control() {
-                FlowControl::Call => noreturn_addrs.contains(&instr.near_branch_target()),
-                FlowControl::IndirectCall if instr.is_ip_rel_memory_operand() => {
-                    match slots.get(&instr.ip_rel_memory_address()) {
-                        Some(name)
-                        if !is_conditionally_noreturn(name)
-                            && (noreturn.declared.contains(name) || is_runtime_noreturn(name)) =>
-                    {
-                            noreturn_imports.insert(name.clone());
-                            true
-                        }
-                        _ => false,
-                    }
+        let bytes = &section_data[offset..offset + function.size as usize];
+        let scan = match architecture {
+            Architecture::Aarch64 => aarch64::scan(bytes, function.addr, &data),
+            _ => x86_64::scan(bytes, function.addr),
+        };
+        instructions += scan.instructions;
+        undecodable_bytes += scan.undecodable_bytes;
+        data_bytes += scan.data_bytes;
+        terminal_calls.extend(scan.final_call);
+        for (at, callee) in scan.calls {
+            let target_noreturn = match callee {
+                Callee::Direct(target) => {
+                    direct_calls.push((at, target));
+                    noreturn_addrs.contains(&target) || stubs.get(&target).is_some_and(&mut noreturn_import)
                 }
-                _ => false,
+                Callee::Slot(slot) => noreturn_import(&slot),
             };
             if target_noreturn {
-                noreturn_calls.push(instr.ip());
+                noreturn_calls.push(at);
             }
-        }
-        if let Some((addr, true)) = last_real {
-            terminal_calls.push(addr);
         }
     }
     // Widen from the calls that end a function to every call of the same callee.
@@ -291,5 +332,6 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
         terminal_calls,
         noreturn_imports: noreturn_imports.into_iter().collect(),
         undecodable_bytes,
+        data_bytes,
     })
 }

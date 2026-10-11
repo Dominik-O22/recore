@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Breaks an analyzer's reported function starts down by evidence type and outcome.
 
-Usage: origins.py <analysis-dir>   e.g. corpus/recore-noframes
+Usage: origins.py <analysis-dir> [corpus-dir]   e.g. corpus/recore-noframes
 Outcome is hit (true start), mid (inside a real function), cold (inside a cold fragment) or
 outside (not in any known function).
 """
 import bisect, collections, glob, json, os, sys
 
-corpus = os.path.dirname(os.path.abspath(__file__))
+corpus = sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(os.path.abspath(__file__))
 counts = collections.Counter()
 worst = collections.Counter()
 for path in glob.glob(f"{corpus}/truth/*.json"):

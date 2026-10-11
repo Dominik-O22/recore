@@ -230,12 +230,15 @@ fn next_function_start<A: Arch>(image: &Image, from: u64, end: u64) -> Option<u6
     let mut decoder = A::decode(bytes, from).skip_while(|d| d.insn.as_ref().is_some_and(A::is_padding));
     let first = decoder.next()?;
     let mut insn = first.insn?;
-    if A::is_entry_marker(&insn) {
+    let marked = A::is_entry_marker(&insn);
+    if marked {
         insn = decoder.next()?.insn?;
     }
-    // Landing pads sit at arbitrary offsets; a function that starts flush against the previous
-    // one, with no padding to mark the boundary, still starts aligned.
-    (first.addr % A::FUNCTION_ALIGN == 0 && !A::opens_landing_pad(&insn)).then_some(first.addr)
+    // Landing pads sit at arbitrary offsets and carry no entry marker. A function that starts
+    // flush against the previous one, with no padding to mark the boundary, still starts
+    // aligned, or with a marker where alignment says nothing.
+    let looks_like_entry = if A::ALIGNMENT_IS_EVIDENCE { first.addr % A::FUNCTION_ALIGN == 0 } else { marked };
+    (looks_like_entry && !A::opens_landing_pad(&insn)).then_some(first.addr)
 }
 
 /// Analyzes a loaded image with the support for its architecture.
