@@ -92,7 +92,7 @@ pub fn list() -> Value {
         ),
         tool(
             "classes",
-            "C++ classes recovered from the type information of Windows binaries: each with its base classes, its vtable address and its virtual functions in vtable order. A virtual call through slot N of an object goes to entry N here.",
+            "C++ classes recovered from the type information that MSVC, GCC and Clang emit: each with its base classes, its vtable address and its virtual functions in vtable order. A virtual call through slot N of an object goes to entry N here. A class with several vtables is listed once per vtable.",
             json!({ "pattern": pattern("class name") }),
             &[],
         ),
@@ -672,7 +672,12 @@ fn classes(binary: &mut Binary, args: Classes) -> Result<String> {
         let bases = if class.bases.is_empty() { String::new() } else { format!(" : {}", class.bases.join(", ")) };
         writeln!(out, "{}{bases}, {} {:#x}", class.name, if class.objc { "Objective-C class at" } else { "vtable" }, class.vtable)?;
         for (index, &method) in class.methods.iter().enumerate() {
-            writeln!(out, "  {index} {}", binary.program.label(method))?;
+            // A C++ slot bound to another image's function is listed by the slot's address.
+            match binary.program.import_name(method).filter(|_| !class.objc) {
+                Some(import) => writeln!(out, "  {index} import {import}")?,
+                None if method == 0 => writeln!(out, "  {index} null")?,
+                None => writeln!(out, "  {index} {}", binary.program.label(method))?,
+            }
         }
     }
     Ok(out)

@@ -391,6 +391,19 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
     let pointer_slots: FxHashMap<u64, u64> = image.relative_targets.iter().copied().collect();
 
+    _phase = phase::scope("classes");
+    let mut classes = crate::rtti::classes(image);
+    if classes.is_empty() {
+        classes = crate::itanium::classes(image, &pointer_slots);
+        // A virtual function is called through its vtable, and in an image that relocates
+        // nothing its vtable slot is all that says it is a function.
+        let methods = classes.iter().flat_map(|class| class.methods.iter().copied());
+        for method in methods.filter(|&method| image.section_at(method).is_some_and(is_function_section)) {
+            discovery.starts.entry(method).or_insert(Origin::DataPointer);
+            discovery.referenced.insert(method);
+        }
+    }
+
     let (starts, functions, chunks, noreturn, controls, extents) = loop {
         _phase = phase::scope("decode functions");
         let starts: Vec<u64> = discovery.starts.keys().copied().collect();
@@ -712,15 +725,20 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     }
 
     // A virtual function nothing else names takes the name of its vtable slot, in the class
-    // that has the fewest bases among those listing it: the one that introduced it.
+    // that has the fewest bases among those listing it: the one that introduced it. A class
+    // with several vtables numbers the slots of each from zero, and the first to claim a name
+    // keeps it.
     _phase = phase::scope("classes");
-    let classes = crate::rtti::classes(image);
     let mut by_depth: Vec<&crate::report::Class> = classes.iter().collect();
     by_depth.sort_by_key(|class| class.bases.len());
+    let mut slot_names: FxHashSet<String> = FxHashSet::default();
     for class in by_depth {
         for (index, &method) in class.methods.iter().enumerate() {
-            if starts.contains(&method) {
-                names.entry(method).or_insert_with(|| format!("{}::vfunc_{index}", class.name));
+            if is_start(method) && !names.contains_key(&method) {
+                let name = format!("{}::vfunc_{index}", class.name);
+                if slot_names.insert(name.clone()) {
+                    names.insert(method, name);
+                }
             }
         }
     }

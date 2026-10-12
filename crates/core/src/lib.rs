@@ -10,6 +10,7 @@ pub mod cfg;
 pub mod discover;
 pub mod edits;
 pub mod image;
+pub mod itanium;
 pub mod jumptable;
 pub mod macho;
 pub mod names;
