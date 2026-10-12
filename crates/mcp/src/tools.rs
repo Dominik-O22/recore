@@ -162,7 +162,9 @@ fn describe(binary: &Binary, addr: u64) -> String {
 
 /// The run of pointers stored from the data address `addr` on, as `(slot, target)`: a vtable,
 /// or a table of strings or handlers. A slot counts while it holds an address inside the image,
-/// and is relocated if the image relocates its pointers.
+/// and is relocated if the image relocates its pointers. The run ends where pointers to code
+/// give way to pointers to data or the reverse, which is where one vtable ends and the type
+/// information of the next begins.
 fn pointer_table(binary: &Binary, addr: u64) -> Vec<(u64, u64)> {
     /// Entries shown. Longer tables can be read on from the last slot.
     const LONGEST: usize = 64;
@@ -172,13 +174,14 @@ fn pointer_table(binary: &Binary, addr: u64) -> Vec<(u64, u64)> {
     }
     let size = if image.machine == Machine::X86 { 4 } else { 8 };
     let relocated: BTreeSet<u64> = image.relative_targets.iter().map(|&(slot, _)| slot).collect();
+    let mut to_code = None;
     (0..LONGEST as u64)
         .map(|index| addr + index * size)
         .map_while(|slot| {
             let bytes = image.bytes_from(slot)?.get(..size as usize)?;
             let target = bytes.iter().rev().fold(0, |value, &byte| value << 8 | u64::from(byte));
-            let is_pointer = (relocated.is_empty() || relocated.contains(&slot)) && image.section_at(target).is_some();
-            is_pointer.then_some((slot, target))
+            let section = image.section_at(target).filter(|_| relocated.is_empty() || relocated.contains(&slot))?;
+            (*to_code.get_or_insert(section.executable) == section.executable).then_some((slot, target))
         })
         .collect()
 }
