@@ -101,7 +101,7 @@ pub enum Style {
 /// One parameter of a recovered prototype.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
-    /// The decompiler's name for the data type, such as `xunknown8` or `char *`.
+    /// The decompiler's name for the data type, such as `undefined8` or `char *`.
     pub type_name: String,
     /// Register name (`RDI`, `XMM0_Qa`) or `stack:0x8`.
     pub storage: String,
