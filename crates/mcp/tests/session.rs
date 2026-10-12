@@ -76,7 +76,7 @@ fn speaks_the_protocol() {
 
     let tools = client.request("tools/list", json!({}));
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["summary", "strings", "imports", "functions", "function", "xrefs", "decompile", "bytes"]);
+    assert_eq!(names, ["summary", "strings", "imports", "functions", "function", "xrefs", "decompile", "bytes", "addr"]);
 
     assert_eq!(client.request("resources/list", json!({}))["error"]["code"], -32601);
     assert_eq!(client.request("tools/call", json!({ "name": "nope" }))["error"]["code"], -32602);

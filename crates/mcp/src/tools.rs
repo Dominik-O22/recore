@@ -65,7 +65,7 @@ pub fn list() -> Value {
         ),
         tool(
             "xrefs",
-            "What refers to an address: call sites if it is a function or an import slot, and the instructions that read or write it or take its address, with the function each is in.",
+            "What refers to an address: call sites if it is a function or an import slot, and the instructions that read or write it or take its address, with the function each is in. If the address holds pointers, such as a vtable or a table of strings, lists what each entry points to.",
             json!({ "addr": addr("The function entry or data address") }),
             &["addr"],
         ),
@@ -87,6 +87,12 @@ pub fn list() -> Value {
             }),
             &["addr"],
         ),
+        tool(
+            "addr",
+            "Converts between an address in the image and an offset in the file, and says what is there. Give `addr` or `offset`.",
+            json!({ "addr": addr("Address in the image"), "offset": addr("Offset in the file") }),
+            &[],
+        ),
     ])
 }
 
@@ -107,6 +113,7 @@ pub fn call(cache: &mut Cache, name: &str, arguments: Value) -> Option<Result<St
         "xrefs" => run(cache, name, arguments, xrefs),
         "decompile" => run(cache, name, arguments, decompile),
         "bytes" => run(cache, name, arguments, bytes),
+        "addr" => run(cache, name, arguments, addr),
         _ => return None,
     })
 }
@@ -153,6 +160,29 @@ fn describe(binary: &Binary, addr: u64) -> String {
     }
 }
 
+/// The run of pointers stored from the data address `addr` on, as `(slot, target)`: a vtable,
+/// or a table of strings or handlers. A slot counts while it holds an address inside the image,
+/// and is relocated if the image relocates its pointers.
+fn pointer_table(binary: &Binary, addr: u64) -> Vec<(u64, u64)> {
+    /// Entries shown. Longer tables can be read on from the last slot.
+    const LONGEST: usize = 64;
+    let image = &binary.program.image;
+    if image.section_at(addr).is_none_or(|section| section.executable) {
+        return Vec::new();
+    }
+    let size = if image.machine == Machine::X86 { 4 } else { 8 };
+    let relocated: BTreeSet<u64> = image.relative_targets.iter().map(|&(slot, _)| slot).collect();
+    (0..LONGEST as u64)
+        .map(|index| addr + index * size)
+        .map_while(|slot| {
+            let bytes = image.bytes_from(slot)?.get(..size as usize)?;
+            let target = bytes.iter().rev().fold(0, |value, &byte| value << 8 | u64::from(byte));
+            let is_pointer = (relocated.is_empty() || relocated.contains(&slot)) && image.section_at(target).is_some();
+            is_pointer.then_some((slot, target))
+        })
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct Summary {}
 
@@ -184,7 +214,8 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
     writeln!(out, "sections:")?;
     for section in &image.sections {
         let kind = if section.executable { "code" } else if section.writable { "data" } else { "read-only data" };
-        writeln!(out, "  {:#x}-{:#x} {} ({kind})", section.addr, section.end(), section.name)?;
+        let stored = section.file_offset.map_or_else(String::new, |offset| format!(", file offset {offset:#x}"));
+        writeln!(out, "  {:#x}-{:#x} {} ({kind}{stored})", section.addr, section.end(), section.name)?;
     }
     Ok(out)
 }
@@ -340,6 +371,13 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
             count += 1;
         }
     }
+    let table = pointer_table(binary, addr);
+    if !table.is_empty() {
+        writeln!(out, "it holds {} pointer{}:", table.len(), if table.len() == 1 { "" } else { "s" })?;
+        for (slot, target) in table {
+            writeln!(out, "  {slot:#x} -> {target:#x} {}", describe(binary, target))?;
+        }
+    }
     if count == 0 {
         writeln!(out, "nothing refers to it directly")?;
         if let Some(entry) = binary.program.owners(addr).first().filter(|&&entry| entry != addr) {
@@ -417,7 +455,8 @@ fn bytes(binary: &mut Binary, args: Bytes) -> Result<String> {
     let available = image.bytes_from(addr).expect("inside a section");
     let data = &available[..len.min(available.len())];
     let mut out = String::new();
-    writeln!(out, "{} bytes at {addr:#x} in {}", data.len(), section.name)?;
+    let stored = section.file_offset.map_or_else(String::new, |offset| format!(", file offset {:#x}", offset + (addr - section.addr)));
+    writeln!(out, "{} bytes at {addr:#x} in {}{stored}", data.len(), section.name)?;
     for (index, row) in data.chunks(16).enumerate() {
         let hex: Vec<String> = row.iter().map(|byte| format!("{byte:02x}")).collect();
         let text: String = row.iter().map(|&byte| if byte.is_ascii_graphic() || byte == b' ' { byte as char } else { '.' }).collect();
@@ -427,4 +466,36 @@ fn bytes(binary: &mut Binary, args: Bytes) -> Result<String> {
         writeln!(out, "{} ends at {:#x}", section.name, section.end())?;
     }
     Ok(out)
+}
+
+#[derive(Deserialize)]
+struct Addr {
+    addr: Option<String>,
+    offset: Option<String>,
+}
+
+fn addr(binary: &mut Binary, args: Addr) -> Result<String> {
+    let image = &binary.program.image;
+    let (section, addr) = match (&args.addr, &args.offset) {
+        (Some(addr), None) => {
+            let addr = addr_arg(addr)?;
+            (image.section_at(addr).with_context(|| format!("{addr:#x} is not in any section stored in the file"))?, addr)
+        }
+        (None, Some(offset)) => {
+            let offset = addr_arg(offset)?;
+            let holds = |start: u64, len: usize| offset >= start && offset < start + len as u64;
+            let (section, start) = image
+                .sections
+                .iter()
+                .find_map(|section| Some((section, section.file_offset.filter(|&start| holds(start, section.data.len()))?)))
+                .with_context(|| format!("file offset {offset:#x} is not in any mapped section (headers, or data the loader does not map)"))?;
+            (section, section.addr + (offset - start))
+        }
+        _ => bail!("`addr` needs exactly one of `addr` and `offset`"),
+    };
+    let stored = match section.file_offset {
+        Some(start) => format!("file offset {:#x}", start + (addr - section.addr)),
+        None => "not stored in the file as mapped".into(),
+    };
+    Ok(format!("address {addr:#x}, {stored}, in {}: {}\n", section.name, describe(binary, addr)))
 }

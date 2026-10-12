@@ -20,7 +20,7 @@ fn image() -> Image {
         base: 0,
         branch_targets_marked: false,
         entry: A,
-        sections: vec![Section { name: ".text".into(), addr: 0x1000, data: vec![0x90; 0x100], executable: true, writable: false }],
+        sections: vec![Section { name: ".text".into(), addr: 0x1000, data: vec![0x90; 0x100], file_offset: None, executable: true, writable: false }],
         import_slots: HashMap::new(),
         exports: Vec::new(),
         symbol_names: HashMap::new(),

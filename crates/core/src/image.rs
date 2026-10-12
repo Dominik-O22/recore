@@ -11,6 +11,8 @@ pub struct Section {
     pub name: String,
     pub addr: u64,
     pub data: Vec<u8>,
+    /// Where `data` starts in the file, for sections stored there as they are mapped.
+    pub file_offset: Option<u64>,
     pub executable: bool,
     /// Whether the program can change the contents while running. Sections the loader makes
     /// read-only after relocation count as not writable.
@@ -85,6 +87,7 @@ impl Image {
                     name: s.name().ok()?.to_string(),
                     addr: s.address(),
                     data: s.uncompressed_data().ok()?.into_owned(),
+                    file_offset: s.file_range().map(|(offset, _)| offset),
                     executable: s.kind() == SectionKind::Text,
                     writable: s.kind() == SectionKind::Data && !is_relro(s.name().unwrap_or("")),
                 })

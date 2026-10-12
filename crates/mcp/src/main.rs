@@ -1,16 +1,18 @@
 //! A Model Context Protocol server over stdio: recore's analysis and the decompiler as tools.
 //!
-//! Messages are JSON-RPC 2.0, one per line. The server answers one request at a time and keeps
+//! Given a tool name and a binary as arguments it runs that one tool and prints the answer; see
+//! `cli`. Otherwise it serves. Messages are JSON-RPC 2.0, one per line. The server answers one request at a time and keeps
 //! every binary it has analyzed, so a session pays for analysis once per binary.
 
 mod binary;
+mod cli;
 mod tools;
 
 use std::io::{BufRead, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde_json::{Value, json};
 
 use binary::Cache;
@@ -31,7 +33,14 @@ fn main() -> Result<()> {
     match args.as_slice() {
         [] => {}
         [worker, binary, options] if worker == WORKER_ARG => return recore_decomp::isolate::serve(Path::new(binary), options),
-        _ => bail!("recore-mcp takes no arguments: it speaks the Model Context Protocol on stdin and stdout"),
+        [tool, binary, rest @ ..] if !tool.starts_with('-') => {
+            print!("{}", cli::run(tool, binary, rest)?);
+            return Ok(());
+        }
+        _ => {
+            print!("{}", cli::usage());
+            return Ok(());
+        }
     }
 
     let mut cache = Cache::default();

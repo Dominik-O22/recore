@@ -1,4 +1,5 @@
-//! Command line for the analysis core.
+//! Command line for developing the analysis core: analyze one binary or a corpus. Queries about
+//! a binary and decompilation are in `recore-mcp`.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -6,8 +7,7 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
-use recore::program::{Program, matches, parse_addr};
-use recore::report::CallTarget;
+use recore::program::Program;
 
 #[derive(Parser)]
 struct Cli {
@@ -21,17 +21,6 @@ enum Command {
     Analyze { binary: PathBuf },
     /// Prints what the binary is and how much was recovered.
     Summary { binary: PathBuf },
-    /// Lists strings with the functions that refer to each. `pattern` filters by a
-    /// case-insensitive substring.
-    Strings { binary: PathBuf, pattern: Option<String> },
-    /// Lists imported functions with the functions that call each.
-    Imports { binary: PathBuf, pattern: Option<String> },
-    /// Shows one function: its extent, what it calls, who calls it, and the strings it uses.
-    /// `addr` is any address inside it, in hex.
-    Function { binary: PathBuf, addr: String },
-    /// Lists what refers to an address: callers if it is a function, otherwise the
-    /// instructions that read, write or take the address of that data. `addr` is in hex.
-    Xrefs { binary: PathBuf, addr: String },
     /// Analyzes every file in a directory, writing `<out>/<name>.json`.
     Corpus {
         bin_dir: PathBuf,
@@ -40,16 +29,6 @@ enum Command {
         #[arg(long)]
         no_frames: bool,
     },
-}
-
-/// Labels of the distinct functions containing the given instruction addresses.
-fn users(program: &Program, sites: impl Iterator<Item = u64>) -> String {
-    program.users(sites).iter().map(|&entry| program.label(entry)).collect::<Vec<_>>().join(" ")
-}
-
-/// Reads a hex address given on the command line.
-fn address(text: &str) -> Result<u64> {
-    parse_addr(text).ok_or_else(|| anyhow::anyhow!("`{text}` is not a hex address"))
 }
 
 fn main() -> Result<()> {
@@ -74,53 +53,6 @@ fn main() -> Result<()> {
                 analysis.strings.len(),
             );
             println!("analyzed in {:.0} ms", start.elapsed().as_secs_f64() * 1000.0);
-        }
-        Command::Strings { binary, pattern } => {
-            let program = Program::load(&binary)?;
-            for string in program.analysis.strings.iter().filter(|s| matches(&s.text, pattern.as_deref())) {
-                let sites = program.refs_to(string.addr).map(|r| r.from);
-                println!("{:#x} {:?} used by: {}", string.addr, string.text, users(&program, sites));
-            }
-        }
-        Command::Imports { binary, pattern } => {
-            let program = Program::load(&binary)?;
-            for import in program.analysis.imports.iter().filter(|i| matches(&i.name, pattern.as_deref())) {
-                let sites = program.calls_to(import.slot).map(|c| c.at);
-                println!("{} called by: {}", import.name, users(&program, sites));
-            }
-        }
-        Command::Xrefs { binary, addr } => {
-            let program = Program::load(&binary)?;
-            let addr = address(&addr)?;
-            for call in program.calls_to(addr) {
-                println!("{:#x} in {} {}", call.at, program.site_label(call.at), if call.tail { "tail-calls it" } else { "calls it" });
-            }
-            for reference in program.refs_to(addr) {
-                println!("{:#x} in {} refers to it", reference.from, program.site_label(reference.from));
-            }
-        }
-        Command::Function { binary, addr } => {
-            let program = Program::load(&binary)?;
-            let entry = program.function_at(address(&addr)?)?;
-            let noreturn = program.function(entry).is_some_and(|f| f.noreturn);
-            let body = program.body(entry);
-            println!("function {}, extent {body:x?}{}", program.label(entry), if noreturn { ", never returns" } else { "" });
-
-            println!("called by: {}", users(&program, program.calls_to(entry).map(|c| c.at)));
-            for &(start, end) in &body {
-                for call in program.calls_in(start, end) {
-                    let target = match call.target {
-                        CallTarget::Function(target) => program.label(target),
-                        CallTarget::Import(slot) => program.import_name(slot).unwrap_or("?").to_string(),
-                    };
-                    println!("  {:#x} {} {target}", call.at, if call.tail { "tail-calls" } else { "calls" });
-                }
-                for reference in program.refs_in(start, end) {
-                    if let Some(string) = program.string_at(reference.to) {
-                        println!("  {:#x} uses string {:?}", reference.from, string.text);
-                    }
-                }
-            }
         }
         Command::Analyze { binary } => {
             let image = recore::Image::load(&binary)?;
