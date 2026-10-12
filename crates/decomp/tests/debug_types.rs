@@ -1,5 +1,5 @@
 //! Types from debug information, read from the two small programs built from `data/types.c`:
-//! an ELF that carries DWARF, and a PE with a PDB next to it.
+//! an ELF that carries DWARF, and a PE with a PDB next to it; and from the C++ of `data/classes.cpp`.
 
 use std::path::{Path, PathBuf};
 
@@ -96,4 +96,26 @@ fn debug_information_is_found_in_the_binary_and_next_to_it() {
     let path = fixture("types.exe");
     let image = recore::Image::load(&path).unwrap();
     assert_eq!(types::debug_file(&path, &image), Some(fixture("types.pdb")));
+}
+
+/// C++ passes a class with a destructor by pointer and returns it through one the caller
+/// passes first, and on x86-64 does not pass a class with nothing in it at all.
+#[test]
+fn cpp_prototypes_are_as_the_machine_code_takes_them() {
+    let path = fixture("classes.elf");
+    let image = recore::Image::load(&path).unwrap();
+    let analysis = recore::analyze(&image);
+    let debug = types::load(&path, &image).unwrap();
+    let mut session = Session::from_image(&image, &analysis).unwrap();
+    let mut importer = Importer::new(&debug, Default::default());
+    let mut signature = |name: &str| {
+        let addr = debug.functions.iter().find(|function| function.name == name).unwrap().addr;
+        importer.functions(&mut session, [addr]);
+        let function = session.decompile(addr).unwrap();
+        let params: Vec<String> = function.params.iter().map(|param| param.type_name.clone()).collect();
+        (function.return_type, params)
+    };
+    assert_eq!(signature("measure"), ("int8".to_string(), vec!["Buffer *".to_string(), "int8".to_string()]));
+    assert_eq!(signature("make"), ("Buffer *".to_string(), vec!["Buffer *".to_string(), "int8".to_string()]));
+    assert_eq!(signature("Buffer::~Buffer"), ("void".to_string(), vec!["Buffer *".to_string()]));
 }
