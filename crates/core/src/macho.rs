@@ -275,6 +275,9 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
     let is_function = |addr: u64| image.section_at(addr).is_some_and(|section| section.executable && !section.is_stubs());
     let methods: Vec<u64> = methods.iter().map(|method| method.0).filter(|&method| is_function(method)).collect();
     image.exports.extend(methods);
+    // Swift's descriptors are all 32-bit offsets, to accessors, methods and witnesses.
+    let swift = crate::swift::metadata(&image).map(|swift| swift.functions).unwrap_or_default();
+    image.exports.extend(swift);
     Ok(image)
 }
 

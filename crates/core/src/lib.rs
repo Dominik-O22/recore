@@ -22,6 +22,7 @@ pub mod report;
 pub mod rtti;
 pub mod signature;
 pub mod strings;
+pub mod swift;
 pub mod x86;
 
 pub use analysis::analyze;

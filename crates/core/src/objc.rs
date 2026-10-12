@@ -32,34 +32,49 @@ pub struct Metadata {
     implementations: FxHashMap<String, Vec<u64>>,
 }
 
-struct Reader<'a> {
-    image: &'a Image,
+/// Reads the image's metadata records: Objective-C's here, and Swift's in [`crate::swift`].
+pub(crate) struct Reader<'a> {
+    pub(crate) image: &'a Image,
 }
 
 impl<'a> Reader<'a> {
-    fn u32(&self, addr: u64) -> Option<u32> {
+    pub(crate) fn u16(&self, addr: u64) -> Option<u16> {
+        Some(u16::from_le_bytes(self.image.bytes_from(addr)?.get(..2)?.try_into().ok()?))
+    }
+
+    pub(crate) fn u32(&self, addr: u64) -> Option<u32> {
         Some(u32::from_le_bytes(self.image.bytes_from(addr)?.get(..4)?.try_into().ok()?))
     }
 
-    fn pointer(&self, addr: u64) -> Option<u64> {
+    pub(crate) fn pointer(&self, addr: u64) -> Option<u64> {
         Some(u64::from_le_bytes(self.image.bytes_from(addr)?.get(..8)?.try_into().ok()?))
     }
 
     /// The address a 32-bit offset stored at `addr` leads to, counted from `addr` itself.
-    fn relative(&self, addr: u64) -> Option<u64> {
+    pub(crate) fn relative(&self, addr: u64) -> Option<u64> {
         Some(addr.wrapping_add_signed(i64::from(self.u32(addr)? as i32)))
     }
 
-    fn text(&self, addr: u64) -> Option<String> {
+    pub(crate) fn text(&self, addr: u64) -> Option<String> {
         let bytes = self.image.bytes_from(addr)?;
         Some(String::from_utf8_lossy(&bytes[..bytes.iter().position(|&byte| byte == 0)?]).into_owned())
     }
 
-    /// The pointers stored in the section called `name`, whichever segment holds it, with the
-    /// slot of each.
+    /// The sections called `name`, whichever segment holds them.
+    pub(crate) fn sections(&self, name: &'a str) -> impl Iterator<Item = &'a crate::image::Section> + 'a {
+        self.image.sections.iter().filter(move |section| section.name.rsplit_once(',').is_some_and(|(_, section)| section == name))
+    }
+
+    /// The 32-bit words stored in the section called `name`, with the address of each.
+    pub(crate) fn words(&self, name: &'a str) -> impl Iterator<Item = (u64, u32)> + 'a {
+        self.sections(name).flat_map(|section| {
+            section.data.chunks_exact(4).zip((section.addr..).step_by(4)).map(|(bytes, slot)| (slot, u32::from_le_bytes(bytes.try_into().unwrap())))
+        })
+    }
+
+    /// The pointers stored in the section called `name`, with the slot of each.
     fn pointers(&self, name: &'a str) -> impl Iterator<Item = (u64, u64)> + 'a {
-        let named = self.image.sections.iter().filter(move |section| section.name.rsplit_once(',').is_some_and(|(_, section)| section == name));
-        named.flat_map(|section| {
+        self.sections(name).flat_map(|section| {
             section.data.chunks_exact(8).zip((section.addr..).step_by(8)).map(|(bytes, slot)| (slot, u64::from_le_bytes(bytes.try_into().unwrap())))
         })
     }
