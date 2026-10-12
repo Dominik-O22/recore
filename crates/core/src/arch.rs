@@ -98,6 +98,12 @@ pub trait Arch: 'static {
         None
     }
 
+    /// The slot the second argument register was loaded from, when the state knows. At an
+    /// Objective-C message send that register holds the selector.
+    fn second_argument_slot(_state: &Self::State) -> Option<u64> {
+        None
+    }
+
     /// Filler the toolchain inserts between functions.
     fn is_padding(insn: &Self::Insn) -> bool;
 

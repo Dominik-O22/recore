@@ -68,9 +68,10 @@ impl Target {
     pub fn of(image: &Image) -> Target {
         match (image.machine, image.format) {
             (Machine::X86, Format::Pe) => Target::X86Windows,
-            (Machine::X86, Format::Elf) => Target::X86Gcc,
+            (Machine::X86, Format::Elf | Format::MachO) => Target::X86Gcc,
             (Machine::X86_64, Format::Pe) => Target::X86_64Windows,
-            (Machine::X86_64, Format::Elf) => Target::X86_64Gcc,
+            // macOS follows the System V convention on x86-64.
+            (Machine::X86_64, Format::Elf | Format::MachO) => Target::X86_64Gcc,
             (Machine::Aarch64, _) => Target::Aarch64,
         }
     }
@@ -348,7 +349,8 @@ impl Session {
     /// Declares the vtables of the classes recore found, so that a constructor storing one
     /// reads `*this = Class::vftable` and not a bare address.
     pub fn add_classes(&mut self, analysis: &Analysis) -> Result<()> {
-        for class in &analysis.classes {
+        // An Objective-C class has no vtable: its methods are found by name.
+        for class in analysis.classes.iter().filter(|class| !class.objc) {
             let name = CString::new(format!("{}::vftable", class.name))?;
             check(|err, len| unsafe { ffi::rd_add_pointer_table(self.raw.as_ptr(), class.vtable, name.as_ptr(), class.methods.len(), err, len) != 0 })?;
         }

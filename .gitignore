@@ -38,3 +38,9 @@ corpus-pe32/signatures/
 corpus-pe/signatures/
 corpus-pe32/ghidra-*/
 corpus-pe/ghidra-*/
+corpus-macho*/pkgs/
+corpus-macho*/bin/
+corpus-macho*/nostarts/
+corpus-macho*/debug/
+corpus-macho*/truth/
+corpus-macho*/recore*/

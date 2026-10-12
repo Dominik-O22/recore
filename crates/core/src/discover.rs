@@ -648,6 +648,17 @@ impl<A: Arch> Explorer<'_, A> {
 
     /// Removes entry points that are targets of a resolved jump table. A switch case or a
     /// computed-goto label is inside its function even when a pointer to it is stored in data.
+    /// Removes entry points that are the address of a resolved jump table. Mach-O compilers put
+    /// a function's tables after its code, and the dispatch takes a table's address just as
+    /// other code takes a function's.
+    fn demote_table_addresses(&mut self) {
+        for (_, table) in &self.tables {
+            if self.starts.get(&table.address) == Some(&Origin::AddressTaken) {
+                self.starts.remove(&table.address);
+            }
+        }
+    }
+
     fn demote_case_targets(&mut self) {
         // Only tables of known length: an unbounded read may run into the next table.
         for (jump, table) in self.tables.iter().filter(|(_, table)| table.bounded) {
@@ -884,7 +895,7 @@ impl<A: Arch> Explorer<'_, A> {
 
 /// Code sections that hold functions. PLT stubs are resolved to imports instead.
 pub fn is_function_section(section: &Section) -> bool {
-    section.executable && !section.name.starts_with(".plt")
+    section.executable && !section.is_stubs()
 }
 
 pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
@@ -1014,6 +1025,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
     }
 
     let _phase = phase::scope("discover/demote");
+    explorer.demote_table_addresses();
     explorer.demote_case_targets();
     while explorer.demote_crossed_starts() {}
     explorer.demote_frame_borrowers();

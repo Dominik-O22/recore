@@ -80,7 +80,7 @@ pub fn classes(image: &Image) -> Vec<Class> {
             let count = reader.u32(hierarchy + 8)?.min(LONGEST);
             let list = reader.link(hierarchy + 12)?;
             let bases = (1..count).filter_map(|index| reader.type_name(reader.link(reader.link(list + 4 * index)?)?)).collect();
-            (!methods.is_empty()).then_some(Class { name, vtable, methods, bases })
+            (!methods.is_empty()).then_some(Class { name, vtable, methods, bases, objc: false })
         })
         .collect();
     classes.sort_by_key(|class| class.vtable);

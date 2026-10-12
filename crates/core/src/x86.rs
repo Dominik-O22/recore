@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 
 use crate::arch::{Arch, Decoded, Flow, Table};
-use crate::image::Image;
+use crate::image::{Format, Image};
 use crate::jumptable::State;
 
 /// x86 in 64-bit or 32-bit mode, under the Windows or the System V calling convention.
@@ -95,6 +95,10 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         (BITS == 32 && insn.memory_displacement64() != 0).then(|| insn.memory_displacement64())
     }
 
+    fn second_argument_slot(state: &State) -> Option<u64> {
+        state.loaded_from(if WINDOWS { Register::RDX } else { Register::RSI })
+    }
+
     fn is_padding(insn: &Instruction) -> bool {
         is_padding(insn)
     }
@@ -167,16 +171,19 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
 
     fn plt_stubs(image: &Image) -> FxHashMap<u64, u64> {
         let mut stubs = FxHashMap::default();
-        for section in image.sections.iter().filter(|s| s.executable && s.name.starts_with(".plt")) {
+        for section in image.sections.iter().filter(|s| s.is_stubs()) {
             let mut stub_start = section.addr;
             for decoded in Self::decode(&section.data, section.addr) {
-                if let Some(Flow::JumpIndirect(Some(slot))) = decoded.insn.as_ref().and_then(classify) {
+                let flow = decoded.insn.as_ref().and_then(classify);
+                if let Some(Flow::JumpIndirect(Some(slot))) = flow {
                     if image.import_slots.contains_key(&slot) {
                         stubs.insert(stub_start, slot);
                     }
                 }
-                // Stubs are padded to 16 bytes; the next one starts at the next boundary.
-                if decoded.next_addr() % 16 == 0 {
+                // ELF pads stubs to 16 bytes, so the next one starts at the next boundary.
+                // Mach-O packs them, each ending with its jump.
+                let ends_stub = image.format == Format::MachO && matches!(flow, Some(Flow::Jump(_) | Flow::JumpIndirect(_)));
+                if ends_stub || decoded.next_addr() % 16 == 0 {
                     stub_start = decoded.next_addr();
                 }
             }

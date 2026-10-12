@@ -5,9 +5,11 @@
 //! instruction boundaries and call sites. Symbols, DWARF and the classification of calls are
 //! shared; only that decode is per architecture (x86-64 and AArch64).
 //!
-//! PE images take their functions from a PDB instead (see [`pe`]) and share the classification.
+//! PE images take their functions from a PDB instead (see [`pe`]), and Mach-O images from an
+//! unstripped copy (see [`macho`]); both share the classification.
 
 mod aarch64;
+mod macho;
 pub mod pe;
 pub mod pe_facts;
 mod x86;
@@ -295,6 +297,9 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     let binary = object::File::parse(&*binary_data)?;
     if binary.format() == object::BinaryFormat::Pe {
         return pe::extract(binary_path, &binary_data, debug_path);
+    }
+    if binary.format() == object::BinaryFormat::MachO {
+        return macho::extract(binary_path, debug_path);
     }
     let debug_data = std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?;
     let debug = object::File::parse(&*debug_data)?;

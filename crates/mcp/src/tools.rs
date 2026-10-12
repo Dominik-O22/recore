@@ -309,6 +309,7 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
     let format = match image.format {
         Format::Elf => "ELF",
         Format::Pe => "PE",
+        Format::MachO => "Mach-O",
     };
     let machine = match image.machine {
         Machine::X86 => "x86 (32-bit)",
@@ -432,7 +433,7 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
     let size: u64 = body.iter().map(|(start, end)| end - start).sum();
     writeln!(out, "function {}: {size} bytes at {}{}", binary.program.label(entry), extent.join(" "), if noreturn { ", never returns" } else { "" })?;
 
-    for class in &binary.program.analysis.classes {
+    for class in binary.program.analysis.classes.iter().filter(|class| !class.objc) {
         for (index, _) in class.methods.iter().enumerate().filter(|&(_, &method)| method == entry) {
             writeln!(out, "virtual function {index} of {} (vtable {:#x})", class.name, class.vtable)?;
         }
@@ -453,6 +454,11 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
         let target = match call.target {
             CallTarget::Function(target) => binary.program.label(target),
             CallTarget::Import(slot) => binary.program.import_name(slot).unwrap_or("?").to_string(),
+        };
+        // A message send names its selector, and the one method this binary has for it.
+        let target = match recore::objc::send_at(&binary.program.analysis, call.at) {
+            Some(send) => format!("{}{}", send.label(), send.implementation.map_or_else(String::new, |method| format!(", implemented only by {}", binary.program.label(method)))),
+            None => target,
         };
         writeln!(out, "  {:#x} {} {target}", call.at, if call.tail { "tail-calls" } else { "calls" })?;
     }
@@ -492,6 +498,10 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
     let mut count = 0;
     for call in binary.program.calls_to(addr) {
         writeln!(out, "{:#x} in {} {} it", call.at, binary.program.site_label(call.at), if call.tail { "tail-calls" } else { "calls" })?;
+        count += 1;
+    }
+    for send in binary.program.analysis.sends.iter().filter(|send| send.implementation == Some(addr)) {
+        writeln!(out, "{:#x} in {} sends {}, which only it implements", send.at, binary.program.site_label(send.at), send.label())?;
         count += 1;
     }
     for reference in binary.program.refs_to(addr) {
@@ -654,7 +664,7 @@ fn classes(binary: &mut Binary, args: Classes) -> Result<String> {
     writeln!(out, "{} classes", found.len())?;
     for class in found {
         let bases = if class.bases.is_empty() { String::new() } else { format!(" : {}", class.bases.join(", ")) };
-        writeln!(out, "{}{bases}, vtable {:#x}", class.name, class.vtable)?;
+        writeln!(out, "{}{bases}, {} {:#x}", class.name, if class.objc { "Objective-C class at" } else { "vtable" }, class.vtable)?;
         for (index, &method) in class.methods.iter().enumerate() {
             writeln!(out, "  {index} {}", binary.program.label(method))?;
         }
