@@ -31,6 +31,10 @@ const NAMES: &[&str] = &[
     "_Unwind_Resume",
     "_ZSt9terminatev",
     "_ZSt21__glibcxx_assert_failPKciS0_S0_",
+    // macOS: what `assert` calls, and the Objective-C runtime's `@throw`.
+    "__assert_rtn",
+    "objc_exception_throw",
+    "objc_exception_rethrow",
 ];
 
 /// Windows API and Microsoft C runtime functions that never return.
