@@ -468,6 +468,45 @@ impl<A: Arch> Explorer<'_, A> {
     }
 
     /// Whether `addr` lies in the entries of a resolved jump table.
+    /// Whether the unreached bytes at `addr` are a whole leaf function: one that needs no unwind
+    /// entry because it calls nothing and touches no stack, so nothing else marks its start.
+    /// Only asked where unwind entries exist and none covers `addr`. The bytes must decode
+    /// without a gap to a return or a jump elsewhere, and be followed by padding or known code.
+    fn is_leaf(&self, index: usize, addr: u64) -> bool {
+        const LONGEST: usize = 48;
+        let region = &self.regions[index];
+        let section = region.section;
+        if self.frames.is_empty() || self.frame_of(addr).is_some() {
+            return false;
+        }
+        let known = |at: u64| ((at - section.addr) as usize) < section.data.len() && region.is_instruction[(at - section.addr) as usize];
+        let state = A::State::default();
+        let mut decoder = A::decode(&section.data[(addr - section.addr) as usize..], addr);
+        for decoded in decoder.by_ref().take(LONGEST) {
+            let Some(insn) = decoded.insn else { return false };
+            let inside = (decoded.addr..decoded.next_addr()).any(|at| known(at) || self.pointer_slots.contains_key(&at));
+            if inside || A::is_padding(&insn) || self.frame_of(decoded.addr).is_some() {
+                return false;
+            }
+            match A::flow(&insn, &state) {
+                Some(Flow::Call(_) | Flow::CallIndirect(_) | Flow::Halt | Flow::JumpIndirect(None)) => return false,
+                Some(Flow::Branch(target)) if target < addr || self.region_index(target).is_none() => return false,
+                Some(Flow::Jump(target)) if self.region_index(target).is_none() => return false,
+                Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) => {
+                    let end = decoded.next_addr();
+                    // A lone `ret` is more often the tail of the function before it.
+                    if end - addr < 3 {
+                        return false;
+                    }
+                    let padded = decoder.next().is_some_and(|next| next.insn.as_ref().is_some_and(A::is_padding));
+                    return padded || known(end) || end == section.addr + section.data.len() as u64 || self.frame_of(end).is_some();
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn in_table(&self, addr: u64) -> bool {
         self.tables.iter().any(|(_, table)| addr >= table.address && addr < table.address + table.entry_size * table.entries.len() as u64)
     }
@@ -563,7 +602,8 @@ impl<A: Arch> Explorer<'_, A> {
                     // After a table, alignment alone proves little: a byte table or more of the
                     // same function may follow. The start of the section is different.
                     let aligned_after_break = aligned && (skipped_padding || offset == 0);
-                    is_start = (aligned_after_break || opens) && !self.inside_frame(addr);
+                    let leaf = after_break && self.is_leaf(index, addr);
+                    is_start = (aligned_after_break || opens || leaf) && !self.inside_frame(addr);
                     if self.pointer_slots.contains_key(&addr) {
                         continue;
                     }
