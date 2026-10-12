@@ -46,3 +46,4 @@ corpus-macho*/truth/
 corpus-macho*/recore*/
 __pycache__/
 corpus*/ghidra-refs/
+untrusted/
