@@ -148,6 +148,44 @@ pub struct Analysis {
     /// of `calls`, to the runtime's dispatcher.
     #[serde(default)]
     pub sends: Vec<MessageSend>,
+    /// Swift classes, structs and enums, in the order the image lists them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<SwiftType>,
+}
+
+/// A Swift class, struct or enum as the image's metadata describes it. A class is also among
+/// the Objective-C classes when the image is built for Apple's runtime.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SwiftType {
+    /// Qualified by module and enclosing types: `Shapes.Shape.Corner`.
+    pub name: String,
+    /// `class`, `struct` or `enum`.
+    pub kind: String,
+    /// Address of the type's descriptor.
+    pub descriptor: u64,
+    /// The superclass of a class.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bases: Vec<String>,
+    /// Stored properties in declaration order, or the cases of an enum.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<Field>,
+    /// Entry points of a class's methods: those it adds to the vtable, in vtable order, with
+    /// zero for one it leaves abstract, and then those that override a superclass's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<u64>,
+    /// The protocols it conforms to by a conformance in this image.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conformances: Vec<String>,
+}
+
+/// A stored property of a Swift type, or a case of an enum.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Field {
+    pub name: String,
+    /// The type as Swift writes it. `None` for an enum case without a payload, and for a type
+    /// the metadata spells in a way that is not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
 }
 
 /// A class as the image describes it: a C++ class by its vtable and type information, or an

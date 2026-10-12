@@ -44,21 +44,24 @@ impl Words {
 
 const UNIQUE: u32 = 1 << 6;
 const GENERIC: u32 = 1 << 7;
+const PROTOCOL: u32 = 3;
 const CLASS: u32 = 16;
 const STRUCT: u32 = 17;
 
-/// An image with a class `Shapes.Shape` of two methods, a generic struct `Shapes.Box` whose
-/// metadata is completed at run time, and a conformance of the class that the runtime
-/// instantiates.
+/// An image of a module `Shapes`: a class `Shape` with two fields and two methods, a generic
+/// struct `Box` whose metadata is completed at run time, a protocol `Drawable` with one
+/// method, and a conformance of the class to it that the runtime instantiates.
 fn shapes() -> Image {
     let records = Words::at(0x2000)
         // The class: flags saying it has a vtable, parent, name, accessor, fields, superclass
-        // and five words of metadata layout, then the vtable's place and its two methods.
+        // and five words of metadata layout, then the vtable's place and its two methods, an
+        // instance method and a getter.
         .word(CLASS | UNIQUE | 1 << 31)
         .to(0x2100)
         .to(0x2110)
         .to(0x1000)
-        .bytes(&[0; 28])
+        .to(0x2180)
+        .bytes(&[0; 24])
         .word(10)
         .word(2)
         .word(0x10)
@@ -84,33 +87,57 @@ fn shapes() -> Image {
         .word(0)
         .until(0x20a0)
         // The conformance: protocol, type, no witness table in the file, and flags for the
-        // two witnesses and the instantiator that follow. The second witness is a name.
-        .word(0)
+        // two witnesses and the instantiator that follow. The first witness implements the
+        // protocol's method, and the second is a name.
+        .to(0x2140)
         .to(0x2000)
         .word(0)
         .word(1 << 16 | 1 << 17)
         .word(2)
-        .word(0)
+        .to(0x2158)
         .to(0x1060)
         .word(0)
         .to(0x3200)
         .word(0)
         .to(0x1070)
         .until(0x2100)
-        // The module both types are in, and the names.
+        // The module all three are in, and the names.
         .word(UNIQUE)
         .word(0)
         .to(0x2120)
         .until(0x2110)
-        .bytes(b"Shape\0Box\0\0\0\0\0\0\0Shapes\0");
-    // A reference to the accessor of an associated conformance, then a name with a reference
-    // to a type, whose offset is not a function's even if it would lead into code.
-    let names = Words::at(0x3200).bytes(&[0xFF, 0x07]).to(0x1080).bytes(b"\0Si\0\x01").to(0x1090).bytes(b"V\0");
+        .bytes(b"Shape\0Box\0\0\0\0\0\0\0Shapes\0\0Drawable\0side\0box\0")
+        .until(0x2140)
+        // The protocol: parent, name, nothing in its signature, and one requirement, a method
+        // without a default implementation.
+        .word(PROTOCOL | UNIQUE)
+        .to(0x2100)
+        .to(0x2128)
+        .word(0)
+        .word(1)
+        .word(0)
+        .word(1)
+        .word(0)
+        .until(0x2180)
+        // The class's fields: no names of the type itself, the size of a record and their
+        // number, then for each its flags, type and name.
+        .bytes(&[0; 10])
+        .bytes(&[12, 0, 2, 0, 0, 0])
+        .word(0)
+        .to(0x3210)
+        .to(0x2131)
+        .word(0)
+        .to(0x3218)
+        .to(0x2136);
+    // A reference to the accessor of an associated conformance, then the fields' types:
+    // `Double`, and `Box<Int>` with the struct referred to by offset.
+    let names = Words::at(0x3200).bytes(&[0xFF, 0x07]).to(0x1080).until(0x3210).bytes(b"Sd\0").until(0x3218).bytes(&[1]).to(0x2050).bytes(b"ySiG\0");
     let sections = vec![
         Words::at(0x1000).until(0x1100).section("__TEXT,__text"),
         records.section("__TEXT,__const"),
         Words::at(0x3000).to(0x2000).to(0x2050).section("__TEXT,__swift5_types"),
         Words::at(0x3100).to(0x20a0).section("__TEXT,__swift5_proto"),
+        Words::at(0x3180).to(0x2140).section("__TEXT,__swift5_protos"),
         names.section("__TEXT,__swift5_typeref"),
     ];
     Image {
@@ -133,10 +160,42 @@ fn shapes() -> Image {
 
 #[test]
 fn descriptors_lead_to_the_functions_the_runtime_calls() {
-    let metadata = recore::swift::metadata(&shapes()).unwrap();
     // The class's accessor and methods, the struct's accessor, instantiation and completion,
     // the conformance's witness and instantiator, and the accessor a name refers to.
-    assert_eq!(metadata.functions, [0x1000, 0x1010, 0x1020, 0x1030, 0x1040, 0x1050, 0x1060, 0x1070, 0x1080]);
+    assert_eq!(recore::swift::functions(&shapes()), [0x1000, 0x1010, 0x1020, 0x1030, 0x1040, 0x1050, 0x1060, 0x1070, 0x1080]);
+}
+
+#[test]
+fn functions_are_named_by_what_refers_to_them() {
+    let metadata = recore::swift::metadata(&shapes()).unwrap();
+    let names: Vec<(u64, &str)> = metadata.names.iter().map(|(addr, name)| (*addr, name.as_str())).collect();
+    assert_eq!(
+        names,
+        [
+            (0x1000, "type metadata accessor for Shapes.Shape"),
+            // A method has no name in the image: its kind and its place in the vtable.
+            (0x1010, "Shapes.Shape.method_0"),
+            (0x1020, "Shapes.Shape.getter_1"),
+            (0x1030, "type metadata accessor for Shapes.Box"),
+            (0x1040, "type metadata instantiation function for Shapes.Box"),
+            (0x1050, "type metadata completion function for Shapes.Box"),
+            (0x1060, "protocol witness for Shapes.Drawable.method_0 in conformance Shapes.Shape : Shapes.Drawable in Shapes"),
+            (0x1070, "instantiation function for generic protocol witness table for Shapes.Shape : Shapes.Drawable in Shapes"),
+        ]
+    );
+}
+
+#[test]
+fn types_list_their_fields_methods_and_conformances() {
+    let metadata = recore::swift::metadata(&shapes()).unwrap();
+    let [shape, shape_box] = metadata.types.as_slice() else { panic!("{} types", metadata.types.len()) };
+    assert_eq!((shape.name.as_str(), shape.kind.as_str(), shape.descriptor), ("Shapes.Shape", "class", 0x2000));
+    let fields: Vec<(&str, Option<&str>)> = shape.fields.iter().map(|field| (field.name.as_str(), field.type_name.as_deref())).collect();
+    // The second field's type refers to the struct by offset, where a symbol would spell it.
+    assert_eq!(fields, [("side", Some("Swift.Double")), ("box", Some("Shapes.Box<Swift.Int>"))]);
+    assert_eq!(shape.methods, [0x1010, 0x1020]);
+    assert_eq!(shape.conformances, ["Shapes.Drawable"]);
+    assert_eq!((shape_box.name.as_str(), shape_box.kind.as_str(), shape_box.fields.len()), ("Shapes.Box", "struct", 0));
 }
 
 #[test]

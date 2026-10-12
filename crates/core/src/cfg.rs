@@ -146,7 +146,7 @@ mod tests {
     fn splits_a_function_at_its_branch_and_join() {
         // 0x1000: test edi, edi; 0x1002: je 0x1009; 0x1004: mov eax, 1; 0x1009: ret
         let code = [0x85, 0xff, 0x74, 0x05, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3];
-        let analysis = Analysis { name: "test".into(), functions: Vec::new(), noreturn_calls: Vec::new(), instructions: 0, jump_tables: Vec::new(), calls: Vec::new(), imports: Vec::new(), data_refs: Vec::new(), strings: Vec::new(), classes: Vec::new(), sends: Vec::new() };
+        let analysis = Analysis { name: "test".into(), functions: Vec::new(), noreturn_calls: Vec::new(), instructions: 0, jump_tables: Vec::new(), calls: Vec::new(), imports: Vec::new(), data_refs: Vec::new(), strings: Vec::new(), classes: Vec::new(), sends: Vec::new(), types: Vec::new() };
         let cfg = cfg(&image(&code), &analysis, &[(0x1000, 0x100a)]);
         let block = |start, end, successors: &[u64], exit| Block { start, end, successors: successors.to_vec(), exit };
         assert_eq!(cfg.blocks, [block(0x1000, 0x1004, &[0x1004, 0x1009], None), block(0x1004, 0x1009, &[0x1009], None), block(0x1009, 0x100a, &[], Some(Exit::Return))]);

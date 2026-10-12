@@ -740,6 +740,13 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         classes.extend(objc.classes);
     }
 
+    // What Swift's metadata calls the functions it refers to, for those nothing else names.
+    _phase = phase::scope("swift");
+    let swift = crate::swift::metadata(image).unwrap_or_default();
+    for (function, name) in swift.names {
+        names.entry(function).or_insert(name);
+    }
+
     _phase = phase::scope("report");
     // References seen in code that was decoded on a guess count now that the functions are
     // settled: those from inside a function, to data or to a function's entry.
@@ -755,6 +762,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     data_refs.dedup();
     Analysis {
         sends,
+        types: swift.types,
         data_refs: data_refs.into_iter().map(|(from, to, access)| DataRef { from, to, access }).collect(),
         classes,
         strings,

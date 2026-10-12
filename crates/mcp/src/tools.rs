@@ -92,7 +92,7 @@ pub fn list() -> Value {
         ),
         tool(
             "classes",
-            "C++ classes recovered from the type information of Windows binaries: each with its base classes, its vtable address and its virtual functions in vtable order. A virtual call through slot N of an object goes to entry N here.",
+            "C++ classes recovered from the type information of Windows binaries: each with its base classes, its vtable address and its virtual functions in vtable order. A virtual call through slot N of an object goes to entry N here. Also the Objective-C classes and categories of a Mach-O binary with their methods, and its Swift classes, structs and enums with their fields, the protocols they conform to, and a class's methods in vtable order followed by its overrides.",
             json!({ "pattern": pattern("class name") }),
             &[],
         ),
@@ -666,12 +666,25 @@ struct Classes {
 fn classes(binary: &mut Binary, args: Classes) -> Result<String> {
     let pattern = args.pattern.as_deref().map(Pattern::new);
     let found: Vec<_> = binary.program.analysis.classes.iter().filter(|class| matches(&class.name, pattern.as_ref())).collect();
+    let types: Vec<_> = binary.program.analysis.types.iter().filter(|class| matches(&class.name, pattern.as_ref())).collect();
     let mut out = String::new();
-    writeln!(out, "{} classes", found.len())?;
+    writeln!(out, "{} classes", found.len() + types.len())?;
     for class in found {
         let bases = if class.bases.is_empty() { String::new() } else { format!(" : {}", class.bases.join(", ")) };
         writeln!(out, "{}{bases}, {} {:#x}", class.name, if class.objc { "Objective-C class at" } else { "vtable" }, class.vtable)?;
         for (index, &method) in class.methods.iter().enumerate() {
+            writeln!(out, "  {index} {}", binary.program.label(method))?;
+        }
+    }
+    for class in types {
+        let bases: Vec<&str> = class.bases.iter().chain(&class.conformances).map(String::as_str).collect();
+        let bases = if bases.is_empty() { String::new() } else { format!(" : {}", bases.join(", ")) };
+        writeln!(out, "{}{bases}, Swift {} described at {:#x}", class.name, class.kind, class.descriptor)?;
+        for field in &class.fields {
+            let type_name = field.type_name.as_ref().map_or_else(String::new, |type_name| format!(": {type_name}"));
+            writeln!(out, "  {} {}{type_name}", if class.kind == "enum" { "case" } else { "var" }, field.name)?;
+        }
+        for (index, &method) in class.methods.iter().enumerate().filter(|&(_, &method)| method != 0) {
             writeln!(out, "  {index} {}", binary.program.label(method))?;
         }
     }

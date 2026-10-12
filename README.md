@@ -89,7 +89,7 @@ There is no Ghidra run for function recovery on the Linux AArch64 and Mach-O cor
 - **Types.** Ghidra propagates data types and imports them from PDB and DWARF. recore knows the types a caller declares, Windows API prototypes, and classes from MSVC type information and Objective-C metadata.
 - **A GUI**, a debugger, scripting, and a database of everything it found.
 
-Other limits: Swift names are demangled but Swift's own metadata is not read; `trace` does not follow a value through memory; a name goes on a function or on data, not on a place inside a function; arm64e Mach-O loads but is untested.
+Other limits: a Swift method that is only in a vtable is named by its kind and place, as `Type.getter_2`, because the image holds no name for it; `trace` does not follow a value through memory; a name goes on a function or on data, not on a place inside a function; arm64e Mach-O loads but is untested.
 
 ## Building
 

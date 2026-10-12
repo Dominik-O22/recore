@@ -91,7 +91,7 @@ impl<'a> Reader<'a> {
 
     /// The name of the class a slot refers to: one in this image, which the slot points at, or
     /// an imported one, which the loader binds to it.
-    fn class_at(&self, slot: u64) -> Option<String> {
+    pub(crate) fn class_at(&self, slot: u64) -> Option<String> {
         match self.pointer(slot)? {
             0 => self.image.import_slots.get(&slot).map(|import| import.strip_prefix("OBJC_CLASS_$_").unwrap_or(import).to_string()),
             class => self.class_name(class),
