@@ -100,3 +100,12 @@ fn compact_unwind_tables_list_function_starts() {
     let starts = recore::macho::unwind_starts(&unwind.data, 0x100000000);
     assert_eq!(starts, [0x1000008e0, 0x1000008f0, 0x10000091c, 0x100000990, 0x1000009d0, 0x1000009e8]);
 }
+
+#[test]
+fn string_literals_are_listed_without_a_pointer_to_them() {
+    // Method type encodings are reached through the 32-bit offsets of a method list, which no
+    // rebased pointer or instruction operand spells out.
+    let strings = recore::analyze(&fixture("shapes-x86_64")).strings;
+    let text: Vec<&str> = strings.iter().map(|string| string.text.as_str()).collect();
+    assert!(text.contains(&"i20@0:8i16") && text.contains(&"@16@0:8"), "{text:?}");
+}

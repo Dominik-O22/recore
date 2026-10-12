@@ -647,9 +647,19 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     _phase = phase::scope("strings");
     let from_code: FxHashSet<u64> = discovery.data_refs.iter().filter(|r| !r.2).map(|&(_, to, _)| to).collect();
     let mut candidates: Vec<u64> = from_code.iter().copied().chain(image.relative_targets.iter().map(|&(_, to)| to)).collect();
+    // A Mach-O image keeps its string literals in a section of their own, back to back, so
+    // each is known whether or not anything points at its first byte. Swift code points 32
+    // bytes before a literal, which lands inside the one before.
+    let literals = image.sections.iter().find(|section| image.format == Format::MachO && section.name == "__TEXT,__cstring");
+    if let Some(section) = literals {
+        candidates.retain(|&addr| !section.contains(addr));
+        let ends = section.data.iter().enumerate().filter(|&(_, &byte)| byte == 0).map(|(offset, _)| offset as u64 + 1);
+        candidates.extend(std::iter::once(0).chain(ends).map(|offset| section.addr + offset).filter(|&addr| section.contains(addr)));
+    }
     candidates.sort_unstable();
     candidates.dedup();
-    let mut strings: Vec<StringLiteral> = candidates.par_iter().filter_map(|&addr| string_at(image, addr, from_code.contains(&addr))).collect();
+    let is_literal = |addr: u64| from_code.contains(&addr) || literals.is_some_and(|section| section.contains(addr));
+    let mut strings: Vec<StringLiteral> = candidates.par_iter().filter_map(|&addr| string_at(image, addr, is_literal(addr))).collect();
     // Class names in type information are strings too, though pointers go to the record
     // around them and not to the text.
     strings.extend(crate::rtti::type_names(image).into_iter().map(|(addr, text)| StringLiteral { addr, text, wide: false }));
