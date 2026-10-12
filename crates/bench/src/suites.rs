@@ -43,6 +43,10 @@ pub struct AnalysisRow {
     /// Reading and parsing the file.
     pub load: Stat,
     pub analyze: Stat,
+    /// Processor instructions executed to load and analyze on one thread, where the kernel
+    /// lets them be counted. Unlike the times, this does not move with the machine's load.
+    #[serde(default)]
+    pub work: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -109,8 +113,11 @@ pub fn analysis(binaries: &[PathBuf], runs: usize) -> Result<Vec<AnalysisRow>> {
             counts[index] = (analysis.instructions, analysis.functions.len());
         }
     }
-    let rows = binaries.iter().zip(times).zip(counts);
-    Ok(rows.map(|((binary, (load, analyze)), (instructions, functions))| AnalysisRow { binary: name(binary), instructions, functions, load: Stat::of(load), analyze: Stat::of(analyze) }).collect())
+    let work = binaries.iter().map(|binary| crate::work::instructions(|| recore::Image::load(binary).map(|image| recore::analyze(&image).instructions)).1);
+    let rows = binaries.iter().zip(times).zip(counts).zip(work.collect::<Vec<_>>());
+    Ok(rows
+        .map(|(((binary, (load, analyze)), (instructions, functions)), work)| AnalysisRow { binary: name(binary), instructions, functions, load: Stat::of(load), analyze: Stat::of(analyze), work })
+        .collect())
 }
 
 /// Prints where the time of analyzing one binary goes, phase by phase. A phase named
@@ -250,12 +257,15 @@ fn typical_noise(mut noise: Vec<f64>) -> f64 {
 pub fn print_analysis(rows: &[AnalysisRow], before: Option<&[AnalysisRow]>) {
     let before_of = |binary: &str| before.and_then(|rows| rows.iter().find(|row| row.binary == binary));
     println!("\nanalysis: load and analyze, fastest run");
-    println!("{:<46} {:>9} {:>8} {:>9} {:>10} {:>8} {:>7}", "binary", "insns", "load ms", "analyze", "ns/insn", "noise", "change");
+    println!("{:<46} {:>9} {:>8} {:>9} {:>10} {:>8} {:>7} {:>9} {:>7}", "binary", "insns", "load ms", "analyze", "ns/insn", "noise", "change", "work M", "change");
+    // Work is executed instructions in millions: the measure that the machine's load leaves alone.
+    let millions = |work: Option<u64>| work.map_or_else(|| "-".to_string(), |work| format!("{:.1}", work as f64 / 1e6));
+    let work_change = |now: Option<u64>, before: Option<u64>| now.map_or_else(String::new, |now| change(now as f64, before.map(|before| before as f64)));
     let total = |rows: &[AnalysisRow]| rows.iter().map(|r| r.load.min + r.analyze.min).sum::<f64>();
     for row in rows {
         let time = row.load.min + row.analyze.min;
         println!(
-            "{:<46} {:>9} {:>8.2} {:>9.2} {:>10.1} {:>7.1}% {:>7}",
+            "{:<46} {:>9} {:>8.2} {:>9.2} {:>10.1} {:>7.1}% {:>7} {:>9} {:>7}",
             short(&row.binary),
             row.instructions,
             row.load.min,
@@ -263,6 +273,8 @@ pub fn print_analysis(rows: &[AnalysisRow], before: Option<&[AnalysisRow]>) {
             time * 1e6 / row.instructions.max(1) as f64,
             row.analyze.noise() * 100.0,
             change(time, before_of(&row.binary).map(|b| b.load.min + b.analyze.min)),
+            millions(row.work),
+            work_change(row.work, before_of(&row.binary).and_then(|b| b.work)),
         );
     }
     let instructions: u64 = rows.iter().map(|r| r.instructions).sum();
@@ -270,14 +282,18 @@ pub fn print_analysis(rows: &[AnalysisRow], before: Option<&[AnalysisRow]>) {
     let shared: Vec<&AnalysisRow> = rows.iter().filter(|row| before_of(&row.binary).is_some()).collect();
     let shared_before: f64 = shared.iter().filter_map(|row| before_of(&row.binary)).map(|b| b.load.min + b.analyze.min).sum();
     let shared_now: f64 = shared.iter().map(|r| r.load.min + r.analyze.min).sum();
+    let work_of = |rows: &mut dyn Iterator<Item = &AnalysisRow>| rows.map(|row| row.work).sum::<Option<u64>>();
+    let shared_work_before = work_of(&mut shared.iter().filter_map(|row| before_of(&row.binary)));
     println!(
-        "{:<46} {:>9} {:>18.1} {:>10.1} {:>7.1}% {:>7}",
+        "{:<46} {:>9} {:>18.1} {:>10.1} {:>7.1}% {:>7} {:>9} {:>7}",
         "total",
         instructions,
         total(rows),
         total(rows) * 1e6 / instructions.max(1) as f64,
         typical_noise(rows.iter().map(|r| r.analyze.noise()).collect()),
         change(shared_now, before.map(|_| shared_before)),
+        millions(work_of(&mut rows.iter())),
+        if before.is_some() { work_change(work_of(&mut shared.iter().copied()), shared_work_before) } else { String::new() },
     );
 }
 
