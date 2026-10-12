@@ -413,6 +413,36 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             Vec::new()
         };
 
+        // A chunk that several functions jump to the top of is a function they all tail-call,
+        // not a cold block of one of them, and so is one that opens like a function.
+        let mut jumped_to: HashMap<u64, HashSet<u64>> = HashMap::new();
+        for function in &functions {
+            for control in &function.controls {
+                if let Flow::Jump(target) | Flow::Branch(target) = control.flow {
+                    jumped_to.entry(target).or_default().insert(function.start);
+                }
+            }
+        }
+        let tail_called: Vec<u64> = chunks
+            .iter()
+            .map(|chunk| chunk.start)
+            .filter(|start| {
+                let sources = jumped_to.get(start).map_or(0, HashSet::len);
+                let opens_function = || {
+                    let mut decoder = A::decode(image.bytes_from(*start)?, *start);
+                    let first = decoder.next()?.insn?;
+                    Some(A::opens_function(&first, decoder.next().and_then(|d| d.insn).as_ref()))
+                };
+                sources >= 2 || (sources == 1 && opens_function() == Some(true))
+            })
+            .collect();
+        if !tail_called.is_empty() {
+            for addr in tail_called {
+                discovery.starts.entry(addr).or_insert(Origin::TailCall);
+            }
+            continue;
+        }
+
         let mut controls: Vec<Control> = functions.iter().chain(&chunks).flat_map(|f| f.controls.iter().copied()).collect();
         controls.sort_unstable_by_key(|c| c.addr);
         let mut extents: Vec<(u64, u64)> = functions.iter().chain(&chunks).map(|f| (f.start, f.end)).collect();

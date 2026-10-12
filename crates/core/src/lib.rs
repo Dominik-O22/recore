@@ -13,6 +13,7 @@ pub mod names;
 pub mod noreturn;
 pub mod pe;
 pub mod report;
+pub mod signature;
 pub mod strings;
 pub mod x86;
 
