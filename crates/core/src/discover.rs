@@ -347,15 +347,19 @@ impl<A: Arch> Explorer<'_, A> {
         tables
     }
 
-    /// Whether execution cannot fall into `addr`: it sits right after a terminator, or after a
-    /// terminator followed only by padding.
+    /// Whether execution cannot fall into `addr`: it sits right after a terminator or a jump
+    /// table, or after one of those followed only by padding.
     fn starts_after_break(&self, addr: u64) -> bool {
         let Some(index) = self.region_index(addr) else { return false };
         let region = &self.regions[index];
         let offset = (addr - region.section.addr) as usize;
         // Padding between functions is shorter than one alignment unit.
         let earliest = offset.saturating_sub(A::FUNCTION_ALIGN as usize - 1);
-        let Some(break_at) = (earliest..=offset).rev().find(|&o| region.follows_break[o]) else {
+        let pointer_size = if self.image.machine == Machine::X86 { 4 } else { 8 };
+        let after_table = |o: usize| {
+            self.image.data_in_code && o >= pointer_size && self.pointer_slots.contains_key(&(region.section.addr + (o - pointer_size) as u64))
+        };
+        let Some(break_at) = (earliest..=offset).rev().find(|&o| region.follows_break[o] || after_table(o)) else {
             return false;
         };
         A::decode(&region.section.data[break_at..offset], 0).all(|decoded| decoded.insn.is_some_and(|insn| A::is_padding(&insn)))
@@ -468,17 +472,14 @@ impl<A: Arch> Explorer<'_, A> {
     }
 
     /// Whether `addr` lies in the entries of a resolved jump table.
-    /// Whether the unreached bytes at `addr` are a whole leaf function: one that needs no unwind
-    /// entry because it calls nothing and touches no stack, so nothing else marks its start.
-    /// Only asked where unwind entries exist and none covers `addr`. The bytes must decode
-    /// without a gap to a return or a jump elsewhere, and be followed by padding or known code.
-    fn is_leaf(&self, index: usize, addr: u64) -> bool {
+    /// Whether the unreached bytes at `addr` are a whole function nothing refers to: they decode
+    /// without a gap to a return or a jump elsewhere, and padding or known code follows.
+    /// `may_call` says whether calls are allowed in it; a function without an unwind entry, where
+    /// others have one, is a leaf and makes none.
+    fn is_whole_function(&self, index: usize, addr: u64, may_call: bool) -> bool {
         const LONGEST: usize = 48;
         let region = &self.regions[index];
         let section = region.section;
-        if self.frames.is_empty() || self.frame_of(addr).is_some() {
-            return false;
-        }
         let known = |at: u64| ((at - section.addr) as usize) < section.data.len() && region.is_instruction[(at - section.addr) as usize];
         let state = A::State::default();
         let mut decoder = A::decode(&section.data[(addr - section.addr) as usize..], addr);
@@ -489,7 +490,9 @@ impl<A: Arch> Explorer<'_, A> {
                 return false;
             }
             match A::flow(&insn, &state) {
-                Some(Flow::Call(_) | Flow::CallIndirect(_) | Flow::Halt | Flow::JumpIndirect(None)) => return false,
+                Some(Flow::Call(target)) if !may_call || self.region_index(target).is_none() => return false,
+                Some(Flow::CallIndirect(_)) if !may_call => return false,
+                Some(Flow::Halt | Flow::JumpIndirect(None)) => return false,
                 Some(Flow::Branch(target)) if target < addr || self.region_index(target).is_none() => return false,
                 Some(Flow::Jump(target)) if self.region_index(target).is_none() => return false,
                 Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) => {
@@ -596,17 +599,26 @@ impl<A: Arch> Explorer<'_, A> {
                     // instructions when they look like a function: aligned behind padding, or
                     // opening like one behind padding or a terminator. A relocated pointer
                     // here is a jump-table entry.
-                    let offset = (addr - section.addr) as usize;
-                    let after_break = skipped_padding || self.regions[index].follows_break[offset] || offset == after_data;
+                    let at = (addr - section.addr) as usize;
+                    let after_break = skipped_padding || self.regions[index].follows_break[at] || at == after_data;
                     let opens = after_break && A::opens_function(&insn, next.as_ref());
                     // After a table, alignment alone proves little: a byte table or more of the
                     // same function may follow. The start of the section is different.
-                    let aligned_after_break = aligned && (skipped_padding || offset == 0);
-                    let leaf = after_break && self.is_leaf(index, addr);
-                    is_start = (aligned_after_break || opens || leaf) && !self.inside_frame(addr);
+                    let aligned_after_break = aligned && (skipped_padding || at == 0);
                     if self.pointer_slots.contains_key(&addr) {
+                        // The padding scan stopped on a table entry; resume after that entry.
+                        let pointer_size = if self.image.machine == Machine::X86 { 4 } else { 8 };
+                        offset = (addr - section.addr) as usize + pointer_size;
+                        after_data = offset;
                         continue;
                     }
+                    // A function with no unwind entry calls nothing; one that starts on an
+                    // alignment boundary straight after a terminator may call.
+                    let unwound_elsewhere = !self.frames.is_empty() && self.frame_of(addr).is_none();
+                    let whole = after_break
+                        && (unwound_elsewhere && self.is_whole_function(index, addr, false)
+                            || aligned && self.is_whole_function(index, addr, true));
+                    is_start = (aligned_after_break || opens || whole) && !self.inside_frame(addr);
                     if !is_start {
                         // Inside an unwind entry the bytes belong to a function, so they are
                         // worth decoding to resolve what they dispatch to, without taking
