@@ -12,6 +12,7 @@ pub mod jumptable;
 pub mod macho;
 pub mod names;
 pub mod noreturn;
+pub mod objc;
 pub mod pe;
 pub mod phase;
 pub mod program;

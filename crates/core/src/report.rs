@@ -140,18 +140,51 @@ pub struct Analysis {
     /// Strings at addresses the code or relocated pointers refer to, sorted by address.
     #[serde(default)]
     pub strings: Vec<StringLiteral>,
-    /// C++ classes that have a vtable and run-time type information, sorted by vtable address.
+    /// C++ classes that have a vtable and run-time type information, sorted by vtable address,
+    /// then Objective-C classes and categories in the order the image lists them.
     #[serde(default)]
     pub classes: Vec<Class>,
+    /// Objective-C message sends whose selector is known, sorted by address. Each is also one
+    /// of `calls`, to the runtime's dispatcher.
+    #[serde(default)]
+    pub sends: Vec<MessageSend>,
 }
 
-/// A C++ class as its vtable and type information describe it.
+/// A class as the image describes it: a C++ class by its vtable and type information, or an
+/// Objective-C class or category by its metadata.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Class {
+    /// An Objective-C category is named `Class(Category)`.
     pub name: String,
+    /// Address of the vtable, or of the class object or category record in Objective-C.
     pub vtable: u64,
-    /// Entry points of the virtual functions, in vtable order.
+    /// Entry points of the virtual functions, in vtable order. In Objective-C, of the instance
+    /// methods and then the class methods, each in the order of its method list.
     pub methods: Vec<u64>,
-    /// Classes it derives from, directly or not.
+    /// Classes it derives from, directly or not, nearest first.
     pub bases: Vec<String>,
+    /// Described by Objective-C metadata, where methods are found by selector and not by slot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub objc: bool,
+}
+
+/// A call to the Objective-C runtime's dispatcher, which picks the method by the receiver's
+/// class and the selector.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MessageSend {
+    /// Address of the call or jump instruction.
+    pub at: u64,
+    pub selector: String,
+    /// The method the image implements for the selector, when it implements exactly one and
+    /// the send is not to a superclass. The receiver may still be an object of another
+    /// library's class that has a method of the same name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation: Option<u64>,
+}
+
+impl MessageSend {
+    /// The send as a method name with the receiver's class left open: `-[? setSide:]`.
+    pub fn label(&self) -> String {
+        format!("-[? {}]", self.selector)
+    }
 }

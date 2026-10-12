@@ -32,7 +32,7 @@ extern void abort(void) __attribute__((noreturn));
 @end
 
 @implementation Square
-- (int)area { return self.side * self.side; }
+- (int)area { return [super area] + self.side * self.side; }
 + (Square *)withSide:(int)side {
     Square *square = [Square alloc];
     square.side = side;

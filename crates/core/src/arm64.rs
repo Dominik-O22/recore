@@ -101,6 +101,12 @@ impl Insn {
         (self.word & 0xFFC0_0000 == 0xF940_0000).then(|| u64::from(self.word >> 10 & 0xFFF) * 8)
     }
 
+    /// 64-bit `ldr xt, label`: the address loaded from. Apple's linker rewrites `adrp` and `ldr`
+    /// to this when the slot is near enough.
+    fn load_literal(self) -> Option<u64> {
+        (self.word & 0xFF00_0000 == 0x5800_0000).then(|| self.branch_target(5, 19))
+    }
+
     /// 64-bit `str xt, [sp, #imm]`: the byte offset.
     fn store_to_stack(self) -> Option<u64> {
         (self.word & 0xFFC0_0000 == 0xF900_0000 && self.rn() == 31).then(|| u64::from(self.word >> 10 & 0xFFF) * 8)
@@ -127,6 +133,13 @@ impl Insn {
     /// `cmp wn, #imm` / `cmp xn, #imm`: `(register, immediate)`.
     fn compare_immediate(self) -> Option<(usize, u64)> {
         (self.word & 0x7F80_001F == 0x7100_001F).then(|| (self.rn(), u64::from(self.word >> 10 & 0xFFF)))
+    }
+
+    /// A vector operation on registers of one shape, such as `mov v0.16b, v11.16b`, or a move
+    /// between floating-point registers, such as `fmov d0, d8`: how floating-point arguments
+    /// are set up. Neither touches a general register.
+    fn writes_vector_only(self) -> bool {
+        self.word & 0x9F20_0400 == 0x0E20_0400 || self.word & 0xFF3F_FC00 == 0x1E20_4000
     }
 
     /// `mov xd, xm`, encoded as `orr xd, xzr, xm`.
@@ -200,6 +213,9 @@ impl State {
             }
             return;
         }
+        if insn.writes_vector_only() {
+            return;
+        }
         if insn.moves_stack_pointer() {
             self.spills = Default::default();
         }
@@ -216,6 +232,8 @@ impl State {
                 Value::Page(base) | Value::Addr(base) => Value::Slot(base + offset),
                 _ => Value::Unknown,
             }
+        } else if let Some(slot) = insn.load_literal() {
+            Value::Slot(slot)
         } else if let Some(source) = insn.register_move() {
             self.registers[source]
         } else if let Some((size, signed)) = insn.indexed_load() {
@@ -339,6 +357,13 @@ impl Arch for Arm64 {
                 (Some(immediate), Value::Page(page)) => Some(page + immediate),
                 _ => None,
             },
+        }
+    }
+
+    fn second_argument_slot(state: &State) -> Option<u64> {
+        match state.registers[1] {
+            Value::Slot(slot) => Some(slot),
+            _ => None,
         }
     }
 

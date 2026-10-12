@@ -51,6 +51,8 @@ enum Value {
     BasedTarget { table_offset: u64, max_index: Option<u64> },
     /// A code pointer loaded from a table of absolute addresses, as computed goto uses.
     Pointer { table: u64, max_index: Option<u64> },
+    /// A pointer loaded from the slot at this address.
+    Slot(u64),
 }
 
 /// Register contents relevant to jump tables at one program point.
@@ -71,6 +73,14 @@ fn index_of(register: Register) -> Option<usize> {
 impl State {
     fn get(&self, register: Register) -> Value {
         index_of(register).map_or(Value::Unknown, |i| self.registers[i])
+    }
+
+    /// The slot `register` was loaded from, if it holds a pointer read from a fixed address.
+    pub fn loaded_from(&self, register: Register) -> Option<u64> {
+        match self.get(register) {
+            Value::Slot(slot) => Some(slot),
+            _ => None,
+        }
     }
 
     fn clear(&mut self, registers: &[Register]) {
@@ -125,6 +135,9 @@ impl State {
                     Some(table) => Value::Pointer { table, max_index: self.bound_of(instr.memory_index()) },
                     None => Value::Unknown,
                 }
+            }
+            Mnemonic::Mov if instr.op1_kind() == OpKind::Memory && instr.is_ip_rel_memory_operand() && instr.op0_register().is_gpr64() => {
+                Value::Slot(instr.ip_rel_memory_address())
             }
             Mnemonic::Movsxd if instr.op1_kind() == OpKind::Memory => self.load(instr),
             Mnemonic::Add => match (dest.map(|d| self.get(d)), source.map(|s| self.get(s))) {

@@ -66,7 +66,8 @@ pub struct Image {
     pub sections: Vec<Section>,
     /// Slot address (GOT entry) to the imported symbol its relocation binds.
     pub import_slots: FxHashMap<u64, String>,
-    /// Exported function addresses from the dynamic symbol table.
+    /// Exported function addresses from the dynamic symbol table. In a Mach-O image, also the
+    /// methods its Objective-C metadata lists, which the runtime calls by name.
     pub exports: Vec<u64>,
     /// Names the image itself carries for addresses in it: exports, as written in the file.
     pub symbol_names: FxHashMap<u64, String>,

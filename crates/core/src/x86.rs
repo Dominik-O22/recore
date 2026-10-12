@@ -95,6 +95,10 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         (BITS == 32 && insn.memory_displacement64() != 0).then(|| insn.memory_displacement64())
     }
 
+    fn second_argument_slot(state: &State) -> Option<u64> {
+        state.loaded_from(if WINDOWS { Register::RDX } else { Register::RSI })
+    }
+
     fn is_padding(insn: &Instruction) -> bool {
         is_padding(insn)
     }

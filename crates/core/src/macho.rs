@@ -245,7 +245,7 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
         }
     }
 
-    Ok(Image {
+    let mut image = Image {
         name,
         format: Format::MachO,
         machine,
@@ -259,7 +259,14 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
         frames,
         relative_targets,
         data_in_code: false,
-    })
+    };
+    // A method list of 32-bit offsets is no pointer the loader rebases, so nothing else says
+    // that its methods are code.
+    let methods = crate::objc::metadata(&image).map(|objc| objc.methods).unwrap_or_default();
+    let is_function = |addr: u64| image.section_at(addr).is_some_and(|section| section.executable && !section.is_stubs());
+    let methods: Vec<u64> = methods.iter().map(|method| method.0).filter(|&method| is_function(method)).collect();
+    image.exports.extend(methods);
+    Ok(image)
 }
 
 /// Function entry points listed in a `__unwind_info` section, the compact unwind tables. The

@@ -710,8 +710,24 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         }
     }
 
+    // Objective-C methods are named by their class and selector, and message sends by the
+    // selector they pass.
+    _phase = phase::scope("objective-c");
+    let mut classes = classes;
+    let mut sends = Vec::new();
+    if let Some(objc) = crate::objc::metadata(image) {
+        for (method, name) in &objc.methods {
+            names.entry(*method).or_insert_with(|| name.clone());
+        }
+        let ranges: Vec<(u64, u64)> = pieces.iter().map(|piece| (piece.start, piece.end)).collect();
+        let case_targets: FxHashSet<u64> = discovery.jump_tables.iter().flat_map(|table| table.targets.iter().copied()).collect();
+        sends = crate::objc::sends::<A>(image, &objc, &ranges, &calls, &case_targets);
+        classes.extend(objc.classes);
+    }
+
     _phase = phase::scope("report");
     Analysis {
+        sends,
         data_refs: discovery.data_refs.iter().map(|&(from, to, access)| DataRef { from, to, access }).collect(),
         classes,
         strings,

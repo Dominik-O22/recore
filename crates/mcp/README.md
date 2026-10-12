@@ -1,6 +1,6 @@
 # recore-mcp
 
-A Model Context Protocol server that gives an agent recore's analysis of an ELF or Windows PE binary, and Ghidra's decompiler on top of it, over stdio. It analyzes each binary once and keeps it, so a query after the first takes about a millisecond.
+A Model Context Protocol server that gives an agent recore's analysis of an ELF, Windows PE or Mach-O binary, and Ghidra's decompiler on top of it, over stdio. It analyzes each binary once and keeps it, so a query after the first takes about a millisecond.
 
 ## Tools
 
@@ -12,14 +12,16 @@ Every tool takes `path`, the binary to analyze, and answers with text. Addresses
 | `strings` | `pattern`?, `limit`? (100) | Each string with its address and the functions that use it. `pattern` is a case-insensitive substring. |
 | `imports` | `pattern`? | Each imported function with its slot and the functions that call it. |
 | `functions` | `pattern`?, `limit`? (100), `sort`? (`address` or `size`) | Address, size in bytes, number of calling functions, name. `pattern` matches names. |
-| `function` | `addr` or `name` | Extent, callers, calls made (imports by name), strings and globals referred to. `addr` is any address inside the function. |
-| `xrefs` | `addr` | Call sites if it is a function or import slot. For data, the instructions that read or write it or take its address, and the pointers in data that hold it. |
+| `function` | `addr` or `name` | Extent, callers, calls made (imports by name, Objective-C message sends by selector), strings and globals referred to. `addr` is any address inside the function. |
+| `xrefs` | `addr` | Call sites if it is a function or import slot, and the message sends only it implements if it is an Objective-C method. For data, the instructions that read or write it or take its address, and the pointers in data that hold it. |
 | `decompile` | `functions` (list of addresses or names), `timeout`? (seconds per function, 30) | C for each function. |
 | `bytes` | `addr`, `len`? (256, at most 4096) | Hex dump of the bytes mapped at the address. |
-| `classes` | `pattern`? | C++ classes from MSVC type information: base classes, vtable address, virtual functions in vtable order. |
+| `classes` | `pattern`? | C++ classes from MSVC type information: base classes, vtable address, virtual functions in vtable order. Objective-C classes and categories from a Mach-O image's metadata: superclasses, instance methods, then class methods. |
 | `addr` | `addr` or `offset` | The address in the image and the offset in the file of the same byte, and what is there. |
 
 The decompiler prints unnamed functions as `func_0x10001000`. Every address argument accepts that form.
+
+From a universal Mach-O file the arm64 slice is analyzed, or the x86-64 one if there is no other. A message send shows as `calls -[? selector]`, since the class of the receiver is only known when the program runs; when the binary implements the selector exactly once, that method is named too.
 
 `xrefs` on a data address that holds pointers, such as a vtable, also lists what each entry points to. `bytes` and `summary` give file offsets next to addresses.
 
