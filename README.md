@@ -1,20 +1,32 @@
 # recore
 
-recore analyzes a compiled program and hands the result to an AI agent: where its functions are, what they call, what they refer to, and what they look like as C. It reads ELF, Windows PE and Mach-O files for x86, x86-64 and AArch64.
+Binary analysis built for AI agents. recore gets a compiled program ready to query more than 1,000 times faster than Ghidra, and serves it over the Model Context Protocol with no JVM, no GUI and no project database.
 
-The analysis is written from scratch in Rust and takes milliseconds. The C comes from Ghidra's decompiler engine, built into recore and fed recore's analysis instead of Ghidra's. There is no Ghidra install, no JVM and no project database.
-
-## What an agent gets
-
-`recore-mcp` is a Model Context Protocol server over stdio. The same program runs any one tool from a shell. [crates/mcp/README.md](crates/mcp/README.md) describes every tool.
-
-| | Tools |
+| 252 binaries, ELF and Windows PE | Time to analyze all of them |
 |---|---|
-| Look around | `summary`, `functions`, `strings`, `imports`, `symbols`, `classes`, `addr`, `bytes` |
-| Read code | `function`, `xrefs`, `disassemble`, `decompile`, `pcode`, `trace` |
-| Record findings | `rename`, `comment`, `declare`, `type` |
+| Ghidra 12.1.4, headless, 4 cores each | 4 hours 30 minutes |
+| recore, one thread | 12.1 seconds |
+| recore, 16 cores | 8.0 seconds |
 
-Names, comments, C types and function prototypes are saved per binary and change every later answer, the decompiled C included.
+That is 1,338 times faster overall. Per binary, recore on one thread is between 171 and 16,592 times faster, with a median of 881. The Ghidra figure is its own reported analysis time, without JVM startup or import. The recore figure is a whole new process, from launch to answer.
+
+| Binary | Ghidra | recore |
+|---|---|---|
+| `git.exe`, 64-bit, 7,672 functions | 433 s | 0.19 s |
+| `eza`, Rust, Linux | 830 s | 0.05 s |
+| coconutBattery, Swift and Objective-C, macOS | 76 s at best, 40 minute timeout by default | 0.028 s |
+
+The last row is from [an issue on the REA project](https://github.com/morluto/rea/issues/1783), where Ghidra's Objective-C analyzer stalls. Those Ghidra times are from the reporter's machine. recore resolves the selector of 4,293 of that program's 4,294 message sends in the same 28 ms.
+
+## Built for agents
+
+An agent asks many small questions and cannot click through a GUI. recore is shaped around that:
+
+- **One process, stdio, plain text.** `recore-mcp` is an MCP server. Every answer is text sized for a context window, with addresses the next call accepts as they are.
+- **Nothing to wait for.** A binary is analyzed in milliseconds on first touch and kept. Functions are decompiled when asked for.
+- **Findings stick.** Names, comments, C structs and function prototypes are saved per binary and change every later answer, the decompiled C included.
+- **A bad function costs one function.** The decompiler runs in a child process with a time limit. A crash or a hang is reported for that function and the session carries on.
+- **The same tools from a shell.** `recore-mcp <tool> <binary>` runs one tool and prints the answer.
 
 ```
 recore-mcp summary program.exe
@@ -24,64 +36,65 @@ recore-mcp trace program.exe 0x401260 --param 1
 recore-mcp rename program.exe 0x401260 check_license
 ```
 
-## How it compares with Ghidra
+| | Tools |
+|---|---|
+| Look around | `summary`, `functions`, `strings`, `imports`, `symbols`, `classes`, `addr`, `bytes` |
+| Read code | `function`, `xrefs`, `disassemble`, `decompile`, `pcode`, `trace` |
+| Record findings | `rename`, `comment`, `declare`, `type` |
 
-Every number here comes from the corpora and scorers in this repository, against ground truth from debug information. Ghidra is 12.1.4, run headless with its default analyzers.
+[crates/mcp/README.md](crates/mcp/README.md) describes each one.
 
-### Finding functions
+## How
 
-| Corpus | | Function recall | Precision | Never-returning calls found | Jump tables exact |
-|---|---|---|---|---|---|
-| Linux x86-64, 184 binaries | recore | 100.0% | 100.0% | 100.0% | 535 of 535 |
-| | Ghidra, 110 of them | 99.9% | 96.8% | 72.7% | 487 of 535 |
-| Windows x86, 65 binaries | recore | 99.3% | 98.8% | 98.2% | 6,244 of 6,277 |
-| | Ghidra | 83.1% | 98.5% | 83.4% | 5,834 of 6,277 |
-| Windows x86-64, 71 binaries | recore | 99.8% | 98.2% | 99.1% | 3,137 of 3,159 |
-| | Ghidra | 91.0% | 97.9% | 86.4% | 2,972 of 3,159 |
+The analysis is written from scratch in Rust: loading, function discovery, calls that never return, jump tables, strings, references, C++ and Objective-C classes. The C comes from Ghidra's decompiler engine, compiled into recore and fed recore's analysis instead of Ghidra's.
 
-The Ghidra run on the Linux corpus covers 110 of its 184 binaries, so those two rows are not over the same set. There is no Ghidra run for the two remaining corpora. On 74 Linux AArch64 binaries recore scores 100.0% recall. On 88 Mach-O binaries the linker's list of function starts is most of the ground truth, so the fair runs hide it from recore: 98.6% recall on AArch64 and 99.2% on x86-64.
+It reads ELF, Windows PE and Mach-O for x86, x86-64 and AArch64.
 
-With the unwind tables hidden as well, recall is 99.8% on Linux x86-64, 99.2% on Linux AArch64, 98.5% on Windows x86-64, 96.5% on AArch64 Mach-O and 98.1% on x86-64 Mach-O.
+## Fast is not sloppy
 
-### Decompiled signatures
+Scored against debug information, on the same binaries as Ghidra.
 
-Parameter counts and whether a function returns a value, against PDB records, on the 8 binaries per corpus that both tools ran on.
+| Corpus | | Functions found | Precision | Jump tables exact |
+|---|---|---|---|---|
+| Linux x86-64 | recore | 100.0% | 100.0% | 535 of 535 |
+| | Ghidra | 99.9% | 96.8% | 487 of 535 |
+| Windows x86 | recore | 99.3% | 98.8% | 6,244 of 6,277 |
+| | Ghidra | 83.1% | 98.5% | 5,834 of 6,277 |
+| Windows x86-64 | recore | 99.8% | 98.2% | 3,137 of 3,159 |
+| | Ghidra | 91.0% | 97.9% | 2,972 of 3,159 |
+
+Ghidra's Linux run covers 110 of that corpus's 184 binaries, so those two rows are not over the same set.
+
+Decompiled function signatures against PDB records, 8 binaries per corpus:
 
 | Corpus | | Functions decompiled | Parameters exact | Returns a value or not |
 |---|---|---|---|---|
-| Windows x86-64, 9,572 functions | recore | 99.7% | 87.9% | 91.4% |
+| Windows x86-64 | recore | 99.7% | 87.9% | 91.4% |
 | | Ghidra | 91.9% | 82.6% | 92.7% |
-| Windows x86, 10,030 functions | recore | 98.8% | 85.7% | 90.1% |
+| Windows x86 | recore | 98.8% | 85.7% | 90.1% |
 | | Ghidra | 85.4% | 86.1% | 90.5% |
 
-Ghidra is ahead on the return column in both corpora and on parameters for 32-bit code.
+Ghidra is ahead on the last column, and on parameters for 32-bit code.
 
-### Speed
+There is no Ghidra run for the Linux AArch64 and Mach-O corpora. With unwind tables hidden, recore finds 99.2% of functions on Linux AArch64. With the linker's list of function starts hidden, it finds 98.6% on AArch64 Mach-O and 99.2% on x86-64 Mach-O.
 
-Analysis runs at about 100 ns per instruction on one machine (Ryzen 7 9850X3D): 240 ms for a 2.6 million instruction binary, 4 ms from a new process to a summary of a small one.
+## What Ghidra does that recore does not
 
-One outside data point: [an issue on the REA project](https://github.com/morluto/rea/issues/1783) reports Ghidra's analysis of a 1.85 MB Swift and Objective-C program timing out after 40 minutes by default, and taking 76 seconds with one analyzer turned off. recore analyzes the same file in 28 ms and resolves the selector of 4,293 of its 4,294 Objective-C message sends. The Ghidra times are from the reporter's machine, not from ours.
+- **Processors.** Ghidra covers dozens. recore covers three.
+- **Types.** Ghidra propagates data types and imports them from PDB and DWARF. recore knows the types a caller declares, Windows API prototypes, and classes from MSVC type information and Objective-C metadata.
+- **A GUI**, a debugger, scripting, and a database of everything it found.
 
-## What is missing
-
-- **Processors and formats.** Only x86, x86-64 and AArch64, in ELF, PE and Mach-O. Ghidra covers dozens of processors.
-- **Type recovery.** Structs come from what the caller declares. Nothing infers them from code, and there is no import of PDB or DWARF types.
-- **C++ classes on Linux and macOS.** Classes are read from MSVC type information and from Objective-C metadata only.
-- **Swift.** Names are demangled, but Swift's own metadata is not read, which costs function recall on Swift programs without symbols.
-- **Edits.** A name goes on a function or on data, not on a place inside a function. Each edit restarts the decompiler process.
-- **`trace`.** It does not follow a value through memory.
-- **arm64e** Mach-O files load but are untested.
+Other limits: Swift names are demangled but Swift's own metadata is not read; `trace` does not follow a value through memory; a name goes on a function or on data, not on a place inside a function; arm64e Mach-O loads but is untested.
 
 ## Building
 
-A Rust toolchain, a C++ compiler and cmake. The C++ compiler builds Ghidra's decompiler engine, which is vendored under `third_party/`, and cmake builds the Swift demangler.
+A Rust toolchain, a C++ compiler and cmake. The C++ compiler builds the decompiler engine, vendored under `third_party/`, and cmake builds the Swift demangler.
 
 ```
 cargo build --release
-cargo test --release --workspace
 ```
 
-To use it from Claude Code, put this in `.mcp.json`:
+For Claude Code, in `.mcp.json`:
 
 ```json
 {
@@ -91,20 +104,18 @@ To use it from Claude Code, put this in `.mcp.json`:
 }
 ```
 
-## Layout
+## Reproducing the numbers
+
+The corpora are not in the repository. `corpus/fetch*.py` download them, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. The speed table compares Ghidra's `Total Time` per binary with the wall time of `recore-mcp summary`, fastest of three runs. Both ran on the same Ryzen 7 9850X3D. Ghidra analyzed several binaries at a time with 4 cores each, and recore one at a time.
 
 | Directory | Contents |
 |---|---|
-| `crates/core` | Loading, function discovery, jump tables, strings, classes, Objective-C metadata |
-| `crates/decomp` | Ghidra's decompiler engine as a library, in a child process per binary so that a crash costs one function |
+| `crates/core` | Loading and analysis |
+| `crates/decomp` | Ghidra's decompiler engine as a library |
 | `crates/mcp` | The MCP server and command line |
-| `crates/corpus` | Ground truth from debug information, and the scorers |
-| `crates/bench` | Timings and a sampling profiler |
-| `corpus/`, `ghidra/` | Scripts that fetch the corpora and run Ghidra for the reference results |
+| `crates/corpus`, `crates/bench` | Scorers, timings and a profiler |
 | `third_party/ghidra-decompiler` | The vendored engine, with its own licence notes |
-
-The corpora themselves are not in the repository. `corpus/fetch*.py` download them, and `check.sh` analyzes and scores them.
 
 ## Licence
 
-Apache 2.0. The vendored decompiler engine is Apache 2.0 from the Ghidra project, with zlib under its own licence; see [third_party/ghidra-decompiler/README.md](third_party/ghidra-decompiler/README.md).
+Apache 2.0. The vendored decompiler engine is Apache 2.0 from the Ghidra project, with zlib under its own licence.
