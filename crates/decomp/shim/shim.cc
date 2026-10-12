@@ -394,6 +394,17 @@ int rd_add_string(RdSession *session, uint64_t addr, const char *name, size_t co
   });
 }
 
+// Replaces every call to the function at `addr` with the p-code of the compiler spec's call
+// fixup `fixup`. Compiler helpers such as the stack-cookie check and `_alloca_probe` break the
+// calling convention, and their fixup says what they really do to the caller.
+int rd_set_call_fixup(RdSession *session, uint64_t addr, const char *fixup, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    int4 id = session->arch->pcodeinjectlib->getPayloadId(InjectPayload::CALLFIXUP_TYPE, fixup);
+    if (id < 0) throw LowlevelError(string("no call fixup named ") + fixup);
+    session->function(addr)->getFuncProto().setInjectId(id);
+  });
+}
+
 // Declares a table of `count` code pointers at `addr`, such as a vtable, as a global named
 // `name`. Its address then prints as the name, and reads through it resolve to functions.
 int rd_add_pointer_table(RdSession *session, uint64_t addr, const char *name, size_t count,

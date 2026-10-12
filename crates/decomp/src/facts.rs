@@ -1,10 +1,13 @@
 //! recore's analysis, rearranged into the per-function statements the decompiler takes.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use recore::Image;
 use recore::image::Machine;
 use recore::report::{Analysis, CallTarget};
+
+use crate::{Target, vendored_spec_dir};
 
 /// Control-flow facts for one binary. Each is attributed to the function whose decompilation
 /// it affects: every function that has the instruction in one of its ranges, or the owner
@@ -18,6 +21,9 @@ pub struct Facts {
     /// Names the image carries for functions, demangled. Naming declares, so fragments are left
     /// out here too.
     pub names: Vec<(u64, String)>,
+    /// `(function, fixup)`: a compiler helper whose calls the compiler spec's call fixup of that
+    /// name stands in for.
+    pub call_fixups: Vec<(u64, String)>,
     /// `(address, slot)`: code that only forwards to the import behind `slot`. These are PLT
     /// stubs, which recore does not list as functions, and import thunks, which it does.
     pub import_aliases: Vec<(u64, u64)>,
@@ -43,6 +49,10 @@ impl Facts {
             names: analysis.functions.iter().filter(|f| f.fragment_of.is_none()).filter_map(|f| Some((f.addr, f.name.clone()?))).collect(),
             ..Facts::default()
         };
+        let fixups: HashMap<String, String> = Target::of(image).call_fixups(&vendored_spec_dir()).into_iter().collect();
+        // 32-bit C names carry one more leading underscore in some symbol sources than others.
+        let fixup_of = |name: &str| fixups.get(name).or_else(|| fixups.get(&format!("_{name}"))).cloned();
+        facts.call_fixups = facts.names.iter().filter_map(|(function, name)| Some((*function, fixup_of(name)?))).collect();
         let mut entries: Vec<u64> = facts.functions.iter().map(|f| f.0).collect();
         entries.sort_unstable();
         let x86 = matches!(image.machine, Machine::X86 | Machine::X86_64);

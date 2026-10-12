@@ -113,6 +113,18 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         false
     }
 
+    /// MSVC's `__security_check_cookie`: compare the cookie passed in `ecx` or `rcx` with the
+    /// global one, and leave for the failure report if they differ.
+    fn checks_stack_cookie(insns: &[Instruction]) -> bool {
+        let [first, second, ..] = insns else { return false };
+        let compares_global = first.mnemonic() == Mnemonic::Cmp
+            && first.op0_kind() == OpKind::Register
+            && first.op0_register().full_register() == Register::RCX
+            && first.op1_kind() == OpKind::Memory
+            && (first.is_ip_rel_memory_operand() || (first.memory_base() == Register::None && first.memory_index() == Register::None));
+        compares_global && second.mnemonic() == Mnemonic::Jne
+    }
+
     fn step(state: &mut State, insn: &Instruction) {
         state.step(insn, Self::CALLER_SAVED);
     }

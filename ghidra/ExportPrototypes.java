@@ -75,7 +75,7 @@ public class ExportPrototypes extends GhidraScript {
                 if (spelling == null || spelling.equals("void")) { spelled = false; break; }
                 String param = arguments[index].getName();
                 if (param == null || !param.matches("[A-Za-z_][A-Za-z0-9_]*") || RESERVED.contains(param)
-                    || param.matches("u?int[0-9]+|float[0-9]+|wchar[0-9]+|xunknown[0-9]+")) {
+                    || param.matches("u?int[0-9]+|float[0-9]+|wchar[0-9]+|undefined[0-9]+")) {
                     param = "param_" + (index + 1);
                 }
                 params.add(spelling.endsWith("*") ? spelling + param : spelling + " " + param);

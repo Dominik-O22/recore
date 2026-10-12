@@ -34,3 +34,7 @@ corpus-pe/recore*/
 corpus-pe32/recore*/
 corpus-pe*/recore-decomp/
 corpus*/recore-decomp/
+corpus-pe32/signatures/
+corpus-pe/signatures/
+corpus-pe32/ghidra-*/
+corpus-pe/ghidra-*/

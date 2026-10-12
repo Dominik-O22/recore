@@ -107,6 +107,12 @@ pub trait Arch: 'static {
         false
     }
 
+    /// Whether a short function beginning with `insns` is the compiler's stack-cookie check,
+    /// which every protected function calls just before it returns.
+    fn checks_stack_cookie(_insns: &[Self::Insn]) -> bool {
+        false
+    }
+
     /// Whether the first real instruction of a block shows it is an exception landing pad.
     fn opens_landing_pad(insn: &Self::Insn) -> bool;
 

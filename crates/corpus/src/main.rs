@@ -3,6 +3,7 @@
 mod jumptables;
 mod score;
 mod signatures;
+mod signatures_score;
 mod truth;
 
 use std::path::{Path, PathBuf};
@@ -36,6 +37,10 @@ enum Command {
     Signatures { out: PathBuf },
     /// Checks fingerprint naming by leaving each project out of the database in turn.
     SignatureCheck,
+    /// Reads function signatures from the PDBs into `<corpus>/signatures`.
+    SignatureTruth,
+    /// Scores decompiler corpus reports in `dirs` against the PDB signatures.
+    ScoreSignatures { dirs: Vec<PathBuf> },
     /// Scores one or more analyzer output directories against the truth.
     Score {
         /// Directories of `<name>.json` analysis files, e.g. `corpus/ghidra`.
@@ -217,6 +222,8 @@ fn main() -> Result<()> {
         Command::Truth => run_truth(&cli.corpus),
         Command::Signatures { out } => signatures::build(&cli.corpus, &out),
         Command::SignatureCheck => signatures::evaluate(&cli.corpus),
+        Command::SignatureTruth => signatures_score::write_truth(&cli.corpus),
+        Command::ScoreSignatures { dirs } => signatures_score::score(&cli.corpus, &dirs),
         Command::Jumptables => run_jumptables(&cli.corpus),
         Command::PeFacts { detail } => run_pe_facts(&cli.corpus, detail),
         Command::Score { dirs, detail } => dirs.iter().try_for_each(|dir| run_score(&cli.corpus, dir, detail)),

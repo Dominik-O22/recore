@@ -655,6 +655,18 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         }
     }
 
+    // The stack-cookie check is too short to fingerprint and matters more than its size: the
+    // decompiler has to know that a call to it changes nothing.
+    if image.format == Format::Pe {
+        for function in functions.iter().filter(|f| f.instructions <= 8) {
+            let Some(bytes) = image.bytes_from(function.start) else { continue };
+            let insns: Vec<A::Insn> = A::decode(bytes, function.start).take(2).map_while(|d| d.insn).collect();
+            if A::checks_stack_cookie(&insns) {
+                names.entry(function.start).or_insert_with(|| "__security_check_cookie".to_string());
+            }
+        }
+    }
+
     // Statically linked library code carries no symbol, but its bytes are the same in every
     // program that links it. The built-in fingerprints come from Windows builds.
     if image.format == Format::Pe {

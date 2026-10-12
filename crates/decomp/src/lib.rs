@@ -80,6 +80,33 @@ impl Target {
         }
     }
 
+    /// The compiler spec file among the language files.
+    fn compiler_spec(self) -> &'static str {
+        match self {
+            Target::X86Windows => "x86win.cspec",
+            Target::X86Gcc => "x86gcc.cspec",
+            Target::X86_64Windows => "x86-64-win.cspec",
+            Target::X86_64Gcc => "x86-64-gcc.cspec",
+            Target::Aarch64 => "AARCH64.cspec",
+        }
+    }
+
+    /// The call fixups of the compiler spec, as (function name, fixup name). The engine reads
+    /// the fixups themselves from the spec but leaves it to its host to apply them by name.
+    fn call_fixups(self, spec_dir: &Path) -> Vec<(String, String)> {
+        let attribute = |line: &str, tag: &str| Some(line.trim().strip_prefix(tag)?.split('"').nth(1)?.to_string());
+        let mut fixups = Vec::new();
+        let mut current = None;
+        for line in std::fs::read_to_string(spec_dir.join(self.compiler_spec())).unwrap_or_default().lines() {
+            if let Some(name) = attribute(line, "<callfixup name=") {
+                current = Some(name);
+            } else if let (Some(target), Some(fixup)) = (attribute(line, "<target name="), &current) {
+                fixups.push((target, fixup.clone()));
+            }
+        }
+        fixups
+    }
+
     pub fn pointer_bytes(self) -> usize {
         if matches!(self, Target::X86Windows | Target::X86Gcc) { 4 } else { 8 }
     }
@@ -253,6 +280,10 @@ impl Session {
         }
         for (function, name) in &facts.names {
             self.name_function(*function, name)?;
+        }
+        for (function, fixup) in &facts.call_fixups {
+            let fixup = CString::new(fixup.as_str())?;
+            check(|err, len| unsafe { ffi::rd_set_call_fixup(self.raw.as_ptr(), *function, fixup.as_ptr(), err, len) != 0 })?;
         }
         for &(function, noreturn) in &facts.functions {
             self.add_function(function, noreturn)?;
