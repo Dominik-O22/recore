@@ -1,0 +1,27 @@
+# The benchmark set: per corpus, the binaries at fixed size quantiles, smallest to largest.
+# Paths are relative to the repository root. `recore-bench` runs them in this order.
+corpus/bin/diffutils__cmp
+corpus/bin/binutils__strip
+corpus/bin/htop__htop
+corpus/bin/deb__fish__fish_key_reader
+corpus/bin/fd__fd
+corpus/bin/deb__cmake__ctest
+corpus-arm64/bin/deb__coreutils__seq
+corpus-arm64/bin/deb__gzip__gzip
+corpus-arm64/bin/deb__openssh-client__ssh-agent
+corpus-arm64/bin/deb__re2c__re2rust
+corpus-arm64/bin/deb__git__git-imap-send
+corpus-arm64/bin/deb__cmake__ctest
+corpus-pe32/bin/obs__inject-helper32.exe
+corpus-pe32/bin/php83__php_ldap.dll
+corpus-pe32/bin/mingw__mujs.exe
+corpus-pe32/bin/php83__php_opcache.dll
+corpus-pe32/bin/py__libcrypto-3.dll
+corpus-pe32/bin/node4__node-v4.9.1-x86.exe
+corpus-pe/bin/mingw__bzip2.exe
+corpus-pe/bin/php83__php_ldap.dll
+corpus-pe/bin/obs__frontend-tools.dll
+corpus-pe/bin/obs__obs-browser.dll
+corpus-pe/bin/git__git-remote-https.exe
+corpus-pe/bin/node4__node-v4.9.1-x64.exe
+corpus-pe32/bin/dell__DELL_IspLibrary.dll

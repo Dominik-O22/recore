@@ -300,19 +300,28 @@ impl Process {
         Ok(Process { child, stdin, events, stderr: Some(drain), ready: false })
     }
 
+    /// Waits for the child to finish setting up.
+    fn wait_ready(&mut self) -> Result<(), Failure> {
+        if self.ready {
+            return Ok(());
+        }
+        match self.events.recv_timeout(SETUP_LIMIT) {
+            Ok(Event::Ready) => {
+                self.ready = true;
+                Ok(())
+            }
+            Ok(_) => Err(Failure { status: Status::Crash, message: "worker answered before it was asked".into() }),
+            Err(error) => {
+                let how = self.end(error == RecvTimeoutError::Timeout);
+                Err(Failure { status: Status::Crash, message: format!("worker stopped during setup: {how}") })
+            }
+        }
+    }
+
     /// Sends one request and waits up to `timeout` for the answer. Setup still under way does
     /// not count towards `timeout`.
     fn ask(&mut self, request: Request, timeout: Duration) -> Result<Event, Failure> {
-        if !self.ready {
-            match self.events.recv_timeout(SETUP_LIMIT) {
-                Ok(Event::Ready) => self.ready = true,
-                Ok(_) => return Err(Failure { status: Status::Crash, message: "worker answered before it was asked".into() }),
-                Err(error) => {
-                    let how = self.end(error == RecvTimeoutError::Timeout);
-                    return Err(Failure { status: Status::Crash, message: format!("worker stopped during setup: {how}") });
-                }
-            }
-        }
+        self.wait_ready()?;
         // A failed write means the child is gone, which the receive below reports.
         let _ = writeln!(self.stdin, "{}", request.line()).and_then(|()| self.stdin.flush());
         match self.events.recv_timeout(timeout) {
@@ -407,14 +416,28 @@ impl Worker {
         }
     }
 
-    /// Asks the child, starting one if the last one is gone. A child can also have died while
-    /// idle, which is not the doing of the function asked for next.
-    fn ask(&mut self, request: Request, timeout: Duration) -> Result<Event, Failure> {
+    /// Waits until a child is set up, so that what is timed next is the decompiler alone.
+    pub fn ready(&mut self) -> bool {
+        let ready = self.process().and_then(Process::wait_ready).is_ok();
+        if !ready {
+            self.process = None;
+        }
+        ready
+    }
+
+    /// The child, started now if the last one is gone. A child can also have died while idle,
+    /// which is not the doing of the function asked for next.
+    fn process(&mut self) -> Result<&mut Process, Failure> {
         if self.process.as_mut().is_none_or(|process| !matches!(process.child.try_wait(), Ok(None))) {
             let started = Process::start((self.command)());
             self.process = Some(started.map_err(|error| Failure { status: Status::Error, message: format!("{error:#}") })?);
         }
-        let result = self.process.as_mut().expect("started above").ask(request, timeout);
+        Ok(self.process.as_mut().expect("started above"))
+    }
+
+    /// Asks the child, starting one if the last one is gone.
+    fn ask(&mut self, request: Request, timeout: Duration) -> Result<Event, Failure> {
+        let result = self.process()?.ask(request, timeout);
         if result.is_err() {
             self.process = None;
         }
