@@ -1,6 +1,7 @@
 //! Corpus tooling: extracts ground truth from debug files and scores analyzer output against it.
 
 mod jumptables;
+mod references;
 mod score;
 mod signatures;
 mod signatures_score;
@@ -41,6 +42,9 @@ enum Command {
     SignatureTruth,
     /// Scores decompiler corpus reports in `dirs` against the PDB signatures.
     ScoreSignatures { dirs: Vec<PathBuf> },
+    /// Compares recore's data references with Ghidra's in `<corpus>/ghidra-refs`, which
+    /// `ghidra/run-refs.sh` writes.
+    ScoreReferences,
     /// Scores one or more analyzer output directories against the truth.
     Score {
         /// Directories of `<name>.json` analysis files, e.g. `corpus/ghidra`.
@@ -225,6 +229,7 @@ fn main() -> Result<()> {
         Command::SignatureTruth => signatures_score::write_truth(&cli.corpus),
         Command::ScoreSignatures { dirs } => signatures_score::score(&cli.corpus, &dirs),
         Command::Jumptables => run_jumptables(&cli.corpus),
+        Command::ScoreReferences => references::score(&cli.corpus),
         Command::PeFacts { detail } => run_pe_facts(&cli.corpus, detail),
         Command::Score { dirs, detail } => dirs.iter().try_for_each(|dir| run_score(&cli.corpus, dir, detail)),
     }

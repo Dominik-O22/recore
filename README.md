@@ -8,12 +8,15 @@ Binary analysis built for AI agents. recore gets a compiled program ready to que
 | recore, one thread | 12.1 seconds |
 | recore, 16 cores | 8.0 seconds |
 
-That is 1,338 times faster overall. Per binary, recore on one thread is between 171 and 16,592 times faster, with a median of 881. The Ghidra figure is its own reported analysis time, without JVM startup or import. The recore figure is a whole new process, from launch to answer.
+That is 1,338 times faster overall, and 881 times for the median binary. The Ghidra figure is its own reported analysis time, without JVM startup or import. The recore figure is a whole new process, from launch to answer.
+
+Most of Ghidra's time goes to two jobs: 44% to recovering jump tables, for which it runs its decompiler on every function that has one, and 16% to finding the functions that never return. recore settles both during its one pass over the code.
 
 | Binary | Ghidra | recore |
 |---|---|---|
 | `git.exe`, 64-bit, 7,672 functions | 433 s | 0.19 s |
-| `eza`, Rust, Linux | 830 s | 0.05 s |
+| `obs-browser.dll`, 64-bit | 21 s | 0.036 s |
+| `bzip2.exe`, 64-bit | 7 s | 0.005 s |
 | coconutBattery, Swift and Objective-C, macOS | 76 s at best, 40 minute timeout by default | 0.028 s |
 
 The last row is from [an issue on the REA project](https://github.com/morluto/rea/issues/1783), where Ghidra's Objective-C analyzer stalls. Those Ghidra times are from the reporter's machine. recore resolves the selector of 4,293 of that program's 4,294 message sends in the same 28 ms.
@@ -76,7 +79,9 @@ Decompiled function signatures against PDB records, 8 binaries per corpus:
 
 Ghidra is ahead on the last column, and on parameters for 32-bit code.
 
-There is no Ghidra run for the Linux AArch64 and Mach-O corpora. With unwind tables hidden, recore finds 99.2% of functions on Linux AArch64. With the linker's list of function starts hidden, it finds 98.6% on AArch64 Mach-O and 99.2% on x86-64 Mach-O.
+References from code to data have no ground truth, so they are scored against Ghidra's own, on 11 binaries: recore finds 94.9% of them on Linux x86-64, 88.2% on Windows x86, 87.3% on Windows x86-64 and 74.0% on Linux AArch64.
+
+There is no Ghidra run for function recovery on the Linux AArch64 and Mach-O corpora. With unwind tables hidden, recore finds 99.2% of functions on Linux AArch64. With the linker's list of function starts hidden, it finds 98.6% on AArch64 Mach-O and 99.2% on x86-64 Mach-O.
 
 ## What Ghidra does that recore does not
 
@@ -106,7 +111,7 @@ For Claude Code, in `.mcp.json`:
 
 ## Reproducing the numbers
 
-The corpora are not in the repository. `corpus/fetch*.py` download them, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. The speed table compares Ghidra's `Total Time` per binary with the wall time of `recore-mcp summary`, fastest of three runs. Both ran on the same Ryzen 7 9850X3D. Ghidra analyzed several binaries at a time with 4 cores each, and recore one at a time.
+The corpora are not in the repository. `corpus/fetch*.py` download them, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. The speed table compares Ghidra's `Total Time` per binary with the wall time of `recore-mcp summary`, fastest of three runs. Both ran on the same Ryzen 7 9850X3D. Ghidra analyzed several binaries at a time with 4 cores each, and recore one at a time.
 
 | Directory | Contents |
 |---|---|

@@ -72,6 +72,7 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
     let mut sections = Vec::new();
     // `(address, size, first indirect symbol)` of each section of symbol pointers.
     let mut pointer_sections = Vec::new();
+    let mut zero_filled: Vec<(u64, u64)> = Vec::new();
     let mut base = 0;
     let mut entry_offset = None;
     let (mut dysymtab, mut dyld_info, mut chained, mut function_starts, mut data_in_code) = (None, None, None, None, None);
@@ -93,7 +94,12 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
                         pointer_sections.push((section.addr(endian), section.size(endian), section.reserved1(endian)));
                     }
                     // Zero-filled sections have no bytes in the file.
-                    let Some((offset, size)) = section.file_range(endian, section.offset(endian).into()).filter(|&(_, size)| size > 0) else { continue };
+                    let Some((offset, size)) = section.file_range(endian, section.offset(endian).into()).filter(|&(_, size)| size > 0) else {
+                        if matches!(kind, macho::S_ZEROFILL | macho::S_GB_ZEROFILL) && section.size(endian) > 0 {
+                            zero_filled.push((section.addr(endian), section.addr(endian) + section.size(endian)));
+                        }
+                        continue;
+                    };
                     let instructions = macho::S_ATTR_PURE_INSTRUCTIONS.0 | macho::S_ATTR_SOME_INSTRUCTIONS.0;
                     sections.push(Section {
                         name: format!("{},{}", String::from_utf8_lossy(section.segment_name()), String::from_utf8_lossy(section.name())),
@@ -246,6 +252,7 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
         }
     }
 
+    zero_filled.sort_unstable();
     let mut image = Image {
         name,
         format: Format::MachO,
@@ -254,6 +261,7 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
         branch_targets_marked: false,
         entry: entry_offset.map_or(0, |offset| base + offset),
         sections,
+        zero_filled,
         import_slots,
         exports,
         symbol_names,

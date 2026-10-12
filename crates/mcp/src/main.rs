@@ -40,7 +40,8 @@ fn main() -> Result<()> {
         [] => {}
         [worker, binary, options] if worker == WORKER_ARG => return recore_decomp::isolate::serve(Path::new(binary), options),
         [tool, binary, rest @ ..] if !tool.starts_with('-') => {
-            print!("{}", cli::run(tool, binary, rest)?);
+            // A reader such as `head` may stop before the answer is all written.
+            let _ = std::io::stdout().write_all(cli::run(tool, binary, rest)?.as_bytes());
             return Ok(());
         }
         _ => {

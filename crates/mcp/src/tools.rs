@@ -271,7 +271,8 @@ pub(crate) fn describe(binary: &Binary, addr: u64) -> String {
     match binary.program.image.section_at(addr) {
         Some(section) if section.executable => format!("code in {}", binary.program.site_label(addr)),
         Some(section) => section.name.clone(),
-        None => "not in the file (uninitialized data or unmapped)".into(),
+        None if binary.program.image.is_zero_filled(addr) => "uninitialized data".into(),
+        None => "not mapped".into(),
     }
 }
 
@@ -337,6 +338,9 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
         let kind = if section.executable { "code" } else if section.writable { "data" } else { "read-only data" };
         let stored = section.file_offset.map_or_else(String::new, |offset| format!(", file offset {offset:#x}"));
         writeln!(out, "  {:#x}-{:#x} {} ({kind}{stored})", section.addr, section.end(), section.name)?;
+    }
+    for (start, end) in &image.zero_filled {
+        writeln!(out, "  {start:#x}-{end:#x} uninitialized data (zero-filled at load, not in the file)")?;
     }
     Ok(out)
 }

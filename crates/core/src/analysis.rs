@@ -645,7 +645,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     // Strings sit where code points, or where a pointer in data points.
     // A string is used by taking its address, so only those references count as evidence.
     _phase = phase::scope("strings");
-    let from_code: FxHashSet<u64> = discovery.data_refs.iter().filter(|r| !r.2).map(|&(_, to, _)| to).collect();
+    // Addresses code takes that are data: an address in code is a function pointer.
+    let from_code: FxHashSet<u64> = discovery.data_refs.iter().filter(|r| !r.2 && !image.is_code(r.1)).map(|&(_, to, _)| to).collect();
     let mut candidates: Vec<u64> = from_code.iter().copied().chain(image.relative_targets.iter().map(|&(_, to)| to)).collect();
     // A Mach-O image keeps its string literals in a section of their own, back to back, so
     // each is known whether or not anything points at its first byte. Swift code points 32
@@ -665,6 +666,10 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     strings.extend(crate::rtti::type_names(image).into_iter().map(|(addr, text)| StringLiteral { addr, text, wide: false }));
     strings.sort_by_key(|string| string.addr);
     strings.dedup_by_key(|string| string.addr);
+    // What is left in the data sections that reads as text, for the strings a program reaches
+    // by an address it computes.
+    strings.extend(crate::strings::unreferenced(image, &strings));
+    strings.sort_by_key(|string| string.addr);
 
     // A function that is a single jump forwards to its target; an export name on such a thunk
     // is really the target's name.

@@ -101,6 +101,15 @@ impl Insn {
         (self.word & 0xFFC0_0000 == 0xF940_0000).then(|| u64::from(self.word >> 10 & 0xFFF) * 8)
     }
 
+    /// A load or store of any width at `[xn, #imm]`, the form that reads and writes globals:
+    /// the byte offset.
+    fn access_offset(self) -> Option<u64> {
+        // Bits 29..27 and 25..24 select the unsigned-offset form; the top two bits give the
+        // width, which scales the offset. A 128-bit vector register is the one exception.
+        let scale = if self.word >> 26 & 1 == 1 && self.word >> 23 & 1 == 1 { 4 } else { self.word >> 30 };
+        (self.word & 0x3B00_0000 == 0x3900_0000).then(|| u64::from(self.word >> 10 & 0xFFF) << scale)
+    }
+
     /// 64-bit `ldr xt, label`: the address loaded from. Apple's linker rewrites `adrp` and `ldr`
     /// to this when the slot is near enough.
     fn load_literal(self) -> Option<u64> {
@@ -360,6 +369,22 @@ impl Arch for Arm64 {
         }
     }
 
+    fn memory_reference(insn: &Insn, state: &State) -> Option<u64> {
+        match (insn.access_offset(), state.registers[insn.rn()]) {
+            (Some(offset), Value::Page(base) | Value::Addr(base)) if insn.rn() != 31 => Some(base + offset),
+            _ => insn.load_literal(),
+        }
+    }
+
+    fn through_pointer(insn: &Insn, state: &State) -> Option<(u64, u64, bool)> {
+        let Value::Slot(slot) = state.registers[insn.rn()] else { return None };
+        match (insn.access_offset(), insn.add_immediate()) {
+            (Some(offset), _) if insn.rn() != 31 => Some((slot, offset, true)),
+            (None, Some(offset)) => Some((slot, offset, false)),
+            _ => None,
+        }
+    }
+
     fn argument_slot(state: &State, index: usize) -> Option<u64> {
         match state.registers[index] {
             Value::Slot(slot) => Some(slot),
@@ -485,5 +510,24 @@ impl Arch for Arm64 {
             }
         }
         stubs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_load_through_a_page_address_refers_to_the_global() {
+        // 0x4000: adrp x0, 0x5000; ldr w1, [x0, #0x10]
+        let code: Vec<u8> = [0xB000_0000u32, 0xB940_1001].iter().flat_map(|word| word.to_le_bytes()).collect();
+        let mut state = State::default();
+        let mut referred = Vec::new();
+        for decoded in Arm64::decode(&code, 0x4000) {
+            let insn = decoded.insn.unwrap();
+            referred.push(Arm64::memory_reference(&insn, &state));
+            Arm64::step(&mut state, &insn);
+        }
+        assert_eq!(referred, [None, Some(0x5010)]);
     }
 }

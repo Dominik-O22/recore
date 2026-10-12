@@ -64,6 +64,9 @@ pub struct Image {
     pub entry: u64,
     /// Loaded sections, sorted by address.
     pub sections: Vec<Section>,
+    /// `[start, end)` of memory the loader fills with zeros and the file holds no bytes for:
+    /// uninitialized globals. Sorted by address.
+    pub zero_filled: Vec<(u64, u64)>,
     /// Slot address (GOT entry) to the imported symbol its relocation binds.
     pub import_slots: FxHashMap<u64, String>,
     /// Exported function addresses from the dynamic symbol table. In a Mach-O image, also the
@@ -106,6 +109,16 @@ impl Image {
             })
             .collect();
         sections.sort_by_key(|s| s.addr);
+        // A section with no bytes in the file, or the tail of one that is larger in memory.
+        let mut zero_filled: Vec<(u64, u64)> = file
+            .sections()
+            .filter(|s| s.address() != 0 && s.kind() != SectionKind::UninitializedTls)
+            .filter_map(|s| {
+                let stored = if s.kind() == SectionKind::UninitializedData { 0 } else { s.file_range().map_or(0, |(_, size)| size) };
+                (s.size() > stored).then(|| (s.address() + stored, s.address() + s.size()))
+            })
+            .collect();
+        zero_filled.sort_unstable();
 
         let is_pe = file.format() == object::BinaryFormat::Pe;
         let (import_slots, relative_targets, exports, frames) = if is_pe {
@@ -145,6 +158,7 @@ impl Image {
             .unwrap_or_default();
 
         Ok(Image {
+            zero_filled,
             format: if is_pe { Format::Pe } else { Format::Elf },
             base: if is_pe { file.relative_address_base() } else { 0 },
             symbol_names,
@@ -164,6 +178,12 @@ impl Image {
     pub fn section_at(&self, addr: u64) -> Option<&Section> {
         let index = self.sections.partition_point(|s| s.addr <= addr);
         self.sections[..index].last().filter(|s| s.contains(addr))
+    }
+
+    /// Whether `addr` is an uninitialized global: memory the program has but the file does not.
+    pub fn is_zero_filled(&self, addr: u64) -> bool {
+        let index = self.zero_filled.partition_point(|&(start, _)| start <= addr);
+        index > 0 && addr < self.zero_filled[index - 1].1
     }
 
     pub fn is_code(&self, addr: u64) -> bool {

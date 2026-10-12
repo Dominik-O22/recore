@@ -389,7 +389,7 @@ pub fn decode_floor(binary: &Path, runs: usize) -> Result<()> {
                     A::step(&mut state, &insn);
                 }
                 if level >= 3 {
-                    found += u64::from(A::memory_reference(&insn).is_some());
+                    found += u64::from(A::memory_reference(&insn, &state).is_some());
                     found += u64::from(A::address_taken(&insn, &state).is_some());
                     found += u64::from(A::based_data_address(&insn, &state).is_some());
                 }

@@ -92,9 +92,18 @@ pub trait Arch: 'static {
         None
     }
 
-    /// The fixed address of data `insn` reads or writes directly, as opposed to taking its
-    /// address: a global variable or a constant table.
-    fn memory_reference(_insn: &Self::Insn) -> Option<u64> {
+    /// The fixed address of data `insn` reads or writes, as opposed to taking its address: a
+    /// global variable or a constant table. The address is in the instruction itself, or is
+    /// an offset from a register whose value the state knows.
+    fn memory_reference(_insn: &Self::Insn, _state: &Self::State) -> Option<u64> {
+        None
+    }
+
+    /// Data that `insn` reaches through a pointer the state knows was loaded from a fixed slot,
+    /// such as a global offset table entry: `(slot, offset from the pointer, whether the data
+    /// is read or written)`. With the pointer the loader puts in the slot, that is a reference
+    /// to a global of another module or of this one.
+    fn through_pointer(_insn: &Self::Insn, _state: &Self::State) -> Option<(u64, u64, bool)> {
         None
     }
 

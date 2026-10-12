@@ -132,6 +132,7 @@ mod tests {
             branch_targets_marked: false,
             entry: 0x1000,
             sections: vec![Section { name: ".text".into(), addr: 0x1000, data: code.to_vec(), file_offset: None, executable: true, writable: false }],
+            zero_filled: Vec::new(),
             import_slots: Default::default(),
             exports: Vec::new(),
             symbol_names: Default::default(),

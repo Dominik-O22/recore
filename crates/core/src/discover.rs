@@ -380,14 +380,31 @@ impl<A: Arch> Explorer<'_, A> {
                     if let Some((base, data)) = A::based_data_address(&insn, &state) {
                         if self.image.base != 0 && base == self.image.base {
                             self.data_refs.push(data);
+                            if !speculative && self.is_data(data) {
+                                self.data_ref_sites.push((decoded.addr, data, true));
+                            }
                         }
                     }
-                    let accessed = A::memory_reference(&insn)
+                    let accessed = A::memory_reference(&insn, &state)
                         .filter(|_| !speculative)
                         .filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target))
                         .filter(|&target| self.is_data(target));
                     if let Some(target) = accessed {
                         self.data_ref_sites.push((decoded.addr, target, true));
+                        // Reading a slot the loader fills with an address in this image also
+                        // takes that address: a global or a function reached through the
+                        // global offset table.
+                        if let Some(&pointee) = self.pointer_slots.get(&target).filter(|_| !speculative) {
+                            self.data_ref_sites.push((decoded.addr, pointee, false));
+                        }
+                    }
+                    /// Offsets from a pointer further than this are not fields of what it points to.
+                    const FARTHEST_FIELD: u64 = 1 << 20;
+                    let through = A::through_pointer(&insn, &state).filter(|&(_, offset, _)| !speculative && offset < FARTHEST_FIELD);
+                    if let Some((pointee, offset, access)) = through.and_then(|(slot, offset, access)| Some((*self.pointer_slots.get(&slot)?, offset, access))) {
+                        if self.is_data(pointee) && self.is_data(pointee + offset) {
+                            self.data_ref_sites.push((decoded.addr, pointee + offset, access));
+                        }
                     }
                     let taken = A::address_taken(&insn, &state)
                         .filter(|_| !speculative)
@@ -395,6 +412,9 @@ impl<A: Arch> Explorer<'_, A> {
                     if let Some(target) = taken {
                         if self.region_index(target).is_some() {
                             self.add_start(target, Origin::AddressTaken);
+                            // Code whose address is taken is a callback or a method table entry,
+                            // and who takes it is worth as much as who calls it.
+                            self.data_ref_sites.push((decoded.addr, target, false));
                         } else {
                             self.data_refs.push(target);
                             self.data_ref_sites.push((decoded.addr, target, false));
@@ -987,7 +1007,12 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         known_lengths,
         frames,
         clock: 0,
-        data_sections: image.sections.iter().filter(|s| !s.executable).map(|s| (s.addr, s.end())).collect(),
+        data_sections: {
+            // Zero-filled memory is data as much as what the file stores.
+            let mut ranges: Vec<(u64, u64)> = image.sections.iter().filter(|s| !s.executable).map(|s| (s.addr, s.end())).chain(image.zero_filled.iter().copied()).collect();
+            ranges.sort_unstable();
+            ranges
+        },
     };
 
     drop(_phase);

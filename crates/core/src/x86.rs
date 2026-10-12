@@ -85,7 +85,7 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
 
     /// A RIP-relative operand in 64-bit code; in 32-bit code a displacement, which the caller
     /// checks against relocations since any constant offset looks the same.
-    fn memory_reference(insn: &Instruction) -> Option<u64> {
+    fn memory_reference(insn: &Instruction, _: &State) -> Option<u64> {
         if !insn.op_kinds().any(|kind| kind == OpKind::Memory) || insn.mnemonic() == Mnemonic::Lea {
             return None;
         }
@@ -93,6 +93,17 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
             return Some(insn.ip_rel_memory_address());
         }
         (BITS == 32 && insn.memory_displacement64() != 0).then(|| insn.memory_displacement64())
+    }
+
+    fn through_pointer(insn: &Instruction, state: &State) -> Option<(u64, u64, bool)> {
+        // `[register + offset]` with nothing else in the operand. Few registers hold a loaded
+        // pointer, so that is asked first.
+        let base = insn.memory_base();
+        if base == Register::None || insn.memory_index() != Register::None {
+            return None;
+        }
+        let slot = state.loaded_from(base).filter(|_| insn.op_kinds().any(|kind| kind == OpKind::Memory))?;
+        Some((slot, insn.memory_displacement64(), insn.mnemonic() != Mnemonic::Lea))
     }
 
     fn argument_slot(state: &State, index: usize) -> Option<u64> {

@@ -17,6 +17,7 @@ fn image() -> Image {
         format: Format::Elf,
         machine: Machine::X86_64,
         base: 0,
+        zero_filled: Vec::new(),
         branch_targets_marked: false,
         entry: A,
         sections: vec![Section { name: ".text".into(), addr: 0x1000, data: vec![0x90; 0x100], file_offset: None, executable: true, writable: false }],
