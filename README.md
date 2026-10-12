@@ -49,7 +49,7 @@ recore-mcp rename program.exe 0x401260 check_license
 
 ## How
 
-The analysis is written from scratch in Rust: loading, function discovery, calls that never return, jump tables, strings, references, C++ and Objective-C classes. The C comes from Ghidra's decompiler engine, compiled into recore and fed recore's analysis instead of Ghidra's.
+The analysis is written from scratch in Rust: loading, function discovery, calls that never return, jump tables, strings, references, library function names by fingerprint, and C++, Objective-C and Swift classes with their methods. The C comes from Ghidra's decompiler engine, compiled into recore and fed recore's analysis instead of Ghidra's.
 
 It reads ELF, Windows PE and Mach-O for x86, x86-64 and AArch64.
 
@@ -81,7 +81,7 @@ Each tool's percentages are over the functions it decompiled, and recore decompi
 
 References from code to data have no ground truth, so they are scored against Ghidra's own, on 11 binaries: recore finds 96.3% of them on Linux x86-64, 88.2% on Windows x86, 93.2% on Windows x86-64 and 85.1% on Linux AArch64.
 
-There is no Ghidra run for function recovery on the Linux AArch64 and Mach-O corpora. With unwind tables hidden, recore finds 99.2% of functions on Linux AArch64. With the linker's list of function starts hidden, it finds 98.6% on AArch64 Mach-O and 99.2% on x86-64 Mach-O.
+There is no Ghidra run for function recovery on the Linux AArch64 and Mach-O corpora. With unwind tables hidden, recore finds 99.2% of functions on Linux AArch64. With the linker's list of function starts hidden, it finds 99.8% on AArch64 Mach-O and 99.2% on x86-64 Mach-O. It finds every C++ class that has type information in the Linux and macOS corpora, 13,952 of them, at the right vtable address.
 
 ## What Ghidra does that recore does not
 
