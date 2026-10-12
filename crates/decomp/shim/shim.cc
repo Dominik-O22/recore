@@ -394,6 +394,21 @@ int rd_add_string(RdSession *session, uint64_t addr, const char *name, size_t co
   });
 }
 
+// Declares a table of `count` code pointers at `addr`, such as a vtable, as a global named
+// `name`. Its address then prints as the name, and reads through it resolve to functions.
+int rd_add_pointer_table(RdSession *session, uint64_t addr, const char *name, size_t count,
+                         char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    Scope *global = arch->symboltab->getGlobalScope();
+    Address where = session->address(addr);
+    if (global->findAddr(where, Address()) != nullptr) return;  // already declared
+    AddrSpace *space = arch->getDefaultCodeSpace();
+    Datatype *pointer = arch->types->getTypePointer(space->getAddrSize(), arch->types->getTypeCode(), space->getWordSize());
+    global->addSymbol(name, arch->types->getTypeArray(count, pointer), where, Address());
+  });
+}
+
 // Marks the jump at `jump` inside `function` as a tail call: a call followed by a return.
 // Without this the engine follows the jump and decompiles the target's body as part of
 // `function`. Only unconditional jumps can be overridden.

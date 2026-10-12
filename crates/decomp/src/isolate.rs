@@ -106,6 +106,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     let mut session = Session::from_image(&image, &analysis)?;
     session.add_functions(&facts)?;
     session.add_strings(&analysis)?;
+    session.add_classes(&analysis)?;
     if options.jump_tables == JumpTables::Recore || (options.jump_tables == JumpTables::Auto && image.format == Format::Pe) {
         session.override_jump_tables(&analysis, &facts)?;
     }

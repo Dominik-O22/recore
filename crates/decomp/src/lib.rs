@@ -283,6 +283,16 @@ impl Session {
         Ok(())
     }
 
+    /// Declares the vtables of the classes recore found, so that a constructor storing one
+    /// reads `*this = Class::vftable` and not a bare address.
+    pub fn add_classes(&mut self, analysis: &Analysis) -> Result<()> {
+        for class in &analysis.classes {
+            let name = CString::new(format!("{}::vftable", class.name))?;
+            check(|err, len| unsafe { ffi::rd_add_pointer_table(self.raw.as_ptr(), class.vtable, name.as_ptr(), class.methods.len(), err, len) != 0 })?;
+        }
+        Ok(())
+    }
+
     /// States that the indirect call at `call` in `function` goes through the import slot
     /// `slot`, which must have been declared with [`Session::add_import`]. The decompiler works
     /// this out by itself, but late, and for a non-returning import it then starts over.

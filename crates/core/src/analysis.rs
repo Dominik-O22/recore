@@ -667,9 +667,22 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         names.extend(recognised.into_iter().map(|(addr, name)| (addr, name.to_string())));
     }
 
+    // A virtual function nothing else names takes the name of its vtable slot, in the class
+    // that has the fewest bases among those listing it: the one that introduced it.
+    let classes = crate::rtti::classes(image);
+    let mut by_depth: Vec<&crate::report::Class> = classes.iter().collect();
+    by_depth.sort_by_key(|class| class.bases.len());
+    for class in by_depth {
+        for (index, &method) in class.methods.iter().enumerate() {
+            if starts.contains(&method) {
+                names.entry(method).or_insert_with(|| format!("{}::vfunc_{index}", class.name));
+            }
+        }
+    }
+
     Analysis {
         data_refs: discovery.data_refs.iter().map(|&(from, to, access)| DataRef { from, to, access }).collect(),
-        classes: crate::rtti::classes(image),
+        classes,
         strings,
         name: image.name.clone(),
         instructions: functions.iter().chain(&chunks).map(|f| f.instructions).sum(),
