@@ -699,10 +699,10 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     }
 
     // Statically linked library code carries no symbol, but its bytes are the same in every
-    // program that links it. The built-in fingerprints come from Windows builds.
+    // program that links it.
     _phase = phase::scope("fingerprints");
-    if image.format == Format::Pe {
-        let signatures = Signatures::builtin(image.machine);
+    let signatures = Signatures::builtin(image.format, image.machine);
+    if !signatures.is_empty() {
         let recognised: Vec<(u64, &str)> = functions
             .par_iter()
             .filter(|f| !names.contains_key(&f.start))
