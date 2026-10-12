@@ -6,6 +6,7 @@
 
 mod profile;
 mod suites;
+mod work;
 
 use std::path::PathBuf;
 

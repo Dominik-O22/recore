@@ -741,9 +741,21 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     }
 
     _phase = phase::scope("report");
+    // References seen in code that was decoded on a guess count now that the functions are
+    // settled: those from inside a function, to data or to a function's entry.
+    let mut extents: Vec<(u64, u64)> = pieces.iter().map(|piece| (piece.start, piece.end)).collect();
+    extents.sort_unstable();
+    let in_function = |addr: u64| extents[..extents.partition_point(|&(start, _)| start <= addr)].last().is_some_and(|&(_, end)| addr < end);
+    let is_data = |addr: u64| image.section_at(addr).map_or_else(|| image.is_zero_filled(addr), |section| !section.executable);
+    let mut data_refs = discovery.data_refs.clone();
+    data_refs.extend(discovery.uncertain_refs.iter().copied().filter(|&(from, target, access)| {
+        in_function(from) && (is_data(target) || (!access && extents.binary_search_by_key(&target, |&(start, _)| start).is_ok()))
+    }));
+    data_refs.sort_unstable();
+    data_refs.dedup();
     Analysis {
         sends,
-        data_refs: discovery.data_refs.iter().map(|&(from, to, access)| DataRef { from, to, access }).collect(),
+        data_refs: data_refs.into_iter().map(|(from, to, access)| DataRef { from, to, access }).collect(),
         classes,
         strings,
         name: image.name.clone(),
