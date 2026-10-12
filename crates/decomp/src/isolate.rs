@@ -173,7 +173,13 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     session.set_style(options.style)?;
     let callees_first = options.callees_first && image.machine == Machine::X86;
     session.keep_prototypes(callees_first);
-    let callees = if callees_first { callees(&analysis) } else { HashMap::new() };
+    let callees = if callees_first { callees(&analysis, false) } else { HashMap::new() };
+    // A function that ends by jumping to another returns what that one returns, which the
+    // engine only learns if the other is decompiled first.
+    let tail_callees = callees_of(&analysis, true);
+    // A function jumped to takes its parameters from the function that jumps, which therefore
+    // takes them too. Its parameters are kept so that the jump is seen to pass them.
+    let jumped_to: HashSet<u64> = tail_callees.values().flatten().filter_map(|target| if let CallTarget::Function(entry) = target { Some(*entry) } else { None }).collect();
     // Functions decompiled so far, whose parameters the session holds if it could recover them.
     let mut known: HashSet<u64> = HashSet::new();
     // Bytes of code per function, fragments included.
@@ -193,10 +199,16 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     send(&Event::Ready)?;
     for line in std::io::stdin().lock().lines() {
         let request: Request = serde_json::from_str(&line?)?;
+        let small = |callee: &u64| !known.contains(callee) && sizes.get(callee).is_some_and(|&size| size <= CALLEE_LIMIT);
         let unknown = |addr: u64| {
-            let mut pending: Vec<u64> = callees.get(&addr).into_iter().flatten().copied().filter(|callee| !known.contains(callee) && sizes.get(callee).is_some_and(|&size| size <= CALLEE_LIMIT)).collect();
+            let mut pending: Vec<u64> = callees.get(&addr).into_iter().flatten().copied().filter(small).collect();
             pending.sort_unstable();
             pending.dedup();
+            // Then the functions it jumps to, each after the ones that one jumps to in turn.
+            let mut chain = Vec::new();
+            tail_chain(&tail_callees, addr, &small, TAIL_DEPTH, &mut chain);
+            pending.retain(|callee| !chain.contains(callee));
+            pending.extend(chain);
             pending
         };
         let text = |result: Result<String>| Event::Text(result.map_err(|error| error.to_string()));
@@ -234,6 +246,12 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         // Decompiled for a caller's sake with every callee of its own known, a function comes
         // out as it would when asked for, so the result is kept for then.
         let keep = matches!(request, Request::Parameters(_)) && unknown(addr).is_empty();
+        for &callee in tail_callees.get(&addr).into_iter().flatten() {
+            if session.returns_like(addr, callee) {
+                break;
+            }
+        }
+        session.keep_prototypes(callees_first || jumped_to.contains(&addr));
         let start = Instant::now();
         let result = session.decompile(addr);
         known.insert(addr);
@@ -265,20 +283,41 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     Ok(())
 }
 
+/// How many jumps from function to function are followed to learn what the first returns.
+const TAIL_DEPTH: usize = 8;
+
+/// Appends to `chain` the functions `addr` jumps to that pass `wanted`, each after the ones it
+/// jumps to itself, so that decompiling them in this order tells each what it returns.
+fn tail_chain(tail_callees: &HashMap<u64, Vec<CallTarget>>, addr: u64, wanted: &impl Fn(&u64) -> bool, depth: usize, chain: &mut Vec<u64>) {
+    for target in tail_callees.get(&addr).into_iter().flatten() {
+        let CallTarget::Function(callee) = *target else { continue };
+        if depth > 0 && callee != addr && wanted(&callee) && !chain.contains(&callee) {
+            tail_chain(tail_callees, callee, wanted, depth - 1, chain);
+            chain.push(callee);
+        }
+    }
+}
+
 /// The functions each function calls or tail-calls, by entry point.
-fn callees(analysis: &Analysis) -> HashMap<u64, Vec<u64>> {
+fn callees(analysis: &Analysis, tail_only: bool) -> HashMap<u64, Vec<u64>> {
+    let functions = |targets: Vec<CallTarget>| targets.into_iter().filter_map(|target| if let CallTarget::Function(entry) = target { Some(entry) } else { None }).collect();
+    callees_of(analysis, tail_only).into_iter().map(|(owner, targets)| (owner, functions(targets))).collect()
+}
+
+/// What each function calls, by entry point, imports included: every call, or with `tail_only`
+/// just the jumps that leave the function for good.
+fn callees_of(analysis: &Analysis, tail_only: bool) -> HashMap<u64, Vec<CallTarget>> {
     let mut extents: Vec<(u64, u64, u64)> =
         analysis.functions.iter().flat_map(|f| f.ranges.iter().map(move |&(start, end)| (start, end, f.fragment_of.unwrap_or(f.addr)))).collect();
     extents.sort_unstable();
-    let mut callees: HashMap<u64, Vec<u64>> = HashMap::new();
-    for call in &analysis.calls {
-        let CallTarget::Function(target) = call.target else { continue };
+    let mut callees: HashMap<u64, Vec<CallTarget>> = HashMap::new();
+    for call in analysis.calls.iter().filter(|call| !tail_only || (call.tail && !call.conditional)) {
         let index = extents.partition_point(|extent| extent.0 <= call.at);
         if let Some(&(_, end, owner)) = index.checked_sub(1).map(|i| &extents[i])
             && call.at < end
-            && owner != target
+            && call.target != CallTarget::Function(owner)
         {
-            callees.entry(owner).or_default().push(target);
+            callees.entry(owner).or_default().push(call.target);
         }
     }
     callees

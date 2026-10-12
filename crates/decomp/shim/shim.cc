@@ -204,6 +204,8 @@ struct RdSession {
   bool keep_prototypes = false;
   bool want_flow = false;
   set<uint64_t> kept;  // functions whose prototype this session locked
+  // Where and as what each function decompiled so far returns its value, if it returns one.
+  map<uint64_t, ParameterPieces> outputs;
 
   // Backing storage for the last RdDecompiled, listing and type layout.
   string c_text, return_type, flow, text;
@@ -669,6 +671,41 @@ int rd_override_tail_call(RdSession *session, uint64_t function, uint64_t jump, 
   });
 }
 
+// Declares that the function at `function` returns what the function at `callee` returns, as it
+// does when it ends by jumping there: the engine sees a call followed by a return and does not
+// connect the two. `callee` must have been decompiled by this session, or be an import with a
+// declared prototype if `import_slot` is set, in which case `callee` is the slot. Answers 1 if
+// the callee returns a value, which `function` then returns too, and 0 if it does not.
+int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int import_slot, char *err,
+                    size_t errlen) {
+  bool returns = false;
+  bool ok = guarded(err, errlen, [&] {
+    ParameterPieces piece;
+    if (import_slot) {
+      auto found = session->slots.find(callee);
+      if (found == session->slots.end()) return;
+      const FuncProto &proto = session->function(found->second)->getFuncProto();
+      if (!proto.isOutputLocked() || proto.getOutputType()->getMetatype() == TYPE_VOID) return;
+      piece.addr = proto.getOutput()->getAddress();
+      piece.type = proto.getOutputType();
+      piece.flags = 0;
+    } else {
+      auto found = session->outputs.find(callee);
+      if (found == session->outputs.end()) return;
+      piece = found->second;
+    }
+    Funcdata *fd = session->function(function);
+    if (fd->getFuncProto().isOutputLocked()) return;  // the caller or an edit has said what it returns
+    bool model_locked = fd->getFuncProto().isModelLocked();
+    fd->getFuncProto().setOutput(piece);
+    fd->getFuncProto().setOutputLock(true);
+    // Locking the output locks the calling convention with it, which is still to be recovered.
+    fd->getFuncProto().setModelLock(model_locked);
+    returns = true;
+  });
+  return ok && returns;
+}
+
 // With `keep` set, the parameters recovered by each successful rd_decompile are locked into the
 // function's symbol, so that later decompilations of its callers pass at least those parameters.
 void rd_keep_prototypes(RdSession *session, int keep) { session->keep_prototypes = keep != 0; }
@@ -878,6 +915,14 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     out->jump_counts = session->jump_counts.data();
     out->jump_table_count = session->jump_addrs.size();
     out->jump_targets = session->jump_targets.data();
+    session->outputs.erase(addr);
+    if (proto.getOutputType()->getMetatype() != TYPE_VOID) {
+      ParameterPieces piece;
+      piece.addr = proto.getOutput()->getAddress();
+      piece.type = proto.getOutputType();
+      piece.flags = 0;
+      session->outputs[addr] = piece;
+    }
     out->flow = session->flow.c_str();
     out->flags = (fd->hasBadData() ? RD_BAD_DATA : 0) |
                  (fd->hasUnimplemented() ? RD_UNIMPLEMENTED : 0) |

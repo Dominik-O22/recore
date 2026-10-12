@@ -252,6 +252,16 @@ impl<A: Arch> Explorer<'_, A> {
     }
 
     /// Whether `addr` is in a section that holds no code.
+    /// Records that the instruction at `at` reads or writes the data at `target`. Reading a slot
+    /// the loader fills with an address in this image also takes that address: a global or a
+    /// function reached through the global offset table.
+    fn note_access(&mut self, at: u64, target: u64) {
+        self.data_ref_sites.push((at, target, true));
+        if let Some(&pointee) = self.pointer_slots.get(&target) {
+            self.data_ref_sites.push((at, pointee, false));
+        }
+    }
+
     fn is_data(&self, addr: u64) -> bool {
         let index = self.data_sections.partition_point(|&(start, _)| start <= addr);
         index > 0 && addr < self.data_sections[index - 1].1
@@ -390,20 +400,21 @@ impl<A: Arch> Explorer<'_, A> {
                         .filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target))
                         .filter(|&target| self.is_data(target));
                     if let Some(target) = accessed {
-                        self.data_ref_sites.push((decoded.addr, target, true));
-                        // Reading a slot the loader fills with an address in this image also
-                        // takes that address: a global or a function reached through the
-                        // global offset table.
-                        if let Some(&pointee) = self.pointer_slots.get(&target).filter(|_| !speculative) {
-                            self.data_ref_sites.push((decoded.addr, pointee, false));
-                        }
+                        self.note_access(decoded.addr, target);
+                    }
+                    if let Some(target) = A::offset_address(&insn, &state).filter(|&target| !speculative && self.is_data(target)) {
+                        self.data_ref_sites.push((decoded.addr, target, false));
                     }
                     /// Offsets from a pointer further than this are not fields of what it points to.
                     const FARTHEST_FIELD: u64 = 1 << 20;
                     let through = A::through_pointer(&insn, &state).filter(|&(_, offset, _)| !speculative && offset < FARTHEST_FIELD);
                     if let Some((pointee, offset, access)) = through.and_then(|(slot, offset, access)| Some((*self.pointer_slots.get(&slot)?, offset, access))) {
                         if self.is_data(pointee) && self.is_data(pointee + offset) {
-                            self.data_ref_sites.push((decoded.addr, pointee + offset, access));
+                            if access {
+                                self.note_access(decoded.addr, pointee + offset);
+                            } else {
+                                self.data_ref_sites.push((decoded.addr, pointee + offset, false));
+                            }
                         }
                     }
                     let taken = A::address_taken(&insn, &state)

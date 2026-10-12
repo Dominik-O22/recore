@@ -391,6 +391,19 @@ impl Session {
         unsafe { ffi::rd_keep_prototypes(self.raw.as_ptr(), keep.into()) }
     }
 
+    /// States that `function` returns what `callee` returns, because it ends by jumping to it.
+    /// `callee` is a function this session has decompiled, or an import, by its slot, whose
+    /// prototype is declared. Says whether the callee returns a value; if it does, `function`
+    /// is from now on decompiled as returning one too.
+    pub fn returns_like(&mut self, function: u64, callee: recore::report::CallTarget) -> bool {
+        let (callee, import) = match callee {
+            recore::report::CallTarget::Function(entry) => (entry, false),
+            recore::report::CallTarget::Import(slot) => (slot, true),
+        };
+        let mut err = [0 as c_char; 64];
+        unsafe { ffi::rd_returns_like(self.raw.as_ptr(), function, callee, import.into(), err.as_mut_ptr(), err.len()) != 0 }
+    }
+
     /// With `keep`, every later [`Session::decompile`] also returns the function's data flow.
     pub fn keep_flow(&mut self, keep: bool) {
         unsafe { ffi::rd_set_flow(self.raw.as_ptr(), keep.into()) }

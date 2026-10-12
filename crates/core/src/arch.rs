@@ -99,6 +99,14 @@ pub trait Arch: 'static {
         None
     }
 
+    /// The address `insn` forms by adding to a complete address a register holds: a place
+    /// further into an object, such as a field or an element. Unlike [`Arch::address_taken`]
+    /// this says nothing about code: the sum of a function's address and a number is not
+    /// where another function starts.
+    fn offset_address(_insn: &Self::Insn, _state: &Self::State) -> Option<u64> {
+        None
+    }
+
     /// Data that `insn` reaches through a pointer the state knows was loaded from a fixed slot,
     /// such as a global offset table entry: `(slot, offset from the pointer, whether the data
     /// is read or written)`. With the pointer the loader puts in the slot, that is a reference

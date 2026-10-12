@@ -125,3 +125,23 @@ fn data_flow_links_the_return_value_to_the_parameters() {
     }).collect();
     assert_eq!(parameters, [0, 1]);
 }
+
+#[test]
+fn a_function_that_jumps_to_another_returns_what_that_one_returns() {
+    use recore::report::CallTarget;
+    // 0x1000: jmp 0x1010. 0x1010: mov eax, 7; ret.
+    let mut code = vec![0xe9, 0x0b, 0x00, 0x00, 0x00];
+    code.resize(0x10, 0x90);
+    code.extend([0xb8, 0x07, 0x00, 0x00, 0x00, 0xc3]);
+    let mut session = session(&code);
+    session.add_functions(&Facts { functions: vec![(0x1000, false), (0x1010, false)], tail_calls: vec![(0x1000, 0x1000)], ..Facts::default() }).unwrap();
+    // The engine sees a call and then a return, and does not hand the one's result to the other.
+    assert!(!session.decompile(0x1000).unwrap().returns_value);
+    // Nothing is known of the callee until it has been decompiled.
+    assert!(!session.returns_like(0x1000, CallTarget::Function(0x1010)));
+    assert!(session.decompile(0x1010).unwrap().returns_value);
+    assert!(session.returns_like(0x1000, CallTarget::Function(0x1010)));
+    let function = session.decompile(0x1000).unwrap();
+    assert!(function.returns_value);
+    assert!(function.c_text.contains("= func_0x00001010();"), "{}", function.c_text);
+}

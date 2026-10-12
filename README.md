@@ -72,14 +72,14 @@ Decompiled function signatures against PDB records, 8 binaries per corpus:
 
 | Corpus | | Functions decompiled | Parameters exact | Returns a value or not |
 |---|---|---|---|---|
-| Windows x86-64 | recore | 99.7% | 87.9% | 91.4% |
+| Windows x86-64 | recore | 99.7% | 88.5% | 93.3% |
 | | Ghidra | 91.9% | 82.6% | 92.7% |
-| Windows x86 | recore | 98.8% | 85.7% | 90.1% |
+| Windows x86 | recore | 98.8% | 85.8% | 91.0% |
 | | Ghidra | 85.4% | 86.1% | 90.5% |
 
-Ghidra is ahead on the last column, and on parameters for 32-bit code.
+Each tool's percentages are over the functions it decompiled, and recore decompiles more of them. On the 8,523 32-bit functions both decompiled, recore gets the parameters of 86.5% right and Ghidra 86.1%.
 
-References from code to data have no ground truth, so they are scored against Ghidra's own, on 11 binaries: recore finds 94.9% of them on Linux x86-64, 88.2% on Windows x86, 87.3% on Windows x86-64 and 74.0% on Linux AArch64.
+References from code to data have no ground truth, so they are scored against Ghidra's own, on 11 binaries: recore finds 95.1% of them on Linux x86-64, 88.2% on Windows x86, 87.4% on Windows x86-64 and 84.7% on Linux AArch64.
 
 There is no Ghidra run for function recovery on the Linux AArch64 and Mach-O corpora. With unwind tables hidden, recore finds 99.2% of functions on Linux AArch64. With the linker's list of function starts hidden, it finds 98.6% on AArch64 Mach-O and 99.2% on x86-64 Mach-O.
 

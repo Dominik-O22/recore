@@ -107,7 +107,17 @@ impl Insn {
         // Bits 29..27 and 25..24 select the unsigned-offset form; the top two bits give the
         // width, which scales the offset. A 128-bit vector register is the one exception.
         let scale = if self.word >> 26 & 1 == 1 && self.word >> 23 & 1 == 1 { 4 } else { self.word >> 30 };
-        (self.word & 0x3B00_0000 == 0x3900_0000).then(|| u64::from(self.word >> 10 & 0xFFF) << scale)
+        if self.word & 0x3B00_0000 == 0x3900_0000 {
+            return Some(u64::from(self.word >> 10 & 0xFFF) << scale);
+        }
+        // The forms with a signed nine-bit offset in bytes: unscaled (`ldur`), and the two
+        // that also move the base, of which the one that moves it afterwards reads at the base.
+        let signed_offset = sign_extend(self.word >> 12 & 0x1FF, 9) as u64;
+        match (self.word & 0x3B20_0000 == 0x3800_0000, self.word >> 10 & 3) {
+            (true, 0b00 | 0b11) => Some(signed_offset),
+            (true, 0b01) => Some(0),
+            _ => None,
+        }
     }
 
     /// 64-bit `ldr xt, label`: the address loaded from. Apple's linker rewrites `adrp` and `ldr`
@@ -232,7 +242,7 @@ impl State {
             if is_page { Value::Page(address) } else { Value::Addr(address) }
         } else if let Some(immediate) = insn.add_immediate() {
             match self.registers[insn.rn()] {
-                Value::Page(page) => Value::Addr(page + immediate),
+                Value::Page(base) | Value::Addr(base) => Value::Addr(base + immediate),
                 _ => Value::Unknown,
             }
         } else if let Some(offset) = insn.load_offset() {
@@ -371,8 +381,15 @@ impl Arch for Arm64 {
 
     fn memory_reference(insn: &Insn, state: &State) -> Option<u64> {
         match (insn.access_offset(), state.registers[insn.rn()]) {
-            (Some(offset), Value::Page(base) | Value::Addr(base)) if insn.rn() != 31 => Some(base + offset),
+            (Some(offset), Value::Page(base) | Value::Addr(base)) if insn.rn() != 31 => Some(base.wrapping_add(offset)),
             _ => insn.load_literal(),
+        }
+    }
+
+    fn offset_address(insn: &Insn, state: &State) -> Option<u64> {
+        match (insn.add_immediate(), state.registers[insn.rn()]) {
+            (Some(immediate), Value::Addr(base)) => Some(base + immediate),
+            _ => None,
         }
     }
 
