@@ -89,7 +89,7 @@ There is no Ghidra run for function recovery on the Linux AArch64 and Mach-O cor
 - **Types.** Ghidra ships struct layouts for the common libraries and lets a user edit types in a GUI. recore knows the types a caller declares, the prototypes of Windows, C library and macOS functions, classes from MSVC and Itanium type information and Objective-C metadata, and, when a binary has DWARF or a PDB, the structs, prototypes and globals in it.
 - **A GUI**, a debugger, scripting, and a database of everything it found.
 
-Other limits: Swift names are demangled but Swift's own metadata is not read; `trace` does not follow a value through memory; a name goes on a function or on data, not on a place inside a function; arm64e Mach-O loads but is untested.
+Other limits: a Swift method that is only in a vtable is named by its kind and place, as `Type.getter_2`, because the image holds no name for it; `trace` does not follow a value through memory; a name goes on a function or on data, not on a place inside a function; arm64e Mach-O loads but is untested.
 
 ## Building
 

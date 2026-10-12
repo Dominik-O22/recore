@@ -122,6 +122,30 @@ pub trait Arch: 'static {
         None
     }
 
+    /// The number another pass gave what the register of the first (`index` 0) or second
+    /// argument holds, with [`Arch::set_argument_object`] or [`Arch::set_result_object`], when
+    /// the value has only been moved since: between registers, or to the stack and back.
+    fn argument_object(_state: &Self::State, _index: usize) -> Option<u32> {
+        None
+    }
+
+    /// Says what the register of argument `index` holds, by a number of the caller's choosing:
+    /// how the Objective-C pass follows a class or an object from where it is made to where a
+    /// message is sent to it.
+    fn set_argument_object(_state: &mut Self::State, _index: usize, _object: u32) {}
+
+    /// [`Arch::step`] for the pass that follows objects, which may take more care that an
+    /// instruction which leaves a register alone leaves the object in it known.
+    fn step_following(state: &mut Self::State, insn: &Self::Insn) {
+        Self::step(state, insn);
+    }
+
+    /// Says what the register Swift passes `self` to a method in holds, at the method's entry.
+    fn set_self_object(_state: &mut Self::State, _object: u32) {}
+
+    /// Says what the register a call returns its result in holds, after the call.
+    fn set_result_object(_state: &mut Self::State, _object: u32) {}
+
     /// Filler the toolchain inserts between functions.
     fn is_padding(insn: &Self::Insn) -> bool;
 

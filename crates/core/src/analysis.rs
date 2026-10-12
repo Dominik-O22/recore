@@ -744,18 +744,25 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     }
 
     // Objective-C methods are named by their class and selector, and message sends by the
-    // selector they pass.
+    // selector they pass and the receiver they can be seen to go to.
     _phase = phase::scope("objective-c");
     let mut classes = classes;
     let mut sends = Vec::new();
+    let swift = crate::swift::metadata(image).unwrap_or_default();
     if let Some(objc) = crate::objc::metadata(image) {
         for (method, name) in &objc.methods {
             names.entry(*method).or_insert_with(|| name.clone());
         }
         let ranges: Vec<(u64, u64)> = pieces.iter().map(|piece| (piece.start, piece.end)).collect();
         let case_targets: FxHashSet<u64> = discovery.jump_tables.iter().flat_map(|table| table.targets.iter().copied()).collect();
-        sends = crate::objc::sends::<A>(image, &objc, &ranges, &calls, &case_targets);
+        let swift_methods: Vec<(u64, &str)> = swift.instance_methods.iter().map(|&(method, class)| (method, swift.types[class].name.as_str())).collect();
+        sends = crate::objc::sends::<A>(image, &objc, &swift_methods, &ranges, &calls, &case_targets);
         classes.extend(objc.classes);
+    }
+
+    // What Swift's metadata calls the functions it refers to, for those nothing else names.
+    for (function, name) in swift.names {
+        names.entry(function).or_insert(name);
     }
 
     _phase = phase::scope("report");
@@ -773,6 +780,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     data_refs.dedup();
     Analysis {
         sends,
+        types: swift.types,
         data_refs: data_refs.into_iter().map(|(from, to, access)| DataRef { from, to, access }).collect(),
         classes,
         strings,

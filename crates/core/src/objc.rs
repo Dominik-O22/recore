@@ -32,34 +32,49 @@ pub struct Metadata {
     implementations: FxHashMap<String, Vec<u64>>,
 }
 
-struct Reader<'a> {
-    image: &'a Image,
+/// Reads the image's metadata records: Objective-C's here, and Swift's in [`crate::swift`].
+pub(crate) struct Reader<'a> {
+    pub(crate) image: &'a Image,
 }
 
 impl<'a> Reader<'a> {
-    fn u32(&self, addr: u64) -> Option<u32> {
+    pub(crate) fn u16(&self, addr: u64) -> Option<u16> {
+        Some(u16::from_le_bytes(self.image.bytes_from(addr)?.get(..2)?.try_into().ok()?))
+    }
+
+    pub(crate) fn u32(&self, addr: u64) -> Option<u32> {
         Some(u32::from_le_bytes(self.image.bytes_from(addr)?.get(..4)?.try_into().ok()?))
     }
 
-    fn pointer(&self, addr: u64) -> Option<u64> {
+    pub(crate) fn pointer(&self, addr: u64) -> Option<u64> {
         Some(u64::from_le_bytes(self.image.bytes_from(addr)?.get(..8)?.try_into().ok()?))
     }
 
     /// The address a 32-bit offset stored at `addr` leads to, counted from `addr` itself.
-    fn relative(&self, addr: u64) -> Option<u64> {
+    pub(crate) fn relative(&self, addr: u64) -> Option<u64> {
         Some(addr.wrapping_add_signed(i64::from(self.u32(addr)? as i32)))
     }
 
-    fn text(&self, addr: u64) -> Option<String> {
+    pub(crate) fn text(&self, addr: u64) -> Option<String> {
         let bytes = self.image.bytes_from(addr)?;
         Some(String::from_utf8_lossy(&bytes[..bytes.iter().position(|&byte| byte == 0)?]).into_owned())
     }
 
-    /// The pointers stored in the section called `name`, whichever segment holds it, with the
-    /// slot of each.
+    /// The sections called `name`, whichever segment holds them.
+    pub(crate) fn sections(&self, name: &'a str) -> impl Iterator<Item = &'a crate::image::Section> + 'a {
+        self.image.sections.iter().filter(move |section| section.name.rsplit_once(',').is_some_and(|(_, section)| section == name))
+    }
+
+    /// The 32-bit words stored in the section called `name`, with the address of each.
+    pub(crate) fn words(&self, name: &'a str) -> impl Iterator<Item = (u64, u32)> + 'a {
+        self.sections(name).flat_map(|section| {
+            section.data.chunks_exact(4).zip((section.addr..).step_by(4)).map(|(bytes, slot)| (slot, u32::from_le_bytes(bytes.try_into().unwrap())))
+        })
+    }
+
+    /// The pointers stored in the section called `name`, with the slot of each.
     fn pointers(&self, name: &'a str) -> impl Iterator<Item = (u64, u64)> + 'a {
-        let named = self.image.sections.iter().filter(move |section| section.name.rsplit_once(',').is_some_and(|(_, section)| section == name));
-        named.flat_map(|section| {
+        self.sections(name).flat_map(|section| {
             section.data.chunks_exact(8).zip((section.addr..).step_by(8)).map(|(bytes, slot)| (slot, u64::from_le_bytes(bytes.try_into().unwrap())))
         })
     }
@@ -76,7 +91,7 @@ impl<'a> Reader<'a> {
 
     /// The name of the class a slot refers to: one in this image, which the slot points at, or
     /// an imported one, which the loader binds to it.
-    fn class_at(&self, slot: u64) -> Option<String> {
+    pub(crate) fn class_at(&self, slot: u64) -> Option<String> {
         match self.pointer(slot)? {
             0 => self.image.import_slots.get(&slot).map(|import| import.strip_prefix("OBJC_CLASS_$_").unwrap_or(import).to_string()),
             class => self.class_name(class),
@@ -207,16 +222,103 @@ fn stub_selectors<'a, A: Arch>(image: &Image, metadata: &'a Metadata) -> FxHashM
     stubs
 }
 
-/// Whether an import is one of the runtime's message dispatchers, and if so whether it sends
-/// to the superclass, whose implementation is never the one the selector alone suggests.
-/// The variants that return a structure through a pointer take the selector third, and are
-/// left out.
-fn dispatcher(import: &str) -> Option<bool> {
-    match import {
-        "objc_msgSend" | "objc_msgSend_fpret" | "objc_msgSend_fp2ret" => Some(false),
-        "objc_msgSendSuper" | "objc_msgSendSuper2" => Some(true),
-        _ => None,
+/// What a call to one of the Objective-C runtime's functions does with its first argument.
+#[derive(Clone, Copy)]
+enum Runtime {
+    /// Sends a message to it, or with `true` to its superclass, whose implementation is never
+    /// the one the selector alone suggests.
+    Send(bool),
+    /// Returns it: `objc_opt_self`, and the functions that retain or release.
+    Returns,
+    /// Returns its class: `objc_opt_class`.
+    ClassOf,
+    /// Takes a class and returns a new object of it: `objc_alloc` and the like.
+    Allocates,
+}
+
+/// What an import does, if it is one of the runtime's functions that take an object and are
+/// followed here. The dispatchers that return a structure through a pointer take the receiver
+/// second and the selector third, and are left out.
+fn runtime(import: &str) -> Option<Runtime> {
+    Some(match import {
+        "objc_msgSend" | "objc_msgSend_fpret" | "objc_msgSend_fp2ret" => Runtime::Send(false),
+        "objc_msgSendSuper" | "objc_msgSendSuper2" => Runtime::Send(true),
+        "objc_opt_class" => Runtime::ClassOf,
+        "objc_alloc" | "objc_allocWithZone" | "objc_alloc_init" | "objc_opt_new" => Runtime::Allocates,
+        "objc_opt_self" | "objc_retain" | "objc_autorelease" | "objc_retainAutorelease" | "objc_retainAutoreleasedReturnValue" | "objc_retainAutoreleaseReturnValue" => Runtime::Returns,
+        "objc_autoreleaseReturnValue" | "objc_claimAutoreleasedReturnValue" | "objc_unsafeClaimAutoreleasedReturnValue" => Runtime::Returns,
+        _ => return None,
+    })
+}
+
+/// A class, or an object of one, as a number the architecture's register tracking carries
+/// along: four times the class's place in a list of names, plus one for an object, plus two
+/// when it may as well be a subclass or an object of one, as `self` in a method may.
+#[derive(Clone, Copy, PartialEq)]
+struct Object(u32);
+
+impl Object {
+    fn is_instance(self) -> bool {
+        self.0 & 1 == 1
     }
+
+    fn may_be_subclass(self) -> bool {
+        self.0 & 2 == 2
+    }
+
+    fn class(self) -> Object {
+        Object(self.0 & !1)
+    }
+
+    fn instance(self) -> Object {
+        Object(self.0 | 1)
+    }
+
+    fn or_subclass(self) -> Object {
+        Object(self.0 | 2)
+    }
+
+    /// What a message with `selector` sent to this returns, where the selector says: a new
+    /// object of the class, the object itself once initialized, or its class.
+    fn after(self, selector: &str) -> Option<Object> {
+        match selector {
+            "alloc" | "allocWithZone:" | "new" if !self.is_instance() => Some(self.instance()),
+            "self" | "retain" | "autorelease" => Some(self),
+            "class" => Some(self.class()),
+            _ if self.is_instance() && selector.starts_with("init") => Some(self),
+            _ => None,
+        }
+    }
+}
+
+/// The class names the image's code can be seen to use, each under a number.
+#[derive(Default)]
+struct ClassNames<'a> {
+    names: Vec<&'a str>,
+    numbers: FxHashMap<&'a str, u32>,
+}
+
+impl<'a> ClassNames<'a> {
+    /// The class called `name`, itself and not an object of it.
+    fn class(&mut self, name: &'a str) -> Object {
+        let next = self.names.len() as u32;
+        let number = *self.numbers.entry(name).or_insert(next);
+        if number == next {
+            self.names.push(name);
+        }
+        Object(4 * number)
+    }
+
+    fn name(&self, object: Object) -> &'a str {
+        self.names[(object.0 / 4) as usize]
+    }
+}
+
+/// `(whether it is an instance method, class, selector)` of a method name such as
+/// `-[Square(Drawing) area]`, the category left out.
+fn method_parts(name: &str) -> Option<(bool, &str, &str)> {
+    let (class, selector) = name.get(2..name.len() - 1)?.split_once(' ')?;
+    Some((name.starts_with('-'), class.split('(').next()?, selector))
 }
 
 /// The message sends among `calls`, sorted by address: every call to a message dispatcher whose
@@ -225,21 +327,57 @@ fn dispatcher(import: &str) -> Option<bool> {
 ///
 /// One pass over each piece that sends anything. Registers are followed in a straight line and
 /// forgotten wherever paths meet, so a selector is reported only when every path to the call
-/// loads the same one.
-pub fn sends<A: Arch>(image: &Image, metadata: &Metadata, pieces: &[(u64, u64)], calls: &[CallSite], join_points: &FxHashSet<u64>) -> Vec<MessageSend> {
+/// loads the same one. A receiver is followed the same way from where its class is known: a
+/// class loaded from a class reference, through the runtime calls that return it or allocate
+/// an object of it and through `alloc` and `init`, and `self` from the entry of a method.
+/// Swift fetches a class with `objc_opt_self` and keeps it in a register across calls, where
+/// Objective-C loads it right before the send.
+///
+/// `swift_methods` are the entries of Swift methods with the class of the object each is
+/// called on, which Swift passes in a register of its own.
+pub fn sends<A: Arch>(image: &Image, metadata: &Metadata, swift_methods: &[(u64, &str)], pieces: &[(u64, u64)], calls: &[CallSite], join_points: &FxHashSet<u64>) -> Vec<MessageSend> {
     let stubs = stub_selectors::<A>(image, metadata);
-    let class_methods: FxHashMap<&str, u64> = metadata.methods.iter().filter(|(_, name)| name.starts_with('+')).map(|(method, name)| (name.as_str(), *method)).collect();
-    let dispatchers: FxHashMap<u64, bool> = image.import_slots.iter().filter_map(|(&slot, name)| Some((slot, dispatcher(name)?))).collect();
-    let dispatched = |call: &CallSite| match call.target {
-        CallTarget::Import(slot) => dispatchers.get(&slot).copied(),
+    let runtime: FxHashMap<u64, Runtime> = image.import_slots.iter().filter_map(|(&slot, name)| Some((slot, runtime(name)?))).collect();
+    let called = |call: &CallSite| match call.target {
+        CallTarget::Import(slot) => runtime.get(&slot).copied(),
         CallTarget::Function(_) => None,
     };
+    let mut classes = ClassNames::default();
+    let class_refs: FxHashMap<u64, Object> = metadata.class_refs.iter().map(|(&slot, name)| (slot, classes.class(name))).collect();
+    // `self` where a method starts, and each method under its name without the category.
+    let mut receivers: FxHashMap<u64, Object> = FxHashMap::default();
+    let mut methods: FxHashMap<(bool, &str, &str), u64> = FxHashMap::default();
+    for (method, name) in &metadata.methods {
+        let Some((instance, class, selector)) = method_parts(name) else { continue };
+        let class_object = classes.class(class);
+        receivers.insert(*method, if instance { class_object.instance() } else { class_object }.or_subclass());
+        methods.entry((instance, class, selector)).or_insert(*method);
+    }
+    let swift_receivers: FxHashMap<u64, Object> = swift_methods.iter().map(|&(method, class)| (method, classes.class(class).instance().or_subclass())).collect();
+    let bases: FxHashMap<&str, &[String]> = metadata.classes.iter().map(|class| (class.name.as_str(), class.bases.as_slice())).collect();
+    // Methods some subclass in the image overrides, under the name of the class they are
+    // inherited from.
+    let mut overridden: FxHashSet<(bool, &str, &str)> = FxHashSet::default();
+    for &(instance, class, selector) in methods.keys() {
+        overridden.extend(bases.get(class).into_iter().flat_map(|bases| bases.iter().map(|base| (instance, base.as_str(), selector))));
+    }
+    // The method a message to `receiver` runs, if this image implements it: the class's own
+    // or the nearest superclass's, unless the receiver may be of a subclass that has its own.
+    let implementation = |receiver: Object, selector: &str| {
+        let class = classes.name(receiver);
+        if receiver.may_be_subclass() && overridden.contains(&(receiver.is_instance(), class, selector)) {
+            return None;
+        }
+        let chain = std::iter::once(class).chain(bases.get(class).into_iter().flat_map(|bases| bases.iter().map(String::as_str)));
+        chain.into_iter().find_map(|class| methods.get(&(receiver.is_instance(), class, selector)).copied())
+    };
+
     let mut sends: Vec<MessageSend> = pieces
         .par_iter()
         .flat_map_iter(|&(start, end)| {
             let calls = &calls[calls.partition_point(|call| call.at < start)..calls.partition_point(|call| call.at < end)];
             let mut found = Vec::new();
-            let bytes = image.bytes_from(start).filter(|_| calls.iter().any(|call| dispatched(call).is_some())).unwrap_or(&[]);
+            let bytes = image.bytes_from(start).filter(|_| calls.iter().any(|call| matches!(called(call), Some(Runtime::Send(_))))).unwrap_or(&[]);
             let bytes = &bytes[..bytes.len().min((end - start) as usize)];
             // Where paths meet: every address a branch in the piece goes to.
             let fresh = A::State::default();
@@ -251,38 +389,63 @@ pub fn sends<A: Arch>(image: &Image, metadata: &Metadata, pieces: &[(u64, u64)],
                 .collect();
 
             let mut state = A::State::default();
+            if let Some(receiver) = receivers.get(&start) {
+                A::set_argument_object(&mut state, 0, receiver.0);
+            }
+            if let Some(receiver) = swift_receivers.get(&start) {
+                A::set_self_object(&mut state, receiver.0);
+            }
             for decoded in A::decode(bytes, start) {
                 let Some(insn) = decoded.insn else { continue };
                 if joins.contains(&decoded.addr) || join_points.contains(&decoded.addr) {
                     state = A::State::default();
                 }
                 let Some(flow) = A::flow(&insn, &state) else {
-                    A::step(&mut state, &insn);
+                    A::step_following(&mut state, &insn);
                     continue;
                 };
                 let call = calls.binary_search_by_key(&decoded.addr, |call| call.at).ok().map(|index| &calls[index]);
-                if let Some((call, to_super)) = call.and_then(|call| Some((call, dispatched(call)?))) {
-                    let through_stub = match flow {
-                        Flow::Call(target) | Flow::Jump(target) | Flow::Branch(target) => stubs.get(&target).copied(),
-                        _ => None,
+                // What the call returns, when that is the class or object it is given.
+                let mut result = None;
+                if let Some((call, runtime)) = call.and_then(|call| Some((call, called(call)?))) {
+                    let loaded = A::argument_slot(&state, 0).and_then(|slot| class_refs.get(&slot)).copied();
+                    let receiver = loaded.or_else(|| A::argument_object(&state, 0).map(Object));
+                    result = match runtime {
+                        Runtime::Returns => receiver,
+                        Runtime::ClassOf => receiver.map(Object::class),
+                        Runtime::Allocates => receiver.filter(|receiver| !receiver.is_instance()).map(Object::instance),
+                        Runtime::Send(_) => None,
                     };
-                    let selector = through_stub.or_else(|| A::argument_slot(&state, 1).and_then(|slot| metadata.selectors.get(&slot)).map(String::as_str));
-                    // A receiver loaded from a class reference is that class itself, so the
-                    // message goes to one of its class methods.
-                    let receiver = A::argument_slot(&state, 0).and_then(|slot| metadata.class_refs.get(&slot)).filter(|_| !to_super);
-                    found.extend(selector.map(|selector| MessageSend {
-                        at: call.at,
-                        selector: selector.to_string(),
-                        implementation: match (receiver, metadata.implementations.get(selector).map(Vec::as_slice)) {
-                            (Some(class), _) => class_methods.get(format!("+[{class} {selector}]").as_str()).copied(),
-                            (None, Some(&[only])) if !to_super => Some(only),
+                    if let Runtime::Send(to_super) = runtime {
+                        let through_stub = match flow {
+                            Flow::Call(target) | Flow::Jump(target) | Flow::Branch(target) => stubs.get(&target).copied(),
                             _ => None,
-                        },
-                        receiver: receiver.cloned(),
-                    }));
+                        };
+                        let selector = through_stub.or_else(|| A::argument_slot(&state, 1).and_then(|slot| metadata.selectors.get(&slot)).map(String::as_str));
+                        // A send to the superclass takes a record of the receiver and the
+                        // class, not the receiver.
+                        let receiver = receiver.filter(|_| !to_super);
+                        result = receiver.zip(selector).and_then(|(receiver, selector)| receiver.after(selector));
+                        found.extend(selector.map(|selector| MessageSend {
+                            at: call.at,
+                            selector: selector.to_string(),
+                            implementation: match (receiver, metadata.implementations.get(selector).map(Vec::as_slice)) {
+                                (Some(receiver), _) => implementation(receiver, selector),
+                                (None, Some(&[only])) if !to_super => Some(only),
+                                _ => None,
+                            },
+                            receiver: receiver.map(|receiver| classes.name(receiver).to_string()),
+                            instance: receiver.is_some_and(Object::is_instance),
+                        }));
+                    }
                 }
                 match flow {
-                    Flow::Call(_) | Flow::CallIndirect(_) => A::step(&mut state, &insn),
+                    Flow::Call(_) | Flow::CallIndirect(_) => {
+                        A::step(&mut state, &insn);
+                        if let Some(result) = result {
+                            A::set_result_object(&mut state, result.0);
+                        }
+                    }
                     Flow::Branch(_) => drop(A::branch(&mut state, &insn)),
                     // Nothing falls through to what follows.
                     _ => state = A::State::default(),
