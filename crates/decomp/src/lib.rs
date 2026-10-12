@@ -66,9 +66,10 @@ impl Target {
     pub fn of(image: &Image) -> Target {
         match (image.machine, image.format) {
             (Machine::X86, Format::Pe) => Target::X86Windows,
-            (Machine::X86, Format::Elf) => Target::X86Gcc,
+            (Machine::X86, Format::Elf | Format::MachO) => Target::X86Gcc,
             (Machine::X86_64, Format::Pe) => Target::X86_64Windows,
-            (Machine::X86_64, Format::Elf) => Target::X86_64Gcc,
+            // macOS follows the System V convention on x86-64.
+            (Machine::X86_64, Format::Elf | Format::MachO) => Target::X86_64Gcc,
             (Machine::Aarch64, _) => Target::Aarch64,
         }
     }

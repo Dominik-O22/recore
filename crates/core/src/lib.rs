@@ -9,6 +9,7 @@ pub mod arm64;
 pub mod discover;
 pub mod image;
 pub mod jumptable;
+pub mod macho;
 pub mod names;
 pub mod noreturn;
 pub mod pe;

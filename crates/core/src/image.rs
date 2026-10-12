@@ -26,6 +26,12 @@ impl Section {
     pub fn contains(&self, addr: u64) -> bool {
         addr >= self.addr && addr < self.end()
     }
+    /// Whether the section holds the linker's stubs for reaching imports, not functions of the
+    /// program: an ELF PLT, or Mach-O's `__stubs` and the like.
+    pub fn is_stubs(&self) -> bool {
+        let mach_o = ["__stubs", "__auth_stubs", "__objc_stubs", "__stub_helper"];
+        self.executable && (self.name.starts_with(".plt") || self.name.rsplit_once(',').is_some_and(|(_, section)| mach_o.contains(&section)))
+    }
 }
 
 /// The instruction set an image is built for.
@@ -42,6 +48,7 @@ pub enum Machine {
 pub enum Format {
     Elf,
     Pe,
+    MachO,
 }
 
 pub struct Image {
@@ -49,7 +56,7 @@ pub struct Image {
     pub format: Format,
     pub machine: Machine,
     /// The address the image is linked to load at. PE images express many addresses as offsets
-    /// from it. Zero for ELF, which uses plain addresses.
+    /// from it. Zero for ELF and Mach-O, which use plain addresses.
     pub base: u64,
     /// The image is built with branch target identification (AArch64 BTI), so every address an
     /// indirect branch may reach starts with a marker instruction.
@@ -63,7 +70,8 @@ pub struct Image {
     pub exports: Vec<u64>,
     /// Names the image itself carries for addresses in it: exports, as written in the file.
     pub symbol_names: FxHashMap<u64, String>,
-    /// `[start, end)` of every frame description entry in `.eh_frame`.
+    /// `[start, end)` of every function the image describes: a frame description entry in
+    /// `.eh_frame`, a PE `RUNTIME_FUNCTION`, or a Mach-O function start up to the next one.
     pub frames: Vec<(u64, u64)>,
     /// Pointers stored in data by relative relocations, as `(slot address, target)`. Targets in
     /// code are function pointers or, in computed-goto tables, labels.
@@ -76,6 +84,9 @@ pub struct Image {
 impl Image {
     pub fn load(path: &Path) -> Result<Image> {
         let data = std::fs::read(path).with_context(|| format!("reading {path:?}"))?;
+        if crate::macho::is_macho(&data) {
+            return crate::macho::load(path.file_name().unwrap().to_string_lossy().into_owned(), &data);
+        }
         let file = object::File::parse(&*data)?;
 
         let mut sections: Vec<Section> = file
@@ -165,7 +176,7 @@ impl Image {
     }
 
     pub fn text(&self) -> Option<&Section> {
-        self.sections.iter().find(|s| s.name == ".text")
+        self.sections.iter().find(|s| s.name == ".text" || s.name == "__TEXT,__text")
     }
 }
 
@@ -206,7 +217,10 @@ fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, St
         .map(|s| s.address())
         .collect();
 
-    let frames = file.section_by_name(".eh_frame").map(|s| parse_frames(&s)).unwrap_or_default();
+    let frames = file
+        .section_by_name(".eh_frame")
+        .and_then(|s| Some(parse_frames(&s.uncompressed_data().ok()?, s.address())))
+        .unwrap_or_default();
 
     (import_slots, relative_targets, exports, frames)
 }
@@ -216,14 +230,12 @@ fn is_relro(name: &str) -> bool {
     name.starts_with(".data.rel.ro") || matches!(name, ".got" | ".got.plt" | ".init_array" | ".fini_array" | ".dynamic")
 }
 
-/// Reads the `[start, end)` range of every FDE. Malformed entries are skipped.
-fn parse_frames(section: &object::Section) -> Vec<(u64, u64)> {
+/// Reads the `[start, end)` range of every FDE in an `.eh_frame` section loaded at `addr`.
+/// Malformed entries are skipped.
+pub(crate) fn parse_frames(data: &[u8], addr: u64) -> Vec<(u64, u64)> {
     use gimli::UnwindSection;
-    let Ok(data) = section.uncompressed_data() else {
-        return Vec::new();
-    };
-    let eh_frame = gimli::EhFrame::new(&data, gimli::LittleEndian);
-    let bases = gimli::BaseAddresses::default().set_eh_frame(section.address());
+    let eh_frame = gimli::EhFrame::new(data, gimli::LittleEndian);
+    let bases = gimli::BaseAddresses::default().set_eh_frame(addr);
     let mut frames = Vec::new();
     let mut entries = eh_frame.entries(&bases);
     let mut cies = FxHashMap::default();

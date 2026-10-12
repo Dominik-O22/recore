@@ -431,31 +431,32 @@ impl Arch for Arm64 {
         Some(matches!(word, BTI_J | BTI_JC))
     }
 
-    /// A PLT stub is `adrp x16, page; ldr x17, [x16, #offset]; add x16, ...; br x17`, optionally
-    /// preceded by `bti c`.
+    /// A stub loads the address in an import slot and jumps to it. ELF's is `adrp x16, page;
+    /// ldr x17, [x16, #offset]; add x16, ...; br x17`, optionally after `bti c`; Mach-O's is
+    /// `adrp x16, page; ldr x16, [x16, #offset]; br x16`, with a pointer-authenticating form,
+    /// and one that loads a selector first to send an Objective-C message.
     fn plt_stubs(image: &Image) -> FxHashMap<u64, u64> {
         let mut stubs = FxHashMap::default();
-        for section in image.sections.iter().filter(|s| s.executable && s.name.starts_with(".plt")) {
-            let mut stub_start = section.addr;
-            let mut page = None;
-            let mut previous = 0u32;
+        for section in image.sections.iter().filter(|s| s.is_stubs()) {
+            let mut state = State::default();
+            let mut stub_start = None;
             for decoded in Self::decode(&section.data, section.addr) {
                 let Some(insn) = decoded.insn else { continue };
-                match (insn.pc_relative(), insn.load_offset()) {
-                    (Some((true, address)), _) if insn.rd() == 16 => {
-                        page = Some(address);
-                        stub_start = if previous == BTI_C { decoded.addr - 4 } else { decoded.addr };
-                    }
-                    (_, Some(offset)) if insn.rd() == 17 && insn.rn() == 16 => {
-                        if let Some(slot) = page.take().map(|page| page + offset) {
-                            if image.import_slots.contains_key(&slot) {
-                                stubs.insert(stub_start, slot);
-                            }
-                        }
-                    }
-                    _ => {}
+                // Padding and traps separate stubs.
+                if insn.word == NOP || Self::flow(&insn, &state) == Some(Flow::Halt) {
+                    continue;
                 }
-                previous = insn.word;
+                let start = *stub_start.get_or_insert(decoded.addr);
+                if insn.register_branch().is_none() && insn.direct().is_none() {
+                    state.step(insn);
+                    continue;
+                }
+                if let (Some(0), Value::Slot(slot)) = (insn.register_branch(), state.registers[insn.rn()]) {
+                    if image.import_slots.contains_key(&slot) {
+                        stubs.insert(start, slot);
+                    }
+                }
+                (state, stub_start) = (State::default(), None);
             }
         }
         stubs

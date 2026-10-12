@@ -884,7 +884,7 @@ impl<A: Arch> Explorer<'_, A> {
 
 /// Code sections that hold functions. PLT stubs are resolved to imports instead.
 pub fn is_function_section(section: &Section) -> bool {
-    section.executable && !section.name.starts_with(".plt")
+    section.executable && !section.is_stubs()
 }
 
 pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
