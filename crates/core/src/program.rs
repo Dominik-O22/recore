@@ -40,9 +40,25 @@ fn target_addr(target: CallTarget) -> u64 {
     }
 }
 
-/// Whether `text` contains `pattern`, ignoring case. No pattern matches everything.
-pub fn matches(text: &str, pattern: Option<&str>) -> bool {
-    pattern.is_none_or(|p| text.to_lowercase().contains(&p.to_lowercase()))
+/// What a listing is narrowed by: a regular expression matched anywhere in the text, ignoring
+/// case. Text that is not a valid expression, such as `operator()` or `c++`, is matched as it is
+/// written.
+pub struct Pattern(regex::Regex);
+
+impl Pattern {
+    pub fn new(pattern: &str) -> Pattern {
+        let build = |source: &str| regex::RegexBuilder::new(source).case_insensitive(true).build();
+        Pattern(build(pattern).or_else(|_| build(&regex::escape(pattern))).expect("an escaped pattern is valid"))
+    }
+
+    pub fn matches(&self, text: &str) -> bool {
+        self.0.is_match(text)
+    }
+}
+
+/// Whether `text` matches `pattern`. No pattern matches everything.
+pub fn matches(text: &str, pattern: Option<&Pattern>) -> bool {
+    pattern.is_none_or(|pattern| pattern.matches(text))
 }
 
 /// Reads an address in hex, with or without `0x`. Also takes the names the decompiler prints
@@ -197,7 +213,8 @@ impl Program {
         if let Some((entry, _)) = named().find(|&(_, candidate)| candidate == name) {
             return Ok(entry);
         }
-        let partial: Vec<(u64, &str)> = named().filter(|(_, candidate)| matches(candidate, Some(name))).collect();
+        let lowered = name.to_lowercase();
+        let partial: Vec<(u64, &str)> = named().filter(|(_, candidate)| candidate.to_lowercase().contains(&lowered)).collect();
         match partial.as_slice() {
             [(entry, _)] => Ok(*entry),
             [] => bail!("no function is named `{name}`; the `functions` tool lists the names this binary carries"),

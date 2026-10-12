@@ -9,7 +9,7 @@ Every tool takes `path`, the binary to analyze, and answers with text. Addresses
 | Tool | Arguments | Answer |
 |---|---|---|
 | `summary` | | Format, machine, image base, entry, sections, counts of functions, imports, strings and jump tables, analysis time. |
-| `strings` | `pattern`?, `limit`? (100) | Each string with its address and the functions that use it. `pattern` is a case-insensitive substring. |
+| `strings` | `pattern`?, `limit`? (100) | Each string with its address and the functions that use it. `pattern` is a regular expression matched anywhere, ignoring case; text that is not a valid expression is matched as written. |
 | `imports` | `pattern`? | Each imported function with its slot and the functions that call it. |
 | `functions` | `pattern`?, `limit`? (100), `sort`? (`address` or `size`) | Address, size in bytes, number of calling functions, name. `pattern` matches names. |
 | `function` | `addr` or `name` | Extent, callers, calls made (imports by name), strings and globals referred to. `addr` is any address inside the function. |
@@ -18,10 +18,30 @@ Every tool takes `path`, the binary to analyze, and answers with text. Addresses
 | `bytes` | `addr`, `len`? (256, at most 4096) | Hex dump of the bytes mapped at the address. |
 | `classes` | `pattern`? | C++ classes from MSVC type information: base classes, vtable address, virtual functions in vtable order. |
 | `addr` | `addr` or `offset` | The address in the image and the offset in the file of the same byte, and what is there. |
+| `disassemble` | `function` or `addr`, `count`?, `pcode`? | Instructions as Ghidra's listing prints them, in basic blocks with each block's successors. Each line has the bytes and what the analysis knows: call target, string or data referred to, switch targets, comment. `pcode` adds each instruction's raw p-code. |
+| `pcode` | `function`, `limit`? (400), `timeout`? | The function's data flow after the decompiler has simplified it: blocks, and operations over values assigned once each. |
+| `trace` | `function`, then `param`, `returns`, or `call` with `arg`; `depth`? (2), `timeout`? | One value followed through the code and across calls: a parameter forward, or a returned value or call argument back to where it comes from. |
+| `symbols` | `pattern`?, `limit`? (100) | Every named address: functions, import slots, vtables, exported data, and names given with `rename`. |
+| `rename` | `addr` and `name`, or `names` (list of both) | Names a function entry or a data address. An empty name removes it. |
+| `comment` | `addr`, `text` | Attaches a note to an address. `function`, `disassemble` and `decompile` show it. Empty text removes it. |
+| `declare` | `code`, or `addr` and `type` | `code` is C: `struct`, `union`, `enum`, `typedef`, and `extern` prototypes that set a named function's parameters and return type. `addr` with `type` says what the data at an address is. |
+| `type` | `name`? | Size, alignment and fields with offsets of a struct or union, or the values of an enum. Without `name`, what `declare` has recorded. |
 
 The decompiler prints unnamed functions as `func_0x10001000`. Every address argument accepts that form.
 
 `xrefs` on a data address that holds pointers, such as a vtable, also lists what each entry points to. `bytes` and `summary` give file offsets next to addresses.
+
+## Edits
+
+`rename`, `comment` and `declare` change what every later answer says, the decompiler's C included. They are saved in one JSON file per binary under `$XDG_DATA_HOME/recore/edits` (or `~/.local/share/recore/edits`), named after the file and a hash of its contents. They survive a restart and a move of the binary, and do not apply to a file whose bytes have changed. `RECORE_EDITS_DIR` names another directory. `summary` prints the path.
+
+An edit replaces the decompiler process with one that starts from the new edits, so the first decompilation after an edit waits for that process to load the binary again. Several renames in one `names` list cost one restart.
+
+A name goes on a function entry or on data. A place inside a function takes a comment, not a name.
+
+## Data flow
+
+`pcode` and `trace` read the decompiler's own intermediate form, the one its C is printed from. Stack bookkeeping and dead code are gone, every value has one definition, and a call lists its arguments in order. `trace` follows a value through at most 16 functions and does not follow it through memory: a value stored to a global or the heap and read back elsewhere is reported at the store and no further.
 
 ## From a shell
 
@@ -34,6 +54,11 @@ recore-mcp xrefs firmware.dll 0x1002abd0
 recore-mcp decompile firmware.dll 0x10001260 0x10014750
 recore-mcp bytes firmware.dll 0x1002abd0 64
 recore-mcp addr firmware.dll --offset 0x280cc
+recore-mcp disassemble firmware.dll 0x10001260 --count 40 --pcode
+recore-mcp trace firmware.dll 0x10001260 --param 1
+recore-mcp rename firmware.dll 0x10001260 parse_header
+recore-mcp declare firmware.dll 'struct Header { uint4 magic; uint2 version; };'
+recore-mcp declare firmware.dll 0x1002abd0 Header
 ```
 
 Plain arguments are what the tool looks up; the other arguments in the table are options, `--limit 20`. `recore-mcp --help` lists the tools. Each run analyzes the binary again, so a long session is faster through the server.

@@ -6,6 +6,8 @@
 
 mod binary;
 mod cli;
+mod code;
+mod edit;
 mod tools;
 
 use std::io::{BufRead, Write};

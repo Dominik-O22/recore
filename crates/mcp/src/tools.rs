@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use recore::image::{Format, Machine};
-use recore::program::{Program, matches, parse_addr};
+use recore::program::{Pattern, Program, matches, parse_addr};
 use recore::report::CallTarget;
 use recore_decomp::isolate::Status;
 use serde::Deserialize;
@@ -15,9 +15,10 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::binary::{Binary, Cache};
+use crate::{code, edit};
 
 /// Rows a listing shows unless the caller sets `limit`.
-const DEFAULT_LIMIT: usize = 100;
+pub(crate) const DEFAULT_LIMIT: usize = 100;
 /// Functions named on one line before the rest are counted.
 const USERS_SHOWN: usize = 12;
 /// Characters of a string shown in a listing.
@@ -32,7 +33,9 @@ fn tool(name: &str, description: &str, mut properties: Value, required: &[&str])
 }
 
 pub fn list() -> Value {
-    let pattern = |of: &str| json!({ "type": "string", "description": format!("Case-insensitive substring of the {of}.") });
+    let pattern = |of: &str| json!({ "type": "string", "description": format!("Regular expression matched anywhere in the {of}, ignoring case. Plain text works as a substring.") });
+    let function = json!({ "type": "string", "description": "The function: its name, or a hex address anywhere inside it." });
+    let timeout = json!({ "type": "number", "description": "Seconds each decompilation may take (default 30)." });
     let limit = json!({ "type": "integer", "minimum": 1, "description": format!("Most rows to return (default {DEFAULT_LIMIT}).") });
     let addr = |what: &str| json!({ "type": "string", "description": format!("{what}, in hex with or without 0x.") });
     json!([
@@ -99,6 +102,75 @@ pub fn list() -> Value {
             json!({ "addr": addr("Address in the image"), "offset": addr("Offset in the file") }),
             &[],
         ),
+        tool(
+            "disassemble",
+            "Instructions as Ghidra's listing prints them, grouped into basic blocks with where each block goes next. Each line carries the instruction's bytes and what the analysis knows about it: the function it calls, the string or data it refers to, a switch's targets, a comment. Give `function` for a whole function, or `addr` to start anywhere in code.",
+            json!({
+                "function": function,
+                "addr": addr("Where to start; inside a function this snaps to the instruction it is in"),
+                "count": { "type": "integer", "minimum": 1, "description": "Instructions to show (default 500 for a function, 32 from an address)." },
+                "pcode": { "type": "boolean", "description": "Also show each instruction's raw p-code: what it does to registers and memory, one operation per line." },
+            }),
+            &[],
+        ),
+        tool(
+            "pcode",
+            "A function's data flow after the decompiler has simplified it: basic blocks, and operations over values that are each assigned once (SSA). Shows exactly what feeds every call, store, branch and return, where the C leaves it implicit.",
+            json!({ "function": function, "limit": limit, "timeout": timeout }),
+            &["function"],
+        ),
+        tool(
+            "trace",
+            "Follows one value through the code, across calls. `param` follows a parameter forward to everything computed from it, into the functions it is passed to. `returns`, or `call` with `arg`, follows a returned value or a call's argument back to the constants, parameters, memory and call results it comes from, out into callers. Values that pass through memory are not followed.",
+            json!({
+                "function": function,
+                "param": { "type": "integer", "minimum": 1, "description": "Parameter to follow forward, from 1: param_1 is 1." },
+                "returns": { "type": "boolean", "description": "Follow the returned value backward." },
+                "call": addr("A call instruction in the function, to follow one of its arguments backward"),
+                "arg": { "type": "integer", "minimum": 1, "description": "Which argument of `call`, from 1." },
+                "depth": { "type": "integer", "minimum": 0, "description": "Calls to follow into callees and out to callers (default 2)." },
+                "timeout": timeout,
+            }),
+            &["function"],
+        ),
+        tool(
+            "symbols",
+            "Every address that has a name: functions, import slots, vtables, exported data, and the names given with `rename`.",
+            json!({ "pattern": pattern("name"), "limit": limit }),
+            &[],
+        ),
+        tool(
+            "rename",
+            "Names a function (at its entry address) or a data address. The name is saved for this binary and used everywhere from then on, the decompiler's C included. An empty name removes it. Give `addr` and `name`, or several in `names`.",
+            json!({
+                "addr": addr("A function entry or a data address"),
+                "name": { "type": "string", "description": "The new name; empty to remove." },
+                "names": { "type": "array", "items": { "type": "object", "properties": { "addr": { "type": "string" }, "name": { "type": "string" } }, "required": ["addr", "name"] }, "description": "Several renames at once, which restarts the decompiler only once." },
+            }),
+            &[],
+        ),
+        tool(
+            "comment",
+            "Attaches a note to an address, saved for this binary and shown by `function`, `disassemble` and `decompile`. Empty text removes it.",
+            json!({ "addr": addr("Any address in the image"), "text": { "type": "string", "description": "The note; empty to remove." } }),
+            &["addr", "text"],
+        ),
+        tool(
+            "declare",
+            "Tells the decompiler about data types, saved for this binary. `code` takes C: `struct`, `union`, `enum` and `typedef` declarations, and `extern` prototypes that set the parameters and return type of a named function, such as `extern int parse(Request *req, char *text);`. A calling convention goes before the return type: `extern __stdcall int f(void);`. `addr` with `type` says what the data at an address is, such as `Config` or `char *`. Sizes are spelled int1, int2, int4, int8, uint1 to uint8, float4, float8; char and void also work.",
+            json!({
+                "code": { "type": "string", "description": "One or more C declarations." },
+                "addr": addr("A data address"),
+                "type": { "type": "string", "description": "A type name the decompiler knows; empty to remove." },
+            }),
+            &[],
+        ),
+        tool(
+            "type",
+            "The layout of a data type: size, alignment, and each field of a struct or union with its offset, or the values of an enum. Without `name`, lists what `declare` has recorded.",
+            json!({ "name": { "type": "string", "description": "A type name, declared or built in." } }),
+            &[],
+        ),
     ])
 }
 
@@ -121,12 +193,35 @@ pub fn call(cache: &mut Cache, name: &str, arguments: Value) -> Option<Result<St
         "bytes" => run(cache, name, arguments, bytes),
         "classes" => run(cache, name, arguments, classes),
         "addr" => run(cache, name, arguments, addr),
+        "disassemble" => run(cache, name, arguments, code::disassemble),
+        "pcode" => run(cache, name, arguments, code::pcode),
+        "trace" => run(cache, name, arguments, code::trace),
+        "symbols" => run(cache, name, arguments, edit::symbols),
+        "rename" => run(cache, name, arguments, edit::rename),
+        "comment" => run(cache, name, arguments, edit::comment),
+        "declare" => run(cache, name, arguments, edit::declare),
+        "type" => run(cache, name, arguments, edit::type_),
         _ => return None,
     })
 }
 
-fn addr_arg(text: &str) -> Result<u64> {
+pub(crate) fn addr_arg(text: &str) -> Result<u64> {
     parse_addr(text).with_context(|| format!("`{text}` is not a hex address"))
+}
+
+/// The entry of the function `text` names or points into. A name first: `add` is a hex number
+/// too.
+pub(crate) fn resolve_function(binary: &Binary, text: &str) -> Result<u64> {
+    match (binary.program.function_named(text), parse_addr(text)) {
+        (Ok(entry), _) => Ok(entry),
+        (Err(_), Some(addr)) => binary.program.function_at(addr),
+        (Err(error), None) => Err(error),
+    }
+}
+
+/// The end of a listing's first line when it has more rows than it shows.
+pub(crate) fn shown(found: usize, limit: usize) -> String {
+    if found > limit { format!(", first {limit} shown") } else { String::new() }
 }
 
 /// A string's text quoted, cut short if it is long.
@@ -149,8 +244,18 @@ fn labels(binary: &Binary, entries: &BTreeSet<u64>) -> String {
     line
 }
 
+/// The comments on addresses inside `body`, in address order.
+fn comments<'a>(binary: &'a Binary, body: &[(u64, u64)]) -> Vec<(u64, &'a str)> {
+    let mut found: Vec<(u64, &str)> = body.iter().flat_map(|&(start, end)| binary.edits.comments.range(start..end)).map(|(&addr, text)| (addr, text.as_str())).collect();
+    found.sort_unstable();
+    found
+}
+
 /// What lies at a data address, as far as the analysis knows.
-fn describe(binary: &Binary, addr: u64) -> String {
+pub(crate) fn describe(binary: &Binary, addr: u64) -> String {
+    if let Some((_, name, kind)) = binary.edits.globals(&binary.program.analysis).into_iter().find(|global| global.0 == addr) {
+        return format!("{name}{}", kind.map_or_else(String::new, |kind| format!(" ({kind})")));
+    }
     if let Some(string) = binary.program.string_at(addr) {
         return format!("string {}", quoted(&string.text));
     }
@@ -224,6 +329,8 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
         analysis.jump_tables.len(),
     )?;
     writeln!(out, "analyzed in {:.0} ms, kept until the file changes", binary.analysis_ms)?;
+    let edits = &binary.edits;
+    writeln!(out, "edits: {} names, {} comments, {} declarations, {} typed data, saved in {}", edits.names.len(), edits.comments.len(), edits.declarations.len(), edits.types.len(), binary.edits_file()?.display())?;
     writeln!(out, "sections:")?;
     for section in &image.sections {
         let kind = if section.executable { "code" } else if section.writable { "data" } else { "read-only data" };
@@ -240,10 +347,11 @@ struct Strings {
 }
 
 fn strings(binary: &mut Binary, args: Strings) -> Result<String> {
-    let found: Vec<_> = binary.program.analysis.strings.iter().filter(|s| matches(&s.text, args.pattern.as_deref())).collect();
+    let pattern = args.pattern.as_deref().map(Pattern::new);
+    let found: Vec<_> = binary.program.analysis.strings.iter().filter(|s| matches(&s.text, pattern.as_ref())).collect();
     let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
     let mut out = String::new();
-    writeln!(out, "{} strings{}", found.len(), if found.len() > limit { format!(", first {limit} shown") } else { String::new() })?;
+    writeln!(out, "{} strings{}", found.len(), shown(found.len(), limit))?;
     for string in found.iter().take(limit) {
         let users = binary.program.users(binary.program.refs_to(string.addr).map(|r| r.from));
         // A string no instruction refers to is reached through a pointer in data, which `xrefs` shows.
@@ -258,7 +366,8 @@ struct Imports {
 }
 
 fn imports(binary: &mut Binary, args: Imports) -> Result<String> {
-    let found: Vec<_> = binary.program.analysis.imports.iter().filter(|i| matches(&i.name, args.pattern.as_deref())).collect();
+    let pattern = args.pattern.as_deref().map(Pattern::new);
+    let found: Vec<_> = binary.program.analysis.imports.iter().filter(|i| matches(&i.name, pattern.as_ref())).collect();
     let mut out = String::new();
     writeln!(out, "{} imports", found.len())?;
     for import in found {
@@ -288,13 +397,14 @@ fn functions(binary: &mut Binary, args: Functions) -> Result<String> {
     let sizes = binary.program.sizes();
     let size = |entry: u64| sizes.get(&entry).copied().unwrap_or(0);
     // Without a pattern every function is listed; with one, only functions that have a name.
-    let mut found: Vec<_> = binary.program.functions().filter(|f| args.pattern.is_none() || f.name.as_deref().is_some_and(|name| matches(name, args.pattern.as_deref()))).collect();
+    let pattern = args.pattern.as_deref().map(Pattern::new);
+    let mut found: Vec<_> = binary.program.functions().filter(|f| pattern.is_none() || f.name.as_deref().is_some_and(|name| matches(name, pattern.as_ref()))).collect();
     if let Sort::Size = args.sort {
         found.sort_by_key(|f| std::cmp::Reverse(size(f.addr)));
     }
     let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
     let mut out = String::new();
-    writeln!(out, "{} functions{}", found.len(), if found.len() > limit { format!(", first {limit} shown") } else { String::new() })?;
+    writeln!(out, "{} functions{}", found.len(), shown(found.len(), limit))?;
     writeln!(out, "address size callers name")?;
     for function in found.iter().take(limit) {
         let callers = binary.program.users(binary.program.calls_to(function.addr).map(|call| call.at)).len();
@@ -327,10 +437,18 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
             writeln!(out, "virtual function {index} of {} (vtable {:#x})", class.name, class.vtable)?;
         }
     }
+    for (addr, comment) in comments(binary, &body) {
+        writeln!(out, "// {addr:#x}: {comment}")?;
+    }
+    let graph = recore::cfg::cfg(&binary.program.image, &binary.program.analysis, &body);
+    writeln!(out, "{} basic blocks, {} instructions; `disassemble` lists them", graph.blocks.len(), graph.instructions.len())?;
     let callers = binary.program.users(binary.program.calls_to(entry).map(|call| call.at));
     writeln!(out, "called by ({}): {}", callers.len(), labels(binary, &callers))?;
 
     writeln!(out, "calls:")?;
+    for site in &graph.unresolved_calls {
+        writeln!(out, "  {site:#x} calls through a register or pointer the analysis could not resolve")?;
+    }
     for call in body.iter().flat_map(|&(start, end)| binary.program.calls_in(start, end)) {
         let target = match call.target {
             CallTarget::Function(target) => binary.program.label(target),
@@ -438,7 +556,13 @@ fn decompile(binary: &mut Binary, args: Decompile) -> Result<String> {
         let (record, c_text) = binary.decompile(entry, timeout);
         let label = binary.program.label(entry);
         match (record.status, c_text) {
-            (Status::Ok, Some(text)) => writeln!(out, "// {label} ({:.0} ms)\n{}\n", record.ms, text.trim())?,
+            (Status::Ok, Some(text)) => {
+                writeln!(out, "// {label} ({:.0} ms)", record.ms)?;
+                for (addr, comment) in comments(binary, &binary.program.body(entry)) {
+                    writeln!(out, "// {addr:#x}: {comment}")?;
+                }
+                writeln!(out, "{}\n", text.trim())?;
+            }
             (status, _) => {
                 failed += 1;
                 let how = match status {
@@ -524,7 +648,8 @@ struct Classes {
 }
 
 fn classes(binary: &mut Binary, args: Classes) -> Result<String> {
-    let found: Vec<_> = binary.program.analysis.classes.iter().filter(|class| matches(&class.name, args.pattern.as_deref())).collect();
+    let pattern = args.pattern.as_deref().map(Pattern::new);
+    let found: Vec<_> = binary.program.analysis.classes.iter().filter(|class| matches(&class.name, pattern.as_ref())).collect();
     let mut out = String::new();
     writeln!(out, "{} classes", found.len())?;
     for class in found {

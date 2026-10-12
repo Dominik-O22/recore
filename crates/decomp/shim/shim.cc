@@ -55,6 +55,8 @@ struct RdDecompiled {
   size_t jump_table_count;
   const uint64_t *jump_targets;
   uint32_t flags;
+  // The function's data flow after simplification, if rd_set_flow asked for it: see `dump_flow`.
+  const char *flow;
 };
 
 }  // extern "C"
@@ -200,10 +202,11 @@ struct RdSession {
   const Translate *translator = nullptr;
   bool print_c = true;
   bool keep_prototypes = false;
+  bool want_flow = false;
   set<uint64_t> kept;  // functions whose prototype this session locked
 
-  // Backing storage for the last RdDecompiled.
-  string c_text, return_type;
+  // Backing storage for the last RdDecompiled, listing and type layout.
+  string c_text, return_type, flow, text;
   vector<string> strings;
   vector<RdParam> params;
   vector<uint64_t> jump_addrs, jump_targets;
@@ -287,6 +290,138 @@ static bool reads_unexplained_register(Funcdata *fd) {
     if (addr.getSpace()->getType() != IPTR_SPACEBASE) return true;
   }
   return false;
+}
+
+// One operand of raw p-code, written the way Ghidra's listing shows it.
+static void print_operand(ostream &s, const Translate *translate, const VarnodeData &vn) {
+  if (vn.space->getType() == IPTR_CONSTANT) {
+    s << "0x" << hex << vn.offset << dec;
+    return;
+  }
+  string reg = translate->getRegisterName(vn.space, vn.offset, vn.size);
+  if (!reg.empty()) {
+    s << reg;
+    return;
+  }
+  if (vn.space->getType() == IPTR_INTERNAL)
+    s << "$U" << hex << vn.offset << dec;
+  else
+    s << vn.space->getName() << "[0x" << hex << vn.offset << dec << "]";
+  s << ":" << vn.size;
+}
+
+class ListingAssembly : public AssemblyEmit {
+ public:
+  string text;
+  void dump(const Address &, const string &mnem, const string &body) override {
+    text = body.empty() ? mnem : mnem + " " + body;
+  }
+};
+
+class ListingPcode : public PcodeEmit {
+  const Translate *translate;
+  ostream &out;
+
+ public:
+  ListingPcode(const Translate *t, ostream &o) : translate(t), out(o) {}
+  void dump(const Address &, OpCode opc, VarnodeData *outvar, VarnodeData *vars, int4 isize) override {
+    out << "\t";
+    if (outvar != nullptr) {
+      print_operand(out, translate, *outvar);
+      out << " = ";
+    }
+    out << get_opname(opc);
+    for (int4 i = 0; i < isize; ++i) {
+      out << (i == 0 ? " " : ", ");
+      // The first input of a load or store names the address space, not a value.
+      if (i == 0 && (opc == CPUI_LOAD || opc == CPUI_STORE))
+        out << ((AddrSpace *)(uintp)vars[i].offset)->getName();
+      else
+        print_operand(out, translate, vars[i]);
+    }
+    out << "\n";
+  }
+};
+
+// The name of a data type as C spells it. getName() is empty for pointers and arrays.
+static string type_name(const Datatype *type) {
+  ostringstream s;
+  type->printRaw(s);
+  return s.str();
+}
+
+// The decompiler's name for an operation. The two that only exist after analysis share their
+// numbers with operations of the processor specs, whose names get_opname gives.
+static const char *flow_opname(OpCode code) {
+  if (code == CPUI_MULTIEQUAL) return "MULTIEQUAL";
+  if (code == CPUI_INDIRECT) return "INDIRECT";
+  return get_opname(code);
+}
+
+// Writes the function's simplified p-code as lines of tab-separated fields:
+//   B <index> <start> <stop> <successor indices, comma-separated>
+//   V <id> <size> <kind> <text>     kind: const, param, global, local or temp
+//   O <address> <block> <opcode> <output id or -> <input ids, comma-separated> <callee address and name, or ->
+// A value is one SSA varnode, defined by at most one operation. A parameter's text is its
+// position and name; a constant's is its value; a global's is its address.
+static void dump_flow(Funcdata *fd, ostream &out) {
+  const BlockGraph &blocks = fd->getBasicBlocks();
+  out << hex;
+  for (int4 i = 0; i < blocks.getSize(); ++i) {
+    const FlowBlock *block = blocks.getBlock(i);
+    out << "B\t" << i << "\t" << block->getStart().getOffset() << "\t" << block->getStop().getOffset() << "\t";
+    for (int4 j = 0; j < block->sizeOut(); ++j) out << (j == 0 ? "" : ",") << block->getOut(j)->getIndex();
+    out << "\n";
+  }
+  set<uint4> seen;
+  auto value = [&](const Varnode *vn) {
+    uint4 id = vn->getCreateIndex();
+    if (!seen.insert(id).second) return id;
+    out << "V\t" << id << "\t" << vn->getSize() << "\t";
+    Symbol *symbol = nullptr;
+    try {
+      symbol = vn->getHigh()->getSymbol();
+    } catch (const LowlevelError &) {
+    }
+    if (vn->isConstant())
+      out << "const\t" << vn->getOffset();
+    else if (symbol != nullptr && symbol->getCategory() == Symbol::function_parameter)
+      out << "param\t" << symbol->getCategoryIndex() << " " << symbol->getName();
+    else if (vn->isPersist() && vn->getSpace()->getType() == IPTR_PROCESSOR)
+      out << "global\t" << vn->getOffset() << (symbol != nullptr ? " " + symbol->getName() : "");
+    else if (symbol != nullptr)
+      out << "local\t" << symbol->getName();
+    else {
+      out << "temp\t";
+      vn->printRawNoMarkup(out);
+    }
+    out << "\n";
+    return id;
+  };
+  for (int4 index = 0; index < blocks.getSize(); ++index) {
+    const BlockBasic *block = static_cast<const BlockBasic *>(blocks.getBlock(index));
+    for (auto it = block->beginOp(); it != block->endOp(); ++it) {
+    const PcodeOp *op = *it;
+    uint4 output = op->getOut() != nullptr ? value(op->getOut()) : 0;
+    vector<uint4> inputs;
+    // The first input of a call is its target, of a load or store the address space, and of a
+    // return the place the return address was read from: none of them is a value passed on.
+    bool skip_first = op->isCall() || op->code() == CPUI_LOAD || op->code() == CPUI_STORE || op->code() == CPUI_RETURN;
+    for (int4 i = skip_first ? 1 : 0; i < op->numInput(); ++i)
+      if (!op->getIn(i)->isAnnotation()) inputs.push_back(value(op->getIn(i)));
+    out << "O\t" << op->getAddr().getOffset() << "\t" << index << "\t" << flow_opname(op->code()) << "\t";
+    if (op->getOut() != nullptr) out << output; else out << "-";
+    out << "\t";
+    for (size_t i = 0; i < inputs.size(); ++i) out << (i == 0 ? "" : ",") << inputs[i];
+    out << "\t";
+    FuncCallSpecs *call = op->code() == CPUI_CALL ? fd->getCallSpecs(op) : nullptr;
+    if (call != nullptr && !call->getEntryAddress().isInvalid())
+      out << call->getEntryAddress().getOffset() << " " << call->getName();
+    else
+      out << "-";
+    out << "\n";
+    }
+  }
 }
 
 // The engine allocates and frees small objects by the million: tree nodes for every varnode and
@@ -522,6 +657,120 @@ int rd_set_style(RdSession *session, const char *name, char *err, size_t errlen)
   });
 }
 
+// With `on`, each rd_decompile also fills RdDecompiled::flow.
+void rd_set_flow(RdSession *session, int on) { session->want_flow = on != 0; }
+
+// Disassembles `[start, end)` into `*out`, one line per instruction: its address and length in
+// hex and its text, tab-separated. Bytes that do not decode give a line with the text `(bad)`.
+// With `pcode`, each instruction is followed by its raw p-code, one operation per line, each
+// starting with a tab. The text stays valid until the next call on the session.
+int rd_listing(RdSession *session, uint64_t start, uint64_t end, int pcode, const char **out,
+               char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    const Translate *translate = session->arch->translate;
+    ostringstream text;
+    uint64_t step = max(1, translate->getAlignment());
+    for (uint64_t addr = start; addr < end;) {
+      ListingAssembly line;
+      ostringstream ops;
+      int4 length = 0;
+      try {
+        length = translate->printAssembly(line, session->address(addr));
+        if (pcode) {
+          ListingPcode emit(translate, ops);
+          translate->oneInstruction(emit, session->address(addr));
+        }
+      } catch (const UnimplError &) {
+        // Decoded, but the processor spec gives it no semantics.
+      } catch (const LowlevelError &) {
+        length = 0;
+      }
+      if (length <= 0) {
+        text << hex << addr << "\t" << step << "\t(bad)\n";
+        addr += step;
+        continue;
+      }
+      text << hex << addr << "\t" << length << "\t" << line.text << "\n" << ops.str();
+      addr += length;
+    }
+    session->text = text.str();
+    *out = session->text.c_str();
+  });
+}
+
+// Declares a global variable `name` at `addr`. `type` is a C type the session knows, such as
+// `int4`, `char *` or a declared struct; empty for a label on data of unknown type.
+int rd_add_global(RdSession *session, uint64_t addr, const char *name, const char *type, char *err,
+                  size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    Scope *global = arch->symboltab->getGlobalScope();
+    Address where = session->address(addr);
+    Datatype *datatype = arch->types->getBase(1, TYPE_UNKNOWN);
+    if (type[0] != 0) {
+      static mutex parser_lock;
+      lock_guard<mutex> guard(parser_lock);
+      istringstream text(type);
+      string unused;
+      datatype = parse_type(text, unused, arch);
+    }
+    // A string or vtable declared here before gives way to what the caller says it is.
+    SymbolEntry *old = global->findAddr(where, Address());
+    if (old != nullptr) global->removeSymbol(old->getSymbol());
+    global->addSymbol(name, datatype, where, Address());
+  });
+}
+
+// Describes the data type `name` in `*out`: its kind, size and alignment on the first line, then
+// one line per field of a struct or union (offset, type, name) or per value of an enum.
+int rd_type_layout(RdSession *session, const char *name, const char **out, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    Datatype *type = arch->types->findByName(name);
+    if (type == nullptr) {
+      static mutex parser_lock;
+      lock_guard<mutex> guard(parser_lock);
+      istringstream text(name);
+      string unused;
+      type = parse_type(text, unused, arch);
+    }
+    ostringstream s;
+    auto header = [&](const char *kind) {
+      s << kind << " " << type_name(type) << ", " << dec << type->getSize() << " bytes, alignment " << type->getAlignment() << "\n";
+    };
+    auto field = [&](const TypeField &f) {
+      s << "  +0x" << hex << f.offset << " " << type_name(f.type) << " " << f.name << dec << " (" << f.type->getSize() << " bytes)\n";
+    };
+    if (type->getTypedef() != nullptr) {
+      header("typedef");
+      s << "  of " << type_name(type->getTypedef()) << "\n";
+    } else if (type->getMetatype() == TYPE_STRUCT) {
+      header("struct");
+      const TypeStruct *st = static_cast<const TypeStruct *>(type);
+      for (auto it = st->beginField(); it != st->endField(); ++it) field(*it);
+    } else if (type->getMetatype() == TYPE_UNION) {
+      header("union");
+      const TypeUnion *un = static_cast<const TypeUnion *>(type);
+      for (int4 i = 0; i < un->numDepend(); ++i) field(*un->getField(i));
+    } else if (type->isEnumType()) {
+      header("enum");
+      const TypeEnum *en = static_cast<const TypeEnum *>(type);
+      for (auto it = en->beginEnum(); it != en->endEnum(); ++it) s << "  " << it->second << " = 0x" << hex << it->first << dec << "\n";
+    } else if (type->getMetatype() == TYPE_PTR) {
+      header("pointer");
+      s << "  to " << type_name(static_cast<const TypePointer *>(type)->getPtrTo()) << "\n";
+    } else if (type->getMetatype() == TYPE_ARRAY) {
+      header("array");
+      const TypeArray *array = static_cast<const TypeArray *>(type);
+      s << "  of " << array->numElements() << " " << type_name(array->getBase()) << "\n";
+    } else {
+      header("type");
+    }
+    session->text = s.str();
+    *out = session->text.c_str();
+  });
+}
+
 int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err, size_t errlen) {
   Funcdata *fd = nullptr;
   Architecture *arch = session->arch;
@@ -558,13 +807,11 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       arch->print->docFunction(fd);
     }
     session->c_text = text.str();
+    ostringstream flow;
+    if (session->want_flow) dump_flow(fd, flow);
+    session->flow = flow.str();
 
     const FuncProto &proto = fd->getFuncProto();
-    auto type_name = [](Datatype *type) {
-      ostringstream s;
-      type->printRaw(s);  // getName() is empty for pointers and arrays
-      return s.str();
-    };
     session->return_type = type_name(proto.getOutputType());
     session->strings.clear();
     session->params.clear();
@@ -605,6 +852,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     out->jump_counts = session->jump_counts.data();
     out->jump_table_count = session->jump_addrs.size();
     out->jump_targets = session->jump_targets.data();
+    out->flow = session->flow.c_str();
     out->flags = (fd->hasBadData() ? RD_BAD_DATA : 0) |
                  (fd->hasUnimplemented() ? RD_UNIMPLEMENTED : 0) |
                  (proto.getOutputType()->getMetatype() != TYPE_VOID ? RD_RETURNS_VALUE : 0);

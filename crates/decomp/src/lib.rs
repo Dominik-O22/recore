@@ -12,6 +12,7 @@
 pub mod dwarf;
 pub mod facts;
 mod ffi;
+pub mod flow;
 pub mod isolate;
 pub mod prototypes;
 
@@ -22,12 +23,13 @@ use std::ffi::{CStr, CString, c_char};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use recore::Image;
 use recore::image::{Format, Machine};
 use recore::report::Analysis;
 
 pub use facts::Facts;
+pub use flow::Flow;
 
 /// The allocator the engine's C++ side is built to use. A program that decompiles a lot does
 /// well to make it the Rust side's too.
@@ -160,6 +162,21 @@ pub struct Decompiled {
     /// Control flow hit an instruction the processor spec has no semantics for.
     pub unimplemented: bool,
     pub jump_tables: Vec<JumpTable>,
+    /// The function's data flow, if [`Session::keep_flow`] asked for it.
+    pub flow: Option<Flow>,
+}
+
+/// One disassembled instruction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Instruction {
+    pub addr: u64,
+    pub len: u64,
+    /// Mnemonic and operands as Ghidra's listing prints them, or `(bad)` for bytes that do not
+    /// decode.
+    pub text: String,
+    /// Its raw p-code, one operation each, when asked for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pcode: Vec<String>,
 }
 
 impl Decompiled {
@@ -358,6 +375,46 @@ impl Session {
         unsafe { ffi::rd_keep_prototypes(self.raw.as_ptr(), keep.into()) }
     }
 
+    /// With `keep`, every later [`Session::decompile`] also returns the function's data flow.
+    pub fn keep_flow(&mut self, keep: bool) {
+        unsafe { ffi::rd_set_flow(self.raw.as_ptr(), keep.into()) }
+    }
+
+    /// Disassembles `[start, end)` linearly, with each instruction's raw p-code if `pcode`.
+    pub fn listing(&mut self, start: u64, end: u64, pcode: bool) -> Result<Vec<Instruction>> {
+        let mut out = std::ptr::null();
+        check(|err, len| unsafe { ffi::rd_listing(self.raw.as_ptr(), start, end, pcode.into(), &mut out, err, len) != 0 })?;
+        let text = unsafe { CStr::from_ptr(out) }.to_string_lossy();
+        let mut instructions: Vec<Instruction> = Vec::new();
+        for line in text.lines() {
+            if let Some(operation) = line.strip_prefix('\t') {
+                instructions.last_mut().context("p-code before an instruction")?.pcode.push(operation.to_string());
+                continue;
+            }
+            let mut fields = line.splitn(3, '\t');
+            let mut hex = || Ok::<u64, anyhow::Error>(u64::from_str_radix(fields.next().context("short listing line")?, 16)?);
+            let (addr, len) = (hex()?, hex()?);
+            instructions.push(Instruction { addr, len, text: fields.next().unwrap_or_default().to_string(), pcode: Vec::new() });
+        }
+        Ok(instructions)
+    }
+
+    /// Declares a global variable `name` at `addr`, of the C type `type_name` if one is given.
+    /// Replaces what was declared there before.
+    pub fn add_global(&mut self, addr: u64, name: &str, type_name: Option<&str>) -> Result<()> {
+        let (name, type_name) = (CString::new(name)?, CString::new(type_name.unwrap_or_default())?);
+        check(|err, len| unsafe { ffi::rd_add_global(self.raw.as_ptr(), addr, name.as_ptr(), type_name.as_ptr(), err, len) != 0 })
+    }
+
+    /// Describes a data type the session knows: its size, and the fields of a struct or union
+    /// with their offsets, or the values of an enum.
+    pub fn type_layout(&mut self, name: &str) -> Result<String> {
+        let name = CString::new(name)?;
+        let mut out = std::ptr::null();
+        check(|err, len| unsafe { ffi::rd_type_layout(self.raw.as_ptr(), name.as_ptr(), &mut out, err, len) != 0 })?;
+        Ok(unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned())
+    }
+
     /// Hands recore's jump tables to the decompiler as overrides. Call before decompiling.
     pub fn override_jump_tables(&mut self, analysis: &Analysis, facts: &Facts) -> Result<()> {
         for &(function, index) in &facts.jump_tables {
@@ -398,7 +455,9 @@ impl Session {
                     JumpTable { jump, targets: table.to_vec() }
                 })
                 .collect();
+            let flow = text(out.flow);
             Ok(Decompiled {
+                flow: if flow.is_empty() { None } else { Some(Flow::parse(&flow)?) },
                 c_text: text(out.c_text),
                 params,
                 return_type: text(out.return_type),

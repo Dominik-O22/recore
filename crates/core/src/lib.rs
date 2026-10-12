@@ -6,7 +6,9 @@
 pub mod analysis;
 pub mod arch;
 pub mod arm64;
+pub mod cfg;
 pub mod discover;
+pub mod edits;
 pub mod image;
 pub mod jumptable;
 pub mod names;

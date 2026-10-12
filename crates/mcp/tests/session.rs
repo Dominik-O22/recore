@@ -1,6 +1,8 @@
 //! The server as a client sees it: spawned, and spoken to over its stdin and stdout.
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
@@ -16,9 +18,20 @@ struct Client {
     next_id: u64,
 }
 
+/// A directory of its own for a server's edits, so that no test writes to the user's.
+fn edits_dir() -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    std::env::temp_dir().join(format!("recore-mcp-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)))
+}
+
 impl Client {
     fn start() -> Client {
-        let mut child = Command::new(SERVER).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        Client::start_in(&edits_dir())
+    }
+
+    /// Starts a server that keeps its edits in `edits`.
+    fn start_in(edits: &Path) -> Client {
+        let mut child = Command::new(SERVER).env(recore::edits::DIR_VAR, edits).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Client { child, stdin, stdout, next_id: 0 }
@@ -76,7 +89,10 @@ fn speaks_the_protocol() {
 
     let tools = client.request("tools/list", json!({}));
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["summary", "strings", "imports", "functions", "function", "xrefs", "decompile", "bytes", "classes", "addr"]);
+    assert_eq!(
+        names,
+        ["summary", "strings", "imports", "functions", "function", "xrefs", "decompile", "bytes", "classes", "addr", "disassemble", "pcode", "trace", "symbols", "rename", "comment", "declare", "type"]
+    );
 
     assert_eq!(client.request("resources/list", json!({}))["error"]["code"], -32601);
     assert_eq!(client.request("tools/call", json!({ "name": "nope" }))["error"]["code"], -32602);
@@ -125,4 +141,28 @@ fn decompiling_survives_a_timeout_and_a_dead_child() {
     assert!(Command::new("pkill").args(["-KILL", "-P", &server]).status().unwrap().success());
     std::thread::sleep(Duration::from_millis(200));
     assert!(decompile(&mut client, 60.0).unwrap().contains('{'));
+}
+
+#[test]
+fn edits_reach_every_view_and_outlive_the_server() {
+    let edits = edits_dir();
+    let mut client = Client::start_in(&edits);
+    let entry = client.entry();
+    client.tool("rename", json!({ "addr": entry, "name": "program_start" })).unwrap();
+    client.tool("comment", json!({ "addr": entry, "text": "where the loader hands over" })).unwrap();
+    client.tool("declare", json!({ "code": "struct Pair { int4 left; int8 right; };" })).unwrap();
+    assert!(client.tool("declare", json!({ "code": "struct Bad { nosuchtype x; };" })).unwrap_err().contains("does not take this declaration"));
+
+    let listing = client.tool("disassemble", json!({ "function": "program_start", "count": 4 })).unwrap();
+    assert!(listing.starts_with(&format!("function {entry}(program_start):")), "{listing}");
+    assert!(listing.contains("// where the loader hands over"), "{listing}");
+    let c_text = client.tool("decompile", json!({ "functions": ["program_start"], "timeout": 60.0 })).unwrap();
+    assert!(c_text.contains("program_start("), "{c_text}");
+    assert_eq!(client.tool("type", json!({ "name": "Pair" })).unwrap(), "struct Pair, 16 bytes, alignment 8\n  +0x0 int4 left (4 bytes)\n  +0x8 int8 right (8 bytes)\n");
+
+    // A new server finds the edits; one that keeps its edits elsewhere does not.
+    drop(client);
+    let function = Client::start_in(&edits).tool("function", json!({ "name": "program_start" })).unwrap();
+    assert!(function.starts_with(&format!("function {entry}(program_start):")), "{function}");
+    assert!(Client::start().tool("function", json!({ "name": "program_start" })).unwrap_err().contains("no function is named"));
 }

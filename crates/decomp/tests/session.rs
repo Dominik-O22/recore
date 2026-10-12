@@ -96,3 +96,32 @@ fn archive_prototypes_parse() {
     }
     assert!(rejected.len() * 200 < declarations.len(), "{} of {} rejected, such as {:?}", rejected.len(), declarations.len(), &rejected[..rejected.len().min(5)]);
 }
+
+#[test]
+fn lists_instructions_with_their_pcode() {
+    // lea eax, [rdi+rsi]; ret; then a byte that starts no instruction in 64-bit mode.
+    let listing = session(&[0x8d, 0x04, 0x37, 0xc3, 0x06]).listing(0x1000, 0x1005, true).unwrap();
+    let lines: Vec<(u64, u64, &str)> = listing.iter().map(|i| (i.addr, i.len, i.text.as_str())).collect();
+    assert_eq!(lines, [(0x1000, 3, "LEA EAX,[RDI + RSI*0x1]"), (0x1003, 1, "RET"), (0x1004, 1, "(bad)")]);
+    assert_eq!(listing[1].pcode, ["RIP = LOAD ram, RSP", "RSP = INT_ADD RSP, 0x8", "RETURN RIP"]);
+}
+
+#[test]
+fn data_flow_links_the_return_value_to_the_parameters() {
+    use recore_decomp::flow::Kind;
+    // lea eax, [rdi+rsi]; ret
+    let mut session = session(&[0x8d, 0x04, 0x37, 0xc3]);
+    session.keep_flow(true);
+    let flow = session.decompile(0x1000).unwrap().flow.unwrap();
+    let returned = flow.ops.iter().find(|op| op.code == "RETURN").unwrap().inputs[0];
+    // The sum is copied into the return register.
+    let copy = flow.definition(returned).unwrap();
+    assert_eq!(copy.code, "COPY");
+    let sum = flow.definition(copy.inputs[0]).unwrap();
+    assert_eq!(sum.code, "INT_ADD");
+    let parameters: Vec<usize> = sum.inputs.iter().map(|id| match &flow.values[id].kind {
+        Kind::Param { index, .. } => *index,
+        other => panic!("{other:?}"),
+    }).collect();
+    assert_eq!(parameters, [0, 1]);
+}

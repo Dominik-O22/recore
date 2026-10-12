@@ -19,7 +19,9 @@ use recore::image::{Format, Machine};
 use recore::report::{Analysis, CallTarget};
 use serde::{Deserialize, Serialize};
 
-use crate::{Facts, Session, Style};
+use recore::edits::Edits;
+
+use crate::{Facts, Flow, Instruction, Session, Style};
 
 /// Where switch targets come from.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -99,38 +101,28 @@ enum Event {
     Done { record: FunctionRecord, c_text: Option<String> },
     /// The functions a function calls whose parameters the session does not hold yet.
     Callees(Vec<u64>),
+    Listing(Result<Vec<Instruction>, String>),
+    Flow(Result<Flow, String>),
+    /// The answer to [`Request::Declare`], empty, or to [`Request::Type`].
+    Text(Result<String, String>),
 }
 
-/// One line of a worker's stdin: a letter and a hex address.
-#[derive(Clone, Copy)]
+/// One line of a worker's stdin.
+#[derive(Serialize, Deserialize, Clone)]
 enum Request {
-    /// `d`: decompile the function.
     Decompile(u64),
-    /// `p`: decompile it for its parameters only, which the session keeps for its callers.
+    /// Decompile the function for its parameters only, which the session keeps for its callers.
     Parameters(u64),
-    /// `c`: list its callees not decompiled yet.
+    /// List the function's callees not decompiled yet.
     Callees(u64),
-}
-
-impl Request {
-    fn line(self) -> String {
-        match self {
-            Request::Decompile(addr) => format!("d {addr:x}"),
-            Request::Parameters(addr) => format!("p {addr:x}"),
-            Request::Callees(addr) => format!("c {addr:x}"),
-        }
-    }
-
-    fn parse(line: &str) -> Result<Request> {
-        let (kind, addr) = line.split_once(' ').context("request without an address")?;
-        let addr = u64::from_str_radix(addr, 16)?;
-        match kind {
-            "d" => Ok(Request::Decompile(addr)),
-            "p" => Ok(Request::Parameters(addr)),
-            "c" => Ok(Request::Callees(addr)),
-            _ => anyhow::bail!("unknown request {kind}"),
-        }
-    }
+    /// Disassemble `[start, end)`.
+    Listing { start: u64, end: u64, pcode: bool },
+    /// Decompile the function for its data flow.
+    Flow(u64),
+    /// Parse a C declaration, to learn whether the engine takes it.
+    Declare(String),
+    /// Describe a data type.
+    Type(String),
 }
 
 /// Callees with more code than this, in bytes, are not decompiled ahead of their callers. The few
@@ -147,12 +139,14 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
 
     let image = recore::Image::load(binary)?;
     // The engine reads its language files while the analysis runs.
-    let (session, analysis) = std::thread::scope(|scope| {
+    let (session, mut analysis) = std::thread::scope(|scope| {
         let session = scope.spawn(|| Session::load(&image));
         let analysis = recore::analyze(&image);
         (session.join().expect("loading does not panic"), analysis)
     });
     let mut session = session?;
+    let edits = Edits::load(binary)?;
+    edits.apply(&mut analysis);
     session.add_imports(&image, &analysis)?;
     let facts = Facts::derive(&image, &analysis);
     session.add_functions(&facts)?;
@@ -160,6 +154,19 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     session.add_classes(&analysis)?;
     if options.jump_tables == JumpTables::Recore || (options.jump_tables == JumpTables::Auto && image.format == Format::Pe) {
         session.override_jump_tables(&analysis, &facts)?;
+    }
+
+    // Each edit was accepted by a session when it was made. One that no longer is, after a
+    // change to an earlier declaration, is reported and costs only itself.
+    for declaration in &edits.declarations {
+        if let Err(error) = session.declare(declaration) {
+            eprintln!("declaration `{declaration}`: {error}");
+        }
+    }
+    for (addr, name, kind) in edits.globals(&analysis) {
+        if let Err(error) = session.add_global(addr, &name, kind) {
+            eprintln!("global {name} at {addr:#x}: {error}");
+        }
     }
 
     session.set_style(options.style)?;
@@ -184,22 +191,42 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     };
     send(&Event::Ready)?;
     for line in std::io::stdin().lock().lines() {
-        let request = Request::parse(&line?)?;
+        let request: Request = serde_json::from_str(&line?)?;
         let unknown = |addr: u64| {
             let mut pending: Vec<u64> = callees.get(&addr).into_iter().flatten().copied().filter(|callee| !known.contains(callee) && sizes.get(callee).is_some_and(|&size| size <= CALLEE_LIMIT)).collect();
             pending.sort_unstable();
             pending.dedup();
             pending
         };
+        let text = |result: Result<String>| Event::Text(result.map_err(|error| error.to_string()));
         let addr = match request {
             Request::Callees(addr) => {
                 // A function ready to be handed over has nothing left to wait for.
                 send(&Event::Callees(if ready.contains_key(&addr) { Vec::new() } else { unknown(addr) }))?;
                 continue;
             }
+            Request::Listing { start, end, pcode } => {
+                send(&Event::Listing(session.listing(start, end, pcode).map_err(|error| error.to_string())))?;
+                continue;
+            }
+            Request::Flow(addr) => {
+                session.keep_flow(true);
+                let flow = session.decompile(addr).map(|function| function.flow.unwrap_or_default());
+                session.keep_flow(false);
+                send(&Event::Flow(flow.map_err(|error| error.to_string())))?;
+                continue;
+            }
+            Request::Declare(ref declaration) => {
+                send(&text(session.declare(declaration).map(|()| String::new())))?;
+                continue;
+            }
+            Request::Type(ref name) => {
+                send(&text(session.type_layout(name)))?;
+                continue;
+            }
             Request::Decompile(addr) | Request::Parameters(addr) => addr,
         };
-        if let (Request::Decompile(_), Some(event)) = (request, ready.remove(&addr)) {
+        if let (Request::Decompile(_), Some(event)) = (&request, ready.remove(&addr)) {
             send(&event)?;
             continue;
         }
@@ -323,7 +350,7 @@ impl Process {
     fn ask(&mut self, request: Request, timeout: Duration) -> Result<Event, Failure> {
         self.wait_ready()?;
         // A failed write means the child is gone, which the receive below reports.
-        let _ = writeln!(self.stdin, "{}", request.line()).and_then(|()| self.stdin.flush());
+        let _ = writeln!(self.stdin, "{}", serde_json::to_string(&request).expect("plain data")).and_then(|()| self.stdin.flush());
         match self.events.recv_timeout(timeout) {
             Ok(Event::Ready) | Err(RecvTimeoutError::Disconnected) => Err(Failure { status: Status::Crash, message: self.end(false) }),
             Ok(event) => Ok(event),
@@ -352,6 +379,14 @@ impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Why a request got no answer of the kind it asks for.
+fn unexpected(answer: Result<Event, Failure>) -> String {
+    match answer {
+        Ok(_) => "the decompiler process answered something else".into(),
+        Err(failure) => format!("the decompiler process failed and was replaced: {}", failure.message),
     }
 }
 
@@ -384,6 +419,25 @@ impl Worker {
     /// With [`Options::callees_first`] the function's callees are decompiled before it, each
     /// within `timeout` of its own.
     pub fn decompile(&mut self, addr: u64, timeout: Duration) -> (FunctionRecord, Option<String>) {
+        let ahead = self.callees_first(addr, timeout);
+        let start = Instant::now();
+        let mut result = self.ask(Request::Decompile(addr), timeout);
+        if result.is_err() && ahead > 0 {
+            // Known parameters at its calls can send a function astray that decompiles well
+            // without them. The new child knows none.
+            result = self.ask(Request::Decompile(addr), timeout);
+        }
+        match result {
+            Ok(Event::Done { record, c_text }) => (record, c_text),
+            Ok(_) => (FunctionRecord::failed(addr, Status::Crash, "worker answered something else".into(), 0.0), None),
+            Err(failure) => (FunctionRecord::failed(addr, failure.status, failure.message, start.elapsed().as_secs_f64() * 1e3), None),
+        }
+    }
+
+    /// With [`Options::callees_first`], decompiles the callees of the function at `addr` whose
+    /// parameters the child does not hold yet, each within `timeout`. Returns how many it did
+    /// since the child last started.
+    fn callees_first(&mut self, addr: u64, timeout: Duration) -> usize {
         let mut ahead = 0;
         if self.options.callees_first
             && let Ok(Event::Callees(callees)) = self.ask(Request::Callees(addr), timeout)
@@ -402,18 +456,46 @@ impl Worker {
                 }
             }
         }
-        let start = Instant::now();
-        let mut result = self.ask(Request::Decompile(addr), timeout);
-        if result.is_err() && ahead > 0 {
-            // Known parameters at its calls can send a function astray that decompiles well
-            // without them. The new child knows none.
-            result = self.ask(Request::Decompile(addr), timeout);
+        ahead
+    }
+
+    /// Disassembles `[start, end)`, with raw p-code per instruction if `pcode`.
+    pub fn listing(&mut self, start: u64, end: u64, pcode: bool, timeout: Duration) -> Result<Vec<Instruction>, String> {
+        match self.ask(Request::Listing { start, end, pcode }, timeout) {
+            Ok(Event::Listing(listing)) => listing,
+            other => Err(unexpected(other)),
         }
-        match result {
-            Ok(Event::Done { record, c_text }) => (record, c_text),
-            Ok(_) => (FunctionRecord::failed(addr, Status::Crash, "worker answered something else".into(), 0.0), None),
-            Err(failure) => (FunctionRecord::failed(addr, failure.status, failure.message, start.elapsed().as_secs_f64() * 1e3), None),
+    }
+
+    /// The data flow of the function at `addr`, which costs one decompilation.
+    pub fn flow(&mut self, addr: u64, timeout: Duration) -> Result<Flow, String> {
+        self.callees_first(addr, timeout);
+        match self.ask(Request::Flow(addr), timeout) {
+            Ok(Event::Flow(flow)) => flow,
+            other => Err(unexpected(other)),
         }
+    }
+
+    /// Checks that the engine takes a C declaration. The child's session keeps it, but only a
+    /// declaration among the binary's edits is there again after [`Worker::restart`].
+    pub fn declare(&mut self, declaration: &str, timeout: Duration) -> Result<(), String> {
+        match self.ask(Request::Declare(declaration.to_string()), timeout) {
+            Ok(Event::Text(result)) => result.map(drop),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Describes a data type: see [`Session::type_layout`].
+    pub fn type_layout(&mut self, name: &str, timeout: Duration) -> Result<String, String> {
+        match self.ask(Request::Type(name.to_string()), timeout) {
+            Ok(Event::Text(result)) => result,
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Replaces the child with a new one, which reads the binary's edits as they are now.
+    pub fn restart(&mut self) {
+        self.process = Process::start((self.command)()).ok();
     }
 
     /// Waits until a child is set up, so that what is timed next is the decompiler alone.

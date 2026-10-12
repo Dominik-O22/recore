@@ -8,7 +8,9 @@ use crate::binary::Cache;
 use crate::tools;
 
 /// Options whose value is a number. Everything else, addresses included, stays text.
-const NUMERIC: [&str; 3] = ["limit", "len", "timeout"];
+const NUMERIC: [&str; 7] = ["limit", "len", "timeout", "count", "param", "arg", "depth"];
+/// Options that are on or off.
+const FLAGS: [&str; 2] = ["pcode", "returns"];
 
 pub fn usage() -> String {
     let mut text = String::from(
@@ -35,6 +37,10 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
             plain.push(argument.as_str());
             continue;
         };
+        if FLAGS.contains(&key) {
+            named.insert(key.to_string(), json!(true));
+            continue;
+        }
         let Some(value) = rest.next() else { bail!("--{key} needs a value") };
         let number = || value.parse::<u64>().map(Value::from).or_else(|_| value.parse::<f64>().map(Value::from));
         let value = if NUMERIC.contains(&key) { number()? } else { json!(value) };
@@ -43,7 +49,22 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
     match (tool, plain.as_slice()) {
         (_, []) => {}
         ("decompile", functions) => drop(named.insert("functions".into(), json!(functions))),
-        ("strings" | "imports" | "functions" | "classes", [pattern]) => drop(named.insert("pattern".into(), json!(pattern))),
+        ("strings" | "imports" | "functions" | "classes" | "symbols", [pattern]) => drop(named.insert("pattern".into(), json!(pattern))),
+        ("disassemble" | "pcode" | "trace", [function]) => drop(named.insert("function".into(), json!(function))),
+        ("rename", [addr, name]) => {
+            named.insert("addr".into(), json!(addr));
+            named.insert("name".into(), json!(name));
+        }
+        ("comment", [addr, text]) => {
+            named.insert("addr".into(), json!(addr));
+            named.insert("text".into(), json!(text));
+        }
+        ("declare", [code]) => drop(named.insert("code".into(), json!(code))),
+        ("declare", [addr, kind]) => {
+            named.insert("addr".into(), json!(addr));
+            named.insert("type".into(), json!(kind));
+        }
+        ("type", [name]) => drop(named.insert("name".into(), json!(name))),
         // `add` is a name and a hex number; a function called that needs `--name add`.
         ("function", [which]) => drop(named.insert(if parse_addr(which).is_some() { "addr" } else { "name" }.into(), json!(which))),
         ("xrefs" | "addr", [addr]) => drop(named.insert("addr".into(), json!(addr))),
