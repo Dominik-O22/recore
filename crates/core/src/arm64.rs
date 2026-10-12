@@ -114,7 +114,16 @@ impl Insn {
         // that also move the base, of which the one that moves it afterwards reads at the base.
         let signed_offset = sign_extend(self.word >> 12 & 0x1FF, 9) as u64;
         match (self.word & 0x3B20_0000 == 0x3800_0000, self.word >> 10 & 3) {
-            (true, 0b00 | 0b11) => Some(signed_offset),
+            (true, 0b00 | 0b11) => return Some(signed_offset),
+            (true, 0b01) => return Some(0),
+            _ => {}
+        }
+        // A pair of registers loaded or stored at once (`ldp`, `stp`): a signed seven-bit
+        // offset scaled by the width of one register.
+        let pair_scale = 2 + (self.word >> 30) - u32::from(self.word >> 26 & 1 == 0 && self.word >> 31 == 1);
+        let pair_offset = (sign_extend(self.word >> 15 & 0x7F, 7) << pair_scale) as u64;
+        match (self.word & 0x3A00_0000 == 0x2800_0000, self.word >> 23 & 3) {
+            (true, 0b10 | 0b11) => Some(pair_offset),
             (true, 0b01) => Some(0),
             _ => None,
         }
@@ -546,5 +555,16 @@ mod tests {
             Arm64::step(&mut state, &insn);
         }
         assert_eq!(referred, [None, Some(0x5010)]);
+    }
+
+    #[test]
+    fn offsets_of_the_other_addressing_forms_are_read() {
+        let offset = |word: u32| Insn { word, addr: 0 }.access_offset().map(|offset| offset as i64);
+        // ldur x0, [x1, #-0x8]; ldr x0, [x1], #0x8; strb w1, [x3, #-0x1]!
+        assert_eq!([offset(0xF85F_8020), offset(0xF840_8420), offset(0x381F_FC61)], [Some(-8), Some(0), Some(-1)]);
+        // stp xzr, xzr, [x3, #0x10]; stp wzr, wzr, [x19, #0x4]; stp q21, q21, [x24, #0xc0]
+        assert_eq!([offset(0xA901_7C7F), offset(0x2900_FE7F), offset(0xAD06_5715)], [Some(0x10), Some(4), Some(0xc0)]);
+        // add x1, x1, #0x20 reads nothing.
+        assert_eq!(offset(0x9100_8021), None);
     }
 }
