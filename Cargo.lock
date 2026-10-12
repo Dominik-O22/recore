@@ -556,6 +556,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "recore-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "recore",
+ "recore-decomp",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"

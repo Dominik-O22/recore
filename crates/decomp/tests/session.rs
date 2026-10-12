@@ -1,6 +1,6 @@
 //! Sessions over hand-assembled code, so the tests need no corpus binary.
 
-use recore_decomp::{Section, Session, Target, vendored_spec_dir};
+use recore_decomp::{Facts, Section, Session, Target, vendored_spec_dir};
 
 fn session(code: &[u8]) -> Session {
     Session::new(&vendored_spec_dir(), Target::X86_64Gcc, &[Section { addr: 0x1000, data: code, readonly: true, code: true }]).unwrap()
@@ -38,6 +38,23 @@ fn flow_stops_at_another_function() {
     informed.add_function(0x1005, false).unwrap();
     assert!(informed.decompile(0x1000).unwrap().bad_data);
     assert!(!informed.decompile(0x1005).unwrap().bad_data);
+}
+
+#[test]
+fn flow_passes_an_entry_inside_the_functions_own_range() {
+    // 0x1000: mov eax, 1. 0x1005: add eax, 2; ret. Both addresses are declared functions, and
+    // the first one's extent covers the second, as when two functions share an exit.
+    let code = [0xb8, 0x01, 0x00, 0x00, 0x00, 0x83, 0xc0, 0x02, 0xc3];
+    let declared = Facts { functions: vec![(0x1000, false), (0x1005, false)], ..Facts::default() };
+    let mut hidden = session(&code);
+    hidden.add_functions(&declared).unwrap();
+    assert!(hidden.decompile(0x1000).unwrap().bad_data);
+
+    let mut allowed = session(&code);
+    allowed.add_functions(&Facts { own_entries: vec![(0x1000, 0x1005)], ..declared }).unwrap();
+    let function = allowed.decompile(0x1000).unwrap();
+    assert!(!function.bad_data);
+    assert!(function.c_text.contains("return 3"), "{}", function.c_text);
 }
 
 #[test]

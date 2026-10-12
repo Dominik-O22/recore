@@ -1,0 +1,11 @@
+[package]
+name = "recore-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+recore = { version = "0.1.0", path = "../core" }
+recore-decomp = { version = "0.1.0", path = "../decomp" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

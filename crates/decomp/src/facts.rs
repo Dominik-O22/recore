@@ -15,7 +15,8 @@ pub struct Facts {
     /// out: they are reached by jumps, never called, and a declared entry stops flow from other
     /// functions.
     pub functions: Vec<(u64, bool)>,
-    /// Names the image carries for functions, demangled.
+    /// Names the image carries for functions, demangled. Naming declares, so fragments are left
+    /// out here too.
     pub names: Vec<(u64, String)>,
     /// `(address, slot)`: code that only forwards to the import behind `slot`. These are PLT
     /// stubs, which recore does not list as functions, and import thunks, which it does.
@@ -39,7 +40,7 @@ impl Facts {
     pub fn derive(image: &Image, analysis: &Analysis) -> Facts {
         let mut facts = Facts {
             functions: analysis.functions.iter().filter(|f| f.fragment_of.is_none()).map(|f| (f.addr, f.noreturn)).collect(),
-            names: analysis.functions.iter().filter_map(|f| Some((f.addr, f.name.clone()?))).collect(),
+            names: analysis.functions.iter().filter(|f| f.fragment_of.is_none()).filter_map(|f| Some((f.addr, f.name.clone()?))).collect(),
             ..Facts::default()
         };
         let mut entries: Vec<u64> = facts.functions.iter().map(|f| f.0).collect();

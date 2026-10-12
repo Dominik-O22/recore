@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use recore::image::Format;
 use serde::{Deserialize, Serialize};
 
@@ -152,12 +152,23 @@ pub struct Worker {
     stdin: ChildStdin,
     events: Receiver<Event>,
     stderr: Option<JoinHandle<String>>,
+    /// The child has reported that its session is set up.
+    ready: bool,
 }
 
 impl Worker {
-    /// Starts a worker. `command` must run a program that ends up calling [`serve`] with the
-    /// two arguments appended here: the binary's path and the options as JSON.
-    pub fn spawn(mut command: Command, binary: &Path, options: &Options) -> Result<Worker> {
+    /// Starts a worker and waits until its session is set up. `command` must run a program that
+    /// ends up calling [`serve`] with the two arguments appended here: the binary's path and
+    /// the options as JSON.
+    pub fn spawn(command: Command, binary: &Path, options: &Options) -> Result<Worker> {
+        let mut worker = Worker::start(command, binary, options)?;
+        worker.wait_ready().map_err(|message| anyhow::anyhow!("worker stopped during setup: {message}"))?;
+        Ok(worker)
+    }
+
+    /// Starts a worker without waiting for it, so that it sets up while the caller does other
+    /// work. The first [`Worker::decompile`] waits for whatever setup is left.
+    pub fn start(mut command: Command, binary: &Path, options: &Options) -> Result<Worker> {
         command.arg(binary).arg(serde_json::to_string(options)?);
         let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("spawning worker")?;
         let stdin = child.stdin.take().expect("piped");
@@ -179,29 +190,49 @@ impl Worker {
             let _ = stderr.read_to_string(&mut text);
             text
         });
-        let mut worker = Worker { child, stdin, events, stderr: Some(drain) };
-        match worker.events.recv_timeout(SETUP_LIMIT) {
-            Ok(Event::Ready) => Ok(worker),
-            Ok(Event::Done { .. }) => bail!("worker answered before it was asked"),
-            Err(error) => bail!("worker stopped during setup: {}", worker.end(error == RecvTimeoutError::Timeout)),
+        Ok(Worker { child, stdin, events, stderr: Some(drain), ready: false })
+    }
+
+    /// Waits for the child to finish setting up. On failure the child is gone and the error
+    /// says how it ended.
+    fn wait_ready(&mut self) -> Result<(), String> {
+        if self.ready {
+            return Ok(());
         }
+        match self.events.recv_timeout(SETUP_LIMIT) {
+            Ok(Event::Ready) => {
+                self.ready = true;
+                Ok(())
+            }
+            Ok(Event::Done { .. }) => Err("worker answered before it was asked".into()),
+            Err(error) => Err(self.end(error == RecvTimeoutError::Timeout)),
+        }
+    }
+
+    /// Whether the child is still running. A worker kept between requests can die while idle,
+    /// and asking it for a function would then blame that function.
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
     }
 
     /// Decompiles one function. If the worker dies or exceeds `timeout`, the record says so
     /// and the worker is gone: `Err` hands back that record, and the caller starts a new worker
-    /// for whatever comes next.
+    /// for whatever comes next. Setup still under way does not count towards `timeout`.
     pub fn decompile(&mut self, addr: u64, timeout: Duration) -> Result<(FunctionRecord, Option<String>), FunctionRecord> {
+        let start = Instant::now();
+        let failed = |status, message, start: Instant| FunctionRecord::failed(addr, status, message, start.elapsed().as_secs_f64() * 1e3);
+        if let Err(message) = self.wait_ready() {
+            return Err(failed(Status::Crash, format!("worker stopped during setup: {message}"), start));
+        }
         let start = Instant::now();
         // A failed write means the child is gone, which the receive below reports.
         let _ = writeln!(self.stdin, "{addr:x}").and_then(|()| self.stdin.flush());
-        let lost = match self.events.recv_timeout(timeout) {
-            Ok(Event::Done { record, c_text }) => return Ok((record, c_text)),
-            Ok(Event::Ready) | Err(RecvTimeoutError::Disconnected) => false,
-            Err(RecvTimeoutError::Timeout) => true,
-        };
-        let status = if lost { Status::Timeout } else { Status::Crash };
-        let message = if lost { format!("no result after {timeout:.0?}") } else { self.end(false) };
-        Err(FunctionRecord::failed(addr, status, message, start.elapsed().as_secs_f64() * 1e3))
+        match self.events.recv_timeout(timeout) {
+            Ok(Event::Done { record, c_text }) => Ok((record, c_text)),
+            Ok(Event::Ready) | Err(RecvTimeoutError::Disconnected) => Err(failed(Status::Crash, self.end(false), start)),
+            // The child is still busy; dropping this worker kills it.
+            Err(RecvTimeoutError::Timeout) => Err(failed(Status::Timeout, format!("no result after {timeout:.0?}"), start)),
+        }
     }
 
     /// Kills the child if it is still running and describes how it ended.
