@@ -12,6 +12,7 @@ pub mod jumptable;
 pub mod names;
 pub mod noreturn;
 pub mod pe;
+pub mod program;
 pub mod report;
 pub mod signature;
 pub mod strings;

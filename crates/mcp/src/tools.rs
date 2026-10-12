@@ -7,13 +7,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use recore::image::{Format, Machine};
+use recore::program::{Program, matches, parse_addr};
 use recore::report::CallTarget;
 use recore_decomp::isolate::Status;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::binary::{Binary, Cache, matches, parse_addr};
+use crate::binary::{Binary, Cache};
 
 /// Rows a listing shows unless the caller sets `limit`.
 const DEFAULT_LIMIT: usize = 100;
@@ -127,7 +128,7 @@ fn labels(binary: &Binary, entries: &BTreeSet<u64>) -> String {
     if entries.is_empty() {
         return "none".into();
     }
-    let mut line = entries.iter().take(USERS_SHOWN).map(|&entry| binary.label(entry)).collect::<Vec<_>>().join(" ");
+    let mut line = entries.iter().take(USERS_SHOWN).map(|&entry| binary.program.label(entry)).collect::<Vec<_>>().join(" ");
     if entries.len() > USERS_SHOWN {
         write!(line, " (+{} more)", entries.len() - USERS_SHOWN).unwrap();
     }
@@ -136,17 +137,17 @@ fn labels(binary: &Binary, entries: &BTreeSet<u64>) -> String {
 
 /// What lies at a data address, as far as the analysis knows.
 fn describe(binary: &Binary, addr: u64) -> String {
-    if let Some(string) = binary.string_at(addr) {
+    if let Some(string) = binary.program.string_at(addr) {
         return format!("string {}", quoted(&string.text));
     }
-    if let Some(name) = binary.import_name(addr) {
+    if let Some(name) = binary.program.import_name(addr) {
         return format!("import slot of {name}");
     }
-    if binary.function(addr).is_some() {
-        return format!("function {}", binary.label(addr));
+    if binary.program.function(addr).is_some() {
+        return format!("function {}", binary.program.label(addr));
     }
-    match binary.image.section_at(addr) {
-        Some(section) if section.executable => format!("code in {}", binary.site_label(addr)),
+    match binary.program.image.section_at(addr) {
+        Some(section) if section.executable => format!("code in {}", binary.program.site_label(addr)),
         Some(section) => section.name.clone(),
         None => "not in the file (uninitialized data or unmapped)".into(),
     }
@@ -156,7 +157,7 @@ fn describe(binary: &Binary, addr: u64) -> String {
 struct Summary {}
 
 fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
-    let Binary { image, analysis, .. } = &*binary;
+    let Program { image, analysis, .. } = &binary.program;
     let format = match image.format {
         Format::Elf => "ELF",
         Format::Pe => "PE",
@@ -171,8 +172,8 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
     writeln!(
         out,
         "{} functions ({} never return), {} instructions, {} calls, {} imports, {} strings, {} jump tables",
-        binary.functions().count(),
-        binary.functions().filter(|f| f.noreturn).count(),
+        binary.program.functions().count(),
+        binary.program.functions().filter(|f| f.noreturn).count(),
         analysis.instructions,
         analysis.calls.len(),
         analysis.imports.len(),
@@ -195,12 +196,12 @@ struct Strings {
 }
 
 fn strings(binary: &mut Binary, args: Strings) -> Result<String> {
-    let found: Vec<_> = binary.analysis.strings.iter().filter(|s| matches(&s.text, args.pattern.as_deref())).collect();
+    let found: Vec<_> = binary.program.analysis.strings.iter().filter(|s| matches(&s.text, args.pattern.as_deref())).collect();
     let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
     let mut out = String::new();
     writeln!(out, "{} strings{}", found.len(), if found.len() > limit { format!(", first {limit} shown") } else { String::new() })?;
     for string in found.iter().take(limit) {
-        let users = binary.users(binary.refs_to(string.addr).map(|r| r.from));
+        let users = binary.program.users(binary.program.refs_to(string.addr).map(|r| r.from));
         // A string no instruction refers to is reached through a pointer in data, which `xrefs` shows.
         writeln!(out, "{:#x} {}{} used by: {}", string.addr, quoted(&string.text), if string.wide { " (UTF-16)" } else { "" }, labels(binary, &users))?;
     }
@@ -213,11 +214,11 @@ struct Imports {
 }
 
 fn imports(binary: &mut Binary, args: Imports) -> Result<String> {
-    let found: Vec<_> = binary.analysis.imports.iter().filter(|i| matches(&i.name, args.pattern.as_deref())).collect();
+    let found: Vec<_> = binary.program.analysis.imports.iter().filter(|i| matches(&i.name, args.pattern.as_deref())).collect();
     let mut out = String::new();
     writeln!(out, "{} imports", found.len())?;
     for import in found {
-        let callers = binary.users(binary.calls_to(import.slot).map(|call| call.at));
+        let callers = binary.program.users(binary.program.calls_to(import.slot).map(|call| call.at));
         writeln!(out, "{} (slot {:#x}){} called by: {}", import.name, import.slot, if import.noreturn { ", never returns" } else { "" }, labels(binary, &callers))?;
     }
     Ok(out)
@@ -240,10 +241,10 @@ struct Functions {
 }
 
 fn functions(binary: &mut Binary, args: Functions) -> Result<String> {
-    let sizes = binary.sizes();
+    let sizes = binary.program.sizes();
     let size = |entry: u64| sizes.get(&entry).copied().unwrap_or(0);
     // Without a pattern every function is listed; with one, only functions that have a name.
-    let mut found: Vec<_> = binary.functions().filter(|f| args.pattern.is_none() || f.name.as_deref().is_some_and(|name| matches(name, args.pattern.as_deref()))).collect();
+    let mut found: Vec<_> = binary.program.functions().filter(|f| args.pattern.is_none() || f.name.as_deref().is_some_and(|name| matches(name, args.pattern.as_deref()))).collect();
     if let Sort::Size = args.sort {
         found.sort_by_key(|f| std::cmp::Reverse(size(f.addr)));
     }
@@ -252,7 +253,7 @@ fn functions(binary: &mut Binary, args: Functions) -> Result<String> {
     writeln!(out, "{} functions{}", found.len(), if found.len() > limit { format!(", first {limit} shown") } else { String::new() })?;
     writeln!(out, "address size callers name")?;
     for function in found.iter().take(limit) {
-        let callers = binary.users(binary.calls_to(function.addr).map(|call| call.at)).len();
+        let callers = binary.program.users(binary.program.calls_to(function.addr).map(|call| call.at)).len();
         writeln!(out, "{:#x} {} {callers} {}", function.addr, size(function.addr), function.name.as_deref().unwrap_or("-"))?;
     }
     Ok(out)
@@ -266,39 +267,39 @@ struct Function {
 
 fn function(binary: &mut Binary, args: Function) -> Result<String> {
     let entry = match (&args.addr, &args.name) {
-        (Some(addr), None) => binary.function_at(addr_arg(addr)?)?,
-        (None, Some(name)) => binary.function_named(name)?,
+        (Some(addr), None) => binary.program.function_at(addr_arg(addr)?)?,
+        (None, Some(name)) => binary.program.function_named(name)?,
         _ => bail!("`function` needs either `addr` or `name`"),
     };
-    let body = binary.body(entry);
+    let body = binary.program.body(entry);
     let mut out = String::new();
     let extent: Vec<String> = body.iter().map(|(start, end)| format!("{start:#x}-{end:#x}")).collect();
-    let noreturn = binary.function(entry).is_some_and(|f| f.noreturn);
+    let noreturn = binary.program.function(entry).is_some_and(|f| f.noreturn);
     let size: u64 = body.iter().map(|(start, end)| end - start).sum();
-    writeln!(out, "function {}: {size} bytes at {}{}", binary.label(entry), extent.join(" "), if noreturn { ", never returns" } else { "" })?;
+    writeln!(out, "function {}: {size} bytes at {}{}", binary.program.label(entry), extent.join(" "), if noreturn { ", never returns" } else { "" })?;
 
-    let callers = binary.users(binary.calls_to(entry).map(|call| call.at));
+    let callers = binary.program.users(binary.program.calls_to(entry).map(|call| call.at));
     writeln!(out, "called by ({}): {}", callers.len(), labels(binary, &callers))?;
 
     writeln!(out, "calls:")?;
-    for call in body.iter().flat_map(|&(start, end)| binary.calls_in(start, end)) {
+    for call in body.iter().flat_map(|&(start, end)| binary.program.calls_in(start, end)) {
         let target = match call.target {
-            CallTarget::Function(target) => binary.label(target),
-            CallTarget::Import(slot) => binary.import_name(slot).unwrap_or("?").to_string(),
+            CallTarget::Function(target) => binary.program.label(target),
+            CallTarget::Import(slot) => binary.program.import_name(slot).unwrap_or("?").to_string(),
         };
         writeln!(out, "  {:#x} {} {target}", call.at, if call.tail { "tail-calls" } else { "calls" })?;
     }
 
     // Per address referred to: the instructions that read or write it, and those that take it.
     let mut targets: BTreeMap<u64, [Vec<u64>; 2]> = BTreeMap::new();
-    for reference in body.iter().flat_map(|&(start, end)| binary.refs_in(start, end)) {
+    for reference in body.iter().flat_map(|&(start, end)| binary.program.refs_in(start, end)) {
         targets.entry(reference.to).or_default()[usize::from(reference.access)].push(reference.from);
     }
     let sites = |sites: &[u64]| sites.iter().map(|site| format!("{site:#x}")).collect::<Vec<_>>().join(" ");
-    let (strings, globals): (Vec<_>, Vec<_>) = targets.iter().partition(|(addr, _)| binary.string_at(**addr).is_some());
+    let (strings, globals): (Vec<_>, Vec<_>) = targets.iter().partition(|(addr, _)| binary.program.string_at(**addr).is_some());
     writeln!(out, "strings:")?;
     for (addr, [taken, _]) in strings {
-        writeln!(out, "  {addr:#x} {} at {}", quoted(&binary.string_at(*addr).expect("partitioned on it").text), sites(taken))?;
+        writeln!(out, "  {addr:#x} {} at {}", quoted(&binary.program.string_at(*addr).expect("partitioned on it").text), sites(taken))?;
     }
     writeln!(out, "globals:")?;
     for (addr, [taken, accessed]) in globals {
@@ -322,27 +323,27 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
     let mut out = String::new();
     writeln!(out, "{addr:#x}: {}", describe(binary, addr))?;
     let mut count = 0;
-    for call in binary.calls_to(addr) {
-        writeln!(out, "{:#x} in {} {} it", call.at, binary.site_label(call.at), if call.tail { "tail-calls" } else { "calls" })?;
+    for call in binary.program.calls_to(addr) {
+        writeln!(out, "{:#x} in {} {} it", call.at, binary.program.site_label(call.at), if call.tail { "tail-calls" } else { "calls" })?;
         count += 1;
     }
-    for reference in binary.refs_to(addr) {
+    for reference in binary.program.refs_to(addr) {
         let how = if reference.access { "reads or writes it" } else { "takes its address" };
-        writeln!(out, "{:#x} in {} {how}", reference.from, binary.site_label(reference.from))?;
+        writeln!(out, "{:#x} in {} {how}", reference.from, binary.program.site_label(reference.from))?;
         count += 1;
     }
     // Relocated pointers in data: tables of strings, of functions, of methods. Those inside
     // instructions are the references above.
-    for &(slot, _) in binary.image.relative_targets.iter().filter(|&&(_, target)| target == addr) {
-        if let Some(section) = binary.image.section_at(slot).filter(|section| !section.executable) {
+    for &(slot, _) in binary.program.image.relative_targets.iter().filter(|&&(_, target)| target == addr) {
+        if let Some(section) = binary.program.image.section_at(slot).filter(|section| !section.executable) {
             writeln!(out, "{slot:#x} in {} holds a pointer to it", section.name)?;
             count += 1;
         }
     }
     if count == 0 {
         writeln!(out, "nothing refers to it directly")?;
-        if let Some(entry) = binary.owners(addr).first().filter(|&&entry| entry != addr) {
-            writeln!(out, "it is inside function {}; references are recorded to function entries and data addresses", binary.label(*entry))?;
+        if let Some(entry) = binary.program.owners(addr).first().filter(|&&entry| entry != addr) {
+            writeln!(out, "it is inside function {}; references are recorded to function entries and data addresses", binary.program.label(*entry))?;
         }
     }
     Ok(out)
@@ -359,9 +360,9 @@ fn decompile(binary: &mut Binary, args: Decompile) -> Result<String> {
     let timeout = Duration::try_from_secs_f64(args.timeout.unwrap_or(30.0)).map_err(|_| anyhow!("`timeout` must be a positive number of seconds"))?;
     // A name first: `add` is a hex number too. An address in no function is decompiled as it
     // is, for code the analysis did not make a function of.
-    let resolve = |text: &String| match (binary.function_named(text), parse_addr(text)) {
+    let resolve = |text: &String| match (binary.program.function_named(text), parse_addr(text)) {
         (Ok(entry), _) => Ok(entry),
-        (Err(_), Some(addr)) if binary.image.is_code(addr) => Ok(binary.function_at(addr).unwrap_or(addr)),
+        (Err(_), Some(addr)) if binary.program.image.is_code(addr) => Ok(binary.program.function_at(addr).unwrap_or(addr)),
         (Err(_), Some(addr)) => bail!("{addr:#x} is not code"),
         (Err(error), None) => Err(error),
     };
@@ -379,7 +380,7 @@ fn decompile(binary: &mut Binary, args: Decompile) -> Result<String> {
             }
         };
         let (record, c_text) = binary.decompile(entry, timeout);
-        let label = binary.label(entry);
+        let label = binary.program.label(entry);
         match (record.status, c_text) {
             (Status::Ok, Some(text)) => writeln!(out, "// {label} ({:.0} ms)\n{}\n", record.ms, text.trim())?,
             (status, _) => {
@@ -408,7 +409,7 @@ fn bytes(binary: &mut Binary, args: Bytes) -> Result<String> {
     let addr = addr_arg(&args.addr)?;
     let len = args.len.unwrap_or(256);
     ensure!((1..=MAX_BYTES).contains(&len), "`len` must be between 1 and {MAX_BYTES}");
-    let image = &binary.image;
+    let image = &binary.program.image;
     let Some(section) = image.section_at(addr) else {
         let mapped: Vec<String> = image.sections.iter().map(|s| format!("{} {:#x}-{:#x}", s.name, s.addr, s.end())).collect();
         bail!("{addr:#x} has no bytes in the file (unmapped, or data that is only zero-filled at load). Mapped: {}", mapped.join(", "));
