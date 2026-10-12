@@ -14,7 +14,7 @@ use crate::image::{Format, Image, Machine};
 use crate::noreturn::is_noreturn_import;
 use crate::phase;
 use crate::report::{AnalyzedFunction, Analysis, CallSite, CallTarget, DataRef, Import, Origin, StringLiteral};
-use crate::signature::{Signatures, fingerprint};
+use crate::signature::Signatures;
 use crate::strings::string_at;
 use crate::x86::X86;
 
@@ -712,14 +712,14 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     }
 
     // Statically linked library code carries no symbol, but its bytes are the same in every
-    // program that links it. The built-in fingerprints come from Windows builds.
+    // program that links it.
     _phase = phase::scope("fingerprints");
-    if image.format == Format::Pe {
-        let signatures = Signatures::builtin(image.machine);
+    let signatures = Signatures::builtin(image.format, image.machine);
+    if !signatures.is_empty() {
         let recognised: Vec<(u64, &str)> = functions
             .par_iter()
             .filter(|f| !names.contains_key(&f.start))
-            .filter_map(|f| Some((f.start, signatures.name(fingerprint(image, &pointer_slots, f.start, f.end)?)?)))
+            .filter_map(|f| Some((f.start, signatures.recognise(image, &pointer_slots, f.start, f.end)?)))
             .collect();
         names.extend(recognised.into_iter().map(|(addr, name)| (addr, name.to_string())));
     }
