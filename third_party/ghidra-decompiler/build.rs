@@ -24,7 +24,7 @@ fn main() {
         .std("c++11")
         .define("LOCAL_ZLIB", None)
         .files(sources(&cpp, "cc"))
-        .opt_level(2)
+        .opt_level(3)
         .warnings(false)
         .compile("ghidra_decomp");
     // Linked after the engine, which is its only user. NO_GZIP as in Ghidra's own build: the

@@ -10,6 +10,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 ghidra-decompiler-sys = { version = "0.1.0", path = "../../third_party/ghidra-decompiler" }
 gimli = "0.34.0"
 libc = "0.2"
+mimalloc = "0.1"
 object = { version = "0.40.0", features = ["compression"] }
 recore = { version = "0.1.0", path = "../core" }
 serde = { version = "1.0.229", features = ["derive"] }

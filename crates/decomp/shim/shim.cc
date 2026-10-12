@@ -289,6 +289,27 @@ static bool reads_unexplained_register(Funcdata *fd) {
   return false;
 }
 
+// The engine allocates and frees small objects by the million: tree nodes for every varnode and
+// operation. These replace the C++ allocation functions for the whole program with mimalloc,
+// which the Rust side links.
+extern "C" {
+void *mi_malloc(size_t size);
+void mi_free(void *block);
+}
+
+void *operator new(size_t size) {
+  void *block = mi_malloc(size);
+  if (block == nullptr) throw std::bad_alloc();
+  return block;
+}
+void *operator new[](size_t size) { return operator new(size); }
+void *operator new(size_t size, const std::nothrow_t &) noexcept { return mi_malloc(size); }
+void *operator new[](size_t size, const std::nothrow_t &) noexcept { return mi_malloc(size); }
+void operator delete(void *block) noexcept { mi_free(block); }
+void operator delete[](void *block) noexcept { mi_free(block); }
+void operator delete(void *block, size_t) noexcept { mi_free(block); }
+void operator delete[](void *block, size_t) noexcept { mi_free(block); }
+
 extern "C" {
 
 // `spec_dir` holds the .ldefs/.pspec/.cspec/.sla files. The first session fixes it for the

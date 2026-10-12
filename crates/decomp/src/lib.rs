@@ -29,6 +29,10 @@ use recore::report::Analysis;
 
 pub use facts::Facts;
 
+/// The allocator the engine's C++ side is built to use. A program that decompiles a lot does
+/// well to make it the Rust side's too.
+pub use mimalloc::MiMalloc;
+
 /// Bytes mapped at a virtual address.
 pub struct Section<'a> {
     pub addr: u64,

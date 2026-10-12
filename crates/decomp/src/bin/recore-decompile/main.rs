@@ -125,6 +125,9 @@ enum Command {
     Worker { binary: PathBuf, options: String },
 }
 
+#[global_allocator]
+static ALLOCATOR: recore_decomp::MiMalloc = recore_decomp::MiMalloc;
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Corpus { bin_dir, out_dir, jobs, timeout, shard, worker } => {

@@ -17,6 +17,10 @@ use serde_json::{Value, json};
 
 use binary::Cache;
 
+/// This program is also its own decompiler process, which lives on small allocations.
+#[global_allocator]
+static ALLOCATOR: recore_decomp::MiMalloc = recore_decomp::MiMalloc;
+
 /// First argument of the child processes that decompile: see `recore_decomp::isolate`.
 const WORKER_ARG: &str = "decompile-worker";
 

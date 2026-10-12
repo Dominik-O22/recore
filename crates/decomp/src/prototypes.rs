@@ -6,8 +6,7 @@
 //! `data/win32.protos`, the prototypes of Ghidra's 32-bit Windows type archive with types reduced
 //! to numbers, strings and pointers; `ghidra/ExportPrototypes.java` writes that file.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::collections::HashSet;
 
 use anyhow::Result;
 
@@ -27,10 +26,24 @@ const TYPES: &[&str] = &[
 /// The exported archive: one `<convention> <prototype>` per line, sorted by function name.
 const ARCHIVE: &str = include_str!("../data/win32.protos");
 
-/// The archive by function name, as (convention, prototype). The convention is `-` if unknown.
-fn archive() -> &'static HashMap<&'static str, (&'static str, &'static str)> {
-    static BY_NAME: OnceLock<HashMap<&str, (&str, &str)>> = OnceLock::new();
-    BY_NAME.get_or_init(|| ARCHIVE.lines().filter_map(|line| line.split_once(' ')).map(|(convention, prototype)| (name_of(prototype), (convention, prototype))).collect())
+/// The archive's entry for a function, as (convention, prototype); the convention is `-` if
+/// unknown. Found by bisecting the text, so that a session pays for the imports it has and not
+/// for an index of all twenty thousand.
+fn archived(name: &str) -> Option<(&'static str, &'static str)> {
+    let bytes = ARCHIVE.as_bytes();
+    let (mut low, mut high) = (0, bytes.len());
+    while low < high {
+        let middle = (low + high) / 2;
+        let start = bytes[..middle].iter().rposition(|&byte| byte == b'\n').map_or(0, |at| at + 1);
+        let end = bytes[start..].iter().position(|&byte| byte == b'\n').map_or(bytes.len(), |at| start + at);
+        let (convention, prototype) = ARCHIVE.get(start..end)?.split_once(' ')?;
+        match name_of(prototype).cmp(name) {
+            std::cmp::Ordering::Less => low = end + 1,
+            std::cmp::Ordering::Greater => high = start,
+            std::cmp::Ordering::Equal => return Some((convention, prototype)),
+        }
+    }
+    None
 }
 
 /// C runtime functions, `__cdecl` on 32-bit Windows.
@@ -157,13 +170,18 @@ const WIN32: &[&str] = &[
     "BOOL CryptDestroyKey(HANDLE key)",
 ];
 
-/// Every archive prototype as the declaration [`declare`] would make for it on `target`.
+/// The declaration [`declare`] makes on `target` for an archive entry.
+fn declaration(target: Target, convention: &str, prototype: &str) -> String {
+    // Only 32-bit Windows has more than one convention to choose from.
+    let convention = if target == Target::X86Windows && convention != "-" { format!("__{convention} ") } else { String::new() };
+    format!("extern {convention}{prototype};")
+}
+
+/// Every archive prototype by function name, as the declaration [`declare`] would make for it
+/// on `target`.
 pub fn archive_declarations(target: Target) -> impl Iterator<Item = (&'static str, String)> {
-    let windows32 = target == Target::X86Windows;
-    archive().iter().map(move |(&name, &(convention, prototype))| {
-        let convention = if windows32 && convention != "-" { format!("__{convention} ") } else { String::new() };
-        (name, format!("extern {convention}{prototype};"))
-    })
+    let entries = ARCHIVE.lines().filter_map(|line| line.split_once(' '));
+    entries.map(move |(convention, prototype)| (name_of(prototype), declaration(target, convention, prototype)))
 }
 
 /// Every function the table has a prototype for.
@@ -195,9 +213,11 @@ pub fn declare<'a>(session: &mut Session, target: Target, imports: impl Iterator
     }
     // The archive describes Windows; an ELF import of the same name may differ.
     if matches!(target, Target::X86Windows | Target::X86_64Windows) {
-        for (_, declaration) in archive_declarations(target).filter(|(name, _)| wanted.contains(name)) {
+        let mut wanted: Vec<&str> = wanted.into_iter().collect();
+        wanted.sort_unstable();
+        for (convention, prototype) in wanted.into_iter().filter_map(archived) {
             // One prototype the parser rejects must not cost the session the rest.
-            let _ = session.declare(&declaration);
+            let _ = session.declare(&declaration(target, convention, prototype));
         }
     }
     Ok(())
