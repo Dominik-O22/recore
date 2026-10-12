@@ -44,3 +44,4 @@ corpus-macho*/nostarts/
 corpus-macho*/debug/
 corpus-macho*/truth/
 corpus-macho*/recore*/
+__pycache__/
