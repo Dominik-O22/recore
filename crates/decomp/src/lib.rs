@@ -332,7 +332,8 @@ impl Session {
     /// Declares the vtables of the classes recore found, so that a constructor storing one
     /// reads `*this = Class::vftable` and not a bare address.
     pub fn add_classes(&mut self, analysis: &Analysis) -> Result<()> {
-        for class in &analysis.classes {
+        // An Objective-C class has no vtable: its methods are found by name.
+        for class in analysis.classes.iter().filter(|class| !class.objc) {
             let name = CString::new(format!("{}::vftable", class.name))?;
             check(|err, len| unsafe { ffi::rd_add_pointer_table(self.raw.as_ptr(), class.vtable, name.as_ptr(), class.methods.len(), err, len) != 0 })?;
         }
