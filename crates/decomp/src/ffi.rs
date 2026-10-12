@@ -73,6 +73,7 @@ unsafe extern "C" {
     pub fn rd_override_tail_call(session: *mut RdSession, function: u64, jump: u64, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_keep_prototypes(session: *mut RdSession, keep: i32);
     pub fn rd_set_style(session: *mut RdSession, name: *const c_char, err: *mut c_char, errlen: usize) -> i32;
+    pub fn rd_set_param_count(session: *mut RdSession, addr: u64, count: usize, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_set_flow(session: *mut RdSession, on: i32);
     pub fn rd_listing(session: *mut RdSession, start: u64, end: u64, pcode: i32, out: *mut *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_add_global(session: *mut RdSession, addr: u64, name: *const c_char, type_name: *const c_char, err: *mut c_char, errlen: usize) -> i32;

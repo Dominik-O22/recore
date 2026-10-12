@@ -408,7 +408,7 @@ fn functions(binary: &mut Binary, args: Functions) -> Result<String> {
     writeln!(out, "{} functions{}", found.len(), shown(found.len(), limit))?;
     writeln!(out, "address size callers name")?;
     for function in found.iter().take(limit) {
-        let callers = binary.program.users(binary.program.calls_to(function.addr).map(|call| call.at)).len();
+        let callers = binary.program.users(binary.program.sites_reaching(function.addr)).len();
         writeln!(out, "{:#x} {} {callers} {}", function.addr, size(function.addr), function.name.as_deref().unwrap_or("-"))?;
     }
     Ok(out)
@@ -443,8 +443,10 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
     }
     let graph = recore::cfg::cfg(&binary.program.image, &binary.program.analysis, &body);
     writeln!(out, "{} basic blocks, {} instructions; `disassemble` lists them", graph.blocks.len(), graph.instructions.len())?;
-    let callers = binary.program.users(binary.program.calls_to(entry).map(|call| call.at));
-    writeln!(out, "called by ({}): {}", callers.len(), labels(binary, &callers))?;
+    let callers = binary.program.users(binary.program.sites_reaching(entry));
+    let by_message = binary.program.sends_to(entry).count();
+    let how = if by_message == 0 { String::new() } else { format!(", {by_message} of the call sites by message send") };
+    writeln!(out, "called by ({}{how}): {}", callers.len(), labels(binary, &callers))?;
 
     writeln!(out, "calls:")?;
     for site in &graph.unresolved_calls {
@@ -500,7 +502,7 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
         writeln!(out, "{:#x} in {} {} it", call.at, binary.program.site_label(call.at), if call.tail { "tail-calls" } else { "calls" })?;
         count += 1;
     }
-    for send in binary.program.analysis.sends.iter().filter(|send| send.implementation == Some(addr)) {
+    for send in binary.program.sends_to(addr) {
         writeln!(out, "{:#x} in {} sends {}, which only it implements", send.at, binary.program.site_label(send.at), send.label())?;
         count += 1;
     }

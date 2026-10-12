@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::Image;
-use crate::report::{Analysis, AnalyzedFunction, CallSite, CallTarget, DataRef, StringLiteral};
+use crate::report::{Analysis, AnalyzedFunction, CallSite, CallTarget, DataRef, MessageSend, StringLiteral};
 
 /// Part of a function's body.
 struct Extent {
@@ -31,6 +31,9 @@ pub struct Program {
     refs_to: FxHashMap<u64, Vec<usize>>,
     /// Function entry or import slot to the indices in `Analysis::calls` that go there.
     calls_to: FxHashMap<u64, Vec<usize>>,
+    /// Method entry to the indices in `Analysis::sends` of the message sends that only it can
+    /// answer.
+    sends_to: FxHashMap<u64, Vec<usize>>,
 }
 
 /// The address a call or tail call goes to: a function entry or an import slot.
@@ -103,7 +106,13 @@ impl Program {
         for (index, call) in analysis.calls.iter().enumerate() {
             calls_to.entry(target_addr(call.target)).or_default().push(index);
         }
-        Program { image, analysis, extents, reach, refs_to, calls_to }
+        let mut sends_to: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+        for (index, send) in analysis.sends.iter().enumerate() {
+            if let Some(method) = send.implementation {
+                sends_to.entry(method).or_default().push(index);
+            }
+        }
+        Program { image, analysis, extents, reach, refs_to, calls_to, sends_to }
     }
 
     /// The function entered at `entry`, if it is one in its own right and not a fragment.
@@ -180,6 +189,17 @@ impl Program {
     /// Calls and tail calls that go to the function or import slot at `target`.
     pub fn calls_to(&self, target: u64) -> impl Iterator<Item = &CallSite> {
         self.calls_to.get(&target).into_iter().flatten().map(|&index| &self.analysis.calls[index])
+    }
+
+    /// Message sends whose selector only the method at `method` implements in this image.
+    pub fn sends_to(&self, method: u64) -> impl Iterator<Item = &MessageSend> {
+        self.sends_to.get(&method).into_iter().flatten().map(|&index| &self.analysis.sends[index])
+    }
+
+    /// The instructions that reach the function at `entry`: calls, tail calls, and message sends
+    /// that only it can answer.
+    pub fn sites_reaching(&self, entry: u64) -> impl Iterator<Item = u64> {
+        self.calls_to(entry).map(|call| call.at).chain(self.sends_to(entry).map(|send| send.at))
     }
 
     /// Instructions that refer to the data at `addr`.

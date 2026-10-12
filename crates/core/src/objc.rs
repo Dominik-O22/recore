@@ -24,7 +24,10 @@ pub struct Metadata {
     /// Method implementations with their names, such as `-[Square area]`.
     pub methods: Vec<(u64, String)>,
     /// Slot in `__objc_selrefs` to the selector it holds.
-    selectors: FxHashMap<u64, String>,
+    pub selectors: FxHashMap<u64, String>,
+    /// Slot that holds a class, in `__objc_classrefs` or among the import slots, to the name of
+    /// the class, which is in this image or imported.
+    pub class_refs: FxHashMap<u64, String>,
     /// Selector to the implementations of it in this image.
     implementations: FxHashMap<String, Vec<u64>>,
 }
@@ -160,13 +163,16 @@ pub fn metadata(image: &Image) -> Option<Metadata> {
     if classes.is_empty() && selectors.is_empty() {
         return None;
     }
+    let mut class_refs: FxHashMap<u64, String> = reader.pointers("__objc_classrefs").filter_map(|(slot, _)| Some((slot, reader.class_at(slot)?))).collect();
+    // Newer linkers reach an imported class through an ordinary import slot instead.
+    class_refs.extend(image.import_slots.iter().filter_map(|(&slot, import)| Some((slot, import.strip_prefix("OBJC_CLASS_$_")?.to_string()))));
     let mut implementations: FxHashMap<String, Vec<u64>> = FxHashMap::default();
     for (implementation, name) in &methods {
         // `-[Class selector]`: the selector follows the only space.
         let selector = name.rsplit_once(' ').map_or("", |(_, selector)| selector.trim_end_matches(']'));
         implementations.entry(selector.to_string()).or_default().push(*implementation);
     }
-    Some(Metadata { classes, methods, selectors, implementations })
+    Some(Metadata { classes, methods, selectors, class_refs, implementations })
 }
 
 /// The message send that the call at `at` makes, if its selector is known.
@@ -187,7 +193,7 @@ fn stub_selectors<'a, A: Arch>(image: &Image, metadata: &'a Metadata) -> FxHashM
                 // Traps pad the space between stubs.
                 Some(Flow::Halt) => {}
                 Some(_) => {
-                    let selector = A::second_argument_slot(&state).and_then(|slot| metadata.selectors.get(&slot));
+                    let selector = A::argument_slot(&state, 1).and_then(|slot| metadata.selectors.get(&slot));
                     stubs.extend(selector.map(|selector| (start.unwrap_or(decoded.addr), selector.as_str())));
                     (state, start) = (A::State::default(), None);
                 }
@@ -222,6 +228,7 @@ fn dispatcher(import: &str) -> Option<bool> {
 /// loads the same one.
 pub fn sends<A: Arch>(image: &Image, metadata: &Metadata, pieces: &[(u64, u64)], calls: &[CallSite], join_points: &FxHashSet<u64>) -> Vec<MessageSend> {
     let stubs = stub_selectors::<A>(image, metadata);
+    let class_methods: FxHashMap<&str, u64> = metadata.methods.iter().filter(|(_, name)| name.starts_with('+')).map(|(method, name)| (name.as_str(), *method)).collect();
     let dispatchers: FxHashMap<u64, bool> = image.import_slots.iter().filter_map(|(&slot, name)| Some((slot, dispatcher(name)?))).collect();
     let dispatched = |call: &CallSite| match call.target {
         CallTarget::Import(slot) => dispatchers.get(&slot).copied(),
@@ -259,14 +266,19 @@ pub fn sends<A: Arch>(image: &Image, metadata: &Metadata, pieces: &[(u64, u64)],
                         Flow::Call(target) | Flow::Jump(target) | Flow::Branch(target) => stubs.get(&target).copied(),
                         _ => None,
                     };
-                    let selector = through_stub.or_else(|| A::second_argument_slot(&state).and_then(|slot| metadata.selectors.get(&slot)).map(String::as_str));
+                    let selector = through_stub.or_else(|| A::argument_slot(&state, 1).and_then(|slot| metadata.selectors.get(&slot)).map(String::as_str));
+                    // A receiver loaded from a class reference is that class itself, so the
+                    // message goes to one of its class methods.
+                    let receiver = A::argument_slot(&state, 0).and_then(|slot| metadata.class_refs.get(&slot)).filter(|_| !to_super);
                     found.extend(selector.map(|selector| MessageSend {
                         at: call.at,
                         selector: selector.to_string(),
-                        implementation: match metadata.implementations.get(selector).map(Vec::as_slice) {
-                            Some(&[only]) if !to_super => Some(only),
+                        implementation: match (receiver, metadata.implementations.get(selector).map(Vec::as_slice)) {
+                            (Some(class), _) => class_methods.get(format!("+[{class} {selector}]").as_str()).copied(),
+                            (None, Some(&[only])) if !to_super => Some(only),
                             _ => None,
                         },
+                        receiver: receiver.cloned(),
                     }));
                 }
                 match flow {

@@ -21,6 +21,10 @@ pub struct Facts {
     /// Names the image carries for functions, demangled. Naming declares, so fragments are left
     /// out here too.
     pub names: Vec<(u64, String)>,
+    /// `(function, count)`: a function known to take exactly `count` pointer-sized parameters:
+    /// a stub that sends one Objective-C message, to a receiver and one argument per colon of
+    /// the selector.
+    pub param_counts: Vec<(u64, usize)>,
     /// `(function, fixup)`: a compiler helper whose calls the compiler spec's call fixup of that
     /// name stands in for.
     pub call_fixups: Vec<(u64, String)>,
@@ -59,6 +63,7 @@ impl Facts {
         // A function owns every one of its ranges: the main extent, cold blocks, and exits it
         // shares with other functions. What happens in a range is a fact about each function
         // that has it, and about the owner if the function is itself a fragment.
+        let mut stub_names: Vec<(u64, String)> = Vec::new();
         for function in &analysis.functions {
             let owner = function.fragment_of.unwrap_or(function.addr);
             for &(start, end) in &function.ranges {
@@ -80,18 +85,26 @@ impl Facts {
                         (false, CallTarget::Function(target)) if through_slot => facts.local_calls.push((owner, call.at, target)),
                         _ => {}
                     }
-                    if let (Machine::Aarch64, false, CallTarget::Import(slot)) = (image.machine, call.tail, call.target) {
-                        // `bl` to a PLT stub: the top six bits are the opcode, the rest a word offset.
+                    // A stub the linker made for one Objective-C selector passes that selector to
+                    // the dispatcher. Under the linker's own name for it, `objc_msgSend$alloc`,
+                    // a call to it reads as the message it sends.
+                    let mut stub = |stub: u64, slot: u64| match recore::objc::send_at(analysis, call.at).filter(|_| image.section_at(stub).is_some_and(|section| section.name.ends_with("__objc_stubs"))) {
+                        Some(send) => stub_names.push((stub, format!("objc_msgSend${}", send.selector))),
+                        None => facts.import_aliases.push((stub, slot)),
+                    };
+                    if let (Machine::Aarch64, CallTarget::Import(slot)) = (image.machine, call.target) {
+                        // `bl` to a PLT stub, or `b` to one as a tail call: the top six bits are
+                        // the opcode, the rest a word offset.
                         let word = image.bytes_from(call.at).and_then(|b| b.first_chunk::<4>()).map(|b| u32::from_le_bytes(*b));
-                        if let Some(word) = word.filter(|word| word >> 26 == 0b100101) {
+                        if let Some(word) = word.filter(|word| word >> 26 == if call.tail { 0b000101 } else { 0b100101 }) {
                             let offset = i64::from((word << 6) as i32 >> 6) * 4;
-                            facts.import_aliases.push((call.at.wrapping_add_signed(offset), slot));
+                            stub(call.at.wrapping_add_signed(offset), slot);
                         }
                     }
                     match (call.tail, call.target, bytes.first_chunk::<5>()) {
                         // A direct call that recore resolves to an import goes to a PLT stub.
                         (false, CallTarget::Import(slot), Some([0xe8, rel @ ..])) => {
-                            facts.import_aliases.push(((call.at + 5).wrapping_add_signed(i32::from_le_bytes(*rel).into()), slot));
+                            stub((call.at + 5).wrapping_add_signed(i32::from_le_bytes(*rel).into()), slot);
                         }
                         // A function that starts by jumping through an import slot is a thunk for it.
                         (true, CallTarget::Import(slot), _) if call.at == function.addr && through_slot => {
@@ -126,6 +139,10 @@ impl Facts {
         facts.jump_tables.dedup();
         facts.import_aliases.sort_unstable();
         facts.import_aliases.dedup_by_key(|alias| alias.0);
+        stub_names.sort_unstable();
+        stub_names.dedup_by_key(|name| name.0);
+        facts.param_counts = stub_names.iter().map(|(stub, name)| (*stub, 1 + name.matches(':').count())).collect();
+        facts.names.extend(stub_names);
         facts
     }
 }

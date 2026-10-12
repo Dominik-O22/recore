@@ -42,6 +42,11 @@ fn notes(binary: &Binary, graph: Option<&Cfg>, addr: u64, end: u64) -> String {
             CallTarget::Function(target) => program.label(target),
             CallTarget::Import(slot) => program.import_name(slot).unwrap_or("?").to_string(),
         };
+        // A message send names its selector, and the one method this binary has for it.
+        let target = match recore::objc::send_at(&program.analysis, call.at) {
+            Some(send) => format!("{}{}", send.label(), send.implementation.map_or_else(String::new, |method| format!(", implemented only by {}", program.label(method)))),
+            None => target,
+        };
         notes.push(format!("{} {target}", if call.tail { "tail-calls" } else { "calls" }));
     }
     if graph.is_some_and(|graph| graph.unresolved_calls.contains(&addr)) {
@@ -338,7 +343,7 @@ impl Tracer<'_> {
                     self.line(indent, &format!("read from {addr:#x} {what}"));
                 }
                 Kind::Param { index, name } => {
-                    let callers: Vec<u64> = self.binary.program.calls_to(entry).map(|call| call.at).collect();
+                    let callers: Vec<u64> = self.binary.program.sites_reaching(entry).collect();
                     self.line(indent, &format!("parameter {name} of {}, called from {} places", self.binary.program.label(entry), callers.len()));
                     if depth == 0 {
                         continue;

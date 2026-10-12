@@ -41,10 +41,11 @@ fn slice(file: &[u8]) -> Result<&[u8]> {
     Ok(chosen.context("the universal file has no arm64 or x86-64 slice")?.2)
 }
 
-/// A name as source code spells it: the linker's leading underscore removed.
+/// A name as source code spells it: a Swift name demangled, and otherwise the linker's leading
+/// underscore removed.
 fn plain_name(symbol: &[u8]) -> String {
     let name = String::from_utf8_lossy(symbol);
-    name.strip_prefix('_').unwrap_or(&name).to_string()
+    crate::names::swift_name(&name).unwrap_or_else(|| name.strip_prefix('_').unwrap_or(&name).to_string())
 }
 
 /// The eight bytes of the loaded image at `slot`.

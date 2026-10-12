@@ -606,6 +606,32 @@ int rd_add_string(RdSession *session, uint64_t addr, const char *name, size_t co
   });
 }
 
+// Declares the function at `addr` as a stub that sends one Objective-C message: it takes the
+// receiver and `count - 1` arguments, each as wide as a pointer and of unknown type. What it
+// returns is left for each call to show. A selector's colons count its arguments.
+int rd_set_param_count(RdSession *session, uint64_t addr, size_t count, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    Funcdata *fd = session->function(addr);
+    int4 size = arch->getDefaultCodeSpace()->getAddrSize();
+    PrototypePieces pieces;
+    pieces.model = arch->defaultfp;
+    pieces.name = fd->getName();
+    pieces.outtype = arch->types->getBase(size, TYPE_UNKNOWN);
+    pieces.firstVarArgSlot = -1;
+    // The convention's second register carries the selector, which the function at `addr`
+    // loads itself. Laying out one parameter more and dropping the second leaves the
+    // arguments in the registers the caller really uses.
+    for (size_t i = 0; i < count + 1; ++i) {
+      pieces.intypes.push_back(arch->types->getBase(size, TYPE_UNKNOWN));
+      pieces.innames.push_back(i == 0 ? "self" : i == 1 ? "_cmd" : "arg" + to_string(i - 1));
+    }
+    fd->getFuncProto().setPieces(pieces);
+    fd->getFuncProto().removeParam(1);
+    fd->getFuncProto().setOutputLock(false);
+  });
+}
+
 // Replaces every call to the function at `addr` with the p-code of the compiler spec's call
 // fixup `fixup`. Compiler helpers such as the stack-cookie check and `_alloca_probe` break the
 // calling convention, and their fixup says what they really do to the caller.

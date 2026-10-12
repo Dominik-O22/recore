@@ -320,6 +320,9 @@ impl Session {
         for &(function, noreturn) in &facts.functions {
             self.add_function(function, noreturn)?;
         }
+        for &(function, count) in &facts.param_counts {
+            check(|err, len| unsafe { ffi::rd_set_param_count(self.raw.as_ptr(), function, count, err, len) != 0 })?;
+        }
         for &(function, jump) in &facts.tail_calls {
             self.override_tail_call(function, jump)?;
         }
@@ -353,6 +356,17 @@ impl Session {
         for class in analysis.classes.iter().filter(|class| !class.objc) {
             let name = CString::new(format!("{}::vftable", class.name))?;
             check(|err, len| unsafe { ffi::rd_add_pointer_table(self.raw.as_ptr(), class.vtable, name.as_ptr(), class.methods.len(), err, len) != 0 })?;
+        }
+        Ok(())
+    }
+
+    /// Names the image's Objective-C selector and class references, so that a message send
+    /// reads `objc_msgSend(class_NSString, sel_alloc)` and not two bare addresses.
+    pub fn add_objc(&mut self, image: &Image) -> Result<()> {
+        let Some(metadata) = recore::objc::metadata(image) else { return Ok(()) };
+        let named = |prefix: &str, slots: &recore::FxHashMap<u64, String>| slots.iter().map(|(&slot, name)| (slot, format!("{prefix}{name}"))).collect::<Vec<_>>();
+        for (slot, name) in named("sel_", &metadata.selectors).into_iter().chain(named("class_", &metadata.class_refs)) {
+            self.add_global(slot, &name, Some("void *"))?;
         }
         Ok(())
     }

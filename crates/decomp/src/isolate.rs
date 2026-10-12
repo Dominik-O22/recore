@@ -152,6 +152,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     session.add_functions(&facts)?;
     session.add_strings(&analysis)?;
     session.add_classes(&analysis)?;
+    session.add_objc(&image)?;
     if options.jump_tables == JumpTables::Recore || (options.jump_tables == JumpTables::Auto && image.format == Format::Pe) {
         session.override_jump_tables(&analysis, &facts)?;
     }

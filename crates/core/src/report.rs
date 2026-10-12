@@ -175,16 +175,25 @@ pub struct MessageSend {
     /// Address of the call or jump instruction.
     pub at: u64,
     pub selector: String,
-    /// The method the image implements for the selector, when it implements exactly one and
-    /// the send is not to a superclass. The receiver may still be an object of another
-    /// library's class that has a method of the same name.
+    /// The class the message is sent to, when the receiver is loaded from a class reference
+    /// right before the send: `[NSString alloc]`. Unknown for a message to an object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<String>,
+    /// The method the image implements for the message: the receiver's class method when the
+    /// receiver is known, and otherwise the selector's implementation when the image has
+    /// exactly one and the send is not to a superclass. In the second case the receiver may
+    /// still be an object of another library's class that has a method of the same name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implementation: Option<u64>,
 }
 
 impl MessageSend {
-    /// The send as a method name with the receiver's class left open: `-[? setSide:]`.
+    /// The send as a method name: `+[NSString alloc]` to a known class, and `-[? setSide:]`
+    /// with the class left open otherwise.
     pub fn label(&self) -> String {
-        format!("-[? {}]", self.selector)
+        match &self.receiver {
+            Some(class) => format!("+[{class} {}]", self.selector),
+            None => format!("-[? {}]", self.selector),
+        }
     }
 }

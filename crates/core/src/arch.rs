@@ -98,9 +98,10 @@ pub trait Arch: 'static {
         None
     }
 
-    /// The slot the second argument register was loaded from, when the state knows. At an
-    /// Objective-C message send that register holds the selector.
-    fn second_argument_slot(_state: &Self::State) -> Option<u64> {
+    /// The slot the register of the first (`index` 0) or second argument was loaded from, when
+    /// the state knows. At an Objective-C message send the first holds the receiver, which is a
+    /// class when the slot is a class reference, and the second holds the selector.
+    fn argument_slot(_state: &Self::State, _index: usize) -> Option<u64> {
         None
     }
 

@@ -29,7 +29,9 @@ Every tool takes `path`, the binary to analyze, and answers with text. Addresses
 
 The decompiler prints unnamed functions as `func_0x10001000`. Every address argument accepts that form.
 
-From a universal Mach-O file the arm64 slice is analyzed, or the x86-64 one if there is no other. A message send shows as `calls -[? selector]`, since the class of the receiver is only known when the program runs; when the binary implements the selector exactly once, that method is named too.
+From a universal Mach-O file the arm64 slice is analyzed, or the x86-64 one if there is no other. A message send to an object shows as `calls -[? selector]`, since the class of the receiver is only known when the program runs; when the binary implements the selector exactly once, that method is named too, and counts the send among its callers. A send to a class loaded right before it shows as `calls +[NSString stringWithFormat:]`.
+
+In decompiled C a send through one of the linker's selector stubs reads `objc_msgSend$addSubview:(view, child)`, with the receiver and one argument per colon. Selector and class references print as `sel_init` and `class_NSString`. Swift names are demangled with Swift's own demangler.
 
 `xrefs` on a data address that holds pointers, such as a vtable, also lists what each entry points to. `bytes` and `summary` give file offsets next to addresses.
 

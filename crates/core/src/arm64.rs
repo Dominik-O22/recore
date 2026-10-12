@@ -360,8 +360,8 @@ impl Arch for Arm64 {
         }
     }
 
-    fn second_argument_slot(state: &State) -> Option<u64> {
-        match state.registers[1] {
+    fn argument_slot(state: &State, index: usize) -> Option<u64> {
+        match state.registers[index] {
             Value::Slot(slot) => Some(slot),
             _ => None,
         }

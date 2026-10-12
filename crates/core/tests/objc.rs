@@ -70,3 +70,11 @@ fn message_sends_resolve_on_x86_64() {
         [(0x100000a4f, "area", None), (0x100000a8e, "area", None), (0x100000af4, "setSide:", Some(0x100000b20)), (0x100000b99, "area", None)]
     );
 }
+
+#[test]
+fn a_send_to_a_class_names_the_class_and_its_method() {
+    let analysis = analyze("shapes-arm64");
+    let to_classes: Vec<_> = analysis.sends.iter().filter_map(|send| Some((send.at, send.receiver.as_deref()?, send.label(), send.implementation))).collect();
+    // `[Square withSide:argc]` in `main`: the receiver is loaded from a class reference.
+    assert_eq!(to_classes, [(0x100000a08, "Square", "+[Square withSide:]".to_string(), Some(0x100000990))]);
+}
