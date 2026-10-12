@@ -14,7 +14,9 @@ pub mod facts;
 mod ffi;
 pub mod flow;
 pub mod isolate;
+pub mod pdb;
 pub mod prototypes;
+pub mod types;
 
 // The engine is only reached through the shim, so name the crate to keep it in the link.
 extern crate ghidra_decompiler_sys;
@@ -433,6 +435,16 @@ impl Session {
     pub fn add_global(&mut self, addr: u64, name: &str, type_name: Option<&str>) -> Result<()> {
         let (name, type_name) = (CString::new(name)?, CString::new(type_name.unwrap_or_default())?);
         check(|err, len| unsafe { ffi::rd_add_global(self.raw.as_ptr(), addr, name.as_ptr(), type_name.as_ptr(), err, len) != 0 })
+    }
+
+    /// Adds data types, function prototypes and typed globals written in the engine's own XML,
+    /// which [`types::Types::xml`] produces from debug information. Returns what the engine
+    /// rejected, one line each; a rejected entry costs only itself.
+    pub fn add_types(&mut self, xml: &str) -> Result<Vec<String>> {
+        let xml = CString::new(xml)?;
+        let mut out = std::ptr::null();
+        check(|err, len| unsafe { ffi::rd_add_types(self.raw.as_ptr(), xml.as_ptr(), &mut out, err, len) != 0 })?;
+        Ok(unsafe { CStr::from_ptr(out) }.to_string_lossy().lines().map(str::to_string).collect())
     }
 
     /// Describes a data type the session knows: its size, and the fields of a struct or union

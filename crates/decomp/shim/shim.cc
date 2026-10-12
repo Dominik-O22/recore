@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -447,6 +448,10 @@ void operator delete[](void *block) noexcept { mi_free(block); }
 void operator delete(void *block, size_t) noexcept { mi_free(block); }
 void operator delete[](void *block, size_t) noexcept { mi_free(block); }
 
+// The engine's XML parser keeps its state in globals. Sessions are created under this lock,
+// since that parses the language files, and so is every other document parsed.
+static mutex xml_lock;
+
 extern "C" {
 
 // `spec_dir` holds the .ldefs/.pspec/.cspec/.sla files. The first session fixes it for the
@@ -454,9 +459,8 @@ extern "C" {
 RdSession *rd_session_new(const char *spec_dir, const char *language, const RdSection *sections,
                           size_t count, char *err, size_t errlen) {
   // Spec loading goes through bison parsers with global state and fills static tables.
-  static mutex init_lock;
   static bool started = false;
-  lock_guard<mutex> guard(init_lock);
+  lock_guard<mutex> guard(xml_lock);
 
   RdSession *session = new RdSession;
   bool ok = guarded(err, errlen, [&] {
@@ -784,6 +788,101 @@ int rd_add_global(RdSession *session, uint64_t addr, const char *name, const cha
   });
 }
 
+// The value of an attribute of an XML element, or the empty string if it has none.
+static string attribute(const Element *element, const char *name) {
+  for (int4 i = 0; i < element->getNumAttributes(); ++i)
+    if (element->getAttributeName(i) == name) return element->getAttributeValue(i);
+  return "";
+}
+
+// The data type an element describes in the engine's own format: `<type>`, `<typeref>`, `<def>`
+// or `<void>`.
+static Datatype *decode_type(Architecture *arch, const Element *element) {
+  XmlDecode decoder(arch, element);
+  return arch->types->decodeType(decoder);
+}
+
+// Reads a prototype from the `<p>` children of `element`, each holding one type: the first is
+// what the function returns, the others are its parameters, by `name`. A `dotdotdot`
+// attribute makes it variadic and `model` names its calling convention.
+static void decode_prototype(Architecture *arch, const Element *element, PrototypePieces &pieces) {
+  string model = attribute(element, "model");
+  pieces.model = model.empty() ? arch->defaultfp : arch->getModel(model);
+  const List &children = element->getChildren();
+  if (children.empty()) throw LowlevelError("prototype without a return type");
+  for (size_t i = 0; i < children.size(); ++i) {
+    Datatype *type = decode_type(arch, children[i]->getChildren().at(0));
+    if (i == 0) {
+      pieces.outtype = type;
+    } else {
+      pieces.intypes.push_back(type);
+      pieces.innames.push_back(attribute(children[i], "name"));
+    }
+  }
+  pieces.firstVarArgSlot = attribute(element, "dotdotdot").empty() ? -1 : (int4)pieces.intypes.size();
+}
+
+// Adds data types, function prototypes and typed globals from the children of the XML element
+// `xml`, in order:
+//   <type>, <def>          a data type in the engine's own format, with exact field offsets
+//   <functype name id>     a named function type, for pointers to it; children as below
+//   <function addr>        the prototype of the function at `addr` (hex), from <p> children
+//   <global addr name>     a global variable; its one child is its type
+// A child the engine rejects costs only itself: `*out` lists those, one line each.
+int rd_add_types(RdSession *session, const char *xml, const char **out, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    Scope *global = arch->symboltab->getGlobalScope();
+    unique_ptr<Document> document;
+    {
+      lock_guard<mutex> guard(xml_lock);
+      istringstream text(xml);
+      document.reset(xml_tree(text));
+    }
+    ostringstream rejected;
+    for (const Element *element : document->getRoot()->getChildren()) {
+      const string &tag = element->getName();
+      string name = attribute(element, "name");
+      auto reject = [&](const string &why) { rejected << tag << " " << name << attribute(element, "addr") << ": " << why << "\n"; };
+      try {
+        if (tag == "functype") {
+          PrototypePieces pieces;
+          decode_prototype(arch, element, pieces);
+          arch->types->getTypedef(arch->types->getTypeCode(pieces), name, stoull(attribute(element, "id")), 0);
+        } else if (tag == "function") {
+          PrototypePieces pieces;
+          decode_prototype(arch, element, pieces);
+          // A parameter the convention has no place for would be stored at no address at all.
+          vector<ParameterPieces> storage;
+          pieces.model->assignParameterStorage(pieces, storage, true);
+          for (size_t i = 1; i < storage.size(); ++i)
+            if (storage[i].addr.isInvalid()) throw LowlevelError("the calling convention has no place for a parameter");
+          Funcdata *fd = session->function(stoull(attribute(element, "addr"), nullptr, 16));
+          pieces.name = fd->getName();
+          fd->getFuncProto().setPieces(pieces);
+        } else if (tag == "global") {
+          Address where = session->address(stoull(attribute(element, "addr"), nullptr, 16));
+          Datatype *type = decode_type(arch, element->getChildren().at(0));
+          SymbolEntry *old = global->findAddr(where, Address());
+          if (old != nullptr) global->removeSymbol(old->getSymbol());
+          global->addSymbol(name, type, where, Address());
+        } else {
+          XmlDecode decoder(arch, element);
+          arch->types->decodeType(decoder);
+        }
+      } catch (const LowlevelError &e) {
+        reject(e.explain);
+      } catch (const DecoderError &e) {
+        reject(e.explain);
+      } catch (const std::exception &e) {
+        reject(e.what());
+      }
+    }
+    session->text = rejected.str();
+    *out = session->text.c_str();
+  });
+}
+
 // Describes the data type `name` in `*out`: its kind, size and alignment on the first line, then
 // one line per field of a struct or union (offset, type, name) or per value of an enum.
 int rd_type_layout(RdSession *session, const char *name, const char **out, char *err, size_t errlen) {
@@ -837,8 +936,11 @@ int rd_type_layout(RdSession *session, const char *name, const char **out, char 
 int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err, size_t errlen) {
   Funcdata *fd = nullptr;
   Architecture *arch = session->arch;
+  // A prototype that was declared, not recovered, is the whole truth and stays as it is.
+  bool declared = false;
   bool ok = guarded(err, errlen, [&] {
     fd = session->function(addr);
+    declared = fd->getFuncProto().isInputLocked() && session->kept.count(addr) == 0;
     if (fd->getFuncProto().isInputLocked() && session->kept.erase(addr) != 0) {
       // Recover the prototype afresh instead of replaying the one kept from an earlier run.
       fd->getFuncProto().setInputLock(false);
@@ -928,7 +1030,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
                  (fd->hasUnimplemented() ? RD_UNIMPLEMENTED : 0) |
                  (proto.getOutputType()->getMetatype() != TYPE_VOID ? RD_RETURNS_VALUE : 0);
   });
-  if (ok && session->keep_prototypes) {
+  if (ok && session->keep_prototypes && !declared) {
     // A variadic function spills all eight vector argument registers, which the engine reads as
     // eight parameters. Kept, that prototype would make every caller pass them all.
     size_t vector_params = 0;

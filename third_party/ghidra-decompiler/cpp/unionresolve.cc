@@ -41,6 +41,16 @@ ResolvedUnion::ResolvedUnion(Datatype *unresType)
 ResolvedUnion::ResolvedUnion(Datatype *unresType,int4 fldNum,TypeFactory &typegrp)
 
 {
+  // recore: a field number recorded for one data-type can arrive here with another one, a piece
+  // of the first, that has fewer fields. Upstream then reads past the end of the field list.
+  // Such a number is taken to mean the data-type as a whole.
+  Datatype *holder = unresType;
+  if (holder->getMetatype() == TYPE_PARTIALUNION)
+    holder = ((TypePartialUnion *)holder)->getParentUnion();
+  else if (holder->getMetatype() == TYPE_PTR)
+    holder = ((TypePointer *)holder)->getPtrTo();
+  if (fldNum >= holder->numDepend())
+    fldNum = -1;
   baseType = unresType;
   fieldNum = fldNum;
   lock = false;
@@ -1181,6 +1191,10 @@ ScoreUnionFields::ScoreUnionFields(Funcdata &fd,TypeUnion *unionType,int4 offset
     run();
   computeBestIndex();
   result.resolve = typegrp.getExactPiece(result.resolve, offset, vn->getSize());
+  // recore: no data-type covers this piece of the chosen field when it is part of a number.
+  // Upstream stores the null and dereferences it later; an untyped value of the size stands in.
+  if (result.resolve == (Datatype *)0)
+    result.resolve = typegrp.getBase(vn->getSize(), TYPE_UNKNOWN);
 }
 
 /// \brief Score a union data-type against data-flow, where there is an implied truncation
@@ -1220,6 +1234,10 @@ ScoreUnionFields::ScoreUnionFields(Funcdata &fd,TypeUnion *unionType,int4 offset
     run();
   computeBestIndex();
   result.resolve = typegrp.getExactPiece(result.resolve, offset, vn->getSize());
+  // recore: no data-type covers this piece of the chosen field when it is part of a number.
+  // Upstream stores the null and dereferences it later; an untyped value of the size stands in.
+  if (result.resolve == (Datatype *)0)
+    result.resolve = typegrp.getBase(vn->getSize(), TYPE_UNKNOWN);
 }
 
 /// If a resolution for the data-type exists along the given edge, it is cached.  Otherwise there is no change.

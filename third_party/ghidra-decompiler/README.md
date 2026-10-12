@@ -1,7 +1,7 @@
 # Ghidra decompiler engine (vendored)
 
 The C++ decompiler from Ghidra, built as a static library by `build.rs` and used by
-`crates/decomp`. Two files are modified, see below.
+`crates/decomp`. Three files are modified, see below.
 
 Source: `Ghidra/Features/Decompiler/src/decompile/` of the Ghidra repository at commit
 `918d44ebc2` (12.3 DEV), copied from `~/Work/tries/ghidra-profile/master`.
@@ -28,6 +28,13 @@ SLEIGH compiler. The `.sla` format version must match the engine.
 - `cpp/sleigh_arch.cc`, `SleighArchitecture::buildTypegrp`: the untyped core types are named
   `undefined1` to `undefined8`, as Ghidra's interface names them, where upstream's standalone
   default is `xunknown1` to `xunknown8`. Marked with a `recore:` comment.
+
+- `cpp/unionresolve.cc`: two guards for unions, which programs with debug information for C++
+  library types reach. `ResolvedUnion::ResolvedUnion` takes a field number that the data-type it
+  comes with does not have to mean the data-type as a whole, where upstream reads past the end
+  of the field list. The two `ScoreUnionFields` constructors for truncations resolve to an
+  untyped value when no data-type covers the piece of the chosen field, where upstream stores a
+  null pointer and dereferences it later. Marked with `recore:` comments.
 
 ## Licences
 

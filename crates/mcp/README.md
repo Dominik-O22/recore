@@ -43,6 +43,10 @@ An edit replaces the decompiler process with one that starts from the new edits,
 
 A name goes on a function entry or on data. A place inside a function takes a comment, not a name.
 
+## Debug information
+
+When a binary has debug information, the decompiler uses it: functions take their prototypes and parameter names, globals their types, and fields print by name. It is read from DWARF in the binary itself, from a `.debug` file, or from the `.pdb` of a Windows binary, looked for next to the binary under the binary's name (`tool.debug`, `tool.exe.pdb`, `tool.pdb`) or the name the binary records, and in a `.debug` directory there. `RECORE_DEBUG` names more directories to look in, separated by colons; `RECORE_DEBUG=off` turns it off. `type` and `declare` know the types by name. Only the decompiler reads debug information: `summary`, `functions` and the other tools that do not decompile are as fast with it as without, and do not show its names.
+
 ## Data flow
 
 `pcode` and `trace` read the decompiler's own intermediate form, the one its C is printed from. Stack bookkeeping and dead code are gone, every value has one definition, and a call lists its arguments in order. `trace` follows a value through at most 16 functions and does not follow it through memory: a value stored to a global or the heap and read back elsewhere is reported at the store and no further.

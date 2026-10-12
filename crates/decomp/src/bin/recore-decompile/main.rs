@@ -129,6 +129,10 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         list: usize,
     },
+    /// Reads a binary's debug information and gives its types to a decompiler session, printing
+    /// what was found and how long each step took, and how long a child takes to be ready with
+    /// the debug information and without.
+    DebugInfo { binary: PathBuf },
     /// Child process of the other commands: see `recore_decomp::isolate`.
     #[command(hide = true)]
     Worker { binary: PathBuf, options: String },
@@ -147,6 +151,7 @@ fn main() -> Result<()> {
         }
         Command::Params { out_dir, debug_dir, jobs, list } => params::compare(&out_dir, &debug_dir, jobs, list),
         Command::Imports { bin_dir, list } => imports::coverage(&bin_dir, list),
+        Command::DebugInfo { binary } => imports::debug_info(&binary),
         Command::Worker { binary, options } => isolate::serve(&binary, &options),
     }
 }

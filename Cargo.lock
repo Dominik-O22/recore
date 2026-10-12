@@ -794,6 +794,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "object 0.40.0",
+ "pdb2",
  "recore",
  "serde",
  "serde_json",

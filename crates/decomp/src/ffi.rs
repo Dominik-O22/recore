@@ -78,6 +78,7 @@ unsafe extern "C" {
     pub fn rd_set_flow(session: *mut RdSession, on: i32);
     pub fn rd_listing(session: *mut RdSession, start: u64, end: u64, pcode: i32, out: *mut *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_add_global(session: *mut RdSession, addr: u64, name: *const c_char, type_name: *const c_char, err: *mut c_char, errlen: usize) -> i32;
+    pub fn rd_add_types(session: *mut RdSession, xml: *const c_char, out: *mut *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_type_layout(session: *mut RdSession, name: *const c_char, out: *mut *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_decompile(session: *mut RdSession, addr: u64, out: *mut RdDecompiled, err: *mut c_char, errlen: usize) -> i32;
 }

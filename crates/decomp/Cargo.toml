@@ -12,6 +12,7 @@ ghidra-decompiler-sys = { version = "0.1.0", path = "../../third_party/ghidra-de
 gimli = "0.34.0"
 libc = "0.2"
 mimalloc = "0.1"
+pdb2 = "0.10.2"
 object = { version = "0.40.0", features = ["compression"] }
 recore = { version = "0.1.0", path = "../core" }
 serde = { version = "1.0.229", features = ["derive"] }

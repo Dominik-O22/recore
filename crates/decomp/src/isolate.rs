@@ -138,23 +138,42 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     unsafe { libc::setrlimit(libc::RLIMIT_AS, &libc::rlimit { rlim_cur: bytes, rlim_max: bytes }) };
 
     let image = recore::Image::load(binary)?;
-    // The engine reads its language files while the analysis runs.
-    let (session, mut analysis) = std::thread::scope(|scope| {
+    // The engine reads its language files, and debug information is read if there is any,
+    // while the analysis runs.
+    let (session, mut analysis, debug) = std::thread::scope(|scope| {
         let session = scope.spawn(|| Session::load(&image));
+        let debug = scope.spawn(|| crate::types::load(binary, &image));
         let analysis = recore::analyze(&image);
-        (session.join().expect("loading does not panic"), analysis)
+        (session.join().expect("loading does not panic"), analysis, debug.join().ok().flatten())
     });
     let mut session = session?;
     let edits = Edits::load(binary)?;
     edits.apply(&mut analysis);
     session.add_imports(&image, &analysis)?;
-    let facts = Facts::derive(&image, &analysis);
+    let mut facts = Facts::derive(&image, &analysis);
+    // Functions the debug information describes, among the ones the analysis found.
+    let described = |addr: u64| analysis.functions.binary_search_by_key(&addr, |f| f.addr).is_ok_and(|index| analysis.functions[index].fragment_of.is_none());
+    if let Some(debug) = &debug {
+        // A function the binary has no name for takes the one its debug information gives it.
+        let named: HashSet<u64> = facts.names.iter().map(|name| name.0).collect();
+        facts.names.extend(debug.functions.iter().filter(|f| !f.name.is_empty() && !named.contains(&f.addr) && described(f.addr)).map(|f| (f.addr, f.name.clone())));
+    }
     session.add_functions(&facts)?;
     session.add_strings(&analysis)?;
     session.add_classes(&analysis)?;
     session.add_objc(&image)?;
     if options.jump_tables == JumpTables::Recore || (options.jump_tables == JumpTables::Auto && image.format == Format::Pe) {
         session.override_jump_tables(&analysis, &facts)?;
+    }
+
+    // Types from debug information go in before the edits, which have the last word and may
+    // name them. The prototypes follow as functions are asked for.
+    let mut importer = debug.as_ref().map(crate::types::Importer::new);
+    if let Some(importer) = &mut importer {
+        importer.globals(&mut session);
+        for text in edits.declarations.iter().chain(edits.types.values()) {
+            importer.mentioned(&mut session, text);
+        }
     }
 
     // Each edit was accepted by a session when it was made. One that no longer is, after a
@@ -173,7 +192,10 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     session.set_style(options.style)?;
     let callees_first = options.callees_first && image.machine == Machine::X86;
     session.keep_prototypes(callees_first);
-    let callees = if callees_first { callees(&analysis, false) } else { HashMap::new() };
+    // What each function calls: with debug information, the functions whose prototypes its
+    // calls need.
+    let called = if callees_first || importer.is_some() { callees(&analysis, false) } else { HashMap::new() };
+    let callees = if callees_first { called.clone() } else { HashMap::new() };
     // A function that ends by jumping to another returns what that one returns, which the
     // engine only learns if the other is decompiled first.
     let tail_callees = callees_of(&analysis, true);
@@ -223,6 +245,9 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Flow(addr) => {
+                if let Some(importer) = &mut importer {
+                    importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
+                }
                 session.keep_flow(true);
                 let flow = session.decompile(addr).map(|function| function.flow.unwrap_or_default());
                 session.keep_flow(false);
@@ -230,10 +255,16 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Declare(ref declaration) => {
+                if let Some(importer) = &mut importer {
+                    importer.mentioned(&mut session, declaration);
+                }
                 send(&text(session.declare(declaration).map(|()| String::new())))?;
                 continue;
             }
             Request::Type(ref name) => {
+                if let Some(importer) = &mut importer {
+                    importer.mentioned(&mut session, name);
+                }
                 send(&text(session.type_layout(name)))?;
                 continue;
             }
@@ -252,6 +283,9 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             }
         }
         session.keep_prototypes(callees_first || jumped_to.contains(&addr));
+        if let Some(importer) = &mut importer {
+            importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
+        }
         let start = Instant::now();
         let result = session.decompile(addr);
         known.insert(addr);
