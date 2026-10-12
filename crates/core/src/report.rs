@@ -158,8 +158,9 @@ pub struct Class {
     pub name: String,
     /// Address of the vtable, or of the class object or category record in Objective-C.
     pub vtable: u64,
-    /// Entry points of the virtual functions, in vtable order. In Objective-C, of the instance
-    /// methods and then the class methods, each in the order of its method list.
+    /// Entry points of the virtual functions, in vtable order. A slot bound to a function of
+    /// another image holds the slot's own address, and a null slot zero. In Objective-C, the
+    /// instance methods and then the class methods, each in the order of its method list.
     pub methods: Vec<u64>,
     /// Classes it derives from, directly or not, nearest first.
     pub bases: Vec<String>,

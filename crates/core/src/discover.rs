@@ -133,6 +133,9 @@ pub struct Discovery {
     /// `(instruction, address, accessed)` for each data address an instruction refers to:
     /// `accessed` when it reads or writes there, otherwise it takes the address.
     pub data_refs: Vec<(u64, u64, bool)>,
+    /// The same for instructions decoded on a guess that they are code. They count once the
+    /// instruction turns out to be part of a function.
+    pub uncertain_refs: Vec<(u64, u64, bool)>,
     /// Every stretch of decoded instructions, as sorted `[start, end)` ranges.
     pub code: Vec<(u64, u64)>,
 }
@@ -232,6 +235,8 @@ struct Explorer<'a, A: Arch> {
     data_refs: Vec<u64>,
     /// `(instruction, address, accessed)` for each data address an instruction refers to.
     data_ref_sites: Vec<(u64, u64, bool)>,
+    /// References seen while decoding speculatively, which decide nothing during discovery.
+    uncertain_ref_sites: Vec<(u64, u64, bool)>,
     /// Slot address to target for every pointer a relative relocation stores in data.
     pointer_slots: &'a FxHashMap<u64, u64>,
     /// Every value a relocation stores, for telling addresses from look-alike constants.
@@ -393,14 +398,18 @@ impl<A: Arch> Explorer<'_, A> {
                             if !speculative && self.is_data(data) {
                                 self.data_ref_sites.push((decoded.addr, data, true));
                             }
+                        } else if !speculative && self.is_data(base) && self.is_data(data) {
+                            // A field or an element of the global whose address the register holds.
+                            self.data_ref_sites.push((decoded.addr, data, true));
                         }
                     }
                     let accessed = A::memory_reference(&insn, &state)
-                        .filter(|_| !speculative)
                         .filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target))
                         .filter(|&target| self.is_data(target));
-                    if let Some(target) = accessed {
-                        self.note_access(decoded.addr, target);
+                    match accessed {
+                        Some(target) if speculative => self.uncertain_ref_sites.push((decoded.addr, target, true)),
+                        Some(target) => self.note_access(decoded.addr, target),
+                        None => {}
                     }
                     if let Some(target) = A::offset_address(&insn, &state).filter(|&target| !speculative && self.is_data(target)) {
                         self.data_ref_sites.push((decoded.addr, target, false));
@@ -417,10 +426,10 @@ impl<A: Arch> Explorer<'_, A> {
                             }
                         }
                     }
-                    let taken = A::address_taken(&insn, &state)
-                        .filter(|_| !speculative)
-                        .filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
-                    if let Some(target) = taken {
+                    let taken = A::address_taken(&insn, &state).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
+                    if let Some(target) = taken.filter(|_| speculative) {
+                        self.uncertain_ref_sites.push((decoded.addr, target, false));
+                    } else if let Some(target) = taken {
                         if self.region_index(target).is_some() {
                             self.add_start(target, Origin::AddressTaken);
                             // Code whose address is taken is a callback or a method table entry,
@@ -958,7 +967,8 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
     data_refs.dedup();
     let _phase = phase::scope("discover/code ranges");
     let code = explorer.code_ranges();
-    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, code }
+    let uncertain_refs = std::mem::take(&mut explorer.uncertain_ref_sites);
+    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code }
 }
 
 /// What the image's relative relocations say, in the forms exploring looks them up.
@@ -1013,6 +1023,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         unresolved: BTreeSet::new(),
         data_refs: Vec::new(),
         data_ref_sites: Vec::new(),
+        uncertain_ref_sites: Vec::new(),
         pointer_slots: &pointers.slots,
         pointer_values: &pointers.values,
         known_lengths,

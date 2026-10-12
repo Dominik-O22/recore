@@ -8,30 +8,68 @@ use rustc_hash::FxHashMap;
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
 
-use crate::image::{Image, Machine};
+use crate::image::{Format, Image, Machine};
 
 /// Functions shorter than this are too alike to tell apart: many are a move and a return.
 const MIN_INSTRUCTIONS: usize = 10;
 const MIN_BYTES: u64 = 32;
 
-/// The fingerprint of the function occupying `[start, end)`, or `None` when it is too small to
-/// be distinctive or the architecture is not supported.
-pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64) -> Option<u64> {
-    let bits = match image.machine {
-        Machine::X86 => 32,
-        Machine::X86_64 => 64,
-        Machine::Aarch64 => return None,
+/// The same bound for AArch64. It is higher because short functions there are more often one
+/// body under several names: with each corpus project held out in turn, the names given to
+/// functions of 10 to 15 instructions were wrong 14 times in 417, and 15 times in 3,738 above.
+const MIN_WORDS: usize = 16;
+
+/// FNV-1a over the bytes fed to it.
+struct Hash(u64);
+
+impl Hash {
+    fn new() -> Hash {
+        Hash(0xcbf2_9ce4_8422_2325)
+    }
+    fn feed(&mut self, byte: u8) {
+        self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+/// What shows of the function occupying `[start, end)` without decoding it, and is the same
+/// wherever the function is linked: its length, and the leading byte of its first instruction
+/// less any bits of an address. Functions with one fingerprint have one outline, so a table
+/// that lists the outlines of its functions rules most others out for the cost of a search.
+/// `None` when the function is too small to be distinctive.
+pub fn outline(image: &Image, start: u64, end: u64) -> Option<u32> {
+    let length = end.checked_sub(start).filter(|length| (MIN_BYTES..1 << 24).contains(length))?;
+    let lead = match (image.machine, image.bytes_from(start)?) {
+        (Machine::X86 | Machine::X86_64, &[opcode, ..]) => opcode,
+        // The top byte holds offset bits in `b` and `bl`, and in `adr` and `adrp`.
+        (Machine::Aarch64, &[_, _, _, top, ..]) if top & 0x7C == 0x14 => top & 0xFC,
+        (Machine::Aarch64, &[_, _, _, top, ..]) if top & 0x1F == 0x10 => top & 0x9F,
+        (Machine::Aarch64, &[_, _, _, top, ..]) => top,
+        _ => return None,
     };
+    Some((length as u32) << 8 | u32::from(lead))
+}
+
+/// The fingerprint of the function occupying `[start, end)`, or `None` when it is too small to
+/// be distinctive.
+pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64) -> Option<u64> {
     if end.checked_sub(start)? < MIN_BYTES {
         return None;
     }
     let bytes = image.bytes_from(start)?;
     let bytes = bytes.get(..(end - start) as usize)?;
+    match image.machine {
+        Machine::X86 => x86(32, bytes, pointer_slots, start, end),
+        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end),
+        Machine::Aarch64 => aarch64(bytes, start, end),
+    }
+}
+
+/// An x86 function: displacements and immediates are blanked where they are relative to the
+/// instruction pointer and leave the function, or where the loader relocates them.
+fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64) -> Option<u64> {
     let mut decoder = Decoder::with_ip(bits, bytes, start, DecoderOptions::NONE);
 
-    // FNV-1a.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut feed = |byte: u8| hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    let mut hash = Hash::new();
     let mut instructions = 0;
 
     while decoder.can_decode() {
@@ -71,44 +109,264 @@ pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u6
             }
         }
         for (index, &byte) in raw.iter().enumerate() {
-            feed(if blank[index] { 0 } else { byte });
+            hash.feed(if blank[index] { 0 } else { byte });
         }
     }
-    (instructions >= MIN_INSTRUCTIONS).then_some(hash)
+    (instructions >= MIN_INSTRUCTIONS).then_some(hash.0)
 }
 
-/// Known fingerprints and the library function each belongs to.
-pub struct Signatures {
-    names: FxHashMap<u64, &'static str>,
-}
+/// An AArch64 function, a word at a time. Blanked are the offsets of calls and of branches and
+/// literal loads that leave the function, the address `adr` or `adrp` forms, and the low twelve
+/// bits an `add`, load or store then adds to a page. Which registers hold a page is followed
+/// along the instructions in address order, which is all the pairing compilers emit needs.
+fn aarch64(bytes: &[u8], start: u64, end: u64) -> Option<u64> {
+    const OFFSET_26: u32 = 0x03FF_FFFF;
+    const OFFSET_19: u32 = 0x00FF_FFE0;
+    const OFFSET_14: u32 = 0x0007_FFE0;
+    const PC_RELATIVE: u32 = 0x60FF_FFE0;
+    const LOW_12: u32 = 0x003F_FC00;
+    /// The registers a call may change: `x0` to `x18` and the link register.
+    const CALLER_SAVED: u32 = 0x4007_FFFF;
 
-impl Signatures {
-    /// The signatures built into this crate for `machine`: one `hash name` pair per line.
-    pub fn builtin(machine: Machine) -> Signatures {
-        let text = match machine {
-            Machine::X86 => include_str!("../data/x86.sigs"),
-            Machine::X86_64 => include_str!("../data/x86_64.sigs"),
-            Machine::Aarch64 => "",
+    if bytes.len() / 4 < MIN_WORDS {
+        return None;
+    }
+    let mut hash: u64 = 0;
+    // Bit `n` is set while register `n` holds a page address.
+    let mut pages: u32 = 0;
+    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let word = u32::from_le_bytes(chunk.try_into().unwrap());
+        let (rd, rn) = (word & 31, word >> 5 & 31);
+        // Whether the branch offset in the bits of `field`, counted in words, leaves the function.
+        let leaves = |field: u32| {
+            let unused = 64 - field.count_ones();
+            let offset = (i64::from((word & field) >> field.trailing_zeros()) << unused >> unused) * 4;
+            let target = (start + index as u64 * 4).wrapping_add_signed(offset);
+            target < start || target >= end
         };
-        let names = text
-            .lines()
-            .filter_map(|line| {
-                let (hash, name) = line.split_once(' ')?;
-                Some((u64::from_str_radix(hash, 16).ok()?, name))
-            })
-            .collect();
-        Signatures { names }
+        let blank_if = |condition: bool, field: u32| if condition { field } else { 0 };
+        let mut blank = 0;
+        if word & 0x7C00_0000 == 0x1400_0000 {
+            // `b` and `bl`.
+            let is_call = word >> 31 == 1;
+            blank = blank_if(is_call || leaves(OFFSET_26), OFFSET_26);
+            if is_call {
+                pages &= !CALLER_SAVED;
+            }
+        } else if word & 0xFF00_0000 == 0x5400_0000 || word & 0x7E00_0000 == 0x3400_0000 {
+            // `b.cond`, `cbz` and `cbnz`.
+            blank = blank_if(leaves(OFFSET_19), OFFSET_19);
+        } else if word & 0x7E00_0000 == 0x3600_0000 {
+            // `tbz` and `tbnz`.
+            blank = blank_if(leaves(OFFSET_14), OFFSET_14);
+        } else if word & 0xFFFF_FC1F == 0xD63F_0000 {
+            // `blr`.
+            pages &= !CALLER_SAVED;
+        } else if word & 0x1F00_0000 == 0x1000_0000 {
+            // `adrp` and `adr`. What `adr` reaches is nearly always data outside the function.
+            blank = PC_RELATIVE;
+            pages = pages & !(1 << rd) | (word >> 31) << rd;
+        } else if word & 0x3B00_0000 == 0x1800_0000 {
+            // A load from a literal.
+            blank = blank_if(leaves(OFFSET_19), OFFSET_19);
+            pages &= !(1 << rd);
+        } else if word & 0xFFC0_0000 == 0x9100_0000 {
+            // 64-bit `add xd, xn, #imm`.
+            blank = blank_if(pages >> rn & 1 == 1, LOW_12);
+            pages &= !(1 << rd);
+        } else if word & 0x3B00_0000 == 0x3900_0000 {
+            // A load or store at `[xn, #imm]`. A load into a general register overwrites it.
+            blank = blank_if(pages >> rn & 1 == 1, LOW_12);
+            if word >> 22 & 3 != 0 && word >> 26 & 1 == 0 {
+                pages &= !(1 << rd);
+            }
+        } else if word >> 25 & 0b0101 == 0b0100 {
+            // Other loads and stores: the general registers loaded, and the base when it moves.
+            let is_pair = word & 0x3A00_0000 == 0x2800_0000;
+            if word >> 22 & 1 == 1 && word >> 26 & 1 == 0 {
+                pages &= !(1 << rd);
+                if is_pair {
+                    pages &= !(1 << (word >> 10 & 31));
+                }
+            }
+            let writes_base = if is_pair { word >> 23 & 1 == 1 } else { word >> 24 & 1 == 0 && word >> 10 & 1 == 1 };
+            if writes_base {
+                pages &= !(1 << rn);
+            }
+        } else if word >> 25 & 0b0111 != 0b0111 {
+            // Everything else that is not floating-point or vector arithmetic writes `rd`.
+            pages &= !(1 << rd);
+        }
+        // One multiplication a word; the rotation carries high bits back into the low ones.
+        hash = (hash.rotate_left(5) ^ u64::from(word & !blank)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    Some(hash)
+}
+
+/// Known fingerprints and the library function each belongs to: a table that is searched where
+/// it lies, so a program pays nothing to load it and touches only the pages a search reaches.
+///
+/// The table is the number of outlines and the number of fingerprints in four bytes each, the
+/// outlines in four bytes each, the fingerprints in eight bytes each, for each fingerprint in
+/// four bytes where its name ends, and the names back to back. Outlines and fingerprints are in
+/// ascending order and all numbers are little-endian. `recore-corpus signatures` writes one.
+pub struct Signatures<'a> {
+    outlines: &'a [u8],
+    hashes: &'a [u8],
+    ends: &'a [u8],
+    names: &'a [u8],
+}
+
+/// The position of the first of `count` numbers `width` bytes wide that is not below `wanted`.
+fn lower_bound(numbers: &[u8], width: usize, wanted: u64) -> usize {
+    let (mut low, mut high) = (0, numbers.len() / width);
+    while low < high {
+        let middle = (low + high) / 2;
+        if number(numbers, width, middle) < wanted {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
+/// The number at `index` among those `width` bytes wide.
+fn number(numbers: &[u8], width: usize, index: usize) -> u64 {
+    let mut raw = [0; 8];
+    raw[..width].copy_from_slice(&numbers[index * width..][..width]);
+    u64::from_le_bytes(raw)
+}
+
+impl<'a> Signatures<'a> {
+    /// The signatures built into this crate for images of `format` on `machine`. Empty where
+    /// the corpora hold too little shared library code to name anything, which is Mach-O.
+    pub fn builtin(format: Format, machine: Machine) -> Signatures<'static> {
+        let table: &[u8] = match (format, machine) {
+            (Format::Pe, Machine::X86) => include_bytes!("../data/pe-x86.sigs"),
+            (Format::Pe, Machine::X86_64) => include_bytes!("../data/pe-x86_64.sigs"),
+            (Format::Elf, Machine::X86_64) => include_bytes!("../data/elf-x86_64.sigs"),
+            (Format::Elf, Machine::Aarch64) => include_bytes!("../data/elf-aarch64.sigs"),
+            _ => &[0; 8],
+        };
+        Signatures::read(table).expect("built-in signature tables are well formed")
     }
 
-    pub fn name(&self, fingerprint: u64) -> Option<&'static str> {
-        self.names.get(&fingerprint).copied()
+    /// The table in `bytes`, or `None` when they are not laid out as one.
+    pub fn read(bytes: &'a [u8]) -> Option<Signatures<'a>> {
+        let (outlines, rest) = bytes.split_first_chunk::<4>()?;
+        let (count, rest) = rest.split_first_chunk::<4>()?;
+        let count = u32::from_le_bytes(*count) as usize;
+        let (outlines, rest) = rest.split_at_checked(u32::from_le_bytes(*outlines) as usize * 4)?;
+        let (hashes, rest) = rest.split_at_checked(count * 8)?;
+        let (ends, names) = rest.split_at_checked(count * 4)?;
+        (count == 0 || number(ends, 4, count - 1) == names.len() as u64).then_some(Signatures { outlines, hashes, ends, names })
+    }
+
+    /// The bytes of a table of `(fingerprint, outline, name)` entries, which must be in
+    /// ascending order of fingerprint.
+    pub fn write(entries: &[(u64, u32, &str)]) -> Vec<u8> {
+        let mut outlines: Vec<u32> = entries.iter().map(|entry| entry.1).collect();
+        outlines.sort_unstable();
+        outlines.dedup();
+        let mut table = (outlines.len() as u32).to_le_bytes().to_vec();
+        table.extend((entries.len() as u32).to_le_bytes());
+        table.extend(outlines.into_iter().flat_map(u32::to_le_bytes));
+        table.extend(entries.iter().flat_map(|entry| entry.0.to_le_bytes()));
+        let mut end = 0;
+        for entry in entries {
+            end += entry.2.len() as u32;
+            table.extend(end.to_le_bytes());
+        }
+        table.extend(entries.iter().flat_map(|entry| entry.2.bytes()));
+        table
+    }
+
+    /// The name of the library function with this fingerprint.
+    pub fn name(&self, fingerprint: u64) -> Option<&'a str> {
+        let index = lower_bound(self.hashes, 8, fingerprint);
+        if index == self.len() || number(self.hashes, 8, index) != fingerprint {
+            return None;
+        }
+        let start = if index == 0 { 0 } else { number(self.ends, 4, index - 1) };
+        std::str::from_utf8(self.names.get(start as usize..number(self.ends, 4, index) as usize)?).ok()
+    }
+
+    /// The name of the library function occupying `[start, end)`, if it is one the table knows.
+    /// The function is only decoded when its outline is that of some function in the table.
+    pub fn recognise(&self, image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64) -> Option<&'a str> {
+        let outline = u64::from(outline(image, start, end)?);
+        let index = lower_bound(self.outlines, 4, outline);
+        if index * 4 == self.outlines.len() || number(self.outlines, 4, index) != outline {
+            return None;
+        }
+        self.name(fingerprint(image, pointer_slots, start, end)?)
     }
 
     pub fn len(&self) -> usize {
-        self.names.len()
+        self.hashes.len() / 8
     }
 
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.hashes.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fingerprint of a function at `start` made of `words` and then enough distinct `mov`
+    /// instructions to be long enough.
+    fn fingerprint_of(words: &[u32], start: u64) -> Option<u64> {
+        let padding = (0..MIN_WORDS as u32).map(|n| 0xD280_0000 | n << 5);
+        let bytes: Vec<u8> = words.iter().copied().chain(padding).flat_map(u32::to_le_bytes).collect();
+        aarch64(&bytes, start, start + bytes.len() as u64)
+    }
+
+    #[test]
+    fn aarch64_fingerprint_ignores_where_the_function_and_its_data_are() {
+        // adrp x8, <page>; ldr x0, [x8, #off]; adrp x1, <page>; add x1, x1, #off; bl <callee>
+        let here = [0x9000_0008, 0xF940_0500, 0xB000_0041, 0x9100_4021, 0x9400_0010];
+        let there = [0xF000_0128, 0xF941_3100, 0x9000_0001, 0x9123_4021, 0x97FF_FF00];
+        assert!(fingerprint_of(&here, 0x1000).is_some());
+        assert_eq!(fingerprint_of(&here, 0x1000), fingerprint_of(&there, 0x7_3000));
+    }
+
+    #[test]
+    fn aarch64_fingerprint_keeps_offsets_that_are_not_addresses() {
+        // ldr x0, [x8, #8] against ldr x0, [x8, #16]: a field of whatever x8 points to.
+        assert_ne!(fingerprint_of(&[0xF940_0500], 0x1000), fingerprint_of(&[0xF940_0900], 0x1000));
+        // The same after x8 stopped holding a page: adrp x8; ldr x8, [x8]; ldr x0, [x8, #off].
+        assert_ne!(
+            fingerprint_of(&[0x9000_0008, 0xF940_0108, 0xF940_0500], 0x1000),
+            fingerprint_of(&[0x9000_0008, 0xF940_0108, 0xF940_0900], 0x1000)
+        );
+        // cbz x0 to the next instruction against the one after: a branch inside the function.
+        assert_ne!(fingerprint_of(&[0xB400_0020], 0x1000), fingerprint_of(&[0xB400_0040], 0x1000));
+    }
+
+    #[test]
+    fn a_written_table_gives_each_fingerprint_its_name() {
+        let bytes = Signatures::write(&[(3, 0x4055, "memcpy"), (0x8000_0000_0000_0001, 0x2041, "core::fmt::write"), (u64::MAX, 0x4055, "_start")]);
+        let table = Signatures::read(&bytes).unwrap();
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.name(3), Some("memcpy"));
+        assert_eq!(table.name(0x8000_0000_0000_0001), Some("core::fmt::write"));
+        assert_eq!(table.name(u64::MAX), Some("_start"));
+        assert_eq!(table.name(4), None);
+        assert!(Signatures::read(&bytes[..bytes.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn built_in_tables_are_sorted_so_every_entry_is_found() {
+        for (format, machine) in [(Format::Pe, Machine::X86), (Format::Pe, Machine::X86_64), (Format::Elf, Machine::X86_64), (Format::Elf, Machine::Aarch64)] {
+            let table = Signatures::builtin(format, machine);
+            assert!(!table.is_empty());
+            let hash = |index| number(table.hashes, 8, index);
+            assert!((1..table.len()).all(|index| hash(index - 1) < hash(index)));
+            assert!((0..table.len()).all(|index| table.name(hash(index)).is_some_and(|name| !name.is_empty())));
+            assert!((1..table.outlines.len() / 4).all(|index| number(table.outlines, 4, index - 1) < number(table.outlines, 4, index)));
+        }
     }
 }

@@ -79,14 +79,14 @@ Decompiled function signatures against PDB records, 8 binaries per corpus:
 
 Each tool's percentages are over the functions it decompiled, and recore decompiles more of them. On the 8,523 32-bit functions both decompiled, recore gets the parameters of 86.5% right and Ghidra 86.1%.
 
-References from code to data have no ground truth, so they are scored against Ghidra's own, on 11 binaries: recore finds 95.1% of them on Linux x86-64, 88.2% on Windows x86, 87.4% on Windows x86-64 and 84.7% on Linux AArch64.
+References from code to data have no ground truth, so they are scored against Ghidra's own, on 11 binaries: recore finds 96.3% of them on Linux x86-64, 88.2% on Windows x86, 93.2% on Windows x86-64 and 85.1% on Linux AArch64.
 
 There is no Ghidra run for function recovery on the Linux AArch64 and Mach-O corpora. With unwind tables hidden, recore finds 99.2% of functions on Linux AArch64. With the linker's list of function starts hidden, it finds 98.6% on AArch64 Mach-O and 99.2% on x86-64 Mach-O.
 
 ## What Ghidra does that recore does not
 
 - **Processors.** Ghidra covers dozens. recore covers three.
-- **Types.** Ghidra ships struct layouts for the common libraries and lets a user edit types in a GUI. recore knows the types a caller declares, the prototypes of Windows, C library and macOS functions, classes from MSVC type information and Objective-C metadata, and, when a binary has DWARF or a PDB, the structs, prototypes and globals in it.
+- **Types.** Ghidra ships struct layouts for the common libraries and lets a user edit types in a GUI. recore knows the types a caller declares, the prototypes of Windows, C library and macOS functions, classes from MSVC and Itanium type information and Objective-C metadata, and, when a binary has DWARF or a PDB, the structs, prototypes and globals in it.
 - **A GUI**, a debugger, scripting, and a database of everything it found.
 
 Other limits: Swift names are demangled but Swift's own metadata is not read; `trace` does not follow a value through memory; a name goes on a function or on data, not on a place inside a function; arm64e Mach-O loads but is untested.
@@ -111,7 +111,9 @@ For Claude Code, in `.mcp.json`:
 
 ## Reproducing the numbers
 
-The corpora are not in the repository. `corpus/fetch*.py` download them, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. The speed table compares Ghidra's `Total Time` per binary with the wall time of `recore-mcp summary`, fastest of three runs. Both ran on the same Ryzen 7 9850X3D. Ghidra analyzed several binaries at a time with 4 cores each, and recore one at a time.
+The corpora are not in the repository. `corpus/fetch*.py` download them, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. `recore-bench run analysis --save <name>` and `--compare <name>` hold a change against an earlier build. Next to the times they report the processor instructions executed, which stay the same to a few hundredths of a percent whatever else the machine is doing.
+
+The speed table compares Ghidra's `Total Time` per binary with the wall time of `recore-mcp summary`, fastest of three runs. Both ran on the same Ryzen 7 9850X3D. Ghidra analyzed several binaries at a time with 4 cores each, and recore one at a time.
 
 | Directory | Contents |
 |---|---|

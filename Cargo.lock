@@ -740,6 +740,7 @@ dependencies = [
  "gimli 0.34.0",
  "iced-x86",
  "libc",
+ "memchr",
  "msvc-demangler",
  "object 0.40.0",
  "rayon",
@@ -757,7 +758,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "pprof",
+ "rayon",
  "recore",
  "recore-decomp",
  "serde",
@@ -770,6 +773,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cpp_demangle 0.5.1",
  "gimli 0.34.0",
  "iced-x86",
  "object 0.40.0",

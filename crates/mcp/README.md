@@ -16,7 +16,7 @@ Every tool takes `path`, the binary to analyze, and answers with text. Addresses
 | `xrefs` | `addr` | Call sites if it is a function or import slot, and the message sends only it implements if it is an Objective-C method. For data, the instructions that read or write it or take its address, and the pointers in data that hold it. |
 | `decompile` | `functions` (list of addresses or names), `timeout`? (seconds per function, 30) | C for each function. |
 | `bytes` | `addr`, `len`? (256, at most 4096) | Hex dump of the bytes mapped at the address. |
-| `classes` | `pattern`? | C++ classes from MSVC type information: base classes, vtable address, virtual functions in vtable order. Objective-C classes and categories from a Mach-O image's metadata: superclasses, instance methods, then class methods. |
+| `classes` | `pattern`? | C++ classes from MSVC and Itanium (GCC, Clang) type information: base classes, vtable address, virtual functions in vtable order. Objective-C classes and categories from a Mach-O image's metadata: superclasses, instance methods, then class methods. |
 | `addr` | `addr` or `offset` | The address in the image and the offset in the file of the same byte, and what is there. |
 | `disassemble` | `function` or `addr`, `count`?, `pcode`? | Instructions as Ghidra's listing prints them, in basic blocks with each block's successors. Each line has the bytes and what the analysis knows: call target, string or data referred to, switch targets, comment. `pcode` adds each instruction's raw p-code. |
 | `pcode` | `function`, `limit`? (400), `timeout`? | The function's data flow after the decompiler has simplified it: blocks, and operations over values assigned once each. |

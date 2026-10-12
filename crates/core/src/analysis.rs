@@ -14,7 +14,7 @@ use crate::image::{Format, Image, Machine};
 use crate::noreturn::is_noreturn_import;
 use crate::phase;
 use crate::report::{AnalyzedFunction, Analysis, CallSite, CallTarget, DataRef, Import, Origin, StringLiteral};
-use crate::signature::{Signatures, fingerprint};
+use crate::signature::Signatures;
 use crate::strings::string_at;
 use crate::x86::X86;
 
@@ -391,6 +391,19 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
     let pointer_slots: FxHashMap<u64, u64> = image.relative_targets.iter().copied().collect();
 
+    _phase = phase::scope("classes");
+    let mut classes = crate::rtti::classes(image);
+    if classes.is_empty() {
+        classes = crate::itanium::classes(image, &pointer_slots);
+        // A virtual function is called through its vtable, and in an image that relocates
+        // nothing its vtable slot is all that says it is a function.
+        let methods = classes.iter().flat_map(|class| class.methods.iter().copied());
+        for method in methods.filter(|&method| image.section_at(method).is_some_and(is_function_section)) {
+            discovery.starts.entry(method).or_insert(Origin::DataPointer);
+            discovery.referenced.insert(method);
+        }
+    }
+
     let (starts, functions, chunks, noreturn, controls, extents) = loop {
         _phase = phase::scope("decode functions");
         let starts: Vec<u64> = discovery.starts.keys().copied().collect();
@@ -699,28 +712,33 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     }
 
     // Statically linked library code carries no symbol, but its bytes are the same in every
-    // program that links it. The built-in fingerprints come from Windows builds.
+    // program that links it.
     _phase = phase::scope("fingerprints");
-    if image.format == Format::Pe {
-        let signatures = Signatures::builtin(image.machine);
+    let signatures = Signatures::builtin(image.format, image.machine);
+    if !signatures.is_empty() {
         let recognised: Vec<(u64, &str)> = functions
             .par_iter()
             .filter(|f| !names.contains_key(&f.start))
-            .filter_map(|f| Some((f.start, signatures.name(fingerprint(image, &pointer_slots, f.start, f.end)?)?)))
+            .filter_map(|f| Some((f.start, signatures.recognise(image, &pointer_slots, f.start, f.end)?)))
             .collect();
         names.extend(recognised.into_iter().map(|(addr, name)| (addr, name.to_string())));
     }
 
     // A virtual function nothing else names takes the name of its vtable slot, in the class
-    // that has the fewest bases among those listing it: the one that introduced it.
+    // that has the fewest bases among those listing it: the one that introduced it. A class
+    // with several vtables numbers the slots of each from zero, and the first to claim a name
+    // keeps it.
     _phase = phase::scope("classes");
-    let classes = crate::rtti::classes(image);
     let mut by_depth: Vec<&crate::report::Class> = classes.iter().collect();
     by_depth.sort_by_key(|class| class.bases.len());
+    let mut slot_names: FxHashSet<String> = FxHashSet::default();
     for class in by_depth {
         for (index, &method) in class.methods.iter().enumerate() {
-            if starts.contains(&method) {
-                names.entry(method).or_insert_with(|| format!("{}::vfunc_{index}", class.name));
+            if is_start(method) && !names.contains_key(&method) {
+                let name = format!("{}::vfunc_{index}", class.name);
+                if slot_names.insert(name.clone()) {
+                    names.insert(method, name);
+                }
             }
         }
     }
@@ -741,9 +759,21 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     }
 
     _phase = phase::scope("report");
+    // References seen in code that was decoded on a guess count now that the functions are
+    // settled: those from inside a function, to data or to a function's entry.
+    let mut extents: Vec<(u64, u64)> = pieces.iter().map(|piece| (piece.start, piece.end)).collect();
+    extents.sort_unstable();
+    let in_function = |addr: u64| extents[..extents.partition_point(|&(start, _)| start <= addr)].last().is_some_and(|&(_, end)| addr < end);
+    let is_data = |addr: u64| image.section_at(addr).map_or_else(|| image.is_zero_filled(addr), |section| !section.executable);
+    let mut data_refs = discovery.data_refs.clone();
+    data_refs.extend(discovery.uncertain_refs.iter().copied().filter(|&(from, target, access)| {
+        in_function(from) && (is_data(target) || (!access && extents.binary_search_by_key(&target, |&(start, _)| start).is_ok()))
+    }));
+    data_refs.sort_unstable();
+    data_refs.dedup();
     Analysis {
         sends,
-        data_refs: discovery.data_refs.iter().map(|&(from, to, access)| DataRef { from, to, access }).collect(),
+        data_refs: data_refs.into_iter().map(|(from, to, access)| DataRef { from, to, access }).collect(),
         classes,
         strings,
         name: image.name.clone(),
