@@ -132,40 +132,22 @@ fn finish(config: &Config, binary: &mut Binary) -> Result<Vec<FunctionRecord>> {
     Ok(report.functions)
 }
 
-/// Decompiles `addrs` in worker processes. A worker that dies or stalls costs only the function
-/// it was working on: that one is recorded as crashed or timed out, and a new worker takes over
-/// the rest.
+/// Decompiles `addrs` in a worker process. A worker that dies or stalls costs only the function
+/// it was working on: that one is recorded as crashed or timed out.
 pub fn run_shard(options: &Options, timeout: Duration, binary: &Path, addrs: &[u64]) -> (Vec<FunctionRecord>, Vec<(u64, String)>) {
+    let command = || {
+        // Without the path of this program no child starts, and each function reports that.
+        let mut command = Command::new(std::env::current_exe().unwrap_or_default());
+        command.arg("worker");
+        command
+    };
+    let mut worker = Worker::new(command, binary, options);
     let mut records = Vec::new();
     let mut c_texts = Vec::new();
-    let mut worker: Option<Worker> = None;
-    for (index, &addr) in addrs.iter().enumerate() {
-        if worker.is_none() {
-            let started = std::env::current_exe().map_err(anyhow::Error::from).and_then(|exe| {
-                let mut command = Command::new(exe);
-                command.arg("worker");
-                Worker::spawn(command, binary, options)
-            });
-            match started {
-                Ok(started) => worker = Some(started),
-                Err(error) => {
-                    // Setup failed, so a new worker would fail the same way.
-                    let message = format!("{error:#}");
-                    records.extend(addrs[index..].iter().map(|&addr| FunctionRecord::failed(addr, Status::Error, message.clone(), 0.0)));
-                    break;
-                }
-            }
-        }
-        match worker.as_mut().expect("started above").decompile(addr, timeout) {
-            Ok((record, c_text)) => {
-                c_texts.extend(c_text.map(|text| (addr, text)));
-                records.push(record);
-            }
-            Err(record) => {
-                records.push(record);
-                worker = None;
-            }
-        }
+    for &addr in addrs {
+        let (record, c_text) = worker.decompile(addr, timeout);
+        c_texts.extend(c_text.map(|text| (addr, text)));
+        records.push(record);
     }
     (records, c_texts)
 }

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 use recore::Image;
 use recore::program::Program;
-use recore_decomp::isolate::{FunctionRecord, Options, Status, Worker};
+use recore_decomp::isolate::{FunctionRecord, Options, Worker};
 
 /// Binaries kept at once. Each holds its analysis and a decompiler process.
 const KEPT: usize = 8;
@@ -21,20 +21,24 @@ pub struct Binary {
     /// Time spent loading and analyzing.
     pub analysis_ms: f64,
     /// Started when the binary is loaded, so it sets up while the first queries are answered.
-    worker: Option<Worker>,
+    worker: Worker,
 }
 
-fn start_worker(path: &Path) -> Result<Worker> {
-    let mut command = Command::new(std::env::current_exe()?);
-    command.arg(crate::WORKER_ARG);
-    Worker::start(command, path, &Options::default())
+fn start_worker(path: &Path) -> Worker {
+    let command = || {
+        // Without the path of this program no child starts, and each decompilation reports that.
+        let mut command = Command::new(std::env::current_exe().unwrap_or_default());
+        command.arg(crate::WORKER_ARG);
+        command
+    };
+    Worker::new(command, path, &Options::default())
 }
 
 impl Binary {
     fn load(path: &Path, stamp: (SystemTime, u64)) -> Result<Binary> {
         let start = Instant::now();
         // The child repeats the analysis for itself, at the same time as this process.
-        let worker = start_worker(path).ok();
+        let worker = start_worker(path);
         let image = Image::load(path)?;
         let analysis = recore::analyze(&image);
         let analysis_ms = start.elapsed().as_secs_f64() * 1e3;
@@ -44,23 +48,9 @@ impl Binary {
     }
 
     /// Decompiles the function at `addr` in the child process. A crash or a function that runs
-    /// past `timeout` costs that child and is reported in the record; the next one is started
-    /// at once.
+    /// past `timeout` costs that child and is reported in the record.
     pub fn decompile(&mut self, addr: u64, timeout: Duration) -> (FunctionRecord, Option<String>) {
-        // A child can have died while idle; that is not this function's doing.
-        if self.worker.as_mut().is_none_or(|worker| !worker.is_alive()) {
-            match start_worker(&self.path) {
-                Ok(worker) => self.worker = Some(worker),
-                Err(error) => return (FunctionRecord::failed(addr, Status::Error, format!("{error:#}"), 0.0), None),
-            }
-        }
-        match self.worker.as_mut().expect("started above").decompile(addr, timeout) {
-            Ok(result) => result,
-            Err(record) => {
-                self.worker = start_worker(&self.path).ok();
-                (record, None)
-            }
-        }
+        self.worker.decompile(addr, timeout)
     }
 }
 

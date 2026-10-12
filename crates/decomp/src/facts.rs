@@ -113,6 +113,15 @@ impl Facts {
             list.sort_unstable();
             list.dedup();
         }
+        // A function that only jumps to a helper stands in for it: incremental linking calls
+        // `_chkstk` through such a thunk.
+        let helpers: HashMap<u64, String> = facts.call_fixups.iter().cloned().collect();
+        let thunks = analysis.functions.iter().filter(|f| f.thunk && !helpers.contains_key(&f.addr));
+        facts.call_fixups.extend(thunks.filter_map(|thunk| {
+            let jump = &analysis.calls[analysis.calls.binary_search_by_key(&thunk.addr, |call| call.at).ok()?];
+            let CallTarget::Function(target) = jump.target else { return None };
+            Some((thunk.addr, helpers.get(&target).filter(|_| jump.tail)?.clone()))
+        }));
         facts.jump_tables.sort_unstable();
         facts.jump_tables.dedup();
         facts.import_aliases.sort_unstable();

@@ -338,8 +338,8 @@ impl Session {
     }
 
     /// With `keep`, the parameters recovered by every later successful [`Session::decompile`]
-    /// stay attached to the function, and callers decompiled afterwards pass exactly those.
-    /// Decompile callees before callers, or make several passes, to benefit.
+    /// stay attached to the function, and callers decompiled afterwards pass those and whatever
+    /// else the call shows. Decompile callees before callers to benefit.
     pub fn keep_prototypes(&mut self, keep: bool) {
         unsafe { ffi::rd_keep_prototypes(self.raw.as_ptr(), keep.into()) }
     }

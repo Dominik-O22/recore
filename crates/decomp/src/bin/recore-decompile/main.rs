@@ -34,6 +34,10 @@ struct WorkerOptions {
     /// the function is reported as an error.
     #[arg(long, default_value_t = 4)]
     memory_gb: u64,
+    /// Decompile the functions a function calls before the function itself, so that its calls
+    /// pass the parameters they were found to take. Only 32-bit x86 does this.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    callees_first: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -65,6 +69,7 @@ impl From<&WorkerOptions> for Options {
                 JumpTablesArg::Engine => JumpTables::Engine,
             },
             memory_gb: options.memory_gb,
+            callees_first: options.callees_first,
         }
     }
 }

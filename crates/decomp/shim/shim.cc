@@ -233,6 +233,62 @@ struct RdSession {
   }
 };
 
+// Whether a value goes nowhere except through copies and merges into storage that nothing reads
+// directly. A read after a call that may have written the storage is not a read of the value.
+static bool never_read(const Varnode *vn, set<const Varnode *> &seen) {
+  if (!seen.insert(vn).second) return true;
+  for (auto it = vn->beginDescend(); it != vn->endDescend(); ++it) {
+    const PcodeOp *op = *it;
+    switch (op->code()) {
+      case CPUI_INDIRECT:
+        break;
+      case CPUI_COPY:
+      case CPUI_CAST:
+      case CPUI_MULTIEQUAL:
+        if (!never_read(op->getOut(), seen)) return false;
+        break;
+      default:
+        return false;
+    }
+  }
+  return true;
+}
+
+// Whether the function's one register parameter exists only because the register is pushed.
+// MSVC reserves four bytes of stack with `push ecx`; when the address of that slot is passed on,
+// the engine cannot tell that the pushed value is never used, and reports ECX as a parameter.
+static bool only_spills_register_param(Funcdata *fd) {
+  const FuncProto &proto = fd->getFuncProto();
+  // Only where the default convention is the stack-only alternative to the one recovered.
+  if (proto.isModelLocked() || proto.getModelName() == fd->getArch()->defaultfp->getName()) return false;
+  const ProtoParameter *spilled = nullptr;
+  for (int4 i = 0; i < proto.numParams(); ++i) {
+    ProtoParameter *param = proto.getParam(i);
+    if (param->getAddress().getSpace()->getType() == IPTR_SPACEBASE) continue;
+    if (spilled != nullptr) return false;
+    spilled = param;
+  }
+  if (spilled == nullptr) return false;
+  const Varnode *vn = fd->findVarnodeInput(spilled->getSize(), spilled->getAddress());
+  set<const Varnode *> seen;
+  return vn != nullptr && !vn->hasNoDescend() && never_read(vn, seen);
+}
+
+// Whether the function reads a register that its recovered prototype does not account for. Such
+// a prototype is incomplete, and Ghidra's parameter analysis does not pass it on to callers either.
+static bool reads_unexplained_register(Funcdata *fd) {
+  ScopeLocal *scope = fd->getScopeLocal();
+  for (MapIterator it = scope->begin(); it != scope->end(); ++it) {
+    const SymbolEntry *entry = *it;
+    const string &name = entry->getSymbol()->getName();
+    if (name.compare(0, 3, "in_") != 0 || name == "in_FS_OFFSET") continue;
+    if (entry->isDynamic()) continue;
+    const Address &addr = static_cast<const MapEntry *>(entry)->getAddr();
+    if (addr.getSpace()->getType() != IPTR_SPACEBASE) return true;
+  }
+  return false;
+}
+
 extern "C" {
 
 // `spec_dir` holds the .ldefs/.pspec/.cspec/.sla files. The first session fixes it for the
@@ -432,7 +488,7 @@ int rd_override_tail_call(RdSession *session, uint64_t function, uint64_t jump, 
 }
 
 // With `keep` set, the parameters recovered by each successful rd_decompile are locked into the
-// function's symbol, so that later decompilations of its callers pass exactly those parameters.
+// function's symbol, so that later decompilations of its callers pass at least those parameters.
 void rd_keep_prototypes(RdSession *session, int keep) { session->keep_prototypes = keep != 0; }
 
 // Selects the engine's root action: "decompile" (everything), "normalize" (stops before type
@@ -453,6 +509,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     if (fd->getFuncProto().isInputLocked() && session->kept.erase(addr) != 0) {
       // Recover the prototype afresh instead of replaying the one kept from an earlier run.
       fd->getFuncProto().setInputLock(false);
+      fd->getFuncProto().setDotdotdot(false);
       arch->clearAnalysis(fd);
     }
     Action *root = arch->allacts.getCurrent();
@@ -460,6 +517,15 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     session->image->current = addr;
     // Follows flow from the entry point, then runs the whole simplification pipeline.
     if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
+    if (only_spills_register_param(fd)) {
+      // Run again with a convention that passes nothing in registers. The lock stays with the
+      // function, so its callers stop passing the register too.
+      arch->clearAnalysis(fd);
+      fd->getFuncProto().setModel(arch->defaultfp);
+      fd->getFuncProto().setModelLock(true);
+      root->reset(*fd);
+      if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
+    }
 
     ostringstream text;
     if (session->print_c) {
@@ -527,8 +593,11 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     // eight parameters. Kept, that prototype would make every caller pass them all.
     size_t vector_params = 0;
     for (const RdParam &param : session->params) vector_params += strncmp(param.storage, "XMM", 3) == 0;
-    if (vector_params < 8) {
+    if (vector_params < 8 && !reads_unexplained_register(fd)) {
+      // Kept as a lower bound: a call passes these parameters and whatever else the call site
+      // shows. A variadic function looks like one with only its fixed parameters.
       fd->getFuncProto().setInputLock(true);
+      fd->getFuncProto().setDotdotdot(true);
       session->kept.insert(addr);
     }
   }

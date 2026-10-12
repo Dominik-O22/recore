@@ -5,6 +5,7 @@
 //! wall-clock limit. The child side is [`serve`], which the program reaches through a
 //! subcommand of its own executable.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -14,7 +15,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use recore::image::Format;
+use recore::image::{Format, Machine};
+use recore::report::{Analysis, CallTarget};
 use serde::{Deserialize, Serialize};
 
 use crate::{Facts, Session, Style};
@@ -39,11 +41,16 @@ pub struct Options {
     /// Address-space limit in GiB. Past it the engine's allocations fail and the function is
     /// reported as an error, instead of the machine going into swap.
     pub memory_gb: u64,
+    /// Decompile the functions a function calls before the function itself, so that its calls
+    /// pass at least the parameters those were found to take. Only done for 32-bit x86, where a
+    /// call shows what it pushes but not which registers the callee reads. Elsewhere it costs
+    /// time and recovers parameters worse.
+    pub callees_first: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { style: Style::Decompile, emit_c: true, jump_tables: JumpTables::Auto, memory_gb: 4 }
+        Options { style: Style::Decompile, emit_c: true, jump_tables: JumpTables::Auto, memory_gb: 4, callees_first: true }
     }
 }
 
@@ -90,10 +97,44 @@ enum Event {
     /// The binary is loaded and the session is set up.
     Ready,
     Done { record: FunctionRecord, c_text: Option<String> },
+    /// The functions a function calls whose parameters the session does not hold yet.
+    Callees(Vec<u64>),
 }
 
-/// The child side: loads `binary`, then answers each hex address on stdin with one line on
-/// stdout, until stdin closes. `options` is the JSON that [`Worker::spawn`] passed along.
+/// One line of a worker's stdin: a letter and a hex address.
+#[derive(Clone, Copy)]
+enum Request {
+    /// `d`: decompile the function.
+    Decompile(u64),
+    /// `p`: decompile it for its parameters only, which the session keeps for its callers.
+    Parameters(u64),
+    /// `c`: list its callees not decompiled yet.
+    Callees(u64),
+}
+
+impl Request {
+    fn line(self) -> String {
+        match self {
+            Request::Decompile(addr) => format!("d {addr:x}"),
+            Request::Parameters(addr) => format!("p {addr:x}"),
+            Request::Callees(addr) => format!("c {addr:x}"),
+        }
+    }
+
+    fn parse(line: &str) -> Result<Request> {
+        let (kind, addr) = line.split_once(' ').context("request without an address")?;
+        let addr = u64::from_str_radix(addr, 16)?;
+        match kind {
+            "d" => Ok(Request::Decompile(addr)),
+            "p" => Ok(Request::Parameters(addr)),
+            "c" => Ok(Request::Callees(addr)),
+            _ => anyhow::bail!("unknown request {kind}"),
+        }
+    }
+}
+
+/// The child side: loads `binary`, then answers each request on stdin with one line on stdout,
+/// until stdin closes. `options` is the JSON that [`Worker::new`] passed along.
 pub fn serve(binary: &Path, options: &str) -> Result<()> {
     let options: Options = serde_json::from_str(options)?;
     let bytes = options.memory_gb << 30;
@@ -111,6 +152,11 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         session.override_jump_tables(&analysis, &facts)?;
     }
     session.set_style(options.style)?;
+    let callees_first = options.callees_first && image.machine == Machine::X86;
+    session.keep_prototypes(callees_first);
+    let callees = if callees_first { callees(&analysis) } else { HashMap::new() };
+    // Functions decompiled so far, whose parameters the session holds if it could recover them.
+    let mut known: HashSet<u64> = HashSet::new();
 
     let mut out = std::io::stdout().lock();
     let mut send = |event: &Event| -> Result<()> {
@@ -120,9 +166,20 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     };
     send(&Event::Ready)?;
     for line in std::io::stdin().lock().lines() {
-        let addr = u64::from_str_radix(&line?, 16)?;
+        let (addr, emit_c) = match Request::parse(&line?)? {
+            Request::Callees(addr) => {
+                let mut pending: Vec<u64> = callees.get(&addr).into_iter().flatten().copied().filter(|callee| !known.contains(callee)).collect();
+                pending.sort_unstable();
+                pending.dedup();
+                send(&Event::Callees(pending))?;
+                continue;
+            }
+            Request::Decompile(addr) => (addr, options.emit_c),
+            Request::Parameters(addr) => (addr, false),
+        };
         let start = Instant::now();
         let result = session.decompile(addr);
+        known.insert(addr);
         let ms = start.elapsed().as_secs_f64() * 1e3;
         send(&match result {
             Ok(function) => Event::Done {
@@ -136,7 +193,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                     returns_value: function.returns_value,
                     c_len: function.c_text.len(),
                 },
-                c_text: options.emit_c.then_some(function.c_text),
+                c_text: emit_c.then_some(function.c_text),
             },
             Err(error) => Event::Done { record: FunctionRecord::failed(addr, Status::Error, error.to_string(), ms), c_text: None },
         })?;
@@ -144,11 +201,30 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     Ok(())
 }
 
+/// The functions each function calls or tail-calls, by entry point.
+fn callees(analysis: &Analysis) -> HashMap<u64, Vec<u64>> {
+    let mut extents: Vec<(u64, u64, u64)> =
+        analysis.functions.iter().flat_map(|f| f.ranges.iter().map(move |&(start, end)| (start, end, f.fragment_of.unwrap_or(f.addr)))).collect();
+    extents.sort_unstable();
+    let mut callees: HashMap<u64, Vec<u64>> = HashMap::new();
+    for call in &analysis.calls {
+        let CallTarget::Function(target) = call.target else { continue };
+        let index = extents.partition_point(|extent| extent.0 <= call.at);
+        if let Some(&(_, end, owner)) = index.checked_sub(1).map(|i| &extents[i])
+            && call.at < end
+            && owner != target
+        {
+            callees.entry(owner).or_default().push(target);
+        }
+    }
+    callees
+}
+
 /// A worker gets this long to load its binary and declare every function.
 const SETUP_LIMIT: Duration = Duration::from_secs(300);
 
-/// A child process with a warm session for one binary.
-pub struct Worker {
+/// A running child and the pipes to it. Dropping it kills the child.
+struct Process {
     child: Child,
     stdin: ChildStdin,
     events: Receiver<Event>,
@@ -157,20 +233,14 @@ pub struct Worker {
     ready: bool,
 }
 
-impl Worker {
-    /// Starts a worker and waits until its session is set up. `command` must run a program that
-    /// ends up calling [`serve`] with the two arguments appended here: the binary's path and
-    /// the options as JSON.
-    pub fn spawn(command: Command, binary: &Path, options: &Options) -> Result<Worker> {
-        let mut worker = Worker::start(command, binary, options)?;
-        worker.wait_ready().map_err(|message| anyhow::anyhow!("worker stopped during setup: {message}"))?;
-        Ok(worker)
-    }
+/// How a request went wrong, with the child gone.
+struct Failure {
+    status: Status,
+    message: String,
+}
 
-    /// Starts a worker without waiting for it, so that it sets up while the caller does other
-    /// work. The first [`Worker::decompile`] waits for whatever setup is left.
-    pub fn start(mut command: Command, binary: &Path, options: &Options) -> Result<Worker> {
-        command.arg(binary).arg(serde_json::to_string(options)?);
+impl Process {
+    fn start(mut command: Command) -> Result<Process> {
         let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("spawning worker")?;
         let stdin = child.stdin.take().expect("piped");
         let stdout = child.stdout.take().expect("piped");
@@ -191,48 +261,29 @@ impl Worker {
             let _ = stderr.read_to_string(&mut text);
             text
         });
-        Ok(Worker { child, stdin, events, stderr: Some(drain), ready: false })
+        Ok(Process { child, stdin, events, stderr: Some(drain), ready: false })
     }
 
-    /// Waits for the child to finish setting up. On failure the child is gone and the error
-    /// says how it ended.
-    fn wait_ready(&mut self) -> Result<(), String> {
-        if self.ready {
-            return Ok(());
-        }
-        match self.events.recv_timeout(SETUP_LIMIT) {
-            Ok(Event::Ready) => {
-                self.ready = true;
-                Ok(())
+    /// Sends one request and waits up to `timeout` for the answer. Setup still under way does
+    /// not count towards `timeout`.
+    fn ask(&mut self, request: Request, timeout: Duration) -> Result<Event, Failure> {
+        if !self.ready {
+            match self.events.recv_timeout(SETUP_LIMIT) {
+                Ok(Event::Ready) => self.ready = true,
+                Ok(_) => return Err(Failure { status: Status::Crash, message: "worker answered before it was asked".into() }),
+                Err(error) => {
+                    let how = self.end(error == RecvTimeoutError::Timeout);
+                    return Err(Failure { status: Status::Crash, message: format!("worker stopped during setup: {how}") });
+                }
             }
-            Ok(Event::Done { .. }) => Err("worker answered before it was asked".into()),
-            Err(error) => Err(self.end(error == RecvTimeoutError::Timeout)),
         }
-    }
-
-    /// Whether the child is still running. A worker kept between requests can die while idle,
-    /// and asking it for a function would then blame that function.
-    pub fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
-    }
-
-    /// Decompiles one function. If the worker dies or exceeds `timeout`, the record says so
-    /// and the worker is gone: `Err` hands back that record, and the caller starts a new worker
-    /// for whatever comes next. Setup still under way does not count towards `timeout`.
-    pub fn decompile(&mut self, addr: u64, timeout: Duration) -> Result<(FunctionRecord, Option<String>), FunctionRecord> {
-        let start = Instant::now();
-        let failed = |status, message, start: Instant| FunctionRecord::failed(addr, status, message, start.elapsed().as_secs_f64() * 1e3);
-        if let Err(message) = self.wait_ready() {
-            return Err(failed(Status::Crash, format!("worker stopped during setup: {message}"), start));
-        }
-        let start = Instant::now();
         // A failed write means the child is gone, which the receive below reports.
-        let _ = writeln!(self.stdin, "{addr:x}").and_then(|()| self.stdin.flush());
+        let _ = writeln!(self.stdin, "{}", request.line()).and_then(|()| self.stdin.flush());
         match self.events.recv_timeout(timeout) {
-            Ok(Event::Done { record, c_text }) => Ok((record, c_text)),
-            Ok(Event::Ready) | Err(RecvTimeoutError::Disconnected) => Err(failed(Status::Crash, self.end(false), start)),
-            // The child is still busy; dropping this worker kills it.
-            Err(RecvTimeoutError::Timeout) => Err(failed(Status::Timeout, format!("no result after {timeout:.0?}"), start)),
+            Ok(Event::Ready) | Err(RecvTimeoutError::Disconnected) => Err(Failure { status: Status::Crash, message: self.end(false) }),
+            Ok(event) => Ok(event),
+            // The child is still busy; dropping this process kills it.
+            Err(RecvTimeoutError::Timeout) => Err(Failure { status: Status::Timeout, message: format!("no result after {timeout:.0?}") }),
         }
     }
 
@@ -252,9 +303,85 @@ impl Worker {
     }
 }
 
-impl Drop for Worker {
+impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// A child process with a warm session for one binary. A child that dies or stalls is replaced
+/// by a new one, so a failure costs the one function and the parameters kept so far.
+pub struct Worker {
+    command: Box<dyn Fn() -> Command + Send>,
+    options: Options,
+    process: Option<Process>,
+    /// Callees that took a child down. They are no longer decompiled ahead of their callers.
+    avoid: HashSet<u64>,
+}
+
+impl Worker {
+    /// Starts a child without waiting for it, so that it sets up while the caller does other
+    /// work. `command` must build a program that ends up calling [`serve`] with the two arguments
+    /// appended here: the binary's path and the options as JSON.
+    pub fn new(command: impl Fn() -> Command + Send + 'static, binary: &Path, options: &Options) -> Worker {
+        let (binary, json) = (binary.to_path_buf(), serde_json::to_string(options).expect("plain data"));
+        let command = move || {
+            let mut command = command();
+            command.arg(&binary).arg(&json);
+            command
+        };
+        let process = Process::start(command()).ok();
+        Worker { command: Box::new(command), options: options.clone(), process, avoid: HashSet::new() }
+    }
+
+    /// Decompiles one function. If the child dies or exceeds `timeout`, the record says so.
+    /// With [`Options::callees_first`] the function's callees are decompiled before it, each
+    /// within `timeout` of its own.
+    pub fn decompile(&mut self, addr: u64, timeout: Duration) -> (FunctionRecord, Option<String>) {
+        let mut ahead = 0;
+        if self.options.callees_first
+            && let Ok(Event::Callees(callees)) = self.ask(Request::Callees(addr), timeout)
+        {
+            for callee in callees {
+                if self.avoid.contains(&callee) {
+                    continue;
+                }
+                match self.ask(Request::Parameters(callee), timeout) {
+                    Ok(_) => ahead += 1,
+                    // The new child starts without the parameters of the callees before this one.
+                    Err(_) => {
+                        self.avoid.insert(callee);
+                        ahead = 0;
+                    }
+                }
+            }
+        }
+        let start = Instant::now();
+        let mut result = self.ask(Request::Decompile(addr), timeout);
+        if result.is_err() && ahead > 0 {
+            // Known parameters at its calls can send a function astray that decompiles well
+            // without them. The new child knows none.
+            result = self.ask(Request::Decompile(addr), timeout);
+        }
+        match result {
+            Ok(Event::Done { record, c_text }) => (record, c_text),
+            Ok(_) => (FunctionRecord::failed(addr, Status::Crash, "worker answered something else".into(), 0.0), None),
+            Err(failure) => (FunctionRecord::failed(addr, failure.status, failure.message, start.elapsed().as_secs_f64() * 1e3), None),
+        }
+    }
+
+    /// Asks the child, starting one if the last one is gone. A child can also have died while
+    /// idle, which is not the doing of the function asked for next.
+    fn ask(&mut self, request: Request, timeout: Duration) -> Result<Event, Failure> {
+        if self.process.as_mut().is_none_or(|process| !matches!(process.child.try_wait(), Ok(None))) {
+            let started = Process::start((self.command)());
+            self.process = Some(started.map_err(|error| Failure { status: Status::Error, message: format!("{error:#}") })?);
+        }
+        let result = self.process.as_mut().expect("started above").ask(request, timeout);
+        if result.is_err() {
+            self.process = None;
+        }
+        result
     }
 }
