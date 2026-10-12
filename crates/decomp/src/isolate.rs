@@ -133,6 +133,10 @@ impl Request {
     }
 }
 
+/// Callees with more code than this, in bytes, are not decompiled ahead of their callers. The few
+/// large functions take most of the time, and leaving them out costs no measurable accuracy.
+const CALLEE_LIMIT: u64 = 4096;
+
 /// The child side: loads `binary`, then answers each request on stdin with one line on stdout,
 /// until stdin closes. `options` is the JSON that [`Worker::new`] passed along.
 pub fn serve(binary: &Path, options: &str) -> Result<()> {
@@ -142,21 +146,35 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     unsafe { libc::setrlimit(libc::RLIMIT_AS, &libc::rlimit { rlim_cur: bytes, rlim_max: bytes }) };
 
     let image = recore::Image::load(binary)?;
-    let analysis = recore::analyze(&image);
+    // The engine reads its language files while the analysis runs.
+    let (session, analysis) = std::thread::scope(|scope| {
+        let session = scope.spawn(|| Session::load(&image));
+        let analysis = recore::analyze(&image);
+        (session.join().expect("loading does not panic"), analysis)
+    });
+    let mut session = session?;
+    session.add_imports(&image, &analysis)?;
     let facts = Facts::derive(&image, &analysis);
-    let mut session = Session::from_image(&image, &analysis)?;
     session.add_functions(&facts)?;
     session.add_strings(&analysis)?;
     session.add_classes(&analysis)?;
     if options.jump_tables == JumpTables::Recore || (options.jump_tables == JumpTables::Auto && image.format == Format::Pe) {
         session.override_jump_tables(&analysis, &facts)?;
     }
+
     session.set_style(options.style)?;
     let callees_first = options.callees_first && image.machine == Machine::X86;
     session.keep_prototypes(callees_first);
     let callees = if callees_first { callees(&analysis) } else { HashMap::new() };
     // Functions decompiled so far, whose parameters the session holds if it could recover them.
     let mut known: HashSet<u64> = HashSet::new();
+    // Bytes of code per function, fragments included.
+    let mut sizes: HashMap<u64, u64> = HashMap::new();
+    for function in &analysis.functions {
+        *sizes.entry(function.fragment_of.unwrap_or(function.addr)).or_default() += function.ranges.iter().map(|range| range.1 - range.0).sum::<u64>();
+    }
+    // Results of functions decompiled ahead of a caller that are as good as asked for.
+    let mut ready: HashMap<u64, Event> = HashMap::new();
 
     let mut out = std::io::stdout().lock();
     let mut send = |event: &Event| -> Result<()> {
@@ -166,22 +184,33 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     };
     send(&Event::Ready)?;
     for line in std::io::stdin().lock().lines() {
-        let (addr, emit_c) = match Request::parse(&line?)? {
+        let request = Request::parse(&line?)?;
+        let unknown = |addr: u64| {
+            let mut pending: Vec<u64> = callees.get(&addr).into_iter().flatten().copied().filter(|callee| !known.contains(callee) && sizes.get(callee).is_some_and(|&size| size <= CALLEE_LIMIT)).collect();
+            pending.sort_unstable();
+            pending.dedup();
+            pending
+        };
+        let addr = match request {
             Request::Callees(addr) => {
-                let mut pending: Vec<u64> = callees.get(&addr).into_iter().flatten().copied().filter(|callee| !known.contains(callee)).collect();
-                pending.sort_unstable();
-                pending.dedup();
-                send(&Event::Callees(pending))?;
+                // A function ready to be handed over has nothing left to wait for.
+                send(&Event::Callees(if ready.contains_key(&addr) { Vec::new() } else { unknown(addr) }))?;
                 continue;
             }
-            Request::Decompile(addr) => (addr, options.emit_c),
-            Request::Parameters(addr) => (addr, false),
+            Request::Decompile(addr) | Request::Parameters(addr) => addr,
         };
+        if let (Request::Decompile(_), Some(event)) = (request, ready.remove(&addr)) {
+            send(&event)?;
+            continue;
+        }
+        // Decompiled for a caller's sake with every callee of its own known, a function comes
+        // out as it would when asked for, so the result is kept for then.
+        let keep = matches!(request, Request::Parameters(_)) && unknown(addr).is_empty();
         let start = Instant::now();
         let result = session.decompile(addr);
         known.insert(addr);
         let ms = start.elapsed().as_secs_f64() * 1e3;
-        send(&match result {
+        let event = match result {
             Ok(function) => Event::Done {
                 record: FunctionRecord {
                     addr,
@@ -193,10 +222,17 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                     returns_value: function.returns_value,
                     c_len: function.c_text.len(),
                 },
-                c_text: emit_c.then_some(function.c_text),
+                c_text: (options.emit_c && (keep || matches!(request, Request::Decompile(_)))).then_some(function.c_text),
             },
             Err(error) => Event::Done { record: FunctionRecord::failed(addr, Status::Error, error.to_string(), ms), c_text: None },
-        })?;
+        };
+        if keep {
+            // The caller only waits for this to finish.
+            send(&Event::Callees(Vec::new()))?;
+            ready.insert(addr, event);
+        } else {
+            send(&event)?;
+        }
     }
     Ok(())
 }

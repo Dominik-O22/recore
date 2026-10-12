@@ -14,7 +14,8 @@ use crate::report::{JumpTable, Origin};
 /// One executable section and which of its bytes begin a decoded instruction.
 struct Region<'a> {
     section: &'a Section,
-    is_instruction: Vec<bool>,
+    /// Per byte, the length of the decoded instruction that begins there, or zero.
+    insn_len: Vec<u8>,
     /// Addresses that execution cannot fall into: the byte after a terminator or after padding.
     follows_break: Vec<bool>,
 }
@@ -157,7 +158,7 @@ impl<A: Arch> Explorer<'_, A> {
             let mut after_call = false;
             for decoded in A::decode(&section.data[(start - section.addr) as usize..], start) {
                 let offset = (decoded.addr - section.addr) as usize;
-                if std::mem::replace(&mut self.regions[index].is_instruction[offset], true) {
+                if std::mem::replace(&mut self.regions[index].insn_len[offset], decoded.len.max(1)) != 0 {
                     if trusted {
                         self.retry_jump_ahead(index, decoded.addr, state);
                     }
@@ -166,7 +167,7 @@ impl<A: Arch> Explorer<'_, A> {
                 // Padding straight after a call means the call does not return: compilers pad
                 // between functions, not after a call that falls through.
                 let Some(insn) = decoded.insn.filter(|insn| !(after_call && A::is_padding(insn))) else {
-                    self.regions[index].is_instruction[offset] = false;
+                    self.regions[index].insn_len[offset] = 0;
                     break;
                 };
                 after_call = false;
@@ -480,7 +481,7 @@ impl<A: Arch> Explorer<'_, A> {
         const LONGEST: usize = 48;
         let region = &self.regions[index];
         let section = region.section;
-        let known = |at: u64| ((at - section.addr) as usize) < section.data.len() && region.is_instruction[(at - section.addr) as usize];
+        let known = |at: u64| ((at - section.addr) as usize) < section.data.len() && region.insn_len[(at - section.addr) as usize] != 0;
         let state = A::State::default();
         let mut decoder = A::decode(&section.data[(addr - section.addr) as usize..], addr);
         for decoded in decoder.by_ref().take(LONGEST) {
@@ -521,12 +522,12 @@ impl<A: Arch> Explorer<'_, A> {
             let section = region.section;
             let mut offset = 0;
             while offset < section.data.len() {
-                if !region.is_instruction[offset] {
+                let len = u64::from(region.insn_len[offset]);
+                if len == 0 {
                     offset += 1;
                     continue;
                 }
                 let addr = section.addr + offset as u64;
-                let len = A::decode(&section.data[offset..], addr).next().map_or(1, |d| u64::from(d.len.max(1)));
                 match ranges.last_mut() {
                     Some(last) if last.1 == addr => last.1 = addr + len,
                     _ => ranges.push((addr, addr + len)),
@@ -550,9 +551,10 @@ impl<A: Arch> Explorer<'_, A> {
             let mut after_data = 0;
             while offset < section.data.len() {
                 let addr = section.addr + offset as u64;
-                if self.regions[index].is_instruction[offset] {
+                let known = usize::from(self.regions[index].insn_len[offset]);
+                if known != 0 {
                     // Skip the whole instruction, not only its first byte.
-                    offset += A::decode(&section.data[offset..], addr).next().map_or(1, |d| usize::from(d.len.max(1)));
+                    offset += known;
                     continue;
                 }
                 // Relocated pointers in a code section are a jump table. Step over the whole
@@ -569,7 +571,7 @@ impl<A: Arch> Explorer<'_, A> {
                 let mut candidate = None;
                 let mut scanned_to = addr;
                 for decoded in decoder.by_ref() {
-                    if self.regions[index].is_instruction[(decoded.addr - section.addr) as usize] {
+                    if self.regions[index].insn_len[(decoded.addr - section.addr) as usize] != 0 {
                         break;
                     }
                     scanned_to = decoded.next_addr();
@@ -665,7 +667,7 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
         .filter(|&(addr, _)| {
             explorer
                 .region_index(addr)
-                .is_some_and(|i| explorer.regions[i].is_instruction[(addr - explorer.regions[i].section.addr) as usize])
+                .is_some_and(|i| explorer.regions[i].insn_len[(addr - explorer.regions[i].section.addr) as usize] != 0)
         })
         .collect();
     let mut data_refs = std::mem::take(&mut explorer.data_ref_sites);
@@ -682,7 +684,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], known_length
         .filter(|s| is_function_section(s))
         .map(|section| Region {
             section,
-            is_instruction: vec![false; section.data.len()],
+            insn_len: vec![0; section.data.len()],
             follows_break: vec![false; section.data.len()],
         })
         .collect();

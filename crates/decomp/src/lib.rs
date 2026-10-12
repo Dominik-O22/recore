@@ -208,15 +208,25 @@ impl Session {
     /// Loads a recore image as it looks after relocation, with the vendored language files, and
     /// declares the imports its code calls, with prototypes for the well-known ones.
     pub fn from_image(image: &Image, analysis: &Analysis) -> Result<Session> {
-        let target = Target::of(image);
+        let mut session = Session::load(image)?;
+        session.add_imports(image, analysis)?;
+        Ok(session)
+    }
+
+    /// Loads a recore image as it looks after relocation, with the vendored language files.
+    /// This needs no analysis and takes tens of milliseconds, so it can run alongside one.
+    pub fn load(image: &Image) -> Result<Session> {
         let loaded = facts::loaded(image);
         let sections: Vec<Section> = loaded.iter().map(|l| Section { addr: l.addr, data: &l.data, readonly: l.constant, code: l.code }).collect();
-        let mut session = Session::new(&vendored_spec_dir(), target, &sections)?;
+        Session::new(&vendored_spec_dir(), Target::of(image), &sections)
+    }
+
+    /// Declares the imports the code calls, with prototypes for the well-known ones.
+    pub fn add_imports(&mut self, image: &Image, analysis: &Analysis) -> Result<()> {
         for import in &analysis.imports {
-            session.add_import(import.slot, &import.name, import.noreturn)?;
+            self.add_import(import.slot, &import.name, import.noreturn)?;
         }
-        prototypes::declare(&mut session, target, analysis.imports.iter().map(|i| i.name.as_str()))?;
-        Ok(session)
+        prototypes::declare(self, Target::of(image), analysis.imports.iter().map(|i| i.name.as_str()))
     }
 
     /// Declares that the GOT entry at `slot` points to the imported function `name`. Indirect
