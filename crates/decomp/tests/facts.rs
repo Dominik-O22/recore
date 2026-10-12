@@ -1,6 +1,5 @@
 //! What `Facts::derive` attributes to a function whose body is several ranges.
 
-use std::collections::HashMap;
 
 use recore::Image;
 use recore::image::{Format, Machine, Section};
@@ -21,9 +20,9 @@ fn image() -> Image {
         branch_targets_marked: false,
         entry: A,
         sections: vec![Section { name: ".text".into(), addr: 0x1000, data: vec![0x90; 0x100], file_offset: None, executable: true, writable: false }],
-        import_slots: HashMap::new(),
+        import_slots: Default::default(),
         exports: Vec::new(),
-        symbol_names: HashMap::new(),
+        symbol_names: Default::default(),
         frames: Vec::new(),
         relative_targets: Vec::new(),
         data_in_code: false,

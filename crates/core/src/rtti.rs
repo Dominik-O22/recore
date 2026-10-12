@@ -4,7 +4,7 @@
 //! holding its mangled name, and at its list of base classes. In 32-bit images those links are
 //! addresses; in 64-bit images they are offsets from the image base.
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::image::{Format, Image, Machine};
 use crate::report::Class;
@@ -58,7 +58,7 @@ pub fn classes(image: &Image) -> Vec<Class> {
         return Vec::new();
     }
     let reader = Reader { image, pointer: if image.machine == Machine::X86 { 4 } else { 8 } };
-    let relocated: HashSet<u64> = image.relative_targets.iter().map(|&(slot, _)| slot).collect();
+    let relocated: FxHashSet<u64> = image.relative_targets.iter().map(|&(slot, _)| slot).collect();
     let in_data = |addr: u64| image.section_at(addr).is_some_and(|section| !section.executable);
     let mut classes: Vec<Class> = image
         .relative_targets

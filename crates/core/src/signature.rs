@@ -4,7 +4,7 @@
 //! differ only where they hold addresses, so hashing the instructions with those fields blanked
 //! gives a fingerprint that matches across binaries built with the same compiler and library.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
 
@@ -16,7 +16,7 @@ const MIN_BYTES: u64 = 32;
 
 /// The fingerprint of the function occupying `[start, end)`, or `None` when it is too small to
 /// be distinctive or the architecture is not supported.
-pub fn fingerprint(image: &Image, pointer_slots: &HashMap<u64, u64>, start: u64, end: u64) -> Option<u64> {
+pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64) -> Option<u64> {
     let bits = match image.machine {
         Machine::X86 => 32,
         Machine::X86_64 => 64,
@@ -79,7 +79,7 @@ pub fn fingerprint(image: &Image, pointer_slots: &HashMap<u64, u64>, start: u64,
 
 /// Known fingerprints and the library function each belongs to.
 pub struct Signatures {
-    names: HashMap<u64, &'static str>,
+    names: FxHashMap<u64, &'static str>,
 }
 
 impl Signatures {

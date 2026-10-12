@@ -90,24 +90,61 @@ fn sibling(program: &str) -> Result<PathBuf> {
 }
 
 pub fn analysis(binaries: &[PathBuf], runs: usize) -> Result<Vec<AnalysisRow>> {
-    let mut rows = Vec::new();
+    // Once untimed, so that every timed run finds the file in the page cache.
     for binary in binaries {
-        // Once untimed, so that every timed run finds the file in the page cache.
         std::fs::read(binary).with_context(|| format!("reading {}", binary.display()))?;
-        let (mut load, mut analyze) = (Vec::new(), Vec::new());
-        let mut counts = (0, 0);
-        for _ in 0..runs {
+    }
+    let mut times: Vec<(Vec<f64>, Vec<f64>)> = vec![Default::default(); binaries.len()];
+    let mut counts = vec![(0, 0); binaries.len()];
+    // Round after round over all binaries, not run after run of one: a slow spell of the
+    // machine then costs every binary one run and no binary all of its runs.
+    for _ in 0..runs {
+        for (index, binary) in binaries.iter().enumerate() {
             let start = Instant::now();
             let image = recore::Image::load(binary)?;
-            load.push(ms(start));
+            times[index].0.push(ms(start));
             let start = Instant::now();
             let analysis = recore::analyze(&image);
-            analyze.push(ms(start));
-            counts = (analysis.instructions, analysis.functions.len());
+            times[index].1.push(ms(start));
+            counts[index] = (analysis.instructions, analysis.functions.len());
         }
-        rows.push(AnalysisRow { binary: name(binary), instructions: counts.0, functions: counts.1, load: Stat::of(load), analyze: Stat::of(analyze) });
     }
-    Ok(rows)
+    let rows = binaries.iter().zip(times).zip(counts);
+    Ok(rows.map(|((binary, (load, analyze)), (instructions, functions))| AnalysisRow { binary: name(binary), instructions, functions, load: Stat::of(load), analyze: Stat::of(analyze) }).collect())
+}
+
+/// Prints where the time of analyzing one binary goes, phase by phase. A phase named
+/// `outer/inner` is part of `outer` and counted in it.
+pub fn phases(binary: &Path, runs: usize) -> Result<()> {
+    std::fs::read(binary).with_context(|| format!("reading {}", binary.display()))?;
+    let mut fastest: Vec<(&'static str, f64)> = Vec::new();
+    let mut whole = Vec::new();
+    recore::phase::enable(true);
+    for _ in 0..runs {
+        let start = Instant::now();
+        let image = {
+            let _phase = recore::phase::scope("load");
+            recore::Image::load(binary)?
+        };
+        std::hint::black_box(recore::analyze(&image));
+        whole.push(ms(start));
+        for (name, time) in recore::phase::take() {
+            let time = time.as_secs_f64() * 1e3;
+            match fastest.iter_mut().find(|phase| phase.0 == name) {
+                Some(phase) => phase.1 = phase.1.min(time),
+                None => fastest.push((name, time)),
+            }
+        }
+    }
+    recore::phase::enable(false);
+    let whole = Stat::of(whole).min;
+    println!("{:>9.2} ms  everything", whole);
+    for (name, time) in fastest {
+        let depth = name.matches('/').count();
+        let label = name.rsplit('/').next().unwrap_or(name);
+        println!("{time:>9.2} ms {:>5.1}%  {}{label}", time * 100.0 / whole, "  ".repeat(depth));
+    }
+    Ok(())
 }
 
 /// Runs a program to its end and returns the wall time.
@@ -121,19 +158,23 @@ fn timed(command: &mut Command) -> Result<f64> {
 
 pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
     let tool = sibling("recore-mcp")?;
-    let mut rows = Vec::new();
+    let mut functions = Vec::new();
     for binary in binaries {
         let program = Program::load(binary)?;
         let mut by_size: Vec<(u64, u64)> = program.sizes().into_iter().map(|(entry, size)| (size, entry)).collect();
         by_size.sort_unstable();
-        let function = by_size[by_size.len() / 2].1;
-        let run = |arguments: &[&str]| -> Result<Stat> {
-            let times = (0..runs).map(|_| timed(Command::new(&tool).arg(arguments[0]).arg(binary).args(&arguments[1..])));
-            Ok(Stat::of(times.collect::<Result<_>>()?))
-        };
-        rows.push(ColdRow { binary: name(binary), function, summary: run(&["summary"])?, decompile: run(&["decompile", &format!("{function:#x}")])? });
+        functions.push(by_size[by_size.len() / 2].1);
     }
-    Ok(rows)
+    let mut times: Vec<(Vec<f64>, Vec<f64>)> = vec![Default::default(); binaries.len()];
+    // In rounds, as the analysis suite does.
+    for _ in 0..runs {
+        for ((binary, function), times) in binaries.iter().zip(&functions).zip(&mut times) {
+            times.0.push(timed(Command::new(&tool).arg("summary").arg(binary))?);
+            times.1.push(timed(Command::new(&tool).arg("decompile").arg(binary).arg(format!("{function:#x}")))?);
+        }
+    }
+    let rows = binaries.iter().zip(functions).zip(times);
+    Ok(rows.map(|((binary, function), (summary, decompile))| ColdRow { binary: name(binary), function, summary: Stat::of(summary), decompile: Stat::of(decompile) }).collect())
 }
 
 /// At most `count` of the binary's functions, evenly spaced by address.
@@ -256,16 +297,17 @@ pub fn print_cold(rows: &[ColdRow], before: Option<&[ColdRow]>) {
             row.decompile.noise() * 100.0,
         );
     }
+    // Only the rows both runs have count towards the change of a total.
     let shared: Vec<(&ColdRow, &ColdRow)> = rows.iter().filter_map(|row| Some((row, before_of(&row.binary)?))).collect();
-    let sum = |pick: fn(&ColdRow) -> f64, rows: &mut dyn Iterator<Item = &ColdRow>| rows.map(pick).sum::<f64>();
-    let (summary, decompile): (fn(&ColdRow) -> f64, fn(&ColdRow) -> f64) = (|r| r.summary.min, |r| r.decompile.min);
+    let summary = |row: &ColdRow| row.summary.min;
+    let decompile = |row: &ColdRow| row.decompile.min;
     println!(
         "{:<46} {:>9.1} {:>7} {:>10.1} {:>7} {:>7.1}%",
         "total",
-        sum(summary, &mut rows.iter()),
-        change(sum(summary, &mut shared.iter().map(|s| s.0)), before.map(|_| sum(summary, &mut shared.iter().map(|s| s.1)))),
-        sum(decompile, &mut rows.iter()),
-        change(sum(decompile, &mut shared.iter().map(|s| s.0)), before.map(|_| sum(decompile, &mut shared.iter().map(|s| s.1)))),
+        rows.iter().map(summary).sum::<f64>(),
+        change(shared.iter().map(|pair| summary(pair.0)).sum(), before.map(|_| shared.iter().map(|pair| summary(pair.1)).sum())),
+        rows.iter().map(decompile).sum::<f64>(),
+        change(shared.iter().map(|pair| decompile(pair.0)).sum(), before.map(|_| shared.iter().map(|pair| decompile(pair.1)).sum())),
         typical_noise(rows.iter().map(|r| r.decompile.noise()).collect()),
     );
 }
@@ -319,4 +361,57 @@ pub fn print_decompile(rows: &[DecompileRow], before: Option<&[DecompileRow]>) {
         let slow: Vec<String> = row.slow.iter().map(|addr| format!("{addr:#x}")).collect();
         println!("slow in {}: {}", short(&row.binary), slow.join(" "));
     }
+}
+
+/// Times walking every instruction of the binary's code once, with more of what discovery does
+/// per instruction at each level: decoding alone is the floor under any analysis, and the steps
+/// from level to level are what the pieces cost.
+pub fn decode_floor(binary: &Path, runs: usize) -> Result<()> {
+    use recore::arch::Arch;
+    use recore::image::Machine;
+    let program = Program::load(binary)?;
+    let image = &program.image;
+    let ranges: Vec<(u64, u64)> = program.analysis.functions.iter().flat_map(|f| f.ranges.iter().copied()).collect();
+    fn walk<A: Arch>(image: &recore::Image, ranges: &[(u64, u64)], level: usize) -> u64 {
+        let mut instructions = 0;
+        let mut found = 0u64;
+        for &(start, end) in ranges {
+            let Some(bytes) = image.bytes_from(start) else { continue };
+            let bytes = &bytes[..((end - start) as usize).min(bytes.len())];
+            let mut state = A::State::default();
+            for decoded in A::decode(bytes, start) {
+                let Some(insn) = std::hint::black_box(decoded).insn else { continue };
+                instructions += 1;
+                if level >= 1 {
+                    found += u64::from(A::flow(&insn, &state).is_some());
+                }
+                if level >= 2 {
+                    A::step(&mut state, &insn);
+                }
+                if level >= 3 {
+                    found += u64::from(A::memory_reference(&insn).is_some());
+                    found += u64::from(A::address_taken(&insn, &state).is_some());
+                    found += u64::from(A::based_data_address(&insn, &state).is_some());
+                }
+            }
+        }
+        std::hint::black_box(found);
+        instructions
+    }
+    for (level, what) in ["decode", "and classify control flow", "and track registers", "and find the addresses referred to"].iter().enumerate() {
+        let mut times = Vec::new();
+        let mut instructions = 0;
+        for _ in 0..runs {
+            let start = Instant::now();
+            instructions = match image.machine {
+                Machine::X86_64 => walk::<recore::x86::X86<64, false>>(image, &ranges, level),
+                Machine::X86 => walk::<recore::x86::X86<32, false>>(image, &ranges, level),
+                Machine::Aarch64 => walk::<recore::arm64::Arm64>(image, &ranges, level),
+            };
+            times.push(ms(start));
+        }
+        let time = Stat::of(times).min;
+        println!("{time:>8.2} ms {:>6.1} ns per instruction  {what}  ({instructions} instructions)", time * 1e6 / instructions.max(1) as f64);
+    }
+    Ok(())
 }

@@ -15,7 +15,7 @@
 //! registers hold a table base, a bounded index, a loaded entry, or the final target. It is
 //! carried along control-flow edges during discovery, so the pieces may sit in different blocks.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use iced_x86::{ConditionCode, Instruction, Mnemonic, OpKind, Register};
 
@@ -255,21 +255,21 @@ impl State {
 
     /// States on the two edges of a conditional branch: `(taken, not taken)`. An unsigned
     /// compare against an immediate bounds the compared register on one of them.
-    pub fn branch(mut self, instr: &Instruction) -> (State, State) {
+    pub fn branch(&mut self, instr: &Instruction) -> State {
         let compare = self.compare.take();
-        let (mut taken, mut fallthrough) = (self, self);
+        let mut taken = *self;
         if let Some((register, immediate)) = compare {
             match instr.condition_code() {
                 // `ja default`: falling through means index <= immediate.
-                ConditionCode::a => fallthrough.registers[register] = Value::Bounded(immediate),
+                ConditionCode::a => self.registers[register] = Value::Bounded(immediate),
                 // `jae default`: falling through means index < immediate.
-                ConditionCode::ae if immediate > 0 => fallthrough.registers[register] = Value::Bounded(immediate - 1),
+                ConditionCode::ae if immediate > 0 => self.registers[register] = Value::Bounded(immediate - 1),
                 ConditionCode::be => taken.registers[register] = Value::Bounded(immediate),
                 ConditionCode::b if immediate > 0 => taken.registers[register] = Value::Bounded(immediate - 1),
                 _ => {}
             }
         }
-        (taken, fallthrough)
+        taken
     }
 
     /// The state at a case target: everything survives the jump except the target register.
@@ -289,7 +289,7 @@ impl State {
     pub fn resolve(
         &self,
         image: &Image,
-        pointer_slots: &HashMap<u64, u64>,
+        pointer_slots: &FxHashMap<u64, u64>,
         jump: &Instruction,
         is_target: &dyn Fn(u64) -> bool,
         is_code: &dyn Fn(u64) -> bool,

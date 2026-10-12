@@ -1,6 +1,6 @@
 //! x86 support, 64-bit and 32-bit, on top of the iced decoder.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 
@@ -46,6 +46,23 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
 
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Instruction>> {
         let mut decoder = Decoder::with_ip(BITS, bytes, addr, DecoderOptions::NONE);
+        std::iter::from_fn(move || {
+            decoder.can_decode().then(|| {
+                let instr = decoder.decode();
+                Decoded { addr: instr.ip(), len: instr.len().max(1) as u8, insn: (!instr.is_invalid()).then_some(instr) }
+            })
+        })
+    }
+
+    type Decoder<'a> = (Decoder<'a>, u64);
+
+    fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_> {
+        (Decoder::with_ip(BITS, bytes, addr, DecoderOptions::NONE), addr)
+    }
+
+    fn decode_from<'d>((decoder, base): &'d mut Self::Decoder<'_>, offset: usize) -> impl Iterator<Item = Decoded<Instruction>> + 'd {
+        decoder.set_position(offset).expect("an offset into the section");
+        decoder.set_ip(*base + offset as u64);
         std::iter::from_fn(move || {
             decoder.can_decode().then(|| {
                 let instr = decoder.decode();
@@ -129,7 +146,7 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         state.step(insn, Self::CALLER_SAVED);
     }
 
-    fn branch(state: State, insn: &Instruction) -> (State, State) {
+    fn branch(state: &mut State, insn: &Instruction) -> State {
         state.branch(insn)
     }
 
@@ -140,7 +157,7 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
     fn resolve_table(
         state: &State,
         image: &Image,
-        pointer_slots: &HashMap<u64, u64>,
+        pointer_slots: &FxHashMap<u64, u64>,
         jump: &Instruction,
         is_target: &dyn Fn(u64) -> bool,
         is_code: &dyn Fn(u64) -> bool,
@@ -148,8 +165,8 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         state.resolve(image, pointer_slots, jump, is_target, is_code, u64::from(BITS / 8))
     }
 
-    fn plt_stubs(image: &Image) -> HashMap<u64, u64> {
-        let mut stubs = HashMap::new();
+    fn plt_stubs(image: &Image) -> FxHashMap<u64, u64> {
+        let mut stubs = FxHashMap::default();
         for section in image.sections.iter().filter(|s| s.executable && s.name.starts_with(".plt")) {
             let mut stub_start = section.addr;
             for decoded in Self::decode(&section.data, section.addr) {

@@ -1,7 +1,7 @@
 //! The parts of a Windows PE image that differ from ELF: the import address table, base
 //! relocations, and the exception directory.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use anyhow::Result;
 use object::read::pe::{ImageNtHeaders, Import, PeFile};
@@ -12,7 +12,7 @@ use crate::image::Section;
 /// What a PE file contributes to an `Image` beyond its sections.
 pub struct Metadata {
     /// Import address table slot to the name of the function the loader binds there.
-    pub import_slots: HashMap<u64, String>,
+    pub import_slots: FxHashMap<u64, String>,
     /// `(slot, value)` for every pointer the loader would rebase.
     pub relative_targets: Vec<(u64, u64)>,
     pub exports: Vec<u64>,
@@ -26,7 +26,7 @@ pub fn load<Pe: ImageNtHeaders>(data: &[u8], sections: &[Section]) -> Result<Met
     let base = pe.relative_address_base();
     let pointer_size = std::mem::size_of::<Pe::ImageThunkData>() as u64;
 
-    let mut import_slots = HashMap::new();
+    let mut import_slots = FxHashMap::default();
     if let Some(table) = pe.import_table()? {
         let mut descriptors = table.descriptors()?;
         while let Some(descriptor) = descriptors.next()? {

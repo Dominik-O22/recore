@@ -1,6 +1,7 @@
 //! An analyzed binary with the lookups that queries about it share.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use rustc_hash::FxHashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -27,9 +28,9 @@ pub struct Program {
     /// For each extent, the furthest end among it and those before it.
     reach: Vec<u64>,
     /// Data address to the indices in `Analysis::data_refs` that refer to it.
-    refs_to: HashMap<u64, Vec<usize>>,
+    refs_to: FxHashMap<u64, Vec<usize>>,
     /// Function entry or import slot to the indices in `Analysis::calls` that go there.
-    calls_to: HashMap<u64, Vec<usize>>,
+    calls_to: FxHashMap<u64, Vec<usize>>,
 }
 
 /// The address a call or tail call goes to: a function entry or an import slot.
@@ -78,11 +79,11 @@ impl Program {
             })
             .collect();
 
-        let mut refs_to: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut refs_to: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
         for (index, reference) in analysis.data_refs.iter().enumerate() {
             refs_to.entry(reference.to).or_default().push(index);
         }
-        let mut calls_to: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut calls_to: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
         for (index, call) in analysis.calls.iter().enumerate() {
             calls_to.entry(target_addr(call.target)).or_default().push(index);
         }
@@ -124,8 +125,8 @@ impl Program {
     }
 
     /// Bytes of code per function entry.
-    pub fn sizes(&self) -> HashMap<u64, u64> {
-        let mut sizes = HashMap::new();
+    pub fn sizes(&self) -> FxHashMap<u64, u64> {
+        let mut sizes = FxHashMap::default();
         for extent in &self.extents {
             *sizes.entry(extent.owner).or_default() += extent.end - extent.start;
         }

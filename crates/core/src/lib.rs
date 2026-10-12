@@ -12,6 +12,7 @@ pub mod jumptable;
 pub mod names;
 pub mod noreturn;
 pub mod pe;
+pub mod phase;
 pub mod program;
 pub mod report;
 pub mod rtti;
@@ -21,3 +22,6 @@ pub mod x86;
 
 pub use analysis::analyze;
 pub use image::Image;
+/// The hash tables in recore's results. Their keys are addresses, which need no protection
+/// against chosen collisions and are hashed many millions of times per binary.
+pub use rustc_hash::{FxHashMap, FxHashSet};

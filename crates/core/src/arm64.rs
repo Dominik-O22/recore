@@ -5,7 +5,7 @@
 //! markers and padding compilers emit around functions. Everything else is treated as an
 //! ordinary instruction that writes its destination register.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::arch::{Arch, Decoded, Flow, Table};
 use crate::image::Image;
@@ -299,6 +299,16 @@ impl Arch for Arm64 {
         })
     }
 
+    type Decoder<'a> = (&'a [u8], u64);
+
+    fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_> {
+        (bytes, addr)
+    }
+
+    fn decode_from<'d>(&mut (bytes, base): &'d mut Self::Decoder<'_>, offset: usize) -> impl Iterator<Item = Decoded<Insn>> + 'd {
+        Self::decode(&bytes[offset..], base + offset as u64)
+    }
+
     fn flow(insn: &Insn, state: &State) -> Option<Flow> {
         let slot = |register: usize| match state.registers[register] {
             Value::Slot(slot) => Some(slot),
@@ -350,9 +360,9 @@ impl Arch for Arm64 {
         state.step(*insn);
     }
 
-    fn branch(mut state: State, insn: &Insn) -> (State, State) {
-        let compare = state.compare.take();
-        let (mut taken, mut fallthrough) = (state, state);
+    fn branch(fallthrough: &mut State, insn: &Insn) -> State {
+        let compare = fallthrough.compare.take();
+        let mut taken = *fallthrough;
         // Only `b.cond` reads the flags of the compare.
         if let (Some((register, immediate)), true) = (compare, insn.word & 0xFF00_0000 == 0x5400_0000) {
             match insn.word & 0xF {
@@ -366,7 +376,7 @@ impl Arch for Arm64 {
                 _ => {}
             }
         }
-        (taken, fallthrough)
+        taken
     }
 
     fn after_jump(mut state: State, jump: &Insn) -> State {
@@ -378,7 +388,7 @@ impl Arch for Arm64 {
     fn resolve_table(
         state: &State,
         image: &Image,
-        pointer_slots: &HashMap<u64, u64>,
+        pointer_slots: &FxHashMap<u64, u64>,
         jump: &Insn,
         is_target: &dyn Fn(u64) -> bool,
         _is_code: &dyn Fn(u64) -> bool,
@@ -423,8 +433,8 @@ impl Arch for Arm64 {
 
     /// A PLT stub is `adrp x16, page; ldr x17, [x16, #offset]; add x16, ...; br x17`, optionally
     /// preceded by `bti c`.
-    fn plt_stubs(image: &Image) -> HashMap<u64, u64> {
-        let mut stubs = HashMap::new();
+    fn plt_stubs(image: &Image) -> FxHashMap<u64, u64> {
+        let mut stubs = FxHashMap::default();
         for section in image.sections.iter().filter(|s| s.executable && s.name.starts_with(".plt")) {
             let mut stub_start = section.addr;
             let mut page = None;

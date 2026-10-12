@@ -1,6 +1,6 @@
 //! A loaded executable: its mapped bytes and the metadata that survives stripping.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -58,11 +58,11 @@ pub struct Image {
     /// Loaded sections, sorted by address.
     pub sections: Vec<Section>,
     /// Slot address (GOT entry) to the imported symbol its relocation binds.
-    pub import_slots: HashMap<u64, String>,
+    pub import_slots: FxHashMap<u64, String>,
     /// Exported function addresses from the dynamic symbol table.
     pub exports: Vec<u64>,
     /// Names the image itself carries for addresses in it: exports, as written in the file.
-    pub symbol_names: HashMap<u64, String>,
+    pub symbol_names: FxHashMap<u64, String>,
     /// `[start, end)` of every frame description entry in `.eh_frame`.
     pub frames: Vec<(u64, u64)>,
     /// Pointers stored in data by relative relocations, as `(slot address, target)`. Targets in
@@ -171,8 +171,8 @@ impl Image {
 
 /// Imports, relocated pointers, exports and unwind frames of an ELF image.
 #[allow(clippy::type_complexity)]
-fn elf_metadata(file: &object::File, sections: &[Section]) -> (HashMap<u64, String>, Vec<(u64, u64)>, Vec<u64>, Vec<(u64, u64)>) {
-    let mut import_slots = HashMap::new();
+fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, String>, Vec<(u64, u64)>, Vec<u64>, Vec<(u64, u64)>) {
+    let mut import_slots = FxHashMap::default();
     let mut relative_targets = Vec::new();
     if let Some(relocations) = file.dynamic_relocations() {
         let dynsyms = file.dynamic_symbol_table();
@@ -226,7 +226,7 @@ fn parse_frames(section: &object::Section) -> Vec<(u64, u64)> {
     let bases = gimli::BaseAddresses::default().set_eh_frame(section.address());
     let mut frames = Vec::new();
     let mut entries = eh_frame.entries(&bases);
-    let mut cies = HashMap::new();
+    let mut cies = FxHashMap::default();
     while let Ok(Some(entry)) = entries.next() {
         match entry {
             gimli::CieOrFde::Cie(_) => {}

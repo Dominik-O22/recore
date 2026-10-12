@@ -2,7 +2,7 @@
 //! register tracking that resolves jump tables. Discovery and analysis are written once against
 //! this trait.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::image::Image;
 
@@ -68,6 +68,16 @@ pub trait Arch: 'static {
     /// Decodes consecutive instructions from `bytes`, which are loaded at `addr`.
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Self::Insn>>;
 
+    /// A decoder over a whole section, for decoding from many places in it: moving one is
+    /// cheaper than making one.
+    type Decoder<'a>;
+
+    /// A decoder over `bytes`, which are loaded at `addr`.
+    fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_>;
+
+    /// Decodes consecutive instructions from `offset` into the decoder's bytes.
+    fn decode_from<'d>(decoder: &'d mut Self::Decoder<'_>, offset: usize) -> impl Iterator<Item = Decoded<Self::Insn>> + 'd;
+
     /// The control-flow effect of `insn`, given the state before it.
     fn flow(insn: &Self::Insn, state: &Self::State) -> Option<Flow>;
 
@@ -119,8 +129,9 @@ pub trait Arch: 'static {
     /// Updates `state` for an instruction that falls through.
     fn step(state: &mut Self::State, insn: &Self::Insn);
 
-    /// States on the two edges of a conditional branch: `(taken, not taken)`.
-    fn branch(state: Self::State, insn: &Self::Insn) -> (Self::State, Self::State);
+    /// Splits the state at a conditional branch: returns the state on the taken edge and leaves
+    /// `state` as it is when the branch is not taken.
+    fn branch(state: &mut Self::State, insn: &Self::Insn) -> Self::State;
 
     /// The state at the targets of an indirect jump.
     fn after_jump(state: Self::State, jump: &Self::Insn) -> Self::State;
@@ -133,7 +144,7 @@ pub trait Arch: 'static {
     fn resolve_table(
         state: &Self::State,
         image: &Image,
-        pointer_slots: &HashMap<u64, u64>,
+        pointer_slots: &FxHashMap<u64, u64>,
         jump: &Self::Insn,
         is_target: &dyn Fn(u64) -> bool,
         is_code: &dyn Fn(u64) -> bool,
@@ -147,5 +158,5 @@ pub trait Arch: 'static {
     }
 
     /// Maps each PLT stub's address to the slot it jumps through.
-    fn plt_stubs(image: &Image) -> HashMap<u64, u64>;
+    fn plt_stubs(image: &Image) -> FxHashMap<u64, u64>;
 }

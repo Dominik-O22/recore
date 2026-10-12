@@ -4,3 +4,9 @@ members = ["crates/*"]
 
 [profile.release]
 debug = 1
+
+# For `recore-bench profile`: full debug info, so that samples in inlined code name the right
+# caller, and frame pointers, so that every stack unwinds.
+[profile.profiling]
+inherits = "release"
+debug = 2

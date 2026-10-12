@@ -37,7 +37,7 @@ fn samples(corpus: &Path) -> Result<Vec<Sample>> {
             let truth: Truth = serde_json::from_slice(&std::fs::read(corpus.join("truth").join(format!("{name}.json"))).ok()?).ok()?;
             let image = recore::Image::load(&corpus.join("bin").join(name)).ok()?;
             let analysis = recore::analyze(&image);
-            let slots: HashMap<u64, u64> = image.relative_targets.iter().copied().collect();
+            let slots: recore::FxHashMap<u64, u64> = image.relative_targets.iter().copied().collect();
             let named: HashMap<u64, &str> = truth
                 .functions
                 .iter()

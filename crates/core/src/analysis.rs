@@ -4,7 +4,7 @@
 //! calls and tail jumps found while decoding. Each function is decoded linearly inside its range,
 //! which is sound for compiler output because jump tables live in read-only data, not in code.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use rayon::prelude::*;
 
@@ -12,6 +12,7 @@ use crate::arch::{Arch, Flow};
 use crate::discover::{discover, is_function_section};
 use crate::image::{Format, Image, Machine};
 use crate::noreturn::is_noreturn_import;
+use crate::phase;
 use crate::report::{AnalyzedFunction, Analysis, CallSite, CallTarget, DataRef, Import, Origin, StringLiteral};
 use crate::signature::{Signatures, fingerprint};
 use crate::strings::string_at;
@@ -70,7 +71,7 @@ fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool) -> Function 
 struct Imports<'a> {
     image: &'a Image,
     /// PLT stub address to the slot it jumps through.
-    stubs: HashMap<u64, u64>,
+    stubs: FxHashMap<u64, u64>,
 }
 
 impl<'a> Imports<'a> {
@@ -117,10 +118,10 @@ struct Program<'a> {
     /// Each function's `[start, end)`, in the same order as `starts`.
     extents: Vec<(u64, u64)>,
     imports: &'a Imports<'a>,
-    tables: &'a HashMap<u64, &'a [u64]>,
+    tables: &'a FxHashMap<u64, &'a [u64]>,
     /// Slot address to target for pointers the loader relocates. A call through such a slot
     /// goes to a function in this image, not to an import.
-    pointer_slots: &'a HashMap<u64, u64>,
+    pointer_slots: &'a FxHashMap<u64, u64>,
 }
 
 impl Program<'_> {
@@ -144,7 +145,7 @@ impl Program<'_> {
 /// function's entry. A jump to code that is not an entry is followed even outside the function's
 /// own extent, which is how a function reaches its cold part when that sits elsewhere. An
 /// unresolved indirect jump counts as possibly returning.
-fn walk(function: &Function, noreturn: &HashSet<u64>, program: &Program) -> Walk {
+fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program) -> Walk {
     let controls = &program.controls;
     let imports = program.imports;
     let in_extent = |addr: u64| addr >= function.start && addr < function.end;
@@ -162,7 +163,7 @@ fn walk(function: &Function, noreturn: &HashSet<u64>, program: &Program) -> Walk
     };
 
     let mut result = Walk { may_return: false, reach_end: function.start, complete: true, reached: Vec::new() };
-    let mut visited: HashSet<usize> = HashSet::new();
+    let mut visited: FxHashSet<usize> = FxHashSet::default();
     let mut pending = vec![function.start];
     while let Some(addr) = pending.pop() {
         // Everything up to the next control instruction falls through, unless another
@@ -253,7 +254,7 @@ fn walk(function: &Function, noreturn: &HashSet<u64>, program: &Program) -> Walk
 /// Where the code of a function without a frame ends, for images that keep data among the
 /// code: the first unconditional terminator that no earlier forward branch jumps past. Decoding
 /// up to the next function instead would read a trailing jump table as instructions.
-fn code_end<A: Arch>(image: &Image, start: u64, bound: u64, tables: &HashMap<u64, &[u64]>) -> u64 {
+fn code_end<A: Arch>(image: &Image, start: u64, bound: u64, tables: &FxHashMap<u64, &[u64]>) -> u64 {
     let Some(bytes) = image.bytes_from(start) else { return start };
     let bytes = &bytes[..bytes.len().min((bound - start) as usize)];
     let state = A::State::default();
@@ -372,6 +373,8 @@ pub fn analyze(image: &Image) -> Analysis {
 }
 
 fn analyze_with<A: Arch>(image: &Image) -> Analysis {
+    // Assigning starts the next phase and ends the one before.
+    let mut _phase = phase::scope("setup");
     let imports = Imports::new::<A>(image);
     let frames: Vec<(u64, u64)> = image
         .frames
@@ -379,14 +382,17 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         .copied()
         .filter(|&(start, _)| image.section_at(start).is_some_and(is_function_section))
         .collect();
-    let frame_end: HashMap<u64, u64> = frames.iter().copied().collect();
+    let frame_end: FxHashMap<u64, u64> = frames.iter().copied().collect();
 
+    drop(_phase);
     let mut discovery = discover::<A>(image, &frames);
-    let tables: HashMap<u64, &[u64]> = discovery.jump_tables.iter().map(|t| (t.jump, t.targets.as_slice())).collect();
+    _phase = phase::scope("setup");
+    let tables: FxHashMap<u64, &[u64]> = discovery.jump_tables.iter().map(|t| (t.jump, t.targets.as_slice())).collect();
 
-    let pointer_slots: HashMap<u64, u64> = image.relative_targets.iter().copied().collect();
+    let pointer_slots: FxHashMap<u64, u64> = image.relative_targets.iter().copied().collect();
 
-    let (starts, functions, chunks, noreturn) = loop {
+    let (starts, functions, chunks, noreturn, controls, extents) = loop {
+        _phase = phase::scope("decode functions");
         let starts: Vec<u64> = discovery.starts.keys().copied().collect();
         let functions: Vec<Function> = starts
             .par_iter()
@@ -407,6 +413,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         // Where function extents are tight, code that a function reaches by a jump can lie
         // outside every extent: a cold block placed elsewhere, or a shared exit. Those chunks
         // are decoded too, so that a function can be followed into them.
+        _phase = phase::scope("decode chunks");
         let chunks: Vec<Function> = if image.data_in_code {
             let covered: Vec<(u64, u64)> = functions.iter().map(|f| (f.start, f.end)).collect();
             uncovered(&discovery.code, &covered).into_iter().map(|(start, end)| decode::<A>(image, start, end, false)).collect()
@@ -416,11 +423,16 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
         // A chunk that several functions jump to the top of is a function they all tail-call,
         // not a cold block of one of them, and so is one that opens like a function.
-        let mut jumped_to: HashMap<u64, HashSet<u64>> = HashMap::new();
-        for function in &functions {
-            for control in &function.controls {
-                if let Flow::Jump(target) | Flow::Branch(target) = control.flow {
-                    jumped_to.entry(target).or_default().insert(function.start);
+        // Only jumps to the top of a chunk matter, and most images have no chunks at all.
+        let mut jumped_to: FxHashMap<u64, FxHashSet<u64>> = chunks.iter().map(|chunk| (chunk.start, FxHashSet::default())).collect();
+        if !chunks.is_empty() {
+            for function in &functions {
+                for control in &function.controls {
+                    if let Flow::Jump(target) | Flow::Branch(target) = control.flow
+                        && let Some(sources) = jumped_to.get_mut(&target)
+                    {
+                        sources.insert(function.start);
+                    }
                 }
             }
         }
@@ -428,7 +440,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .iter()
             .map(|chunk| chunk.start)
             .filter(|start| {
-                let sources = jumped_to.get(start).map_or(0, HashSet::len);
+                let sources = jumped_to.get(start).map_or(0, FxHashSet::len);
                 let opens_function = || {
                     let mut decoder = A::decode(image.bytes_from(*start)?, *start);
                     let first = decoder.next()?.insn?;
@@ -444,8 +456,9 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             continue;
         }
 
+        _phase = phase::scope("noreturn");
         let mut controls: Vec<Control> = functions.iter().chain(&chunks).flat_map(|f| f.controls.iter().copied()).collect();
-        controls.sort_unstable_by_key(|c| c.addr);
+        controls.par_sort_unstable_by_key(|c| c.addr);
         let mut extents: Vec<(u64, u64)> = functions.iter().chain(&chunks).map(|f| (f.start, f.end)).collect();
         extents.sort_unstable();
         let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots };
@@ -456,7 +469,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         // callee, even when the callee's own code has a return in it, as some C runtime exit
         // functions do. Only an extent that unwind information vouches for counts as "ends
         // the function": an extent inferred from layout may stop short at a wrong boundary.
-        let terminal_callees: HashSet<u64> = functions
+        let terminal_callees: FxHashSet<u64> = functions
             .par_iter()
             .chain(&chunks)
             .flat_map_iter(|f| {
@@ -476,7 +489,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .collect();
 
         // Least fixpoint: a function joins the set once no path through it can return.
-        let mut noreturn: HashSet<u64> = terminal_callees.into_iter().filter(|target| starts.binary_search(target).is_ok()).collect();
+        let mut noreturn: FxHashSet<u64> = terminal_callees.into_iter().filter(|target| starts.binary_search(target).is_ok()).collect();
         loop {
             let added: Vec<u64> = functions
                 .par_iter()
@@ -493,6 +506,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         // different function: it follows a call that never returns, and nothing else marked it
         // as an entry point. Functions with a frame are left alone, since the frame already
         // gives their extent.
+        _phase = phase::scope("unreached splits");
         let splits: Vec<u64> = functions
             .par_iter()
             .filter(|f| !frame_end.contains_key(&f.start) && !image.data_in_code)
@@ -504,7 +518,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             })
             .collect();
         if splits.is_empty() {
-            break (starts, functions, chunks, noreturn);
+            let Program { controls, extents, .. } = program;
+            break (starts, functions, chunks, noreturn, controls, extents);
         }
         for addr in splits {
             discovery.starts.entry(addr).or_insert(Origin::Unreachable);
@@ -512,14 +527,11 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     };
 
     // The chunks each function reaches become further ranges of its body.
+    _phase = phase::scope("chunk ranges");
     let chunk_ranges: Vec<(u64, u64)> = chunks.iter().map(|c| (c.start, c.end)).collect();
-    let extra_ranges: HashMap<u64, Vec<(u64, u64)>> = if chunks.is_empty() {
-        HashMap::new()
+    let extra_ranges: FxHashMap<u64, Vec<(u64, u64)>> = if chunks.is_empty() {
+        FxHashMap::default()
     } else {
-        let mut controls: Vec<Control> = functions.iter().chain(&chunks).flat_map(|f| f.controls.iter().copied()).collect();
-        controls.sort_unstable_by_key(|c| c.addr);
-        let mut extents: Vec<(u64, u64)> = functions.iter().chain(&chunks).map(|f| (f.start, f.end)).collect();
-        extents.sort_unstable();
         let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots };
         functions
             .par_iter()
@@ -532,12 +544,13 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .collect()
     };
 
+    _phase = phase::scope("fragments");
     let is_start = |addr: u64| starts.binary_search(&addr).is_ok();
     let leaves = |function: &Function, target: u64| target < function.start || target >= function.end;
 
     // A frame nothing refers to as a function, entered only by jumps from one other function,
     // is a split-off piece of that function.
-    let mut jumped_from: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut jumped_from: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
     for function in &functions {
         for control in &function.controls {
             if let Flow::Jump(target) | Flow::Branch(target) = control.flow {
@@ -547,7 +560,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             }
         }
     }
-    let by_start: HashMap<u64, &Function> = functions.iter().map(|f| (f.start, f)).collect();
+    let by_start: FxHashMap<u64, &Function> = functions.iter().map(|f| (f.start, f)).collect();
     // A piece of another function either jumps back into the middle of its owner or never
     // returns. A real function that is only ever tail-called from one place does neither.
     let behaves_like_fragment = |piece: &Function, owner: &Function| {
@@ -557,7 +570,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         });
         rejoins_owner || !piece.controls.iter().any(|control| control.flow == Flow::Return)
     };
-    let fragment_of: HashMap<u64, u64> = jumped_from
+    let fragment_of: FxHashMap<u64, u64> = jumped_from
         .iter()
         .filter(|&(target, sources)| {
             !discovery.referenced.contains(target)
@@ -572,6 +585,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         .map(|(&target, sources)| (target, sources[0]))
         .collect();
 
+    _phase = phase::scope("calls");
     let pieces: Vec<&Function> = functions.iter().chain(&chunks).collect();
     let mut calls: Vec<CallSite> = pieces
         .par_iter()
@@ -612,7 +626,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     calls.sort_unstable_by_key(|call| call.at);
 
     let noreturn_calls: Vec<u64> = calls.iter().filter(|call| call.noreturn && !call.tail).map(|call| call.at).collect();
-    let used_slots: HashSet<u64> = calls
+    let used_slots: FxHashSet<u64> = calls
         .iter()
         .filter_map(|call| match call.target {
             CallTarget::Import(slot) => Some(slot),
@@ -630,7 +644,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
     // Strings sit where code points, or where a pointer in data points.
     // A string is used by taking its address, so only those references count as evidence.
-    let from_code: HashSet<u64> = discovery.data_refs.iter().filter(|r| !r.2).map(|&(_, to, _)| to).collect();
+    _phase = phase::scope("strings");
+    let from_code: FxHashSet<u64> = discovery.data_refs.iter().filter(|r| !r.2).map(|&(_, to, _)| to).collect();
     let mut candidates: Vec<u64> = from_code.iter().copied().chain(image.relative_targets.iter().map(|&(_, to)| to)).collect();
     candidates.sort_unstable();
     candidates.dedup();
@@ -643,11 +658,12 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
     // A function that is a single jump forwards to its target; an export name on such a thunk
     // is really the target's name.
+    _phase = phase::scope("names");
     let thunk_target = |f: &Function| match f.controls.as_slice() {
         [Control { flow: Flow::Jump(target), .. }] if f.instructions == 1 => Some(*target),
         _ => None,
     };
-    let mut names: HashMap<u64, String> =
+    let mut names: FxHashMap<u64, String> =
         image.symbol_names.iter().map(|(&addr, symbol)| (addr, crate::names::display_name(symbol))).collect();
     for function in &functions {
         if let (Some(target), Some(name)) = (thunk_target(function), names.get(&function.start).cloned()) {
@@ -669,6 +685,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
     // Statically linked library code carries no symbol, but its bytes are the same in every
     // program that links it. The built-in fingerprints come from Windows builds.
+    _phase = phase::scope("fingerprints");
     if image.format == Format::Pe {
         let signatures = Signatures::builtin(image.machine);
         let recognised: Vec<(u64, &str)> = functions
@@ -681,6 +698,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
     // A virtual function nothing else names takes the name of its vtable slot, in the class
     // that has the fewest bases among those listing it: the one that introduced it.
+    _phase = phase::scope("classes");
     let classes = crate::rtti::classes(image);
     let mut by_depth: Vec<&crate::report::Class> = classes.iter().collect();
     by_depth.sort_by_key(|class| class.bases.len());
@@ -692,6 +710,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         }
     }
 
+    _phase = phase::scope("report");
     Analysis {
         data_refs: discovery.data_refs.iter().map(|&(from, to, access)| DataRef { from, to, access }).collect(),
         classes,

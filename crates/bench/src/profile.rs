@@ -16,6 +16,9 @@ pub enum What {
     Analysis,
     /// Decompiling the chosen functions in this process, without the callees-first pass.
     Decompile,
+    /// Setting up a decompiler session for the binary: what a new decompiler process does
+    /// before its first function, apart from the analysis.
+    Session,
 }
 
 /// Samples per second. High enough for a few seconds to give thousands of samples.
@@ -30,6 +33,24 @@ pub fn run(what: What, binary: &Path, functions: &[String], seconds: f64, top: u
             std::hint::black_box(recore::analyze(&image));
             Ok(())
         }),
+        What::Session => {
+            let program = Program::load(binary)?;
+            Box::new(move || {
+                let (image, analysis) = (&program.image, &program.analysis);
+                let start = Instant::now();
+                let mut session = Session::from_image(image, analysis)?;
+                let loaded = start.elapsed();
+                let facts = Facts::derive(image, analysis);
+                session.add_functions(&facts)?;
+                session.add_strings(analysis)?;
+                session.add_classes(analysis)?;
+                if image.format == Format::Pe {
+                    session.override_jump_tables(analysis, &facts)?;
+                }
+                eprintln!("session: {:.2} ms to load, {:.2} ms in all", loaded.as_secs_f64() * 1e3, start.elapsed().as_secs_f64() * 1e3);
+                Ok(())
+            })
+        }
         What::Decompile => {
             let program = Program::load(binary)?;
             let (image, analysis) = (&program.image, &program.analysis);
@@ -71,11 +92,21 @@ pub fn run(what: What, binary: &Path, functions: &[String], seconds: f64, top: u
     let mut own: HashMap<String, isize> = HashMap::new();
     let mut inclusive: HashMap<String, isize> = HashMap::new();
     let mut stacks: Vec<(String, isize)> = Vec::new();
+    // Per source line of this repository: samples in it or in library code it calls.
+    let mut lines: HashMap<String, isize> = HashMap::new();
     let mut total = 0;
     for (frames, &count) in &report.data {
         // Innermost first; an inlined call adds its own name before the function it is in.
         let names: Vec<String> = frames.frames.iter().flatten().map(|symbol| symbol.name()).collect();
         let Some(leaf) = names.first() else { continue };
+        // The innermost line of this repository's code: time in the libraries it calls counts
+        // for the line that calls them.
+        let file_of = |symbol: &pprof::Symbol| symbol.filename.as_deref().and_then(|path| path.to_str()).map(str::to_owned);
+        let ours = frames.frames.iter().flatten().find_map(|symbol| Some((file_of(symbol).filter(|file| file.contains("/crates/"))?, symbol.lineno?)));
+        if let Some((file, line)) = ours {
+            let file = file.rsplit_once("/crates/").map_or(file.as_str(), |(_, rest)| rest).to_owned();
+            *lines.entry(format!("{file}:{line}")).or_default() += count;
+        }
         total += count;
         *own.entry(leaf.clone()).or_default() += count;
         for name in names.iter().collect::<HashSet<_>>() {
@@ -85,11 +116,13 @@ pub fn run(what: What, binary: &Path, functions: &[String], seconds: f64, top: u
     }
 
     println!("{rounds} rounds in {:.2}s ({:.2} ms each), {total} samples", elapsed.as_secs_f64(), elapsed.as_secs_f64() * 1e3 / f64::from(rounds));
-    for (title, counts) in [("own time", &own), ("time including what it calls", &inclusive)] {
+    for (title, counts) in [("own time", &own), ("time by line of this repository", &lines), ("time including what it calls", &inclusive)] {
         let mut rows: Vec<(&String, &isize)> = counts.iter().collect();
         rows.sort_by_key(|&(name, &count)| (-count, name));
         println!("\n{title}");
-        for (name, &count) in rows.into_iter().take(top) {
+        // The runtime's frames under `main` and around closures include everything and say nothing.
+        let ours = |name: &str| ["recore", "iced_x86", "ghidra::", "rd_"].iter().any(|part| name.contains(part)) && !name.contains("recore_bench");
+        for (name, &count) in rows.into_iter().filter(|(name, _)| !std::ptr::eq(counts, &inclusive) || ours(name)).take(top) {
             let name: String = name.chars().take(150).collect();
             println!("{:>6.2}%  {name}", count as f64 * 100.0 / total.max(1) as f64);
         }

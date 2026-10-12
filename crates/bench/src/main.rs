@@ -42,7 +42,7 @@ enum Command {
         #[arg(long)]
         only: Option<String>,
         /// Runs per measurement.
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 7)]
         runs: usize,
         /// Functions sampled per binary in the decompile suite.
         #[arg(long, default_value_t = 150)]
@@ -53,6 +53,18 @@ enum Command {
         /// Shows the change against `target/bench/<NAME>.json`.
         #[arg(long)]
         compare: Option<String>,
+    },
+    /// Prints the wall time of each phase of analyzing one binary, fastest of several runs.
+    Phases {
+        binary: PathBuf,
+        #[arg(long, default_value_t = 7)]
+        runs: usize,
+    },
+    /// Times decoding every instruction of one binary once, the floor under the analysis.
+    DecodeFloor {
+        binary: PathBuf,
+        #[arg(long, default_value_t = 7)]
+        runs: usize,
     },
     /// Samples the call stack while one binary is analyzed or decompiled over and over, and
     /// prints the functions the time goes to.
@@ -120,6 +132,8 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Phases { binary, runs } => suites::phases(&binary, runs),
+        Command::DecodeFloor { binary, runs } => suites::decode_floor(&binary, runs),
         Command::Profile { what, binary, functions, seconds, top, collapsed } => profile::run(what, &binary, &functions, seconds, top, collapsed.as_deref()),
     }
 }
