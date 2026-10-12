@@ -7,7 +7,9 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use recore_decomp::dwarf::DebugInfo;
 
-use crate::report::{BinaryReport, Status};
+use recore_decomp::isolate::Status;
+
+use crate::report::BinaryReport;
 
 /// Source language and build of a corpus file, from its name: `[deb__]<package>__<binary>`.
 /// The `deb` binaries are distribution builds of the same packages.

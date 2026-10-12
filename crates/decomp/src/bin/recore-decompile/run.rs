@@ -1,20 +1,16 @@
 //! The parent side of a corpus run: plans shards, supervises child processes, writes reports.
 
-use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::process::ExitStatusExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::ValueEnum;
+use recore_decomp::isolate::{FunctionRecord, Options, Status, Worker};
 
-use crate::WorkerOptions;
-use crate::report::{BinaryReport, Event, FunctionRecord, Slow, Status, Summary};
+use crate::report::{BinaryReport, Slow, Summary};
 
 pub struct Config {
     pub bin_dir: PathBuf,
@@ -22,11 +18,8 @@ pub struct Config {
     pub jobs: usize,
     pub timeout: Duration,
     pub shard: usize,
-    pub worker: WorkerOptions,
+    pub worker: Options,
 }
-
-/// A child gets this long to load its binary and declare every function before it is given up on.
-const SETUP_LIMIT: Duration = Duration::from_secs(300);
 
 /// One binary's functions and the results collected for it so far.
 struct Binary {
@@ -139,110 +132,42 @@ fn finish(config: &Config, binary: &mut Binary) -> Result<Vec<FunctionRecord>> {
     Ok(report.functions)
 }
 
-/// Decompiles `addrs` in child processes. A child that dies or stalls costs only the function
-/// it was working on: that one is recorded as crashed or timed out, and a new child takes over
+/// Decompiles `addrs` in worker processes. A worker that dies or stalls costs only the function
+/// it was working on: that one is recorded as crashed or timed out, and a new worker takes over
 /// the rest.
-pub fn run_shard(worker: &WorkerOptions, timeout: Duration, binary: &Path, addrs: &[u64]) -> (Vec<FunctionRecord>, Vec<(u64, String)>) {
-    let mut remaining: VecDeque<u64> = addrs.iter().copied().collect();
+pub fn run_shard(options: &Options, timeout: Duration, binary: &Path, addrs: &[u64]) -> (Vec<FunctionRecord>, Vec<(u64, String)>) {
     let mut records = Vec::new();
     let mut c_texts = Vec::new();
-    while !remaining.is_empty() {
-        let before = remaining.len();
-        if let Err(error) = run_child(worker, timeout, binary, &mut remaining, &mut records, &mut c_texts) {
-            // The child never got as far as a function, so a new one would fail the same way.
-            let message = format!("{error:#}");
-            records.extend(remaining.drain(..).map(|addr| FunctionRecord::failed(addr, Status::Error, message.clone(), 0.0)));
+    let mut worker: Option<Worker> = None;
+    for (index, &addr) in addrs.iter().enumerate() {
+        if worker.is_none() {
+            let started = std::env::current_exe().map_err(anyhow::Error::from).and_then(|exe| {
+                let mut command = Command::new(exe);
+                command.arg("worker");
+                Worker::spawn(command, binary, options)
+            });
+            match started {
+                Ok(started) => worker = Some(started),
+                Err(error) => {
+                    // Setup failed, so a new worker would fail the same way.
+                    let message = format!("{error:#}");
+                    records.extend(addrs[index..].iter().map(|&addr| FunctionRecord::failed(addr, Status::Error, message.clone(), 0.0)));
+                    break;
+                }
+            }
         }
-        debug_assert!(remaining.len() < before, "every child must make progress");
+        match worker.as_mut().expect("started above").decompile(addr, timeout) {
+            Ok((record, c_text)) => {
+                c_texts.extend(c_text.map(|text| (addr, text)));
+                records.push(record);
+            }
+            Err(record) => {
+                records.push(record);
+                worker = None;
+            }
+        }
     }
     (records, c_texts)
-}
-
-/// Runs one child over `remaining`, removing every address that got a record. Fails only when
-/// the child died or stalled with no function in flight.
-fn run_child(
-    worker: &WorkerOptions,
-    timeout: Duration,
-    binary: &Path,
-    remaining: &mut VecDeque<u64>,
-    records: &mut Vec<FunctionRecord>,
-    c_texts: &mut Vec<(u64, String)>,
-) -> Result<()> {
-    let style = worker.style.to_possible_value().expect("no skipped variants");
-    let mut command = Command::new(std::env::current_exe()?);
-    command.arg("worker").arg(binary).args(["--style", style.get_name()]).args(["--memory-gb", &worker.memory_gb.to_string()])
-        .args(["--jump-tables", worker.jump_tables.to_possible_value().expect("no skipped variants").get_name()]);
-    if worker.emit_c {
-        command.arg("--emit-c");
-    }
-    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("spawning worker")?;
-
-    let mut stdin = child.stdin.take().expect("piped");
-    let stdout = child.stdout.take().expect("piped");
-    let mut stderr = child.stderr.take().expect("piped");
-    let list: String = remaining.iter().map(|addr| format!("{addr:x}\n")).collect();
-    let (sender, events) = mpsc::channel::<Event>();
-    // Feeding, reading and draining each get a thread, so that a full pipe never blocks the
-    // supervisor, whose only job is to watch the clock.
-    let feeder = std::thread::spawn(move || drop(stdin.write_all(list.as_bytes())));
-    let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let Ok(event) = serde_json::from_str(&line) else { break };
-            if sender.send(event).is_err() {
-                break;
-            }
-        }
-    });
-    let drain = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text);
-        text
-    });
-
-    // The function the child said it started, and when.
-    let mut in_flight: Option<(u64, Instant)> = None;
-    let mut waiting_since = Instant::now();
-    let timed_out = loop {
-        let limit = if in_flight.is_some() { timeout } else { SETUP_LIMIT };
-        match events.recv_timeout(limit.saturating_sub(waiting_since.elapsed())) {
-            Ok(Event::Start(addr)) => {
-                in_flight = Some((addr, Instant::now()));
-                waiting_since = Instant::now();
-            }
-            Ok(Event::Done { record, c_text }) => {
-                remaining.retain(|&addr| addr != record.addr);
-                c_texts.extend(c_text.map(|text| (record.addr, text)));
-                records.push(record);
-                in_flight = None;
-                waiting_since = Instant::now();
-            }
-            Err(RecvTimeoutError::Timeout) => break true,
-            Err(RecvTimeoutError::Disconnected) => break false,
-        }
-    };
-    if timed_out {
-        let _ = child.kill();
-    }
-    let status = child.wait()?;
-    let _ = (feeder.join(), reader.join());
-    let stderr = drain.join().unwrap_or_default();
-
-    if remaining.is_empty() {
-        return Ok(());
-    }
-    let how = match (timed_out, status.signal()) {
-        (true, _) => format!("no result after {timeout:.0?}"),
-        (false, Some(signal)) => format!("killed by signal {signal}"),
-        (false, None) => format!("exited with {status}"),
-    };
-    // The end of stderr usually names the cause: an assertion, a panic, an abort message.
-    let tail: String = stderr.trim().chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
-    let message = if tail.is_empty() { how } else { format!("{how}: {tail}") };
-    let Some((addr, started)) = in_flight else { anyhow::bail!("worker stopped before its first function: {message}") };
-    remaining.retain(|&a| a != addr);
-    let status = if timed_out { Status::Timeout } else { Status::Crash };
-    records.push(FunctionRecord::failed(addr, status, message, started.elapsed().as_secs_f64() * 1e3));
-    Ok(())
 }
 
 fn summarize(config: &Config, binaries: &[(String, Vec<FunctionRecord>)], fragments_skipped: usize, wall: Duration) -> Summary {
@@ -286,8 +211,8 @@ fn print_summary(s: &Summary) {
 
 /// Prints the C of chosen functions, or of all of them. Each argument is a hex address or a
 /// name the image carries for a function, mangled or demangled.
-pub fn functions(binary: &Path, wanted: &[String], all: bool, jobs: usize, timeout: Duration, worker: &WorkerOptions) -> Result<()> {
-    let worker = WorkerOptions { emit_c: true, ..worker.clone() };
+pub fn functions(binary: &Path, wanted: &[String], all: bool, jobs: usize, timeout: Duration, worker: &Options) -> Result<()> {
+    let worker = Options { emit_c: true, ..worker.clone() };
     let shards: Vec<Vec<u64>> = if all {
         // Listing every function means analyzing here as well as in the children.
         let functions = plan(binary)?.functions;

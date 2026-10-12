@@ -63,6 +63,7 @@ unsafe extern "C" {
     ) -> i32;
     pub fn rd_override_import_call(session: *mut RdSession, function: u64, call: u64, slot: u64, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_alias_import(session: *mut RdSession, addr: u64, slot: u64, err: *mut c_char, errlen: usize) -> i32;
+    pub fn rd_allow_entry(session: *mut RdSession, function: u64, entry: u64, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_override_call(session: *mut RdSession, function: u64, call: u64, target: u64, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_declare(session: *mut RdSession, declaration: *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_add_string(session: *mut RdSession, addr: u64, name: *const c_char, count: usize, wide: i32, err: *mut c_char, errlen: usize) -> i32;

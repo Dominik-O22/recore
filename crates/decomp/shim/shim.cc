@@ -90,6 +90,7 @@ class SectionImage : public LoadImage {
   // functions. The engine's own flow bounds (FlowInfo::setRange) cannot do this: a restart
   // drops them, and a fall-through across the bound fails the function.
   unordered_set<uint64_t> entries;  // every declared function start
+  set<pair<uint64_t, uint64_t>> allowed;  // (function, entry) pairs exempt from the above
   uint64_t current = ~(uint64_t)0;  // the function being decompiled, or none
 
   SectionImage(const string &lang, const RdSection *secs, size_t count)
@@ -118,7 +119,7 @@ class SectionImage : public LoadImage {
     // exactly at an entry is an attempt to decode it; windows that merely overlap one are not.
     const Section *first = find(addr.getOffset());
     if (done > 0 && current != ~(uint64_t)0 && addr.getOffset() != current && first->code &&
-        entries.count(addr.getOffset()) != 0)
+        entries.count(addr.getOffset()) != 0 && allowed.count({current, addr.getOffset()}) == 0)
       memset(ptr, 0xff, done);
     if (done == 0) {
       ostringstream msg;
@@ -349,6 +350,12 @@ int rd_override_jump_table(RdSession *session, uint64_t function, uint64_t jump,
     // labels cases by table position starting at 0.
     fd->installJumpTable(session->address(jump))->setOverride(table, Address(), 0, 0);
   });
+}
+
+// Lets flow from `function` pass through the entry of the declared function `entry`, which lies
+// inside one of `function`'s own ranges.
+int rd_allow_entry(RdSession *session, uint64_t function, uint64_t entry, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] { session->image->allowed.insert({function, entry}); });
 }
 
 // Tells the engine up front that the indirect call at `call` inside `function` reaches the

@@ -3,7 +3,6 @@
 mod params;
 mod report;
 mod run;
-mod worker;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,6 +10,7 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use recore_decomp::Style;
+use recore_decomp::isolate::{self, JumpTables, Options};
 
 #[derive(Parser)]
 struct Cli {
@@ -27,17 +27,17 @@ struct WorkerOptions {
     #[arg(long)]
     emit_c: bool,
     /// Where switch targets come from: recore's jump tables, the engine's own recovery, or
-    /// recore's for images that keep tables among the code (PE) and the engine's otherwise.
+    /// recore's for PE images and the engine's otherwise.
     #[arg(long, value_enum, default_value = "auto")]
-    jump_tables: JumpTables,
+    jump_tables: JumpTablesArg,
     /// Address-space limit per child process, in GiB. Past it the engine's allocations fail and
     /// the function is reported as an error.
     #[arg(long, default_value_t = 4)]
     memory_gb: u64,
 }
 
-#[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
-enum JumpTables {
+#[derive(ValueEnum, Clone, Copy)]
+enum JumpTablesArg {
     Auto,
     Recore,
     Engine,
@@ -50,12 +50,21 @@ enum StyleArg {
     Paramid,
 }
 
-impl From<StyleArg> for Style {
-    fn from(style: StyleArg) -> Style {
-        match style {
-            StyleArg::Decompile => Style::Decompile,
-            StyleArg::Normalize => Style::Normalize,
-            StyleArg::Paramid => Style::ParamId,
+impl From<&WorkerOptions> for Options {
+    fn from(options: &WorkerOptions) -> Options {
+        Options {
+            style: match options.style {
+                StyleArg::Decompile => Style::Decompile,
+                StyleArg::Normalize => Style::Normalize,
+                StyleArg::Paramid => Style::ParamId,
+            },
+            emit_c: options.emit_c,
+            jump_tables: match options.jump_tables {
+                JumpTablesArg::Auto => JumpTables::Auto,
+                JumpTablesArg::Recore => JumpTables::Recore,
+                JumpTablesArg::Engine => JumpTables::Engine,
+            },
+            memory_gb: options.memory_gb,
         }
     }
 }
@@ -106,24 +115,20 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         list: usize,
     },
-    /// Child process of `corpus`: decompiles the addresses read from stdin.
+    /// Child process of the other commands: see `recore_decomp::isolate`.
     #[command(hide = true)]
-    Worker {
-        binary: PathBuf,
-        #[command(flatten)]
-        options: WorkerOptions,
-    },
+    Worker { binary: PathBuf, options: String },
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Corpus { bin_dir, out_dir, jobs, timeout, shard, worker } => {
-            run::corpus(&run::Config { bin_dir, out_dir, jobs, timeout: Duration::from_secs_f64(timeout), shard, worker })
+            run::corpus(&run::Config { bin_dir, out_dir, jobs, timeout: Duration::from_secs_f64(timeout), shard, worker: (&worker).into() })
         }
         Command::Function { binary, functions, all, jobs, timeout, worker } => {
-            run::functions(&binary, &functions, all, jobs, Duration::from_secs_f64(timeout), &worker)
+            run::functions(&binary, &functions, all, jobs, Duration::from_secs_f64(timeout), &(&worker).into())
         }
         Command::Params { out_dir, debug_dir, jobs, list } => params::compare(&out_dir, &debug_dir, jobs, list),
-        Command::Worker { binary, options } => worker::run(&binary, &options),
+        Command::Worker { binary, options } => isolate::serve(&binary, &options),
     }
 }

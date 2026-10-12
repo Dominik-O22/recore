@@ -6,10 +6,9 @@ use recore::Image;
 use recore::image::Machine;
 use recore::report::{Analysis, CallTarget};
 
-/// Control-flow facts for one binary. Each override is attributed to the function whose
-/// decompilation it affects: the function containing the instruction and, when that is a cold
-/// fragment, also the function the fragment belongs to, because the decompiler follows jumps
-/// into fragments.
+/// Control-flow facts for one binary. Each is attributed to the function whose decompilation
+/// it affects: every function that has the instruction in one of its ranges, or the owner
+/// when that function is a cold fragment, because the decompiler follows jumps into those.
 #[derive(Debug, Default)]
 pub struct Facts {
     /// Entry points to declare, with whether the function never returns. Fragments are left
@@ -29,6 +28,11 @@ pub struct Facts {
     pub import_calls: Vec<(u64, u64, u64)>,
     /// `(function, call, target)`: a call through a pointer slot that holds a local function.
     pub local_calls: Vec<(u64, u64, u64)>,
+    /// `(function, entry)`: another declared function whose entry lies inside one of the
+    /// function's ranges, so control flow may pass through it.
+    pub own_entries: Vec<(u64, u64)>,
+    /// `(function, index into Analysis::jump_tables)`: an indirect jump inside the function.
+    pub jump_tables: Vec<(u64, usize)>,
 }
 
 impl Facts {
@@ -38,50 +42,68 @@ impl Facts {
             names: analysis.functions.iter().filter_map(|f| Some((f.addr, f.name.clone()?))).collect(),
             ..Facts::default()
         };
-        // Every range with the functions an instruction inside it affects.
-        let mut ranges: Vec<(u64, u64, u64, Option<u64>)> = analysis
-            .functions
-            .iter()
-            .flat_map(|f| f.ranges.iter().map(move |&(start, end)| (start, end, f.addr, f.fragment_of)))
-            .collect();
-        ranges.sort_unstable();
-
+        let mut entries: Vec<u64> = facts.functions.iter().map(|f| f.0).collect();
+        entries.sort_unstable();
         let x86 = matches!(image.machine, Machine::X86 | Machine::X86_64);
-        for call in &analysis.calls {
-            let index = ranges.partition_point(|range| range.0 <= call.at);
-            let Some(&(_, _, function, owner)) = ranges[..index].last().filter(|range| call.at < range.1) else { continue };
-            // recore says where a call goes, not how. On x86 the opcode tells a call through a
-            // pointer slot (ff /2, possibly behind a `notrack` prefix) from a direct one (e8).
-            let bytes = image.bytes_from(call.at).filter(|_| x86).unwrap_or(&[]);
-            let bytes = bytes.strip_prefix(&[0x3e]).unwrap_or(bytes);
-            let through_slot = bytes.first() == Some(&0xff);
-            for function in std::iter::once(function).chain(owner) {
-                match (call.tail, call.target) {
-                    // The engine can only turn an unconditional jump into a call and return.
-                    (true, _) if !call.conditional => facts.tail_calls.push((function, call.at)),
-                    (false, CallTarget::Import(slot)) if through_slot => facts.import_calls.push((function, call.at, slot)),
-                    (false, CallTarget::Function(target)) if through_slot => facts.local_calls.push((function, call.at, target)),
-                    _ => {}
+        // A function owns every one of its ranges: the main extent, cold blocks, and exits it
+        // shares with other functions. What happens in a range is a fact about each function
+        // that has it, and about the owner if the function is itself a fragment.
+        for function in &analysis.functions {
+            let owner = function.fragment_of.unwrap_or(function.addr);
+            for &(start, end) in &function.ranges {
+                let first = entries.partition_point(|&entry| entry < start);
+                facts.own_entries.extend(entries[first..].iter().take_while(|&&entry| entry < end).filter(|&&entry| entry != owner).map(|&entry| (owner, entry)));
+
+                let first = analysis.calls.partition_point(|call| call.at < start);
+                for call in analysis.calls[first..].iter().take_while(|call| call.at < end) {
+                    // recore says where a call goes, not how. On x86 the opcode tells a call
+                    // through a pointer slot (ff /2, possibly behind a `notrack` prefix) from a
+                    // direct one (e8).
+                    let bytes = image.bytes_from(call.at).filter(|_| x86).unwrap_or(&[]);
+                    let bytes = bytes.strip_prefix(&[0x3e]).unwrap_or(bytes);
+                    let through_slot = bytes.first() == Some(&0xff);
+                    match (call.tail, call.target) {
+                        // The engine can only turn an unconditional jump into a call and return.
+                        (true, _) if !call.conditional => facts.tail_calls.push((owner, call.at)),
+                        (false, CallTarget::Import(slot)) if through_slot => facts.import_calls.push((owner, call.at, slot)),
+                        (false, CallTarget::Function(target)) if through_slot => facts.local_calls.push((owner, call.at, target)),
+                        _ => {}
+                    }
+                    if let (Machine::Aarch64, false, CallTarget::Import(slot)) = (image.machine, call.tail, call.target) {
+                        // `bl` to a PLT stub: the top six bits are the opcode, the rest a word offset.
+                        let word = image.bytes_from(call.at).and_then(|b| b.first_chunk::<4>()).map(|b| u32::from_le_bytes(*b));
+                        if let Some(word) = word.filter(|word| word >> 26 == 0b100101) {
+                            let offset = i64::from((word << 6) as i32 >> 6) * 4;
+                            facts.import_aliases.push((call.at.wrapping_add_signed(offset), slot));
+                        }
+                    }
+                    match (call.tail, call.target, bytes.first_chunk::<5>()) {
+                        // A direct call that recore resolves to an import goes to a PLT stub.
+                        (false, CallTarget::Import(slot), Some([0xe8, rel @ ..])) => {
+                            facts.import_aliases.push(((call.at + 5).wrapping_add_signed(i32::from_le_bytes(*rel).into()), slot));
+                        }
+                        // A function that starts by jumping through an import slot is a thunk for it.
+                        (true, CallTarget::Import(slot), _) if call.at == function.addr && through_slot => {
+                            facts.import_aliases.push((function.addr, slot));
+                        }
+                        _ => {}
+                    }
                 }
-            }
-            if let (Machine::Aarch64, false, CallTarget::Import(slot)) = (image.machine, call.tail, call.target) {
-                // `bl` to a PLT stub: the top six bits are the opcode, the rest a word offset.
-                let word = image.bytes_from(call.at).and_then(|b| b.first_chunk::<4>()).map(|b| u32::from_le_bytes(*b));
-                if let Some(word) = word.filter(|word| word >> 26 == 0b100101) {
-                    let offset = i64::from((word << 6) as i32 >> 6) * 4;
-                    facts.import_aliases.push((call.at.wrapping_add_signed(offset), slot));
-                }
-            }
-            match (call.tail, call.target, bytes.first_chunk::<5>()) {
-                // A direct call that recore resolves to an import goes to a PLT stub.
-                (false, CallTarget::Import(slot), Some([0xe8, rel @ ..])) => {
-                    facts.import_aliases.push(((call.at + 5).wrapping_add_signed(i32::from_le_bytes(*rel).into()), slot));
-                }
-                // A function that starts by jumping through an import slot is a thunk for it.
-                (true, CallTarget::Import(slot), _) if call.at == function && through_slot => facts.import_aliases.push((function, slot)),
-                _ => {}
+
+                let jumps = analysis.jump_tables.iter().enumerate().filter(|(_, table)| (start..end).contains(&table.jump));
+                facts.jump_tables.extend(jumps.map(|(index, _)| (owner, index)));
             }
         }
+        for list in [&mut facts.tail_calls, &mut facts.own_entries] {
+            list.sort_unstable();
+            list.dedup();
+        }
+        for list in [&mut facts.import_calls, &mut facts.local_calls] {
+            list.sort_unstable();
+            list.dedup();
+        }
+        facts.jump_tables.sort_unstable();
+        facts.jump_tables.dedup();
         facts.import_aliases.sort_unstable();
         facts.import_aliases.dedup_by_key(|alias| alias.0);
         facts

@@ -20,10 +20,11 @@ struct Setup<'a> {
 impl Setup<'_> {
     fn session(&self) -> Result<Session> {
         let mut session = Session::from_image(self.image, self.analysis)?;
-        session.add_functions(&Facts::derive(self.image, self.analysis))?;
+        let facts = Facts::derive(self.image, self.analysis);
+        session.add_functions(&facts)?;
         session.set_style(self.style)?;
         if self.jump_tables {
-            session.override_jump_tables(self.analysis)?;
+            session.override_jump_tables(self.analysis, &facts)?;
         }
         Ok(session)
     }

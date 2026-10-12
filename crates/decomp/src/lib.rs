@@ -12,6 +12,7 @@
 pub mod dwarf;
 pub mod facts;
 mod ffi;
+pub mod isolate;
 pub mod prototypes;
 
 // The engine is only reached through the shim, so name the crate to keep it in the link.
@@ -23,8 +24,8 @@ use std::ptr::NonNull;
 
 use anyhow::{Result, bail};
 use recore::Image;
-use recore::image::Machine;
-use recore::report::{AnalyzedFunction, Analysis};
+use recore::image::{Format, Machine};
+use recore::report::Analysis;
 
 pub use facts::Facts;
 
@@ -57,14 +58,13 @@ pub enum Target {
 }
 
 impl Target {
-    /// The target an image was built for. recore does not expose the file format, but only PE
-    /// images have `data_in_code` set, so that stands in for "Windows".
+    /// The target an image was built for.
     pub fn of(image: &Image) -> Target {
-        match (image.machine, image.data_in_code) {
-            (Machine::X86, true) => Target::X86Windows,
-            (Machine::X86, false) => Target::X86Gcc,
-            (Machine::X86_64, true) => Target::X86_64Windows,
-            (Machine::X86_64, false) => Target::X86_64Gcc,
+        match (image.machine, image.format) {
+            (Machine::X86, Format::Pe) => Target::X86Windows,
+            (Machine::X86, Format::Elf) => Target::X86Gcc,
+            (Machine::X86_64, Format::Pe) => Target::X86_64Windows,
+            (Machine::X86_64, Format::Elf) => Target::X86_64Gcc,
             (Machine::Aarch64, _) => Target::Aarch64,
         }
     }
@@ -86,7 +86,7 @@ impl Target {
 }
 
 /// How far the engine takes a function. These are Ghidra's own "simplification styles".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Style {
     /// The full pipeline, ending in structured C.
     #[default]
@@ -263,6 +263,9 @@ impl Session {
         for &(function, call, slot) in &facts.import_calls {
             self.override_import_call(function, call, slot)?;
         }
+        for &(function, entry) in &facts.own_entries {
+            check(|err, len| unsafe { ffi::rd_allow_entry(self.raw.as_ptr(), function, entry, err, len) != 0 })?;
+        }
         for &(function, call, target) in &facts.local_calls {
             check(|err, len| unsafe { ffi::rd_override_call(self.raw.as_ptr(), function, call, target, err, len) != 0 })?;
         }
@@ -301,13 +304,10 @@ impl Session {
     }
 
     /// Hands recore's jump tables to the decompiler as overrides. Call before decompiling.
-    pub fn override_jump_tables(&mut self, analysis: &Analysis) -> Result<()> {
-        for table in &analysis.jump_tables {
-            let inside = |f: &&AnalyzedFunction| f.ranges.iter().any(|&(start, end)| (start..end).contains(&table.jump));
-            if let Some(function) = analysis.functions.iter().find(inside) {
-                // A table inside a cold fragment is reached while decompiling the fragment's owner.
-                self.override_jump_table(function.fragment_of.unwrap_or(function.addr), table.jump, &table.targets)?;
-            }
+    pub fn override_jump_tables(&mut self, analysis: &Analysis, facts: &Facts) -> Result<()> {
+        for &(function, index) in &facts.jump_tables {
+            let table = &analysis.jump_tables[index];
+            self.override_jump_table(function, table.jump, &table.targets)?;
         }
         Ok(())
     }
