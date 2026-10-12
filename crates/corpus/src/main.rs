@@ -1,5 +1,6 @@
 //! Corpus tooling: extracts ground truth from debug files and scores analyzer output against it.
 
+mod classes;
 mod jumptables;
 mod references;
 mod score;
@@ -45,6 +46,12 @@ enum Command {
     /// Compares recore's data references with Ghidra's in `<corpus>/ghidra-refs`, which
     /// `ghidra/run-refs.sh` writes.
     ScoreReferences,
+    /// Scores the C++ classes recore recovers against the symbols and DWARF of each debug file.
+    ScoreClasses {
+        /// Print each class that is missing or differs.
+        #[arg(long)]
+        detail: bool,
+    },
     /// Scores one or more analyzer output directories against the truth.
     Score {
         /// Directories of `<name>.json` analysis files, e.g. `corpus/ghidra`.
@@ -230,6 +237,7 @@ fn main() -> Result<()> {
         Command::ScoreSignatures { dirs } => signatures_score::score(&cli.corpus, &dirs),
         Command::Jumptables => run_jumptables(&cli.corpus),
         Command::ScoreReferences => references::score(&cli.corpus),
+        Command::ScoreClasses { detail } => classes::score(&cli.corpus, detail),
         Command::PeFacts { detail } => run_pe_facts(&cli.corpus, detail),
         Command::Score { dirs, detail } => dirs.iter().try_for_each(|dir| run_score(&cli.corpus, dir, detail)),
     }
