@@ -72,9 +72,21 @@ fn message_sends_resolve_on_x86_64() {
 }
 
 #[test]
-fn a_send_to_a_class_names_the_class_and_its_method() {
+fn a_send_names_its_receiver_where_the_code_says_which() {
     let analysis = analyze("shapes-arm64");
-    let to_classes: Vec<_> = analysis.sends.iter().filter_map(|send| Some((send.at, send.receiver.as_deref()?, send.label(), send.implementation))).collect();
-    // `[Square withSide:argc]` in `main`: the receiver is loaded from a class reference.
-    assert_eq!(to_classes, [(0x100000a08, "Square", "+[Square withSide:]".to_string(), Some(0x100000990))]);
+    let known: Vec<_> = analysis.sends.iter().filter_map(|send| Some((send.at, send.label(), send.implementation))).filter(|send| !send.1.contains('?')).collect();
+    assert_eq!(
+        known,
+        [
+            // `[self area]` in a method of `Shape`: `self` may be a `Square`, which has its own.
+            (0x100000908, "-[Shape area]".to_string(), None),
+            // `self` in methods of `Square`, kept in a register across a call.
+            (0x100000964, "-[Square side]".to_string(), Some(0x1000009d0)),
+            (0x100000974, "-[Square side]".to_string(), Some(0x1000009d0)),
+            // To the object `[Square alloc]` returned, in a class method of `Square`.
+            (0x1000009bc, "-[Square setSide:]".to_string(), Some(0x1000009d8)),
+            // `[Square withSide:argc]` in `main`: the receiver is loaded from a class reference.
+            (0x100000a08, "+[Square withSide:]".to_string(), Some(0x100000990)),
+        ]
+    );
 }

@@ -213,24 +213,32 @@ pub struct MessageSend {
     /// Address of the call or jump instruction.
     pub at: u64,
     pub selector: String,
-    /// The class the message is sent to, when the receiver is loaded from a class reference
-    /// right before the send: `[NSString alloc]`. Unknown for a message to an object.
+    /// The class the message is sent to, or the class of the object it is sent to, when the
+    /// code says which: the receiver is loaded from a class reference or comes from a call
+    /// that returns that class or allocates an object of it, or is `self` in a method of the
+    /// class. Unknown for any other object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver: Option<String>,
-    /// The method the image implements for the message: the receiver's class method when the
-    /// receiver is known, and otherwise the selector's implementation when the image has
-    /// exactly one and the send is not to a superclass. In the second case the receiver may
-    /// still be an object of another library's class that has a method of the same name.
+    /// The receiver is an object of the class, or of a subclass, and not the class itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub instance: bool,
+    /// The method the image implements for the message: the method of that name of the
+    /// receiver's class or the nearest superclass in this image when the receiver is known,
+    /// and otherwise the selector's implementation when the image has exactly one and the
+    /// send is not to a superclass. None for a receiver that may be of a subclass, as `self`
+    /// may, when a subclass in this image has a method of that name too. In the second case
+    /// the receiver may still be an object of another library's class that has a method of
+    /// the same name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implementation: Option<u64>,
 }
 
 impl MessageSend {
-    /// The send as a method name: `+[NSString alloc]` to a known class, and `-[? setSide:]`
-    /// with the class left open otherwise.
+    /// The send as a method name: `+[NSString alloc]` to a known class, `-[NSString init]`
+    /// to an object of one, and `-[? setSide:]` with the class left open otherwise.
     pub fn label(&self) -> String {
         match &self.receiver {
-            Some(class) => format!("+[{class} {}]", self.selector),
+            Some(class) => format!("{}[{class} {}]", if self.instance { '-' } else { '+' }, self.selector),
             None => format!("-[? {}]", self.selector),
         }
     }

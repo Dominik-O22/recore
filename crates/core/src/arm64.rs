@@ -170,6 +170,18 @@ impl Insn {
         self.word & 0x9F20_0400 == 0x0E20_0400 || self.word & 0xFF3F_FC00 == 0x1E20_4000
     }
 
+    /// Whether this is a store, or a load into vector registers: a load or store that writes
+    /// none of the general registers it names as transferred. The exclusive forms also write
+    /// a status register, and do not count.
+    fn transfers_without_writing(self) -> bool {
+        let is_memory = self.word >> 25 & 0b0101 == 0b0100;
+        let is_pair = self.word & 0x3A00_0000 == 0x2800_0000;
+        let is_exclusive = self.word & 0x3F00_0000 == 0x0800_0000;
+        let is_literal = self.word & 0x3B00_0000 == 0x1800_0000;
+        let is_load = is_literal || if is_pair { self.word >> 22 & 1 == 1 } else { self.word >> 22 & 3 != 0 };
+        is_memory && !is_exclusive && !(is_load && self.word >> 26 & 1 == 0)
+    }
+
     /// `mov xd, xm`, encoded as `orr xd, xzr, xm`.
     fn register_move(self) -> Option<usize> {
         (self.word & 0x7FE0_FFE0 == 0x2A00_03E0).then(|| self.rm())
@@ -187,6 +199,8 @@ enum Value {
     Addr(u64),
     /// A pointer loaded from the slot at this address.
     Slot(u64),
+    /// What another pass said the register holds, by a number of its choosing.
+    Object(u32),
     /// An index proven to be at most this value by an unsigned bounds check.
     Bounded(u64),
     /// An entry loaded from a jump table.
@@ -228,10 +242,11 @@ impl State {
             return;
         }
         if let Some(offset) = insn.store_to_stack() {
-            // Remember addresses only: that is all a later dispatch needs back.
+            // Remember addresses, which are all a later dispatch needs back, and what
+            // another pass follows.
             let value = self.registers[insn.rd()];
             let slot = self.spills.iter().position(|(at, _)| *at == offset);
-            match (slot, matches!(value, Value::Addr(_))) {
+            match (slot, matches!(value, Value::Addr(_) | Value::Object(_))) {
                 (Some(slot), _) => self.spills[slot] = (offset, value),
                 (None, true) => {
                     self.spills.rotate_right(1);
@@ -416,6 +431,43 @@ impl Arch for Arm64 {
             Value::Slot(slot) => Some(slot),
             _ => None,
         }
+    }
+
+    fn argument_object(state: &State, index: usize) -> Option<u32> {
+        match state.registers[index] {
+            Value::Object(object) => Some(object),
+            _ => None,
+        }
+    }
+
+    fn set_argument_object(state: &mut State, index: usize, object: u32) {
+        state.registers[index] = Value::Object(object);
+    }
+
+    /// The general step takes every load and store to write the registers it transfers. A
+    /// store writes none, and a function opens by storing the very registers an object is
+    /// kept in across calls.
+    fn step_following(state: &mut State, insn: &Insn) {
+        let transferred = [insn.rd(), (insn.word >> 10 & 31) as usize];
+        let before = transferred.map(|register| state.registers[register]);
+        state.step(*insn);
+        if insn.transfers_without_writing() {
+            for (register, value) in transferred.into_iter().zip(before) {
+                if matches!(value, Value::Object(_)) {
+                    state.registers[register] = value;
+                }
+            }
+        }
+    }
+
+    /// Swift's calling convention keeps `self` in `x20`, which the callee saves for C.
+    fn set_self_object(state: &mut State, object: u32) {
+        state.registers[20] = Value::Object(object);
+    }
+
+    /// A result comes back in `x0`, which is also where the first argument goes.
+    fn set_result_object(state: &mut State, object: u32) {
+        state.registers[0] = Value::Object(object);
     }
 
     fn is_padding(insn: &Insn) -> bool {

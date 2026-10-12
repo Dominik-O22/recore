@@ -41,6 +41,9 @@ pub struct Metadata {
     pub names: Vec<(u64, String)>,
     /// Classes, structs and enums in the order the image lists them.
     pub types: Vec<SwiftType>,
+    /// The instance methods in the vtables of classes, each with its class's place in
+    /// `types`: where a function is entered with an object of that class as `self`.
+    pub instance_methods: Vec<(u64, usize)>,
 }
 
 /// Where the objects that trail a generic context's header end. The header at `header` counts
@@ -99,6 +102,7 @@ struct Collector<'a> {
     /// the type: `getter_2`.
     members: FxHashMap<u64, String>,
     overrides: Vec<Override<'a>>,
+    instance_methods: Vec<(u64, usize)>,
 }
 
 /// What a method or requirement is, from the low four bits of its flags.
@@ -346,7 +350,11 @@ impl<'a> Collector<'a> {
                 let method = at + 8 + 8 * index;
                 let implementation = self.function(method + 4);
                 if self.naming {
-                    let member = format!("{}_{index}", member_kind(self.reader.u32(method)?, false));
+                    /// Set for a method of an object, and clear for one of the type.
+                    const INSTANCE: u32 = 1 << 4;
+                    let flags = self.reader.u32(method)?;
+                    self.instance_methods.extend(implementation.filter(|_| flags & INSTANCE != 0).map(|implementation| (implementation, class)));
+                    let member = format!("{}_{index}", member_kind(flags, false));
                     self.names.extend(implementation.map(|implementation| (implementation, format!("{name}.{member}"))));
                     // An abstract method has no code, and still takes up its place.
                     self.types[class].methods.push(implementation.unwrap_or(0));
@@ -559,6 +567,7 @@ fn read(image: &Image, naming: bool) -> Option<Metadata> {
         type_index: FxHashMap::default(),
         members: FxHashMap::default(),
         overrides: Vec::new(),
+        instance_methods: Vec::new(),
     };
     let mut found = false;
     // The low bits of an entry say whether it leads to the descriptor or to a slot the loader
@@ -588,7 +597,7 @@ fn read(image: &Image, naming: bool) -> Option<Metadata> {
 
     let aligned = |addr: u64| image.machine != Machine::Aarch64 || addr % 4 == 0;
     let is_function = |addr: u64| aligned(addr) && image.section_at(addr).is_some_and(|section| section.executable && !section.is_stubs());
-    let Collector { mut functions, mut names, types, .. } = collector;
+    let Collector { mut functions, mut names, types, instance_methods, .. } = collector;
     functions.retain(|&addr| is_function(addr));
     functions.sort_unstable();
     functions.dedup();
@@ -597,5 +606,5 @@ fn read(image: &Image, naming: bool) -> Option<Metadata> {
     names.retain(|&(addr, _)| is_function(addr));
     names.sort_by_key(|name| name.0);
     names.dedup_by_key(|name| name.0);
-    Some(Metadata { functions, names, types })
+    Some(Metadata { functions, names, types, instance_methods })
 }
