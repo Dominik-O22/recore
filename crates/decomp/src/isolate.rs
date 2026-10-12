@@ -151,13 +151,23 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     edits.apply(&mut analysis);
     session.add_imports(&image, &analysis)?;
     let mut facts = Facts::derive(&image, &analysis);
-    // Functions the debug information describes, among the ones the analysis found.
-    let described = |addr: u64| analysis.functions.binary_search_by_key(&addr, |f| f.addr).is_ok_and(|index| analysis.functions[index].fragment_of.is_none());
-    if let Some(debug) = &debug {
+    // A function that only jumps to another, as an incremental linker's stub does, is described
+    // by what that one's debug information says.
+    let importer = debug.as_ref().map(|debug| {
+        let jumps = callees_of(&analysis, true);
+        let stub = |f: &recore::report::AnalyzedFunction| match jumps.get(&f.addr)?.as_slice() {
+            [CallTarget::Function(target)] if f.thunk && f.fragment_of.is_none() => Some((f.addr, *target)),
+            _ => None,
+        };
+        crate::types::Importer::new(debug, analysis.functions.iter().filter_map(stub).collect())
+    });
+    if let Some(importer) = &importer {
         // A function the binary has no name for takes the one its debug information gives it.
         let named: HashSet<u64> = facts.names.iter().map(|name| name.0).collect();
-        facts.names.extend(debug.functions.iter().filter(|f| !f.name.is_empty() && !named.contains(&f.addr) && described(f.addr)).map(|f| (f.addr, f.name.clone())));
+        let unnamed = analysis.functions.iter().filter(|f| f.fragment_of.is_none() && !named.contains(&f.addr));
+        facts.names.extend(unnamed.filter_map(|f| Some((f.addr, importer.describes(f.addr).filter(|described| !described.name.is_empty())?.name.clone()))));
     }
+    let mut importer = importer;
     session.add_functions(&facts)?;
     session.add_strings(&analysis)?;
     session.add_classes(&analysis)?;
@@ -168,7 +178,6 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
 
     // Types from debug information go in before the edits, which have the last word and may
     // name them. The prototypes follow as functions are asked for.
-    let mut importer = debug.as_ref().map(crate::types::Importer::new);
     if let Some(importer) = &mut importer {
         importer.globals(&mut session);
         for text in edits.declarations.iter().chain(edits.types.values()) {

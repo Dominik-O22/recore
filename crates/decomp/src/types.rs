@@ -7,7 +7,7 @@
 //! parser behind [`crate::Session::declare`] would lay structs out again by its own rules and
 //! cannot spell a C++ name.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -571,13 +571,24 @@ impl<'a> Writer<'a> {
 pub struct Importer<'a> {
     types: &'a Types,
     writer: Writer<'a>,
-    /// Per entry of [`Types::functions`]: its prototype has been handed over.
-    given: Vec<bool>,
+    /// Functions that only jump to another one, as an incremental linker's stubs do, each with
+    /// the function it jumps to, whose prototype is its own.
+    stubs: HashMap<u64, u64>,
+    /// The functions whose prototype has been handed over.
+    given: HashSet<u64>,
 }
 
 impl<'a> Importer<'a> {
-    pub fn new(types: &'a Types) -> Importer<'a> {
-        Importer { types, writer: Writer::new(types), given: vec![false; types.functions.len()] }
+    pub fn new(types: &'a Types, stubs: HashMap<u64, u64>) -> Importer<'a> {
+        Importer { types, writer: Writer::new(types), stubs, given: HashSet::new() }
+    }
+
+    /// What the debug information says about the function at `addr`, or about the function it
+    /// only jumps to.
+    pub fn describes(&self, addr: u64) -> Option<&'a Function> {
+        let described = self.stubs.get(&addr).copied().unwrap_or(addr);
+        let index = self.types.functions.binary_search_by_key(&described, |function| function.addr).ok()?;
+        Some(&self.types.functions[index])
     }
 
     /// Hands over what was written, reporting what the engine rejects on stderr.
@@ -602,10 +613,10 @@ impl<'a> Importer<'a> {
     /// given before. Call it with a function and the functions it calls before decompiling it.
     pub fn functions(&mut self, session: &mut crate::Session, addrs: impl IntoIterator<Item = u64>) {
         for addr in addrs {
-            if let Ok(index) = self.types.functions.binary_search_by_key(&addr, |function| function.addr)
-                && !std::mem::replace(&mut self.given[index], true)
+            if let Some(function) = self.describes(addr)
+                && self.given.insert(addr)
             {
-                self.writer.function(&self.types.functions[index]);
+                self.writer.function(&Function { addr, ..function.clone() });
             }
         }
         self.flush(session);

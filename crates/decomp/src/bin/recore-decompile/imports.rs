@@ -61,7 +61,7 @@ pub fn debug_info(binary: &Path) -> Result<()> {
     let described = |addr: u64| analysis.functions.binary_search_by_key(&addr, |f| f.addr).is_ok_and(|index| analysis.functions[index].fragment_of.is_none());
     // The child gives a session the globals at once and each prototype when it is needed;
     // giving it all of them here is the most that can cost.
-    let mut importer = types::Importer::new(&debug);
+    let mut importer = types::Importer::new(&debug, Default::default());
     let start = std::time::Instant::now();
     importer.globals(&mut session);
     let globals = start.elapsed();

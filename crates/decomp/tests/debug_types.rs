@@ -18,7 +18,7 @@ fn decompiled(name: &str, function: &str) -> (String, String) {
     let analysis = recore::analyze(&image);
     let debug = types::load(&path, &image).expect("the fixture has debug information");
     let mut session = Session::from_image(&image, &analysis).unwrap();
-    let mut importer = Importer::new(&debug);
+    let mut importer = Importer::new(&debug, Default::default());
     importer.globals(&mut session);
     let addr = debug.functions.iter().find(|found| found.name == function).expect("the function is described").addr;
     importer.functions(&mut session, [addr]);
@@ -82,7 +82,7 @@ fn a_type_is_given_when_it_is_named() {
     let analysis = recore::analyze(&image);
     let debug = types::load(&path, &image).unwrap();
     let mut session = Session::from_image(&image, &analysis).unwrap();
-    let mut importer = Importer::new(&debug);
+    let mut importer = Importer::new(&debug, Default::default());
     assert!(session.type_layout("number").is_err());
     importer.mentioned(&mut session, "struct holder { number count; };");
     assert_eq!(session.type_layout("number").unwrap(), "union number, 4 bytes, alignment 4\n  +0x0 int4 whole (4 bytes)\n  +0x0 float4 real (4 bytes)\n");
