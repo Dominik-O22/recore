@@ -2,6 +2,7 @@
 
 mod jumptables;
 mod score;
+mod signatures;
 mod truth;
 
 use std::path::{Path, PathBuf};
@@ -31,6 +32,10 @@ enum Command {
         #[arg(long)]
         detail: bool,
     },
+    /// Builds the library-function fingerprint database from the corpus and writes it to `out`.
+    Signatures { out: PathBuf },
+    /// Checks fingerprint naming by leaving each project out of the database in turn.
+    SignatureCheck,
     /// Scores one or more analyzer output directories against the truth.
     Score {
         /// Directories of `<name>.json` analysis files, e.g. `corpus/ghidra`.
@@ -210,6 +215,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Truth => run_truth(&cli.corpus),
+        Command::Signatures { out } => signatures::build(&cli.corpus, &out),
+        Command::SignatureCheck => signatures::evaluate(&cli.corpus),
         Command::Jumptables => run_jumptables(&cli.corpus),
         Command::PeFacts { detail } => run_pe_facts(&cli.corpus, detail),
         Command::Score { dirs, detail } => dirs.iter().try_for_each(|dir| run_score(&cli.corpus, dir, detail)),

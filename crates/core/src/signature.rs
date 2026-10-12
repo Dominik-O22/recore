@@ -11,8 +11,8 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
 use crate::image::{Image, Machine};
 
 /// Functions shorter than this are too alike to tell apart: many are a move and a return.
-const MIN_INSTRUCTIONS: usize = 6;
-const MIN_BYTES: u64 = 20;
+const MIN_INSTRUCTIONS: usize = 10;
+const MIN_BYTES: u64 = 32;
 
 /// The fingerprint of the function occupying `[start, end)`, or `None` when it is too small to
 /// be distinctive or the architecture is not supported.

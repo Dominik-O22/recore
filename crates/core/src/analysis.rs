@@ -10,9 +10,10 @@ use rayon::prelude::*;
 
 use crate::arch::{Arch, Flow};
 use crate::discover::{discover, is_function_section};
-use crate::image::{Image, Machine};
+use crate::image::{Format, Image, Machine};
 use crate::noreturn::is_noreturn_import;
 use crate::report::{AnalyzedFunction, Analysis, CallSite, CallTarget, DataRef, Import, Origin};
+use crate::signature::{Signatures, fingerprint};
 use crate::strings::string_at;
 use crate::x86::X86;
 
@@ -647,6 +648,18 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         if let (Some(target), Some(name)) = (thunk_target(function), names.get(&function.start).cloned()) {
             names.entry(target).or_insert(name);
         }
+    }
+
+    // Statically linked library code carries no symbol, but its bytes are the same in every
+    // program that links it. The built-in fingerprints come from Windows builds.
+    if image.format == Format::Pe {
+        let signatures = Signatures::builtin(image.machine);
+        let recognised: Vec<(u64, &str)> = functions
+            .par_iter()
+            .filter(|f| !names.contains_key(&f.start))
+            .filter_map(|f| Some((f.start, signatures.name(fingerprint(image, &pointer_slots, f.start, f.end)?)?)))
+            .collect();
+        names.extend(recognised.into_iter().map(|(addr, name)| (addr, name.to_string())));
     }
 
     Analysis {
