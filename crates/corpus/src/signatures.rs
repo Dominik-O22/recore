@@ -10,7 +10,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use rayon::prelude::*;
-use recore::signature::{Signatures, fingerprint};
+use recore::signature::{Signatures, fingerprint, outline};
 
 use crate::truth::Truth;
 
@@ -18,6 +18,7 @@ use crate::truth::Truth;
 struct Sample {
     project: String,
     hash: u64,
+    outline: u32,
     name: String,
     /// The binary itself names the function, as an export, so nothing has to recognise it.
     carried: bool,
@@ -76,9 +77,11 @@ fn samples(corpus: &Path) -> Result<Vec<Sample>> {
                     let name = named.get(&function.addr)?;
                     let &(start, end) = function.ranges.first()?;
                     let hash = fingerprint(&image, &slots, start, end)?;
+                    let outline = outline(&image, start, end)?;
                     Some(Sample {
                         project: project_of(&truth.name).to_string(),
                         hash,
+                        outline,
                         name: listed_name(name),
                         carried: image.symbol_names.contains_key(&function.addr),
                     })
@@ -90,25 +93,24 @@ fn samples(corpus: &Path) -> Result<Vec<Sample>> {
     Ok(per_binary.into_iter().flatten().collect())
 }
 
-/// Fingerprints that at least two projects share under a single name.
-fn database<'a>(samples: impl Iterator<Item = &'a Sample>) -> BTreeMap<u64, &'a str> {
-    let mut seen: HashMap<u64, (BTreeSet<&str>, BTreeSet<&str>)> = HashMap::new();
+/// Fingerprints that at least two projects share under a single name, with one of the samples
+/// that has each.
+fn database<'a>(samples: impl Iterator<Item = &'a Sample>) -> BTreeMap<u64, &'a Sample> {
+    let mut seen: HashMap<u64, (&Sample, bool, BTreeSet<&str>)> = HashMap::new();
     for sample in samples {
-        let (names, projects) = seen.entry(sample.hash).or_default();
-        names.insert(&sample.name);
+        let (first, one_name, projects) = seen.entry(sample.hash).or_insert((sample, true, BTreeSet::new()));
+        *one_name &= first.name == sample.name;
         projects.insert(&sample.project);
     }
-    seen.into_iter()
-        .filter(|(_, (names, projects))| names.len() == 1 && projects.len() >= 2)
-        .map(|(hash, (names, _))| (hash, *names.first().unwrap()))
-        .collect()
+    seen.into_iter().filter(|(_, (_, one_name, projects))| *one_name && projects.len() >= 2).map(|(hash, (sample, ..))| (hash, sample)).collect()
 }
 
 /// Writes the database built from the whole corpus as the table `recore` reads.
 pub fn build(corpus: &Path, out: &Path) -> Result<()> {
     let samples = samples(corpus)?;
     let database = database(samples.iter());
-    std::fs::write(out, Signatures::write(database.iter().map(|(&hash, &name)| (hash, name))))?;
+    let entries: Vec<(u64, u32, &str)> = database.values().map(|sample| (sample.hash, sample.outline, sample.name.as_str())).collect();
+    std::fs::write(out, Signatures::write(&entries))?;
     println!("{} fingerprints from {} named functions", database.len(), samples.len());
     Ok(())
 }
@@ -125,7 +127,7 @@ pub fn evaluate(corpus: &Path) -> Result<()> {
         let database = database(samples.iter().filter(|s| s.project != project));
         let own: Vec<&Sample> = samples.iter().filter(|s| s.project == project).collect();
         let named: Vec<&&Sample> = own.iter().filter(|s| database.contains_key(&s.hash)).collect();
-        let correct = named.iter().filter(|s| database[&s.hash] == s.name).count();
+        let correct = named.iter().filter(|s| database[&s.hash].name == s.name).count();
         println!(
             "{project:10} {:7} functions, {:5} named from other projects, {:5} right, {:3} wrong",
             own.len(),
@@ -133,14 +135,14 @@ pub fn evaluate(corpus: &Path) -> Result<()> {
             correct,
             named.len() - correct
         );
-        for sample in named.iter().filter(|s| database[&s.hash] != s.name) {
-            println!("    {} named {}", sample.name, database[&sample.hash]);
+        for sample in named.iter().filter(|s| database[&s.hash].name != s.name) {
+            println!("    {} named {}", sample.name, database[&sample.hash].name);
         }
         right += correct;
         wrong += named.len() - correct;
         total += own.len();
         gained += named.iter().filter(|s| !s.carried).count();
-        gained_right += named.iter().filter(|s| !s.carried && database[&s.hash] == s.name).count();
+        gained_right += named.iter().filter(|s| !s.carried && database[&s.hash].name == s.name).count();
     }
     println!("total      {total:7} functions, {:5} named, {right:5} right, {wrong:3} wrong", right + wrong);
 
