@@ -14,6 +14,7 @@ pub mod noreturn;
 pub mod pe;
 pub mod program;
 pub mod report;
+pub mod rtti;
 pub mod signature;
 pub mod strings;
 pub mod x86;

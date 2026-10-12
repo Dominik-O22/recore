@@ -12,7 +12,7 @@ use crate::arch::{Arch, Flow};
 use crate::discover::{discover, is_function_section};
 use crate::image::{Format, Image, Machine};
 use crate::noreturn::is_noreturn_import;
-use crate::report::{AnalyzedFunction, Analysis, CallSite, CallTarget, DataRef, Import, Origin};
+use crate::report::{AnalyzedFunction, Analysis, CallSite, CallTarget, DataRef, Import, Origin, StringLiteral};
 use crate::signature::{Signatures, fingerprint};
 use crate::strings::string_at;
 use crate::x86::X86;
@@ -634,7 +634,12 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     let mut candidates: Vec<u64> = from_code.iter().copied().chain(image.relative_targets.iter().map(|&(_, to)| to)).collect();
     candidates.sort_unstable();
     candidates.dedup();
-    let strings = candidates.par_iter().filter_map(|&addr| string_at(image, addr, from_code.contains(&addr))).collect();
+    let mut strings: Vec<StringLiteral> = candidates.par_iter().filter_map(|&addr| string_at(image, addr, from_code.contains(&addr))).collect();
+    // Class names in type information are strings too, though pointers go to the record
+    // around them and not to the text.
+    strings.extend(crate::rtti::type_names(image).into_iter().map(|(addr, text)| StringLiteral { addr, text, wide: false }));
+    strings.sort_by_key(|string| string.addr);
+    strings.dedup_by_key(|string| string.addr);
 
     // A function that is a single jump forwards to its target; an export name on such a thunk
     // is really the target's name.
@@ -664,6 +669,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
     Analysis {
         data_refs: discovery.data_refs.iter().map(|&(from, to, access)| DataRef { from, to, access }).collect(),
+        classes: crate::rtti::classes(image),
         strings,
         name: image.name.clone(),
         instructions: functions.iter().chain(&chunks).map(|f| f.instructions).sum(),

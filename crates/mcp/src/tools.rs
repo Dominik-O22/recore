@@ -39,7 +39,7 @@ pub fn list() -> Value {
         tool("summary", "What the binary is: format, machine, sections, and how many functions, imports, strings and jump tables were recovered. Analysis is cached, so call this first.", json!({}), &[]),
         tool(
             "strings",
-            "Strings the code or relocated pointers refer to, each with its address and the functions that use it. `used by: none` means only a pointer in data refers to it; `xrefs` finds that pointer.",
+            "Strings the code or relocated pointers refer to, each with its address and the functions that use it. `used by: none` means only a pointer in data refers to it; `xrefs` finds that pointer. C++ class names appear here mangled; `classes` lists them with their vtables.",
             json!({ "pattern": pattern("text"), "limit": limit }),
             &[],
         ),
@@ -88,6 +88,12 @@ pub fn list() -> Value {
             &["addr"],
         ),
         tool(
+            "classes",
+            "C++ classes recovered from the type information of Windows binaries: each with its base classes, its vtable address and its virtual functions in vtable order. A virtual call through slot N of an object goes to entry N here.",
+            json!({ "pattern": pattern("class name") }),
+            &[],
+        ),
+        tool(
             "addr",
             "Converts between an address in the image and an offset in the file, and says what is there. Give `addr` or `offset`.",
             json!({ "addr": addr("Address in the image"), "offset": addr("Offset in the file") }),
@@ -113,6 +119,7 @@ pub fn call(cache: &mut Cache, name: &str, arguments: Value) -> Option<Result<St
         "xrefs" => run(cache, name, arguments, xrefs),
         "decompile" => run(cache, name, arguments, decompile),
         "bytes" => run(cache, name, arguments, bytes),
+        "classes" => run(cache, name, arguments, classes),
         "addr" => run(cache, name, arguments, addr),
         _ => return None,
     })
@@ -152,6 +159,9 @@ fn describe(binary: &Binary, addr: u64) -> String {
     }
     if binary.program.function(addr).is_some() {
         return format!("function {}", binary.program.label(addr));
+    }
+    if let Some(class) = binary.program.analysis.classes.iter().find(|class| class.vtable == addr) {
+        return format!("vtable of {}", class.name);
     }
     match binary.program.image.section_at(addr) {
         Some(section) if section.executable => format!("code in {}", binary.program.site_label(addr)),
@@ -312,6 +322,11 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
     let size: u64 = body.iter().map(|(start, end)| end - start).sum();
     writeln!(out, "function {}: {size} bytes at {}{}", binary.program.label(entry), extent.join(" "), if noreturn { ", never returns" } else { "" })?;
 
+    for class in &binary.program.analysis.classes {
+        for (index, _) in class.methods.iter().enumerate().filter(|&(_, &method)| method == entry) {
+            writeln!(out, "virtual function {index} of {} (vtable {:#x})", class.name, class.vtable)?;
+        }
+    }
     let callers = binary.program.users(binary.program.calls_to(entry).map(|call| call.at));
     writeln!(out, "called by ({}): {}", callers.len(), labels(binary, &callers))?;
 
@@ -501,4 +516,23 @@ fn addr(binary: &mut Binary, args: Addr) -> Result<String> {
         None => "not stored in the file as mapped".into(),
     };
     Ok(format!("address {addr:#x}, {stored}, in {}: {}\n", section.name, describe(binary, addr)))
+}
+
+#[derive(Deserialize)]
+struct Classes {
+    pattern: Option<String>,
+}
+
+fn classes(binary: &mut Binary, args: Classes) -> Result<String> {
+    let found: Vec<_> = binary.program.analysis.classes.iter().filter(|class| matches(&class.name, args.pattern.as_deref())).collect();
+    let mut out = String::new();
+    writeln!(out, "{} classes", found.len())?;
+    for class in found {
+        let bases = if class.bases.is_empty() { String::new() } else { format!(" : {}", class.bases.join(", ")) };
+        writeln!(out, "{}{bases}, vtable {:#x}", class.name, class.vtable)?;
+        for (index, &method) in class.methods.iter().enumerate() {
+            writeln!(out, "  {index} {}", binary.program.label(method))?;
+        }
+    }
+    Ok(out)
 }

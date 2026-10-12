@@ -43,7 +43,7 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
     match (tool, plain.as_slice()) {
         (_, []) => {}
         ("decompile", functions) => drop(named.insert("functions".into(), json!(functions))),
-        ("strings" | "imports" | "functions", [pattern]) => drop(named.insert("pattern".into(), json!(pattern))),
+        ("strings" | "imports" | "functions" | "classes", [pattern]) => drop(named.insert("pattern".into(), json!(pattern))),
         // `add` is a name and a hex number; a function called that needs `--name add`.
         ("function", [which]) => drop(named.insert(if parse_addr(which).is_some() { "addr" } else { "name" }.into(), json!(which))),
         ("xrefs" | "addr", [addr]) => drop(named.insert("addr".into(), json!(addr))),

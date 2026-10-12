@@ -16,6 +16,7 @@ Every tool takes `path`, the binary to analyze, and answers with text. Addresses
 | `xrefs` | `addr` | Call sites if it is a function or import slot. For data, the instructions that read or write it or take its address, and the pointers in data that hold it. |
 | `decompile` | `functions` (list of addresses or names), `timeout`? (seconds per function, 30) | C for each function. |
 | `bytes` | `addr`, `len`? (256, at most 4096) | Hex dump of the bytes mapped at the address. |
+| `classes` | `pattern`? | C++ classes from MSVC type information: base classes, vtable address, virtual functions in vtable order. |
 | `addr` | `addr` or `offset` | The address in the image and the offset in the file of the same byte, and what is there. |
 
 The decompiler prints unnamed functions as `func_0x10001000`. Every address argument accepts that form.

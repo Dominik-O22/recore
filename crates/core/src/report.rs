@@ -140,4 +140,18 @@ pub struct Analysis {
     /// Strings at addresses the code or relocated pointers refer to, sorted by address.
     #[serde(default)]
     pub strings: Vec<StringLiteral>,
+    /// C++ classes that have a vtable and run-time type information, sorted by vtable address.
+    #[serde(default)]
+    pub classes: Vec<Class>,
+}
+
+/// A C++ class as its vtable and type information describe it.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Class {
+    pub name: String,
+    pub vtable: u64,
+    /// Entry points of the virtual functions, in vtable order.
+    pub methods: Vec<u64>,
+    /// Classes it derives from, directly or not.
+    pub bases: Vec<String>,
 }
