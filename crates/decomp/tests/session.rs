@@ -79,3 +79,20 @@ fn stdcall_callee_cleanup_gives_stack_parameters() {
     assert_eq!(storage, ["stack:0x4", "stack:0x8"]);
     assert!(function.c_text.contains("param_1 + param_2"), "{}", function.c_text);
 }
+
+/// The engine's C parser accepts the exported Windows prototypes, bar a few.
+#[test]
+fn archive_prototypes_parse() {
+    let target = Target::X86Windows;
+    let mut session = Session::new(&vendored_spec_dir(), target, &[Section { addr: 0x1000, data: &[0xc3], readonly: true, code: true }]).unwrap();
+    recore_decomp::prototypes::declare(&mut session, target, std::iter::empty()).unwrap();
+    let declarations: Vec<(&str, String)> = recore_decomp::prototypes::archive_declarations(target).collect();
+    let mut rejected = Vec::new();
+    for (index, (name, declaration)) in declarations.iter().enumerate() {
+        session.add_import(0x10_0000 + 4 * index as u64, name, false).unwrap();
+        if let Err(error) = session.declare(declaration) {
+            rejected.push(format!("{declaration}: {error}"));
+        }
+    }
+    assert!(rejected.len() * 200 < declarations.len(), "{} of {} rejected, such as {:?}", rejected.len(), declarations.len(), &rejected[..rejected.len().min(5)]);
+}

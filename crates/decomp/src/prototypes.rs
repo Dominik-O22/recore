@@ -2,7 +2,12 @@
 //!
 //! The decompiler cannot see how many arguments an imported function takes, and a wrong guess
 //! spreads to every caller. This small table covers the C runtime and the Win32 calls that turn
-//! up in almost every binary. Ghidra ships type archives for the same purpose.
+//! up in almost every binary, written by hand with the types that read best. Behind it is
+//! `data/win32.protos`, the prototypes of Ghidra's 32-bit Windows type archive with types reduced
+//! to numbers, strings and pointers; `ghidra/ExportPrototypes.java` writes that file.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use anyhow::Result;
 
@@ -18,6 +23,15 @@ const TYPES: &[&str] = &[
     "typedef void *HANDLE;",
     "typedef wchar2 *wstr;",
 ];
+
+/// The exported archive: one `<convention> <prototype>` per line, sorted by function name.
+const ARCHIVE: &str = include_str!("../data/win32.protos");
+
+/// The archive by function name, as (convention, prototype). The convention is `-` if unknown.
+fn archive() -> &'static HashMap<&'static str, (&'static str, &'static str)> {
+    static BY_NAME: OnceLock<HashMap<&str, (&str, &str)>> = OnceLock::new();
+    BY_NAME.get_or_init(|| ARCHIVE.lines().filter_map(|line| line.split_once(' ')).map(|(convention, prototype)| (name_of(prototype), (convention, prototype))).collect())
+}
 
 /// C runtime functions, `__cdecl` on 32-bit Windows.
 const C_RUNTIME: &[&str] = &[
@@ -143,6 +157,15 @@ const WIN32: &[&str] = &[
     "BOOL CryptDestroyKey(HANDLE key)",
 ];
 
+/// Every archive prototype as the declaration [`declare`] would make for it on `target`.
+pub fn archive_declarations(target: Target) -> impl Iterator<Item = (&'static str, String)> {
+    let windows32 = target == Target::X86Windows;
+    archive().iter().map(move |(&name, &(convention, prototype))| {
+        let convention = if windows32 && convention != "-" { format!("__{convention} ") } else { String::new() };
+        (name, format!("extern {convention}{prototype};"))
+    })
+}
+
 /// Every function the table has a prototype for.
 pub fn known() -> impl Iterator<Item = &'static str> {
     C_RUNTIME.iter().chain(WIN32).map(|prototype| name_of(prototype))
@@ -154,19 +177,27 @@ fn name_of(prototype: &str) -> &str {
     head.rsplit([' ', '*']).next().unwrap_or(head)
 }
 
-/// Gives every import in `imports` that the table knows its prototype. The imports must already
-/// be declared in the session.
+/// Gives every import in `imports` that the table or the archive knows its prototype. The
+/// imports must already be declared in the session.
 pub fn declare<'a>(session: &mut Session, target: Target, imports: impl Iterator<Item = &'a str>) -> Result<()> {
-    let wanted: std::collections::HashSet<&str> = imports.collect();
+    let mut wanted: HashSet<&str> = imports.collect();
     let pointer = if target.pointer_bytes() == 4 { "uint4" } else { "uint8" };
     for declaration in TYPES {
         session.declare(&declaration.replace("{ptr}", pointer))?;
     }
     // Only 32-bit Windows has more than one convention to choose from.
-    let conventions = if target == Target::X86Windows { ["__cdecl ", "__stdcall "] } else { ["", ""] };
+    let windows32 = target == Target::X86Windows;
+    let conventions = if windows32 { ["__cdecl ", "__stdcall "] } else { ["", ""] };
     for (table, convention) in [C_RUNTIME, WIN32].into_iter().zip(conventions) {
-        for prototype in table.iter().filter(|p| wanted.contains(name_of(p))) {
+        for prototype in table.iter().filter(|p| wanted.remove(name_of(p))) {
             session.declare(&format!("extern {convention}{prototype};"))?;
+        }
+    }
+    // The archive describes Windows; an ELF import of the same name may differ.
+    if matches!(target, Target::X86Windows | Target::X86_64Windows) {
+        for (_, declaration) in archive_declarations(target).filter(|(name, _)| wanted.contains(name)) {
+            // One prototype the parser rejects must not cost the session the rest.
+            let _ = session.declare(&declaration);
         }
     }
     Ok(())
