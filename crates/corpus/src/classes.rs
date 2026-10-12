@@ -81,12 +81,6 @@ fn normal(name: &str) -> String {
     name.replace(' ', "")
 }
 
-/// A mangled type name as the demangler writes it.
-fn type_name(mangled: &str) -> Option<String> {
-    let name = cpp_demangle::Symbol::new(format!("_ZTS{mangled}")).ok()?.demangle().ok()?;
-    Some(name.strip_prefix("typeinfo name for ")?.to_string())
-}
-
 /// The classes the symbol table of `debug` names, with their vtables as `image` holds them.
 fn true_classes(image: &Image, debug: &object::File) -> Vec<TrueClass> {
     let size = if image.machine == Machine::X86 { 4 } else { 8 };
@@ -97,6 +91,11 @@ fn true_classes(image: &Image, debug: &object::File) -> Vec<TrueClass> {
         .filter_map(|symbol| {
             let name = symbol.name().ok()?;
             let name = if debug.format() == object::BinaryFormat::MachO { name.strip_prefix('_')? } else { name };
+            // A symbol with a version is the image's copy of a library's object, filled in at
+            // load: `_ZTVSt9basic_iosIcSt11char_traitsIcEE@GLIBCXX_3.4`.
+            if name.contains('@') {
+                return None;
+            }
             Some((name.to_string(), symbol.address(), symbol.size()))
         })
         .collect();
@@ -122,7 +121,7 @@ fn true_classes(image: &Image, debug: &object::File) -> Vec<TrueClass> {
         .iter()
         .filter_map(|(symbol, addr, length)| {
             let mangled = plain(symbol.strip_prefix("_ZTV")?);
-            let name = type_name(&mangled)?;
+            let name = recore::itanium::type_name(&mangled);
             let end = if *length > 0 { addr + length } else { addrs.range(addr + 1..).next().copied().unwrap_or(*addr) };
             let is_record = |slot: u64| records.get(&mangled).zip(pointer(slot)).is_some_and(|(records, target)| records.contains(&target));
             let vtables = (*addr..end).step_by(size as usize).filter(|&slot| is_record(slot)).map(|slot| slot + size).collect();

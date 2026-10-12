@@ -44,14 +44,27 @@ const SHAPES: [(&str, Shape); 3] = [
 ];
 
 /// One class's type information record.
-struct Record {
-    /// Address of the mangled name.
-    name: u64,
+struct Record<'a> {
+    /// The class's name, demangled when first asked for: many records are only ever a step
+    /// between a class and its base classes.
+    name: Name<'a>,
     /// The slots that point at the records of its direct base classes, in declaration order.
     bases: Vec<u64>,
     /// Some base class, direct or not, is virtual. Only then can other classes' objects carry
     /// vtables that name this class: the ones in use while they construct this part.
     virtual_bases: bool,
+}
+
+/// A mangled type name and its readable form, worked out once.
+struct Name<'a> {
+    mangled: &'a str,
+    readable: std::cell::OnceCell<String>,
+}
+
+impl Name<'_> {
+    fn readable(&self) -> &str {
+        self.readable.get_or_init(|| type_name(self.mangled))
+    }
 }
 
 /// One vtable: the functions that follow a pointer to a record.
@@ -127,7 +140,7 @@ impl Reader<'_> {
     }
 
     /// The text at `addr` up to its terminating zero.
-    fn text(&self, addr: u64) -> Option<&str> {
+    fn text(&self, addr: u64) -> Option<&'_ str> {
         let bytes = self.image.bytes_from(addr)?;
         let bytes = &bytes[..bytes.len().min(LONGEST as usize)];
         std::str::from_utf8(&bytes[..bytes.iter().position(|&byte| byte == 0)?]).ok()
@@ -182,10 +195,10 @@ impl Reader<'_> {
     }
 
     /// Reads the record at `addr`: its name and the slots that hold its base classes.
-    fn record(&self, addr: u64, shape: Shape) -> Option<Record> {
+    fn record(&self, addr: u64, shape: Shape) -> Option<Record<'_>> {
         // Apple's linker sets the top bit of the pointer to a name that other images may
         // hold their own copy of.
-        let name = self.pointer(addr + self.size)? & !(1 << 63);
+        let name = Name { mangled: self.text(self.pointer(addr + self.size)? & !(1 << 63))?, readable: Default::default() };
         let first = addr + 2 * self.size;
         let bases = match shape {
             Shape::Leaf => Vec::new(),
@@ -229,11 +242,15 @@ impl Reader<'_> {
     }
 }
 
-/// A mangled type name as a person would write it. Names GCC marks with `*` as local to their
-/// object file read the same.
-fn type_name(mangled: &str) -> String {
+/// The longest mangled name that is demangled. Longer ones are instances of library templates
+/// over lambdas and other templates, and come out tens of thousands of characters long.
+const LONGEST_READABLE: usize = 256;
+
+/// A mangled type name as a person would write it, or as it is if it is very long. Names GCC
+/// marks with `*` as local to their object file read the same.
+pub fn type_name(mangled: &str) -> String {
     let mangled = mangled.trim_start_matches('*');
-    let demangled = cpp_demangle::Symbol::new(format!("_ZTS{mangled}")).ok().and_then(|symbol| symbol.demangle().ok());
+    let demangled = (mangled.len() <= LONGEST_READABLE).then(|| cpp_demangle::Symbol::new(format!("_ZTS{mangled}")).ok()?.demangle().ok()).flatten();
     demangled.as_deref().and_then(|name| name.strip_prefix("typeinfo name for ")).unwrap_or(mangled).to_string()
 }
 
@@ -263,9 +280,8 @@ pub fn classes(image: &Image, slots: &FxHashMap<u64, u64>) -> Vec<Class> {
     let base = |slot: u64| match image.import_slots.get(&slot) {
         Some(symbol) => Some((type_name(symbol.trim_start_matches('_').strip_prefix("ZTI")?), None)),
         None => {
-            let addr = reader.pointer(slot)?;
-            let record = records.get(&addr)?;
-            Some((type_name(reader.text(record.name)?), Some(record)))
+            let record = records.get(&reader.pointer(slot)?)?;
+            Some((record.name.readable().to_string(), Some(record)))
         }
     };
     // Base classes nearest first: each direct base, followed by its own.
@@ -392,9 +408,8 @@ pub fn classes(image: &Image, slots: &FxHashMap<u64, u64>) -> Vec<Class> {
             continue;
         }
         let record = &records[&first.record];
-        let Some(name) = reader.text(record.name).map(type_name) else { continue };
         let bases = bases_of(record);
-        classes.extend(group.iter().map(|vtable| Class { name: name.clone(), vtable: vtable.addr, methods: vtable.methods.clone(), bases: bases.clone(), objc: false }));
+        classes.extend(group.iter().map(|vtable| Class { name: record.name.readable().to_string(), vtable: vtable.addr, methods: vtable.methods.clone(), bases: bases.clone(), objc: false }));
     }
     classes.sort_by_key(|class| class.vtable);
     classes
