@@ -248,7 +248,7 @@ impl Session {
         for import in &analysis.imports {
             self.add_import(import.slot, &import.name, import.noreturn)?;
         }
-        prototypes::declare(self, Target::of(image), analysis.imports.iter().map(|i| i.name.as_str()))
+        prototypes::declare(self, Target::of(image), image.format, analysis.imports.iter().map(|i| i.name.as_str()))
     }
 
     /// Declares that the GOT entry at `slot` points to the imported function `name`. Indirect

@@ -1,5 +1,6 @@
 //! Decompiles whole corpora with Ghidra's engine, one disposable child process per shard.
 
+mod imports;
 mod params;
 mod report;
 mod run;
@@ -120,6 +121,14 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         list: usize,
     },
+    /// Prints how many calls to imported functions in a directory of binaries have a prototype,
+    /// and from which table.
+    Imports {
+        bin_dir: PathBuf,
+        /// Imports without a prototype to print, most-called first.
+        #[arg(long, default_value_t = 0)]
+        list: usize,
+    },
     /// Child process of the other commands: see `recore_decomp::isolate`.
     #[command(hide = true)]
     Worker { binary: PathBuf, options: String },
@@ -137,6 +146,7 @@ fn main() -> Result<()> {
             run::functions(&binary, &functions, all, jobs, Duration::from_secs_f64(timeout), &(&worker).into())
         }
         Command::Params { out_dir, debug_dir, jobs, list } => params::compare(&out_dir, &debug_dir, jobs, list),
+        Command::Imports { bin_dir, list } => imports::coverage(&bin_dir, list),
         Command::Worker { binary, options } => isolate::serve(&binary, &options),
     }
 }

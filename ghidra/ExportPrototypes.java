@@ -1,6 +1,9 @@
 // Writes the function prototypes in a Ghidra type archive as one C-like line each, with types
 // reduced to what recore's prototype table uses: sized integers, floats, strings and pointers.
-// Arguments: <archive.gdt> <output file>. Lines read `<convention> <return> <name>(<params>)`.
+// Arguments: <archive.gdt> <output file> [long]. Lines read `<convention> <return> <name>(<params>)`.
+// With `long`, the C types long and unsigned long are written by name and not by their size in
+// the archive: they are 4 bytes on Windows and on 32-bit targets and 8 elsewhere, so one table
+// then serves both, and the 32-bit macOS archive serves 64-bit macOS.
 import java.io.File;
 import java.io.PrintWriter;
 import java.util.ArrayList;
@@ -18,8 +21,11 @@ public class ExportPrototypes extends GhidraScript {
         "uintptr_t", "WPARAM", "LONG_PTR", "INT_PTR", "SSIZE_T", "intptr_t", "ptrdiff_t", "LPARAM", "LRESULT");
     private static final Set<String> RESERVED = Set.of("int", "uint", "char", "void", "bool", "float", "double", "long",
         "short", "unsigned", "signed", "struct", "union", "enum", "const", "typedef", "extern", "code", "size_t",
-        "DWORD", "BOOL", "HANDLE", "wstr", "string", "this", "class", "template", "default", "register", "volatile",
+        "DWORD", "BOOL", "HANDLE", "wstr", "ulong", "string", "this", "class", "template", "default", "register", "volatile",
         "static", "return", "if", "else", "for", "while", "do", "switch", "case", "break", "continue", "goto", "sizeof");
+
+    // Write long and unsigned long as `long` and `ulong`.
+    private static boolean namedLong = false;
 
     private static DataType base(DataType type) {
         while (type instanceof TypeDef) type = ((TypeDef) type).getDataType();
@@ -45,6 +51,8 @@ public class ExportPrototypes extends GhidraScript {
         if (plain instanceof ghidra.program.model.data.Enum) return "uint" + Math.max(size, 1);
         if (plain instanceof BooleanDataType) return "uint1";
         if (plain instanceof AbstractFloatDataType) return "float" + size;
+        if (namedLong && plain instanceof LongDataType) return "long";
+        if (namedLong && plain instanceof UnsignedLongDataType) return "ulong";
         if (plain instanceof AbstractIntegerDataType) {
             boolean signed = ((AbstractIntegerDataType) plain).isSigned();
             return (signed ? "int" : "uint") + size;
@@ -56,6 +64,7 @@ public class ExportPrototypes extends GhidraScript {
 
     public void run() throws Exception {
         String[] args = getScriptArgs();
+        namedLong = args.length > 2 && args[2].equals("long");
         FileDataTypeManager archive = FileDataTypeManager.openFileArchive(new File(args[0]), false);
         TreeMap<String, String> lines = new TreeMap<>();
         Iterator<DataType> all = archive.getAllDataTypes();

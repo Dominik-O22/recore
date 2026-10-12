@@ -59,13 +59,15 @@ fn flow_passes_an_entry_inside_the_functions_own_range() {
 
 #[test]
 fn every_builtin_prototype_parses() {
+    use recore::image::Format;
     use recore_decomp::prototypes;
-    for target in [Target::X86Windows, Target::X86_64Windows, Target::X86_64Gcc] {
+    for (target, format) in [(Target::X86Windows, Format::Pe), (Target::X86_64Windows, Format::Pe), (Target::X86_64Gcc, Format::Elf), (Target::X86Gcc, Format::Elf)] {
         let mut session = Session::new(&vendored_spec_dir(), target, &[Section { addr: 0x1000, data: &[0xc3], readonly: true, code: true }]).unwrap();
         for (index, name) in prototypes::known().enumerate() {
             session.add_import(0x2000 + 8 * index as u64, name, false).unwrap();
         }
-        prototypes::declare(&mut session, target, prototypes::known()).unwrap();
+        // The archives are left out here: a failure in the tables written by hand is an error.
+        prototypes::declare(&mut session, target, format, prototypes::known()).unwrap();
     }
 }
 
@@ -80,21 +82,41 @@ fn stdcall_callee_cleanup_gives_stack_parameters() {
     assert!(function.c_text.contains("param_1 + param_2"), "{}", function.c_text);
 }
 
-/// The engine's C parser accepts the exported Windows prototypes, bar a few.
+/// The engine's C parser accepts the exported prototypes of every archive, bar a few.
 #[test]
 fn archive_prototypes_parse() {
-    let target = Target::X86Windows;
-    let mut session = Session::new(&vendored_spec_dir(), target, &[Section { addr: 0x1000, data: &[0xc3], readonly: true, code: true }]).unwrap();
-    recore_decomp::prototypes::declare(&mut session, target, std::iter::empty()).unwrap();
-    let declarations: Vec<(&str, String)> = recore_decomp::prototypes::archive_declarations(target).collect();
-    let mut rejected = Vec::new();
-    for (index, (name, declaration)) in declarations.iter().enumerate() {
-        session.add_import(0x10_0000 + 4 * index as u64, name, false).unwrap();
-        if let Err(error) = session.declare(declaration) {
-            rejected.push(format!("{declaration}: {error}"));
+    use recore::image::Format;
+    for (target, format) in [(Target::X86Windows, Format::Pe), (Target::X86_64Gcc, Format::Elf), (Target::Aarch64, Format::MachO)] {
+        let mut session = Session::new(&vendored_spec_dir(), target, &[Section { addr: 0x1000, data: &[0xc3], readonly: true, code: true }]).unwrap();
+        recore_decomp::prototypes::declare(&mut session, target, format, std::iter::empty()).unwrap();
+        let declarations: Vec<(&str, String)> = recore_decomp::prototypes::archive_declarations(target, format).collect();
+        let mut rejected = Vec::new();
+        for (index, (name, declaration)) in declarations.iter().enumerate() {
+            session.add_import(0x10_0000 + 4 * index as u64, name, false).unwrap();
+            if let Err(error) = session.declare(declaration) {
+                rejected.push(format!("{declaration}: {error}"));
+            }
         }
+        assert!(rejected.len() * 200 < declarations.len(), "{format:?}: {} of {} rejected, such as {:?}", rejected.len(), declarations.len(), &rejected[..rejected.len().min(5)]);
     }
-    assert!(rejected.len() * 200 < declarations.len(), "{} of {} rejected, such as {:?}", rejected.len(), declarations.len(), &rejected[..rejected.len().min(5)]);
+}
+
+/// A Linux import takes its arguments from the C library archive: `long` is as wide as the
+/// target makes it, and a function no table written by hand lists still gets its three.
+#[test]
+fn elf_imports_take_archive_prototypes() {
+    use recore::image::Format;
+    // mov edi, 3; call [rip+0xff5] (the slot at 0x2000); ret
+    let code = [0xbf, 0x03, 0x00, 0x00, 0x00, 0xff, 0x15, 0xf5, 0x0f, 0x00, 0x00, 0xc3];
+    let mut session = session(&code);
+    session.add_import(0x2000, "lseek", false).unwrap();
+    recore_decomp::prototypes::declare(&mut session, Target::X86_64Gcc, Format::Elf, ["lseek"].into_iter()).unwrap();
+    let function = session.decompile(0x1000).unwrap();
+    let types: Vec<&str> = function.params.iter().map(|param| param.type_name.as_str()).collect();
+    // The first register is taken by the constant, and kept as a parameter to hold its place.
+    assert_eq!(types, ["undefined8", "long", "int4"], "{}", function.c_text);
+    assert!(function.c_text.contains("lseek(3,param_2,param_3)"), "{}", function.c_text);
+    assert_eq!(session.type_layout("long").unwrap().lines().next(), Some("typedef long, 8 bytes, alignment 8"));
 }
 
 #[test]
