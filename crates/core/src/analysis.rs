@@ -497,10 +497,14 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                 sources >= 2 || (sources == 1 && opens_function() == Some(true))
             })
             .collect();
-        if !tail_called.is_empty() {
-            for addr in tail_called {
-                discovery.starts.entry(addr).or_insert(Origin::TailCall);
-            }
+        // Go round again only for a start that is new. A chunk can begin at a start already: a
+        // function whose first instruction runs past the next start decodes to nothing and leaves
+        // its bytes uncovered. Each further round adds a start, and a section holds finitely many.
+        let before = discovery.starts.len();
+        for addr in tail_called {
+            discovery.starts.entry(addr).or_insert(Origin::TailCall);
+        }
+        if discovery.starts.len() > before {
             continue;
         }
 

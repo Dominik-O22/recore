@@ -126,3 +126,26 @@ fn banked_code_calls_through_a_trampoline_into_the_bank_it_names() {
     assert_eq!(calls, expected);
     assert_eq!(recore::i8051::unbanked_transfers(&image, &analysis), [(0x0013, 0x0050)]);
 }
+
+#[test]
+fn a_start_inside_the_first_instruction_of_a_shared_tail_ends_the_analysis() {
+    // Two LJMP 0x0010; at 0x0010: MOV A, #0x22; RET. The second entry is the MOV's operand,
+    // which reads as a RET, so the function the two jumps share has no room for an instruction.
+    let mut bytes = vec![0; 0x13];
+    bytes[..6].copy_from_slice(&[0x02, 0x00, 0x10, 0x02, 0x00, 0x10]);
+    bytes[0x10..].copy_from_slice(&[0x74, 0x22, 0x22]);
+    let layout = r#"
+        machine = "8051"
+        entry = [0x0000, 0x0011]
+
+        [[region]]
+        file = "code.bin"
+        offset = 0
+        length = 0x13
+        address = 0
+        executable = true
+    "#;
+    let image = Image::load(&write("shared-tail", layout, &bytes)).unwrap();
+    let functions: Vec<u64> = recore::analyze(&image).functions.iter().map(|function| function.addr).collect();
+    assert_eq!(functions, [0x0000, 0x0003, 0x0010, 0x0011]);
+}
