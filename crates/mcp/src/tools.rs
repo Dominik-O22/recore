@@ -238,6 +238,18 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
     let changed: Vec<_> = found.pairs.iter().filter(|pair| pair.changed).collect();
     let mut out = String::new();
     writeln!(out, "{} functions before, {} after: {} the same, {} changed, {} removed, {} added", old.functions().count(), new.functions().count(), found.pairs.len() - changed.len(), changed.len(), found.removed.len(), found.added.len())?;
+    // What a function refers to, in terms the two builds share: the functions it calls, as
+    // the after build knows them, and the strings it uses.
+    let paired: FxHashMap<u64, u64> = found.pairs.iter().map(|pair| (pair.old, pair.new)).collect();
+    let refers = |program: &Program, entry: u64, in_new: &dyn Fn(u64) -> Option<u64>| -> (BTreeSet<String>, BTreeSet<String>) {
+        let body = program.body(entry);
+        let calls = body.iter().flat_map(|&(start, end)| program.calls_in(start, end)).filter_map(|call| match call.target {
+            CallTarget::Import(slot) => Some(program.import_name(slot)?.to_string()),
+            CallTarget::Function(callee) => Some(new.label(in_new(callee)?)),
+        });
+        let strings = body.iter().flat_map(|&(start, end)| program.refs_in(start, end)).filter_map(|reference| Some(quoted(&program.string_at(reference.to)?.text)));
+        (calls.collect(), strings.collect())
+    };
     writeln!(out, "\nchanged, as before -> after with bytes of code{}", shown(changed.len(), limit))?;
     for pair in changed.iter().take(limit) {
         let how = match pair.evidence {
@@ -247,10 +259,21 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
             Evidence::Callers => "same callers",
             Evidence::Order => "same place among its neighbours",
         };
-        writeln!(out, "{} {} -> {} {}  ({how})", old.label(pair.old), size(&old_sizes, &pair.old), new.label(pair.new), size(&new_sizes, &pair.new))?;
+        let listed = table_names(new, pair.new).first().map_or_else(String::new, |(_, name)| format!(", listed as {name:?}"));
+        writeln!(out, "{} {} -> {} {}  ({how}{listed})", old.label(pair.old), size(&old_sizes, &pair.old), new.label(pair.new), size(&new_sizes, &pair.new))?;
+        let (calls_before, strings_before) = refers(old, pair.old, &|callee| paired.get(&callee).copied());
+        let (calls_after, strings_after) = refers(new, pair.new, &|callee| Some(callee));
+        for (what, before, after) in [("calls", &calls_before, &calls_after), ("uses", &strings_before, &strings_after)] {
+            for (sign, gone_or_new) in [("no longer", before.difference(after)), ("now", after.difference(before))] {
+                let listed: Vec<&str> = gone_or_new.map(String::as_str).collect();
+                if !listed.is_empty() {
+                    writeln!(out, "    {sign} {what} {}", listed.join(", "))?;
+                }
+            }
+        }
     }
     for (title, entries, program, sizes) in [("removed", &found.removed, old, &old_sizes), ("added", &found.added, new, &new_sizes)] {
-        writeln!(out, "\n{title}{}", shown(entries.len(), limit))?;
+        writeln!(out, "\n{title}{}{}", shown(entries.len(), limit), if entries.is_empty() { ": none" } else { "" })?;
         for entry in entries.iter().take(limit) {
             writeln!(out, "{} {}", program.label(*entry), size(sizes, entry))?;
         }
@@ -270,6 +293,23 @@ pub(crate) fn resolve_function(binary: &Binary, text: &str) -> Result<u64> {
         (Err(_), Some(addr)) => binary.program.function_at(addr),
         (Err(error), None) => Err(error),
     }
+}
+
+/// The names a function is listed under in tables of the program's data: for each slot that
+/// holds a pointer to it, the text the slot before points to. A scripting language's library
+/// and a command table pair each function with its name this way.
+pub(crate) fn table_names(program: &Program, entry: u64) -> Vec<(u64, String)> {
+    let image = &program.image;
+    let pointer = if image.machine == Machine::X86 { 4 } else { 8 };
+    let target_of = |slot: u64| image.relative_targets.iter().find(|&&(at, _)| at == slot).map(|&(_, target)| target);
+    // Read as it lies: a name of two or three letters is too short for `strings` to take.
+    let text = |addr: u64| {
+        let bytes = image.bytes_from(addr).filter(|_| image.section_at(addr).is_some_and(|section| !section.executable))?;
+        let end = bytes.iter().take(64).position(|&byte| byte == 0).filter(|&length| length > 0)?;
+        std::str::from_utf8(&bytes[..end]).ok().filter(|text| text.chars().all(|c| c.is_ascii_graphic())).map(str::to_string)
+    };
+    let slots = image.relative_targets.iter().filter(|&&(slot, target)| target == entry && image.section_at(slot).is_some_and(|section| !section.executable));
+    slots.filter_map(|&(slot, _)| Some((slot, text(target_of(slot.checked_sub(pointer)?)?)?))).collect()
 }
 
 /// The end of a listing's first line when it has more rows than it shows.
@@ -490,6 +530,9 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
     let size: u64 = body.iter().map(|(start, end)| end - start).sum();
     writeln!(out, "function {}: {size} bytes at {}{}", binary.program.label(entry), extent.join(" "), if noreturn { ", never returns" } else { "" })?;
 
+    for (slot, name) in table_names(&binary.program, entry) {
+        writeln!(out, "listed as {name:?} in the table at {slot:#x}")?;
+    }
     for class in binary.program.analysis.classes.iter().filter(|class| !class.objc) {
         for (index, _) in class.methods.iter().enumerate().filter(|&(_, &method)| method == entry) {
             writeln!(out, "virtual function {index} of {} (vtable {:#x})", class.name, class.vtable)?;
@@ -572,7 +615,8 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
     // instructions are the references above.
     for &(slot, _) in binary.program.image.relative_targets.iter().filter(|&&(_, target)| target == addr) {
         if let Some(section) = binary.program.image.section_at(slot).filter(|section| !section.executable) {
-            writeln!(out, "{slot:#x} in {} holds a pointer to it", section.name)?;
+            let named = table_names(&binary.program, addr).into_iter().find(|listed| listed.0 == slot).map_or_else(String::new, |(_, name)| format!(", next to the name {name:?}"));
+            writeln!(out, "{slot:#x} in {} holds a pointer to it{named}", section.name)?;
             count += 1;
         }
     }

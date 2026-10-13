@@ -197,8 +197,9 @@ fn a_patch_shows_as_the_functions_it_touched() {
         diff,
         "3 functions before, 4 after: 2 the same, 1 changed, 0 removed, 1 added\n\n\
          changed, as before -> after with bytes of code\n\
-         0x401000 39 -> 0x40100b 47  (called from the same place)\n\n\
-         removed\n\n\
+         0x401000 39 -> 0x40100b 47  (called from the same place)\n\
+         \x20   now calls 0x401000\n\n\
+         removed: none\n\n\
          added\n\
          0x401000 11\n"
     );
