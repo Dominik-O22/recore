@@ -482,6 +482,18 @@ pub(crate) fn table_names(program: &Program, entry: u64) -> Vec<(u64, String)> {
     slots.filter_map(|&(slot, _)| Some((slot, text(target_of(slot.checked_sub(pointer)?)?)?))).collect()
 }
 
+/// The function names a function's failed assertions would report: `assert` passes the name
+/// of the function it was written in, and that text is in the program. It is the function's own
+/// name unless the assertion came with a function the compiler inlined, so it is a hint.
+pub(crate) fn asserted_names(program: &Program, entry: u64) -> BTreeSet<String> {
+    /// How far before the call the instructions that load its arguments are looked for.
+    const REACH: u64 = 0x28;
+    let identifier = |text: &str| text.len() >= 3 && !text.starts_with(|c: char| c.is_ascii_digit()) && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let body = program.body(entry);
+    let asserts = body.iter().flat_map(|&(start, end)| program.calls_in(start, end)).filter(|call| matches!(call.target, CallTarget::Import(slot) if matches!(program.import_name(slot), Some("__assert_fail" | "__assert_rtn" | "__assert"))));
+    asserts.flat_map(|call| program.refs_in(call.at.saturating_sub(REACH), call.at)).filter_map(|reference| Some(program.string_at(reference.to)?.text.clone())).filter(|text| identifier(text)).collect()
+}
+
 /// The end of a listing's first line when it has more rows than it shows.
 pub(crate) fn shown(found: usize, limit: usize) -> String {
     if found > limit { format!(", first {limit} shown") } else { String::new() }
@@ -709,6 +721,10 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
     for (slot, name) in table_names(&binary.program, entry) {
         writeln!(out, "listed as {name:?} in the table at {slot:#x}")?;
     }
+    let asserted = asserted_names(&binary.program, entry);
+    if !asserted.is_empty() {
+        writeln!(out, "its assertions name {}: its own name, or that of a function compiled into it", asserted.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", "))?;
+    }
     for class in binary.program.analysis.classes.iter().filter(|class| !class.objc) {
         for (index, _) in class.methods.iter().enumerate().filter(|&(_, &method)| method == entry) {
             writeln!(out, "virtual function {index} of {} (vtable {:#x})", class.name, class.vtable)?;
@@ -879,6 +895,10 @@ fn decompile(binary: &mut Binary, args: Decompile) -> Result<String> {
         match (record.status, c_text) {
             (Status::Ok, Some(text)) => {
                 writeln!(out, "// {label} ({:.0} ms)", record.ms)?;
+                let asserted = asserted_names(&binary.program, entry);
+                if !asserted.is_empty() {
+                    writeln!(out, "// its assertions name {}: its own name, or that of a function compiled into it", asserted.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", "))?;
+                }
                 // The decompiler prints a comment beside the code of its instruction. One on
                 // an instruction that left no code of its own is listed here instead.
                 for (addr, comment) in comments(binary, &binary.program.body(entry)).into_iter().filter(|(_, comment)| !text.contains(comment)) {

@@ -52,6 +52,8 @@ When a binary has debug information, the decompiler uses it: functions take thei
 
 `diff` pairs the functions of two builds by name, then by code that is the same but for the addresses in it, then by their place among the callers and callees already paired, and last by their order between paired neighbours. A paired function counts as changed when its code differs. That suits a patch or a point release built with the same compiler; two builds by different compilers have little code in common and come out as mostly changed.
 
+`xrefs` with `offset` answers who sets or uses a field: it lists the functions that reach memory at that offset from a register, whatever structure the register points to, so a large offset is telling and a small one is not. `function` and `decompile` say which function names a function's assertions carry, which is its own name unless the assertion came in with an inlined function.
+
 `pcode` and `trace` read the decompiler's own intermediate form, the one its C is printed from. Stack bookkeeping and dead code are gone, every value has one definition, and a call lists its arguments in order. `trace` follows a value through at most 16 functions and does not follow it through memory: a value stored to a global or the heap and read back elsewhere is reported at the store and no further.
 
 ## From a shell

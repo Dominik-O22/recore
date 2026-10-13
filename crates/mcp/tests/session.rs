@@ -121,7 +121,7 @@ fn answers_queries_and_reports_bad_input_as_tool_errors() {
 
     assert!(client.tool("bytes", json!({ "addr": "0" })).unwrap_err().contains("has no bytes"));
     assert!(client.tool("xrefs", json!({ "addr": "main" })).unwrap_err().contains("not a hex address"));
-    assert!(client.tool("xrefs", json!({})).unwrap_err().contains("missing field `addr`"));
+    assert!(client.tool("xrefs", json!({})).unwrap_err().contains("needs either `addr` or `offset`"));
     let missing = client.request("tools/call", json!({ "name": "summary", "arguments": { "path": "/nonexistent/binary" } }));
     assert_eq!(missing["result"]["isError"], true);
     assert!(missing["result"]["content"][0]["text"].as_str().unwrap().contains("cannot read /nonexistent/binary"));
