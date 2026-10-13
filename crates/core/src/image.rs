@@ -35,7 +35,7 @@ impl Section {
 }
 
 /// The instruction set an image is built for. A layout file names it as renamed here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Machine {
     /// 32-bit x86.
     #[serde(rename = "x86")]

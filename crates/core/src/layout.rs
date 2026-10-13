@@ -38,7 +38,7 @@
 //! stub = "c0 b1 c8 c0 e0 e9 c0 e0 ea 54 0f 53 b1 f0 42 b1 c8 22"
 //! ```
 //!
-//! A layout can leave open what is not yet known of a banked image, for a sweep to
+//! A layout can leave open what is not yet known of a banked image, for [`crate::sweep`] to
 //! find: which bank a region is, written `bank = "?"` with the 16-bit address its bytes start
 //! at as its `address`, the `common` ranges, and the trampolines.
 //!
@@ -109,6 +109,15 @@ pub(crate) struct BankingLayout {
     #[serde(default)]
     pub(crate) trampoline: Vec<Trampoline>,
 }
+
+/// The trampolines of the compilers recore knows, by what to call each and as a layout writes
+/// it, for an image whose layout names none. The first is the table Keil's linker builds from
+/// `L51_BANK.A51`: the stub loads the current bank, masks and shifts it, and pushes it and the
+/// address of the routine that switches back, all of which vary from one program to the next.
+pub(crate) const SCHEMES: [(&str, &str); 2] = [
+    ("Keil C51 bank table", "entry = \"90 hh ll 02 ss ss\"\nstub = \"e5 .. 54 .. 23 23 c0 e0 74 .. c0 e0 c0 82 c0 83 02 .. ..\"\n"),
+    ("SDCC __sdcc_banked_call", "call = \"78 ll 79 hh 7a bb 12 ss ss\"\nstub = \"c0 b1 c8 c0 e0 e9 c0 e0 ea 54 0f 53 b1 f0 42 b1 c8 22\"\n"),
+];
 
 /// How code reaches a function in another bank: through bytes that name the function and go on
 /// to a stub, which switches to the function's bank. They say which bank with `bb`. Without

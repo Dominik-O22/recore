@@ -24,6 +24,14 @@ enum Command {
     /// Scores the layout of a raw image by where its jumps and calls between regions land,
     /// which takes no knowledge of the right answer.
     Score { layout: PathBuf },
+    /// Finds what the layout of a banked image leaves open: the bank of each region written
+    /// `bank = "?"`, the ranges the banks share, and the trampolines between them.
+    Sweep {
+        layout: PathBuf,
+        /// Where to write the layout of the best candidate, complete.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Analyzes every file in a directory, writing `<out>/<name>.json`.
     Corpus {
         bin_dir: PathBuf,
@@ -61,6 +69,14 @@ fn main() -> Result<()> {
             println!("analyzed in {:.0} ms", start.elapsed().as_secs_f64() * 1000.0);
         }
         Command::Score { layout } => print!("{}", recore::score::score(&recore::Image::load(&layout)?)),
+        Command::Sweep { layout, out } => {
+            let sweep = recore::sweep::sweep(&layout)?;
+            print!("{sweep}");
+            if let Some((out, text)) = out.as_ref().and_then(|out| Some((out, sweep.layout(out).transpose()?))) {
+                std::fs::write(out, text?)?;
+                println!("wrote {}", out.display());
+            }
+        }
         Command::Analyze { binary } => {
             let image = recore::Image::load(&binary)?;
             println!("{}", serde_json::to_string(&recore::analyze(&image))?);

@@ -27,6 +27,7 @@ pub mod rtti;
 pub mod score;
 pub mod signature;
 pub mod strings;
+pub mod sweep;
 pub mod swift;
 pub mod x86;
 
