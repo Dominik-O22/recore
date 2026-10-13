@@ -13,7 +13,7 @@ Every tool takes `path`, the binary to analyze, and answers with text. Addresses
 | `imports` | `pattern`? | Each imported function with its slot and the functions that call it. |
 | `functions` | `pattern`?, `limit`? (100), `sort`? (`address` or `size`) | Address, size in bytes, number of calling functions, name. `pattern` matches names. |
 | `function` | `addr` or `name` | Extent, callers, calls made (imports by name, Objective-C message sends by selector), strings and globals referred to. `addr` is any address inside the function. |
-| `xrefs` | `addr` | Call sites if it is a function or import slot, and the message sends only it implements if it is an Objective-C method. For data, the instructions that read or write it or take its address, and the pointers in data that hold it. |
+| `xrefs` | `addr`, or `offset` with `function`? and `limit`? | Call sites if it is a function or import slot, and the message sends only it implements if it is an Objective-C method. For data, the instructions that read or write it or take its address, and the pointers in data that hold it. |
 | `decompile` | `functions` (list of addresses or names), `timeout`? (seconds per function, 30) | C for each function. |
 | `bytes` | `addr`, `len`? (256, at most 4096) | Hex dump of the bytes mapped at the address. |
 | `classes` | `pattern`? | C++ classes from MSVC and Itanium (GCC, Clang) type information: base classes, vtable address, virtual functions in vtable order. Objective-C classes and categories from a Mach-O image's metadata: superclasses, instance methods, then class methods. |

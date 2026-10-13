@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use recore::image::{Format, Machine};
 use recore::program::{Pattern, Program, matches, parse_addr};
 use recore::FxHashMap;
+use recore::arch::FieldUse;
 use recore::diff::{Change, Evidence, Pair};
 use recore::report::CallTarget;
 use recore_decomp::isolate::Status;
@@ -70,9 +71,14 @@ pub fn list() -> Value {
         ),
         tool(
             "xrefs",
-            "What refers to an address: call sites if it is a function or an import slot, and the instructions that read or write it or take its address, with the function each is in. If the address holds pointers, such as a vtable or a table of strings, lists what each entry points to.",
-            json!({ "addr": addr("The function entry or data address") }),
-            &["addr"],
+            "What refers to an address, or with `offset` what uses a field of a structure. For an address: call sites if it is a function or an import slot, and the instructions that read or write it or take its address, with the function each is in. If the address holds pointers, such as a vtable or a table of strings, lists what each entry points to.",
+            json!({
+                "addr": addr("The function entry or data address"),
+                "offset": addr("Instead of `addr`: the offset of a field in a structure. Lists the functions that read or write memory at that offset from a register, which is how to find who sets or uses a field"),
+                "function": { "type": "string", "description": "With `offset`, look in this function only." },
+                "limit": limit,
+            }),
+            &[],
         ),
         tool(
             "decompile",
@@ -762,11 +768,41 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
 
 #[derive(Deserialize)]
 struct Xrefs {
-    addr: String,
+    addr: Option<String>,
+    offset: Option<String>,
+    function: Option<String>,
+    limit: Option<usize>,
+}
+
+/// The instructions that reach memory at `offset` from a register, by function: where code
+/// uses the field at that offset of some structure.
+fn field_xrefs(binary: &Binary, offset: u64, function: Option<&str>, limit: usize) -> Result<String> {
+    let program = &binary.program;
+    let only = function.map(|function| resolve_function(binary, function)).transpose()?;
+    let mut rows: Vec<(u64, Vec<(u64, FieldUse)>)> = program
+        .functions()
+        .filter(|candidate| only.is_none_or(|entry| entry == candidate.addr))
+        .map(|candidate| (candidate.addr, recore::cfg::field_uses(&program.image, &program.body(candidate.addr), offset)))
+        .filter(|(_, uses)| !uses.is_empty())
+        .collect();
+    rows.sort_by_key(|(entry, _)| *entry);
+    let mut out = String::new();
+    writeln!(out, "{} functions reach memory at {offset:#x} from a register{}", rows.len(), shown(rows.len(), limit))?;
+    writeln!(out, "these are the uses of a field at that offset of any structure; whether it is the same structure is for the code to show")?;
+    for (entry, uses) in rows.iter().take(limit) {
+        let by = |wanted: FieldUse| uses.iter().filter(|used| used.1 == wanted).map(|used| format!("{:#x}", used.0)).collect::<Vec<_>>().join(" ");
+        let parts: Vec<String> = [("writes at", FieldUse::Write), ("reads at", FieldUse::Read), ("takes its address at", FieldUse::Address)].into_iter().filter(|(_, wanted)| uses.iter().any(|used| used.1 == *wanted)).map(|(how, wanted)| format!("{how} {}", by(wanted))).collect();
+        writeln!(out, "{} {}", program.label(*entry), parts.join("; "))?;
+    }
+    Ok(out)
 }
 
 fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
-    let addr = addr_arg(&args.addr)?;
+    let addr = match (&args.addr, &args.offset) {
+        (Some(addr), None) => addr_arg(addr)?,
+        (None, Some(offset)) => return field_xrefs(binary, addr_arg(offset)?, args.function.as_deref(), args.limit.unwrap_or(DEFAULT_LIMIT)),
+        _ => bail!("`xrefs` needs either `addr` or `offset`"),
+    };
     let mut out = String::new();
     writeln!(out, "{addr:#x}: {}", describe(binary, addr))?;
     let mut count = 0;

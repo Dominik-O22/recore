@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap;
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 
-use crate::arch::{Arch, Decoded, Flow, Table};
+use crate::arch::{Arch, Decoded, FieldUse, Flow, Table};
 use crate::image::{Format, Image};
 use crate::jumptable::State;
 
@@ -121,6 +121,22 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
 
     fn opens_landing_pad(insn: &Instruction) -> bool {
         opens_landing_pad(insn)
+    }
+
+    fn field_use(insn: &Instruction) -> Option<(u64, FieldUse)> {
+        let base = insn.memory_base();
+        let stack = matches!(base.full_register(), Register::RSP | Register::RBP | Register::RIP | Register::None);
+        if stack || insn.memory_index() != Register::None || !insn.op_kinds().any(|kind| kind == OpKind::Memory) {
+            return None;
+        }
+        let use_ = match insn.mnemonic() {
+            Mnemonic::Lea => FieldUse::Address,
+            // These read their first operand and leave it as it was.
+            Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Push | Mnemonic::Call | Mnemonic::Jmp => FieldUse::Read,
+            _ if insn.op0_kind() == OpKind::Memory => FieldUse::Write,
+            _ => FieldUse::Read,
+        };
+        Some((insn.memory_displacement64(), use_))
     }
 
     fn opens_function(first: &Instruction, second: Option<&Instruction>) -> bool {

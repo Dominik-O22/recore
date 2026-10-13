@@ -7,7 +7,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::arch::{Arch, Decoded, Flow, Table};
+use crate::arch::{Arch, Decoded, FieldUse, Flow, Table};
 use crate::image::Image;
 
 /// How many spilled values are tracked per path.
@@ -501,6 +501,12 @@ impl Arch for Arm64 {
     /// protection the pad opens with `bti j`. A function entry never does either first.
     fn opens_landing_pad(insn: &Insn) -> bool {
         insn.word == BTI_J || insn.register_move() == Some(0)
+    }
+
+    fn field_use(insn: &Insn) -> Option<(u64, FieldUse)> {
+        let offset = insn.access_offset().filter(|_| insn.rn() != 31)?;
+        // Bit 22 tells a load from a store, in the single and in the paired forms alike.
+        Some((offset, if insn.word >> 22 & 1 == 1 { FieldUse::Read } else { FieldUse::Write }))
     }
 
     fn step(state: &mut State, insn: &Insn) {

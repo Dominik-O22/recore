@@ -21,6 +21,15 @@ pub enum Flow {
     Halt,
 }
 
+/// What an instruction does with memory it reaches at an offset from a register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FieldUse {
+    Read,
+    Write,
+    /// It forms the address and neither reads nor writes there.
+    Address,
+}
+
 /// One decoding step: the bytes at `addr` either form an instruction or do not.
 pub struct Decoded<I> {
     pub addr: u64,
@@ -169,6 +178,12 @@ pub trait Arch: 'static {
     /// which every protected function calls just before it returns.
     fn checks_stack_cookie(_insns: &[Self::Insn]) -> bool {
         false
+    }
+
+    /// The offset at which `insn` reaches memory from a register that is not the stack's, and
+    /// what it does there: how code uses a field of the structure the register points to.
+    fn field_use(_insn: &Self::Insn) -> Option<(u64, FieldUse)> {
+        None
     }
 
     /// Whether the first real instruction of a block shows it is an exception landing pad.

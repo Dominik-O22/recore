@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::arch::{Arch, Flow};
+use crate::arch::{Arch, FieldUse, Flow};
 use crate::image::{Image, Machine};
 use crate::report::{Analysis, CallTarget};
 use crate::x86::X86;
@@ -38,6 +38,26 @@ pub struct Cfg {
     pub unresolved_calls: Vec<u64>,
     /// Start of every instruction, sorted.
     pub instructions: Vec<u64>,
+}
+
+/// The instructions in `body`, as `[start, end)` ranges, that reach memory at `offset` from a
+/// register: the uses of a structure's field at that offset, whatever the structure. The larger
+/// the offset, the fewer structures have a field there.
+pub fn field_uses(image: &Image, body: &[(u64, u64)], offset: u64) -> Vec<(u64, FieldUse)> {
+    fn with<A: Arch>(image: &Image, body: &[(u64, u64)], offset: u64) -> Vec<(u64, FieldUse)> {
+        let mut found = Vec::new();
+        for &(start, end) in body {
+            let Some(bytes) = image.bytes_from(start) else { continue };
+            let bytes = &bytes[..bytes.len().min((end - start) as usize)];
+            found.extend(A::decode(bytes, start).filter_map(|decoded| Some((decoded.addr, A::field_use(&decoded.insn?).filter(|used| used.0 == offset)?.1))));
+        }
+        found
+    }
+    match image.machine {
+        Machine::X86_64 => with::<X86<64, false>>(image, body, offset),
+        Machine::X86 => with::<X86<32, false>>(image, body, offset),
+        Machine::Aarch64 => with::<crate::arm64::Arm64>(image, body, offset),
+    }
 }
 
 /// The control-flow graph of the function whose body is `body`, as `[start, end)` ranges.
