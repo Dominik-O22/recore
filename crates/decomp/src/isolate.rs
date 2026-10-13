@@ -15,7 +15,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use recore::image::Format;
+use recore::image::{Format, Machine};
 use recore::report::{Analysis, CallTarget};
 use serde::{Deserialize, Serialize};
 
@@ -26,7 +26,8 @@ use crate::{Facts, Flow, Instruction, Local, Session, Style};
 /// Where switch targets come from.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JumpTables {
-    /// recore's for PE images, which keep tables among the code; the engine's own otherwise.
+    /// recore's for PE images, which keep tables among the code, and for 8051 code, whose tables
+    /// the engine does not find; the engine's own otherwise.
     #[default]
     Auto,
     Recore,
@@ -177,7 +178,8 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     session.add_strings(&analysis)?;
     session.add_classes(&analysis)?;
     session.add_objc(&image)?;
-    if options.jump_tables == JumpTables::Recore || (options.jump_tables == JumpTables::Auto && image.format == Format::Pe) {
+    let recores = image.format == Format::Pe || image.machine == Machine::I8051;
+    if options.jump_tables == JumpTables::Recore || (options.jump_tables == JumpTables::Auto && recores) {
         session.override_jump_tables(&analysis, &facts)?;
     }
 

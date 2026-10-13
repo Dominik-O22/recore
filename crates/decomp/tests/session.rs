@@ -232,6 +232,36 @@ fn flow_stops_at_another_8051_function() {
 }
 
 #[test]
+fn a_call_to_a_switch_routine_is_a_switch_over_its_table() {
+    // MOV A, R7; LCALL 0x0100, then four bytes that are a table and no code. The cases, at
+    // 0x0008 and 0x000B: MOV R7, #1; RET and MOV R7, #2; RET.
+    let mut code = vec![0xef, 0x12, 0x01, 0x00, 0xa5, 0xa5, 0xa5, 0xa5, 0x7f, 0x01, 0x22, 0x7f, 0x02, 0x22];
+    code.resize(0x100, 0x00);
+    code.push(0x22);
+    let mut session = banked_session(&[(0, &code)]);
+    session.add_functions(&Facts { functions: vec![(0, false), (0x100, false)], switch_calls: vec![(0x0001, c"ACC")], ..Facts::default() }).unwrap();
+    session.override_jump_table(0, 0x0001, &[0x0008, 0x000b]).unwrap();
+    let function = session.decompile(0).unwrap();
+    assert!(!function.bad_data, "{}", function.c_text);
+    let c: String = function.c_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // The engine labels the cases of a table it is handed by where they are.
+    assert!(c.contains("switch(param_1) { case 8: return 1; case 0xb: return 2; }"), "{}", function.c_text);
+}
+
+#[test]
+fn a_call_returns_past_the_data_its_routine_reads() {
+    // LCALL 0x0100; four bytes that are no code; MOV R7, #5; RET.
+    let mut code = vec![0x12, 0x01, 0x00, 0xa5, 0xa5, 0xa5, 0xa5, 0x7f, 0x05, 0x22];
+    code.resize(0x100, 0x00);
+    code.push(0x22);
+    let mut session = banked_session(&[(0, &code)]);
+    session.add_functions(&Facts { functions: vec![(0, false)], names: vec![(0x100, "store".into())], data_after_calls: vec![(0, 4)], ..Facts::default() }).unwrap();
+    let function = session.decompile(0).unwrap();
+    assert!(!function.bad_data, "{}", function.c_text);
+    assert!(function.c_text.contains("store();\n  return 5;"), "{}", function.c_text);
+}
+
+#[test]
 fn memory_outside_the_code_is_named_in_its_own_address_space() {
     use recore::i8051::{IDATA, SFR, XDATA};
     // MOV DPTR, #0x1234; MOVX A, @DPTR; ADD A, 0x30; ADD A, 0xC1; MOV R7, A; RET

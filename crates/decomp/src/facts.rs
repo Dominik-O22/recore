@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ffi::CStr;
 
 use recore::Image;
 use recore::image::Machine;
@@ -44,6 +45,13 @@ pub struct Facts {
     pub own_entries: Vec<(u64, u64)>,
     /// `(function, index into Analysis::jump_tables)`: an indirect jump inside the function.
     pub jump_tables: Vec<(u64, usize)>,
+    /// `(call, register)`: a call that is the indirect jump of a jump table. The routine it
+    /// calls takes its return address as the address of a table that follows the call, and
+    /// jumps to the entry the value in the register picks.
+    pub switch_calls: Vec<(u64, &'static CStr)>,
+    /// `(call, bytes)`: a call followed by that much data, which the routine it calls reads
+    /// before it returns to the code after the data.
+    pub data_after_calls: Vec<(u64, u64)>,
 }
 
 impl Facts {
@@ -53,6 +61,22 @@ impl Facts {
             names: analysis.functions.iter().filter(|f| f.fragment_of.is_none()).filter_map(|f| Some((f.addr, f.name.clone()?))).collect(),
             ..Facts::default()
         };
+        if image.machine == Machine::I8051 {
+            // recore lists a call to one of Keil's library routines that read what follows the
+            // call as a jump table at the call: the cases of a `switch`, or for a routine that
+            // stores a four-byte constant the one place it returns to, past the constant.
+            for table in &analysis.jump_tables {
+                let length = match image.bytes_from(table.jump).and_then(|bytes| bytes.first()) {
+                    Some(0x12) => 3,
+                    Some(acall) if acall & 0x1f == 0x11 => 2,
+                    _ => continue,
+                };
+                match table.targets[..] {
+                    [after] if after == table.jump + length + 4 => facts.data_after_calls.push((table.jump, 4)),
+                    _ => facts.switch_calls.push((table.jump, c"ACC")),
+                }
+            }
+        }
         let fixups: HashMap<String, String> = Target::of(image).map(Target::call_fixups).unwrap_or_default().into_iter().collect();
         // 32-bit C names carry one more leading underscore in some symbol sources than others.
         let fixup_of = |name: &str| fixups.get(name).or_else(|| fixups.get(&format!("_{name}"))).cloned();
