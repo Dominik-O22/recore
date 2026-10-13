@@ -1,0 +1,38 @@
+# The tools a build needs, apart from a C++ compiler, and the commands worth a name.
+# `mise install` fetches the tools; `mise run <task>` runs one.
+
+[tools]
+rust = "1.98"
+cmake = "4"
+
+[tasks.build]
+description = "Build everything, optimized"
+run = "cargo build --release"
+
+[tasks.test]
+description = "Run the tests, which need no corpus"
+run = "cargo test --release --workspace"
+
+[tasks.check]
+description = "Analyze and score the corpora, once corpus/fetch*.py have downloaded them"
+run = "./check.sh"
+
+[tasks.dist]
+description = "Pack recore-mcp for this machine into dist/, as a release does"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+version=${RECORE_VERSION:-$(cargo pkgid -p recore-mcp | sed 's/.*@//')}
+version=${version#v}
+case "$(uname -s)" in Linux) os=linux ;; Darwin) os=macos ;; *) echo "no release is built for $(uname -s)" >&2; exit 1 ;; esac
+case "$(uname -m)" in x86_64) arch=x64 ;; arm64 | aarch64) arch=arm64 ;; *) echo "no release is built for $(uname -m)" >&2; exit 1 ;; esac
+name=recore-$version-$os-$arch
+# Without the debug information that the development profile keeps for the profiler.
+cargo build --release -p recore-mcp --config profile.release.debug=0 --config profile.release.strip=true
+rm -rf "dist/$name" && mkdir -p "dist/$name"
+cp target/release/recore-mcp LICENSE README.md "dist/$name/"
+cp third_party/ghidra-decompiler/NOTICE "dist/$name/NOTICE.ghidra-decompiler"
+tar -czf "dist/$name.tar.gz" -C dist "$name"
+rm -r "dist/$name"
+echo "dist/$name.tar.gz"
+'''

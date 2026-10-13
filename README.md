@@ -101,6 +101,8 @@ A Rust toolchain, a C++ compiler and cmake. The C++ compiler builds the decompil
 cargo build --release
 ```
 
+With [mise](https://mise.jdx.dev), `mise install` fetches the Rust toolchain and cmake, and `mise run build`, `mise run test` and `mise run dist` do the rest. `dist` packs `recore-mcp` for the machine it runs on, as a release does. The binary is self-contained: the decompiler's language files are part of it.
+
 For Claude Code, in `.mcp.json`:
 
 ```json

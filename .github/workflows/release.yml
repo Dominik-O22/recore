@@ -1,0 +1,50 @@
+name: release
+
+# A tag `v1.2.3` builds recore-mcp for each platform, publishes the archives as a GitHub release
+# and signs a packslip that lists them, which is what `mise use packslip:github.com/<repo>` and
+# `packslip install` verify before they install.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        # The oldest Linux images, so that the binaries ask for no newer C library than they need.
+        runner: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: c++ --version
+      - run: mise run dist
+        env:
+          RECORE_VERSION: ${{ github.ref_name }} # v1.2.3; the task takes off the v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.runner }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Create the release and upload to it.
+      id-token: write # Sign with this workflow's identity.
+      attestations: write # Attest the archives.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Publish the archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+      - uses: jdx/packslip@v1
+        with:
+          artifacts: dist/*.tar.gz
+          bin: recore-mcp
