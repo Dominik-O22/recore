@@ -91,13 +91,16 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
     /// A RIP-relative operand in 64-bit code; in 32-bit code a displacement, which the caller
     /// checks against relocations since any constant offset looks the same.
     fn memory_reference(insn: &Instruction, _: &State) -> Option<u64> {
-        if !insn.op_kinds().any(|kind| kind == OpKind::Memory) || insn.mnemonic() == Mnemonic::Lea {
+        // The address first: most instructions have none, and going through the operands to see
+        // whether one is memory costs more.
+        let address = if insn.is_ip_rel_memory_operand() {
+            insn.ip_rel_memory_address()
+        } else if BITS == 32 && insn.memory_displacement64() != 0 {
+            insn.memory_displacement64()
+        } else {
             return None;
-        }
-        if insn.is_ip_rel_memory_operand() {
-            return Some(insn.ip_rel_memory_address());
-        }
-        (BITS == 32 && insn.memory_displacement64() != 0).then(|| insn.memory_displacement64())
+        };
+        (insn.mnemonic() != Mnemonic::Lea && insn.op_kinds().any(|kind| kind == OpKind::Memory)).then_some(address)
     }
 
     fn through_pointer(insn: &Instruction, state: &State) -> Option<(u64, u64, bool)> {
