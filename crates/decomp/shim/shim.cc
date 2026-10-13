@@ -207,6 +207,7 @@ struct RdSession {
   bool keep_prototypes = false;
   bool kept_are_lower_bounds = true;  // see rd_keep_prototypes_exact
   bool want_flow = false;
+  bool want_addresses = false;
   set<uint64_t> kept;  // functions whose prototype this session locked
   // Names given to variables, per function: the variable's place and its name.
   map<uint64_t, vector<pair<string, string>>> local_names;
@@ -367,6 +368,75 @@ class ListingPcode : public PcodeEmit {
         print_operand(out, translate, vars[i]);
     }
     out << "\n";
+  }
+};
+
+// Prints C as the engine's plain emitter does, and notes for each line the address of the first
+// operation a token on it was printed for: the instruction that line of C came from.
+class EmitAddressed : public EmitNoMarkup {
+  ostringstream line;  // the line being printed, which the base class writes to
+  ostream *out = nullptr;
+  vector<pair<uint8, string>> lines;  // finished lines, each with its address or ~0 for none
+  uint8 at = ~(uint8)0;
+
+  void note(const PcodeOp *op) {
+    if (op != nullptr && at == ~(uint8)0) at = op->getAddr().getOffset();
+  }
+  void finish() {
+    lines.push_back({at, line.str()});
+    line.str("");
+    at = ~(uint8)0;
+  }
+
+ public:
+  EmitAddressed() { EmitNoMarkup::setOutputStream(&line); }
+  virtual void setOutputStream(ostream *t) { out = t; }
+  virtual ostream *getOutputStream(void) const { return out; }
+  virtual void tagLine(void) {
+    finish();
+    EmitNoMarkup::tagLine();
+  }
+  virtual void tagLine(int4 indent) {
+    finish();
+    EmitNoMarkup::tagLine(indent);
+  }
+  virtual void tagVariable(const string &name, syntax_highlight hl, const Varnode *vn, const PcodeOp *op) {
+    note(op);
+    EmitNoMarkup::tagVariable(name, hl, vn, op);
+  }
+  virtual void tagOp(const string &name, syntax_highlight hl, const PcodeOp *op) {
+    note(op);
+    EmitNoMarkup::tagOp(name, hl, op);
+  }
+  virtual void tagFuncName(const string &name, syntax_highlight hl, const Funcdata *fd, const PcodeOp *op) {
+    note(op);
+    EmitNoMarkup::tagFuncName(name, hl, fd, op);
+  }
+  // Writes the lines out, each after its address in a column as wide as the longest.
+  void flush() {
+    finish();
+    size_t width = 0;
+    for (const auto &entry : lines) {
+      if (entry.first == ~(uint8)0) continue;
+      ostringstream digits;
+      digits << hex << entry.first;
+      width = max(width, digits.str().size());
+    }
+    for (const auto &entry : lines) {
+      // The base class starts each line with a line feed, which stays in front of the column.
+      size_t start = entry.second.find_first_not_of('\n');
+      if (start == string::npos) start = entry.second.size();
+      // An empty line stays empty.
+      if (start == entry.second.size()) {
+        *out << entry.second;
+        continue;
+      }
+      ostringstream digits;
+      if (entry.first != ~(uint8)0) digits << hex << entry.first;
+      *out << entry.second.substr(0, start) << string(width - digits.str().size(), ' ') << digits.str() << "| "
+           << entry.second.substr(start);
+    }
+    lines.clear();
   }
 };
 
@@ -827,6 +897,10 @@ int rd_set_style(RdSession *session, const char *name, char *err, size_t errlen)
 // With `on`, each rd_decompile also fills RdDecompiled::flow.
 void rd_set_flow(RdSession *session, int on) { session->want_flow = on != 0; }
 
+// Whether rd_decompile prints, before each line of C, the address of the instruction the line
+// came from, where it came from one.
+void rd_set_addresses(RdSession *session, int on) { session->want_addresses = on != 0; }
+
 // Names the variable of `function` at `place`, as RdDecompiled::locals gives places. The name
 // shows in every later decompilation of the function in which the variable is still there.
 void rd_name_local(RdSession *session, uint64_t function, const char *place, const char *name) {
@@ -1077,7 +1151,13 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       static mutex print_lock;
       lock_guard<mutex> guard(print_lock);
       arch->print->setOutputStream(&text);
+      EmitAddressed *addressed = nullptr;
+      if (session->want_addresses) arch->print->setLowLevel(addressed = new EmitAddressed);
       arch->print->docFunction(fd);
+      if (addressed != nullptr) {
+        addressed->flush();
+        arch->print->setLowLevel(new EmitNoMarkup);
+      }
     }
     session->c_text = text.str();
     ostringstream flow;

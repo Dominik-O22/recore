@@ -459,6 +459,12 @@ impl Session {
         unsafe { ffi::rd_returns_like(self.raw.as_ptr(), function, callee, import.into(), err.as_mut_ptr(), err.len()) != 0 }
     }
 
+    /// With `keep`, every later [`Session::decompile`] prints each line of C after the address of
+    /// the instruction the line came from, in a column, where it came from one.
+    pub fn keep_addresses(&mut self, keep: bool) {
+        unsafe { ffi::rd_set_addresses(self.raw.as_ptr(), keep.into()) }
+    }
+
     /// With `keep`, every later [`Session::decompile`] also returns the function's data flow.
     pub fn keep_flow(&mut self, keep: bool) {
         unsafe { ffi::rd_set_flow(self.raw.as_ptr(), keep.into()) }

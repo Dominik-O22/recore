@@ -10,7 +10,7 @@ use crate::tools;
 /// Options whose value is a number. Everything else, addresses included, stays text.
 const NUMERIC: [&str; 7] = ["limit", "len", "timeout", "count", "param", "arg", "depth"];
 /// Options that are on or off.
-const FLAGS: [&str; 3] = ["pcode", "returns", "full"];
+const FLAGS: [&str; 4] = ["pcode", "returns", "full", "addresses"];
 
 pub fn usage() -> String {
     let mut text = String::from(

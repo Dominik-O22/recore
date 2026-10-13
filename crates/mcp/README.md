@@ -14,7 +14,7 @@ Every tool takes `path`, the binary to analyze, and answers with text. Addresses
 | `functions` | `pattern`?, `limit`? (100), `sort`? (`address` or `size`) | Address, size in bytes, number of calling functions, name. `pattern` matches names. |
 | `function` | `addr` or `name` | Extent, callers, calls made (imports by name, Objective-C message sends by selector), strings and globals referred to. `addr` is any address inside the function. |
 | `xrefs` | `addr`, or `offset` with `function`? and `limit`? | Call sites if it is a function or import slot, and the message sends only it implements if it is an Objective-C method. For data, the instructions that read or write it or take its address, and the pointers in data that hold it. |
-| `decompile` | `functions` (list of addresses or names), `timeout`? (seconds per function, 30) | C for each function. |
+| `decompile` | `functions` (list), `addresses`?, `around`?, `timeout`? | C for each function. With `addresses`, each line of C follows the address of the instruction it came from. With `around`, only the lines near that address are shown. |
 | `bytes` | `addr`, `len`? (256, at most 4096) | Hex dump of the bytes mapped at the address. |
 | `classes` | `pattern`? | C++ classes from MSVC and Itanium (GCC, Clang) type information: base classes, vtable address, virtual functions in vtable order. Objective-C classes and categories from a Mach-O image's metadata: superclasses, instance methods, then class methods. |
 | `addr` | `addr` or `offset` | The address in the image and the offset in the file of the same byte, and what is there. |
@@ -53,6 +53,8 @@ When a binary has debug information, the decompiler uses it: functions take thei
 `diff` pairs the functions of two builds by name, then by code that is the same but for the addresses in it, then by their place among the callers and callees already paired, and last by their order between paired neighbours. A paired function counts as changed when its code differs. That suits a patch or a point release built with the same compiler; two builds by different compilers have little code in common and come out as mostly changed.
 
 `xrefs` with `offset` answers who sets or uses a field: it lists the functions that reach memory at that offset from a register, whatever structure the register points to, so a large offset is telling and a small one is not. `function` and `decompile` say which function names a function's assertions carry, which is its own name unless the assertion came in with an inlined function.
+
+An answer that leaves something out says so where it does: how many of how many it shows, and the argument that shows the rest.
 
 `pcode` and `trace` read the decompiler's own intermediate form, the one its C is printed from. Stack bookkeeping and dead code are gone, every value has one definition, and a call lists its arguments in order. `trace` follows a value through at most 16 functions and does not follow it through memory: a value stored to a global or the heap and read back elsewhere is reported at the store and no further.
 

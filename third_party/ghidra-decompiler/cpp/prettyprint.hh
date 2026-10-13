@@ -1126,6 +1126,9 @@ public:
   virtual void clear(void);
   virtual void setOutputStream(ostream *t) { lowlevel->setOutputStream(t); }
   virtual ostream *getOutputStream(void) const { return lowlevel->getOutputStream(); }
+  // recore: lets the host put its own emitter under the pretty printer, to see each token
+  // with the operation it was printed for. Takes ownership; the output stream carries over.
+  void setLowLevel(Emit *low) { low->setOutputStream(lowlevel->getOutputStream()); delete lowlevel; lowlevel = low; }
   virtual void setPackedOutput(bool val) { lowlevel->setPackedOutput(val); }
   virtual void spaces(int4 num,int4 bump=0);
   virtual int4 startIndent(void);

@@ -1,7 +1,7 @@
 # Ghidra decompiler engine (vendored)
 
 The C++ decompiler from Ghidra, built as a static library by `build.rs` and used by
-`crates/decomp`. Three files are modified, see below.
+`crates/decomp`. Five files are modified, see below.
 
 Source: `Ghidra/Features/Decompiler/src/decompile/` of the Ghidra repository at commit
 `918d44ebc2` (12.3 DEV), copied from `~/Work/tries/ghidra-profile/master`.
@@ -35,6 +35,12 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   of the field list. The two `ScoreUnionFields` constructors for truncations resolve to an
   untyped value when no data-type covers the piece of the chosen field, where upstream stores a
   null pointer and dereferences it later. Marked with `recore:` comments.
+
+- `cpp/prettyprint.hh` and `cpp/printlanguage.hh`, `setLowLevel` of `EmitPrettyPrint` and of
+  `PrintLanguage`: replaces the emitter the pretty printer
+  writes through, which upstream only swaps between its own two. `crates/decomp` uses it to
+  print each line of C with the address of the instruction it came from. Marked with a
+  `recore:` comment.
 
 ## Licences
 

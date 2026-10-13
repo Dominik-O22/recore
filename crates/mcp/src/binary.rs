@@ -89,6 +89,11 @@ impl Binary {
         self.worker.flow(addr, timeout).map_err(anyhow::Error::msg)
     }
 
+    /// The C of the function at `addr` with the address of its instruction before each line.
+    pub fn addressed(&mut self, addr: u64, timeout: Duration) -> Result<String> {
+        self.worker.addressed(addr, timeout).map_err(anyhow::Error::msg)
+    }
+
     /// The variables of the function at `addr`, which costs one decompilation.
     pub fn locals(&mut self, addr: u64, timeout: Duration) -> Result<Vec<Local>> {
         self.worker.locals(addr, timeout).map_err(anyhow::Error::msg)

@@ -481,6 +481,8 @@ public:
   void setHeaderComment(uint4 val) { head_comment_type = val; }		///< Set the type of comments suitable for a function header
   bool emitsMarkup(void) const { return emit->emitsMarkup(); }		///< Does the low-level emitter, emit markup
   void setMarkup(bool val) { emit->setMarkup(val); }			///< Turn on/off mark-up in emitted output
+  // recore: see EmitPrettyPrint::setLowLevel. The emitter is always an EmitPrettyPrint.
+  void setLowLevel(Emit *low) { static_cast<EmitPrettyPrint *>(emit)->setLowLevel(low); }
   void setPackedOutput(bool val);					///< Turn on/off packed output
   void setFlat(bool val);						///< Set whether nesting code structure should be emitted
 

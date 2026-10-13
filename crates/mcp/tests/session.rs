@@ -207,3 +207,17 @@ fn a_patch_shows_as_the_functions_it_touched() {
     assert!(lines.contains("\n+   if (100 < param_2) {\n"), "{lines}");
     assert!(lines.contains("\n    do {\n"), "{lines}");
 }
+
+#[test]
+fn a_line_of_c_is_found_by_the_address_of_its_instruction() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/types.elf");
+    let mut client = Client::start();
+    let c_text = client.tool("decompile", json!({ "path": path, "functions": ["0x401000"], "addresses": true })).unwrap();
+    assert!(c_text.contains("\n401017|     list = list->next;\n"), "{c_text}");
+    assert!(c_text.contains("\n      | {\n"), "{c_text}");
+    // An address alone names its function, and the lines without one are left as they were.
+    let near = client.tool("decompile", json!({ "path": path, "around": "0x401017" })).unwrap();
+    assert!(near.contains("\n401017|     list = list->next;\n"), "{near}");
+    let plain = client.tool("decompile", json!({ "path": path, "functions": ["0x401000"] })).unwrap();
+    assert!(plain.contains("\n    list = list->next;\n"), "{plain}");
+}

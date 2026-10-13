@@ -122,6 +122,8 @@ enum Request {
     Flow(u64),
     /// Decompile the function for its variables.
     Locals(u64),
+    /// Decompile the function with the address of its instruction before each line of C.
+    Addressed(u64),
     /// Parse a C declaration, to learn whether the engine takes it.
     Declare(String),
     /// Describe a data type.
@@ -277,6 +279,16 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 let flow = session.decompile(addr).map(|function| function.flow.unwrap_or_default());
                 session.keep_flow(false);
                 send(&Event::Flow(flow.map_err(|error| error.to_string())))?;
+                continue;
+            }
+            Request::Addressed(addr) => {
+                if let Some(importer) = &mut importer {
+                    importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
+                }
+                session.keep_addresses(true);
+                let c_text = session.decompile(addr).map(|function| function.c_text);
+                session.keep_addresses(false);
+                send(&text(c_text))?;
                 continue;
             }
             Request::Locals(addr) => {
@@ -578,6 +590,15 @@ impl Worker {
         self.callees_first(addr, timeout);
         match self.ask(Request::Flow(addr), timeout) {
             Ok(Event::Flow(flow)) => flow,
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// The C of the function at `addr` with the address of its instruction before each line.
+    pub fn addressed(&mut self, addr: u64, timeout: Duration) -> Result<String, String> {
+        self.callees_first(addr, timeout);
+        match self.ask(Request::Addressed(addr), timeout) {
+            Ok(Event::Text(text)) => text,
             other => Err(unexpected(other)),
         }
     }

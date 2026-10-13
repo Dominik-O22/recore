@@ -85,9 +85,11 @@ pub fn list() -> Value {
             "Decompiles functions to C with Ghidra's decompiler. A function that crashes the decompiler or runs out of time is reported and the others still come back.",
             json!({
                 "functions": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Hex addresses (anywhere inside a function) or function names. From a shell, several separated by spaces or commas." },
+                "addresses": { "type": "boolean", "description": "Print before each line of C the address of the instruction it came from, to match a line with what `xrefs`, `disassemble` and `comment` say about an address." },
+                "around": addr("Show only the lines of C that came from the instructions near this address, with their addresses. The function it is in need not be given"),
                 "timeout": { "type": "number", "description": "Seconds each function may take (default 30)." },
             }),
-            &["functions"],
+            &[],
         ),
         tool(
             "bytes",
@@ -867,12 +869,43 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
 
 #[derive(Deserialize)]
 struct Decompile {
+    #[serde(default)]
     functions: Vec<String>,
+    #[serde(default)]
+    addresses: bool,
+    around: Option<String>,
     timeout: Option<f64>,
 }
 
+/// The lines of C printed with addresses that are nearest the instruction at `addr`: the line
+/// that came from it or from the last instruction before it, and a few on each side.
+fn around(c_text: &str, addr: u64) -> String {
+    /// Lines shown on each side.
+    const REACH: usize = 8;
+    let lines: Vec<&str> = c_text.lines().collect();
+    let at = |line: &&str| line.split_once('|').and_then(|(column, _)| u64::from_str_radix(column.trim(), 16).ok());
+    let nearest = lines.iter().enumerate().filter_map(|(index, line)| Some((index, at(line)?))).filter(|&(_, from)| from <= addr).max_by_key(|&(index, from)| (from, std::cmp::Reverse(index)));
+    let Some((index, _)) = nearest else { return c_text.to_string() };
+    let (start, end) = (index.saturating_sub(REACH), (index + REACH + 1).min(lines.len()));
+    let mut out = String::new();
+    if start > 0 {
+        // The function's own line says what the parameters in the lines shown are.
+        let header = lines.iter().position(|line| line.contains('(')).unwrap_or(0);
+        out += &format!("{}\n  ...\n", lines[header]);
+    }
+    out += &lines[start..end].join("\n");
+    out + &format!("\n  ...{}", cut(end - start, lines.len(), "lines ", "`decompile` without `around` shows all"))
+}
+
 fn decompile(binary: &mut Binary, args: Decompile) -> Result<String> {
-    ensure!(!args.functions.is_empty(), "`decompile` needs at least one function");
+    let near = args.around.as_deref().map(addr_arg).transpose()?;
+    // The function an address is in need not be named as well.
+    let functions = match (args.functions.is_empty(), &args.around) {
+        (true, Some(around)) => vec![around.clone()],
+        _ => args.functions,
+    };
+    ensure!(!functions.is_empty(), "`decompile` needs at least one function, or `around`");
+    let args = Decompile { functions, ..args };
     let timeout = Duration::try_from_secs_f64(args.timeout.unwrap_or(30.0)).map_err(|_| anyhow!("`timeout` must be a positive number of seconds"))?;
     // A name first: `add` is a hex number too. An address in no function is decompiled as it
     // is, for code the analysis did not make a function of.
@@ -896,6 +929,16 @@ fn decompile(binary: &mut Binary, args: Decompile) -> Result<String> {
             }
         };
         let (record, c_text) = binary.decompile(entry, timeout);
+        // With addresses the C is printed again, which the function's first decompilation
+        // has shown to work.
+        let c_text = match c_text {
+            Some(_) if args.addresses || near.is_some() => binary.addressed(entry, timeout).ok(),
+            c_text => c_text,
+        };
+        let c_text = match near {
+            Some(addr) => c_text.map(|text| around(&text, addr)),
+            None => c_text,
+        };
         let label = binary.program.label(entry);
         match (record.status, c_text) {
             (Status::Ok, Some(text)) => {
@@ -909,7 +952,7 @@ fn decompile(binary: &mut Binary, args: Decompile) -> Result<String> {
                 for (addr, comment) in comments(binary, &binary.program.body(entry)).into_iter().filter(|(_, comment)| !text.contains(comment)) {
                     writeln!(out, "// {addr:#x}: {comment}")?;
                 }
-                writeln!(out, "{}\n", text.trim())?;
+                writeln!(out, "{}\n", text.trim_matches('\n'))?;
             }
             (status, _) => {
                 failed += 1;
