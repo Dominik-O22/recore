@@ -813,17 +813,18 @@ impl<A: Arch> Explorer<'_, A> {
             let section = region.section;
             let mut offset = 0;
             while offset < section.data.len() {
-                let len = u64::from(region.insn_len[offset]);
-                if len == 0 {
+                if region.insn_len[offset] == 0 {
                     offset += 1;
                     continue;
                 }
-                let addr = section.addr + offset as u64;
+                // The instruction here and every one that follows it without a gap.
+                let end = region.end_of_run(offset);
+                let (addr, end_addr) = (section.addr + offset as u64, section.addr + end as u64);
                 match ranges.last_mut() {
-                    Some(last) if last.1 == addr => last.1 = addr + len,
-                    _ => ranges.push((addr, addr + len)),
+                    Some(last) if last.1 == addr => last.1 = end_addr,
+                    _ => ranges.push((addr, end_addr)),
                 }
-                offset += len as usize;
+                offset = end;
             }
         }
         ranges
