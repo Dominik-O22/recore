@@ -191,54 +191,25 @@ enum Inline {
     /// its value, of this many bytes, then a zero address and the address of the default
     /// case. The routine jumps to the case and never returns.
     Cases { value: usize },
-    /// Four bytes that the routine stores through `DPTR` before it returns past them.
+    /// `?C?LSTKXDATA`: four bytes that the routine stores through `DPTR` before it returns
+    /// past them.
     Constant,
 }
 
-/// The whole of `?C?CCASE`: `POP DPH; POP DPL; MOV R0,A`, the search, and `JMP @A+DPTR`.
-const CCASE: [u8; 38] = [
-    0xD0, 0x83, 0xD0, 0x82, 0xF8, 0xE4, 0x93, 0x70, 0x12, 0x74, 0x01, 0x93, 0x70, 0x0D, 0xA3, 0xA3, 0x93, 0xF8, 0x74, 0x01, 0x93, 0xF5, 0x82,
-    0x88, 0x83, 0xE4, 0x73, 0x74, 0x02, 0x93, 0x68, 0x60, 0xEF, 0xA3, 0xA3, 0xA3, 0x80, 0xDF,
-];
-
-/// The whole of `?C?ICASE`, which differs in comparing `B` with the value's high byte as well.
-const ICASE: [u8; 45] = [
-    0xD0, 0x83, 0xD0, 0x82, 0xF8, 0xE4, 0x93, 0x70, 0x12, 0x74, 0x01, 0x93, 0x70, 0x0D, 0xA3, 0xA3, 0x93, 0xF8, 0x74, 0x01, 0x93, 0xF5, 0x82,
-    0x88, 0x83, 0xE4, 0x73, 0x74, 0x02, 0x93, 0xB5, 0xF0, 0x06, 0x74, 0x03, 0x93, 0x68, 0x60, 0xE9, 0xA3, 0xA3, 0xA3, 0xA3, 0x80, 0xD8,
-];
-
-/// The routine that stores a four-byte constant: it keeps `DPTR` in `B` and `R0`, pops the
-/// return address into `DPTR`, calls the helper after it four times, and jumps to where
-/// `DPTR` then points. Each `.. ..` is the address of the helper.
-const STORE: [Option<u8>; 23] = {
-    let (call, any) = (Some(0x12), None);
-    [
-        Some(0xA8), Some(0x82), Some(0x85), Some(0x83), Some(0xF0), Some(0xD0), Some(0x83), Some(0xD0), Some(0x82),
-        call, any, any, call, any, any, call, any, any, call, any, any, Some(0xE4), Some(0x73),
-    ]
-};
-
-/// The helper: it reads the byte at `DPTR` from the code, swaps `DPTR` with `B` and `R0`, stores
-/// the byte there, and swaps back, stepping both addresses on.
-const STORE_BYTE: [u8; 26] = [
-    0xE4, 0x93, 0xA3, 0xC5, 0x83, 0xC5, 0xF0, 0xC5, 0x83, 0xC8, 0xC5, 0x82, 0xC8, 0xF0, 0xA3, 0xC5, 0x83, 0xC5, 0xF0, 0xC5, 0x83, 0xC8, 0xC5,
-    0x82, 0xC8, 0x22,
-];
-
 impl Inline {
     /// What follows a call to `target`, if the code there is one of the routines. Only a
-    /// routine's exact bytes count, since they are what says how its data is laid out.
+    /// routine's exact code counts, since it is what says how its data is laid out, and the
+    /// library's list knows each by a hash of that.
     fn after_call_to(image: &Image, target: u64) -> Option<Inline> {
         let code = image.bytes_from(target).filter(|_| image.is_code(target))?;
-        if code.starts_with(&CCASE) {
-            return Some(Inline::Cases { value: 1 });
-        } else if code.starts_with(&ICASE) {
-            return Some(Inline::Cases { value: 2 });
+        let is = |name: &str| crate::library::routines(Machine::I8051, None).iter().any(|routine| routine.name == name && routine.is_at(code));
+        if is("?C?CCASE") {
+            Some(Inline::Cases { value: 1 })
+        } else if is("?C?ICASE") {
+            Some(Inline::Cases { value: 2 })
+        } else {
+            is("?C?LSTKXDATA").then_some(Inline::Constant)
         }
-        let helper = ((target + STORE.len() as u64) as u16).to_be_bytes();
-        let (routine, rest) = code.split_at_checked(STORE.len())?;
-        let calls_helper = routine.iter().zip(STORE).enumerate().all(|(at, (&byte, expected))| byte == expected.unwrap_or_else(|| helper[(at - 1) % 3]));
-        (calls_helper && rest.starts_with(&STORE_BYTE)).then_some(Inline::Constant)
     }
 
     /// Bytes in one entry of the data.
@@ -828,7 +799,7 @@ mod tests {
         code.push(0x22);
         // The opcode that is no instruction keeps the routine apart from the code.
         code.resize(0x100, 0xA5);
-        code.extend(CCASE);
+        code.extend(stand_in("?C?CCASE"));
         let image = image(&code, 0);
         let analysis = crate::analyze(&image);
         let tables: Vec<(u64, &[u64])> = analysis.jump_tables.iter().map(|table| (table.jump, table.targets.as_slice())).collect();
@@ -844,8 +815,7 @@ mod tests {
         // 0x0000: LCALL 0x0100; the constant, whose bytes would be ACALL 0x0122 and more; RET.
         let mut code = vec![0x12, 0x01, 0x00, 0x11, 0x22, 0x33, 0x44, 0x22];
         code.resize(0x100, 0xA5);
-        code.extend(STORE.iter().enumerate().map(|(at, byte)| byte.unwrap_or_else(|| [0x01, 0x17][(at - 1) % 3])));
-        code.extend(STORE_BYTE);
+        code.extend(stand_in("?C?LSTKXDATA"));
         let analysis = crate::analyze(&image(&code, 0));
         let functions: Vec<(u64, &[(u64, u64)])> = analysis.functions.iter().map(|function| (function.addr, function.ranges.as_slice())).collect();
         assert_eq!(functions, [(0x0000, &[(0x0000, 0x0003), (0x0007, 0x0008)][..])]);
