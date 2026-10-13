@@ -1,8 +1,7 @@
 //! How well the layout of a raw image fits its code, measured without knowing the answer.
 //!
 //! A layout says where bytes load: which region is which bank, what every bank shares, how one
-//! bank reaches another. Code that stays inside a region reads the same under any layout, so
-//! it says nothing. What a layout decides is where a transfer that leaves its region lands: a
+//! bank reaches another. What it decides is where a transfer that leaves its region lands: a
 //! call through a trampoline, a call from a bank into the common code. Under the right layout
 //! such a target is the start of a function. Under a wrong one it is an address like any other.
 //!
@@ -10,6 +9,10 @@
 //! reaches, and puts four questions to each target that crosses. Each is a [`Component`]: how
 //! many targets pass, and how often an address picked blindly from the same sections would.
 //! The evidence is the distance between the two, in bits.
+//!
+//! Code that stays inside a region reads the same whichever bank the region is. It does not
+//! where the region loads at another address and its calls name theirs outright, as an 8051's
+//! do, so the first question is put to the calls inside a region as well.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -76,16 +79,28 @@ pub struct Score {
     /// The code at the target runs to returns and jumps: it reaches no byte that is not an
     /// instruction and does not run or branch out of its section.
     pub runs: Component,
+    /// The target of a call that stays in its section follows such an instruction too. This
+    /// tells the address a section loads at, where calls name their target outright, and not
+    /// which bank it is.
+    pub local_follows_end: Component,
 }
 
 impl Score {
-    pub fn components(&self) -> [(&'static str, &Component); 4] {
+    pub fn components(&self) -> [(&'static str, &Component); 5] {
         [
             ("follow a return or jump", &self.follows_end),
             ("called in their own region", &self.called_locally),
             ("on an instruction", &self.on_instruction),
             ("run to an end", &self.runs),
+            ("local calls follow an end", &self.local_follows_end),
         ]
+    }
+
+    /// The score on the targets that cross alone, which is what tells one bank from another:
+    /// the calls inside a region land the same whichever bank it is, and only add to the score
+    /// of whatever reaches more of them.
+    pub fn crossing(self) -> Score {
+        Score { local_follows_end: Component { good: 0, total: 0, chance: 0.0 }, ..self }
     }
 
     /// The evidence of all components. They overlap, so this ranks layouts and is not the odds
@@ -98,7 +113,9 @@ impl Score {
 impl fmt::Display for Score {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "{:.0} bits", self.bits())?;
-        for (name, component) in self.components() {
+        // Left out where it was not asked, see [`Score::crossing`].
+        let asked = |component: &Component| component.total > 0 || *component != self.local_follows_end;
+        for (name, component) in self.components().into_iter().filter(|(_, component)| asked(component)) {
             let Component { good, total, chance } = *component;
             write!(f, "  {name:<27} {good:>6} of {total:<6} {:>5.1}%, {:>4.1}% by chance: ", 100.0 * component.rate(), 100.0 * chance)?;
             match component.blind() {
@@ -118,7 +135,7 @@ pub fn score(image: &Image) -> Score {
 
 /// Scores `targets` alone, as the only places execution is known to enter `image`.
 pub fn landing(image: &Image, targets: &BTreeSet<u64>) -> Score {
-    by_machine(image, Some(targets))
+    by_machine(image, Some(targets)).crossing()
 }
 
 fn by_machine(image: &Image, targets: Option<&BTreeSet<u64>>) -> Score {
@@ -202,7 +219,7 @@ impl<'a> Walk<'a> {
         (section.executable && section.contains(addr)).then_some((index, section))
     }
 
-    /// Puts the four questions to `targets`, and to the sections they lie in for the chance.
+    /// Puts the questions to `targets`, and to the sections they lie in for the chance.
     fn judge<A: Arch>(mut self, targets: &BTreeSet<u64>) -> Score {
         let places: Vec<(u64, Option<(usize, &Section)>)> = targets.iter().map(|&target| (target, self.code_at(target))).collect();
         let sections: FxHashMap<usize, &Section> = places.iter().filter_map(|&(_, place)| place).collect();
@@ -224,7 +241,8 @@ impl<'a> Walk<'a> {
         let total = places.len();
         let share = |count: usize, of: usize| if of == 0 { 0.0 } else { count as f64 / of as f64 };
 
-        let local_calls = self.local_calls.iter().filter(|&&target| self.code_at(target).is_some_and(|(index, _)| sections.contains_key(&index))).count();
+        let local: Vec<(usize, usize)> = self.local_calls.iter().filter_map(|&target| self.code_at(target).filter(|(index, _)| sections.contains_key(index)).map(|(index, section)| (index, (target - section.addr) as usize))).collect();
+        let local_calls = local.len();
         let (starts, inside) = (marked(START), marked(INSIDE));
         let samples: Vec<u64> = sections.values().flat_map(|section| (0..section.data.len()).step_by((section.data.len() / SAMPLES).max(1)).map(|offset| section.addr + offset as u64)).collect();
         let runs = |addrs: &mut dyn Iterator<Item = u64>| addrs.filter(|&addr| runs_to_end::<A>(image, addr)).count();
@@ -234,6 +252,7 @@ impl<'a> Walk<'a> {
             // A target outside the code is on no instruction. Chance is over the bytes flow reached.
             on_instruction: Component { good: places.iter().filter(|(_, place)| place.is_some()).count() - holds(INSIDE), total, chance: share(starts, starts + inside) },
             runs: Component { good: runs(&mut places.iter().map(|&(target, _)| target)), total, chance: share(runs(&mut samples.iter().copied()), samples.len()) },
+            local_follows_end: Component { good: local.iter().filter(|&&(index, at)| self.marks[index][at] & AFTER_END != 0).count(), total: local_calls, chance: share(marked(AFTER_END), bytes) },
         }
     }
 }
@@ -310,6 +329,9 @@ mod tests {
         let callee = [0x00, 0x00, 0x22, 0xE4, 0x12, 0x80, 0x00, 0x22];
         let right = score(&image(&caller, 0x8000, &callee));
         assert_eq!((right.follows_end.good, right.on_instruction.good, right.runs.good, right.follows_end.total), (1, 1, 1, 1));
+        // The function's own call names 0x8000 outright, which is a function only loaded there.
+        assert_eq!((right.local_follows_end.good, right.local_follows_end.total), (1, 1));
+        assert_eq!(right.crossing().local_follows_end.total, 0);
 
         // Two bytes too low, the call lands on the operand of the function's own call.
         let wrong = score(&image(&caller, 0x7FFE, &callee));

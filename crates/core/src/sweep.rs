@@ -48,7 +48,7 @@ pub struct Candidate {
     pub trampolines: usize,
     /// The open regions in the order of the layout.
     pub placements: Vec<Placement>,
-    /// The score of the whole image under this candidate.
+    /// The score of the whole image under this candidate, on the targets that cross.
     pub score: Score,
     banking: BankingLayout,
     pieces: Vec<Piece>,
@@ -218,7 +218,7 @@ impl Draft<'_> {
                     otherwise: banks.get(others[region].1[region]).copied().filter(|_| measured),
                 })
                 .collect();
-            Ok(Candidate { scheme: scheme.to_string(), trampolines, placements, score: score(&image), banking: banking.clone(), pieces })
+            Ok(Candidate { scheme: scheme.to_string(), trampolines, placements, score: score(&image).crossing(), banking: banking.clone(), pieces })
         };
         let mut candidates = vec![candidate(&best, true)?];
         // The next best assignment over all is the nearest of those.
