@@ -432,7 +432,7 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
             }
             match lines.len() {
                 0 => writeln!(out, "    the C reads the same")?,
-                more if more > LINES => writeln!(out, "    ... {} more lines differ", more - LINES)?,
+                more if more > LINES => writeln!(out, "    ...{}", cut(LINES, more, "differing lines ", &format!("`function` {:#x} shows all", pair.old)))?,
                 _ => {}
             }
         }
@@ -440,7 +440,7 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
     if !renumbered.is_empty() {
         writeln!(out, "\nchanged in numbers only, {}: the same instructions with other constants or offsets, as when a structure gained a field or an assertion moved to another line of the source", renumbered.len())?;
         let pairs: Vec<String> = renumbered.iter().take(limit).map(|pair| format!("{} -> {}", old.label(pair.old), new.label(pair.new))).collect();
-        writeln!(out, "{}{}", pairs.join(", "), if renumbered.len() > limit { " ..." } else { "" })?;
+        writeln!(out, "{}{}", pairs.join(", "), cut(limit, renumbered.len(), "", &format!("`limit` {} shows all", renumbered.len())))?;
     }
     for (title, entries, program, sizes) in [("removed", &found.removed, old, &old_sizes), ("added", &found.added, new, &new_sizes)] {
         writeln!(out, "\n{title}{}{}", shown(entries.len(), limit), if entries.is_empty() { ": none" } else { "" })?;
@@ -496,27 +496,32 @@ pub(crate) fn asserted_names(program: &Program, entry: u64) -> BTreeSet<String> 
 
 /// The end of a listing's first line when it has more rows than it shows.
 pub(crate) fn shown(found: usize, limit: usize) -> String {
-    if found > limit { format!(", first {limit} shown") } else { String::new() }
+    cut(limit, found, "", &format!("`limit` {found} shows all"))
+}
+
+/// What an answer says wherever it leaves something out, so that a part is never taken for
+/// the whole: how many of how many it shows, and what to ask to get the rest. Every tool that
+/// shortens its answer says so through this. Empty when nothing is left out.
+pub(crate) fn cut(shown: usize, total: usize, what: &str, rest: &str) -> String {
+    if total > shown { format!(" ({shown} of {total} {what}shown; {rest})") } else { String::new() }
 }
 
 /// A string's text quoted, cut short if it is long.
 fn quoted(text: &str) -> String {
     match text.char_indices().nth(TEXT_SHOWN) {
-        Some((cut, _)) => format!("{:?}...(+{} chars)", &text[..cut], text.chars().count() - TEXT_SHOWN),
+        Some((end, _)) => format!("{:?}...{}", &text[..end], cut(TEXT_SHOWN, text.chars().count(), "characters ", "`strings` with `full` shows it whole")),
         None => format!("{text:?}"),
     }
 }
 
 /// Function labels on one line, the first few and a count of the rest.
-fn labels(binary: &Binary, entries: &BTreeSet<u64>) -> String {
+/// `rest` says what lists them all.
+fn labels(binary: &Binary, entries: &BTreeSet<u64>, rest: &str) -> String {
     if entries.is_empty() {
         return "none".into();
     }
-    let mut line = entries.iter().take(USERS_SHOWN).map(|&entry| binary.program.label(entry)).collect::<Vec<_>>().join(" ");
-    if entries.len() > USERS_SHOWN {
-        write!(line, " (+{} more)", entries.len() - USERS_SHOWN).unwrap();
-    }
-    line
+    let line = entries.iter().take(USERS_SHOWN).map(|&entry| binary.program.label(entry)).collect::<Vec<_>>().join(" ");
+    line + &cut(USERS_SHOWN, entries.len(), "", rest)
 }
 
 /// The comments on addresses inside `body`, in address order.
@@ -638,7 +643,7 @@ fn strings(binary: &mut Binary, args: Strings) -> Result<String> {
         let users = binary.program.users(binary.program.refs_to(string.addr).map(|r| r.from));
         // A string no instruction refers to is reached through a pointer in data, which `xrefs` shows.
         let text = if args.full { format!("{:?}", string.text) } else { quoted(&string.text) };
-        writeln!(out, "{:#x} {text}{} used by: {}", string.addr, if string.wide { " (UTF-16)" } else { "" }, labels(binary, &users))?;
+        writeln!(out, "{:#x} {text}{} used by: {}", string.addr, if string.wide { " (UTF-16)" } else { "" }, labels(binary, &users, &format!("`xrefs` of {:#x} lists all", string.addr)))?;
     }
     Ok(out)
 }
@@ -655,7 +660,7 @@ fn imports(binary: &mut Binary, args: Imports) -> Result<String> {
     writeln!(out, "{} imports", found.len())?;
     for import in found {
         let callers = binary.program.users(binary.program.calls_to(import.slot).map(|call| call.at));
-        writeln!(out, "{} (slot {:#x}){} called by: {}", import.name, import.slot, if import.noreturn { ", never returns" } else { "" }, labels(binary, &callers))?;
+        writeln!(out, "{} (slot {:#x}){} called by: {}", import.name, import.slot, if import.noreturn { ", never returns" } else { "" }, labels(binary, &callers, &format!("`xrefs` of {:#x} lists all", import.slot)))?;
     }
     Ok(out)
 }
@@ -738,7 +743,7 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
     let callers = binary.program.users(binary.program.sites_reaching(entry));
     let by_message = binary.program.sends_to(entry).count();
     let how = if by_message == 0 { String::new() } else { format!(", {by_message} of the call sites by message send") };
-    writeln!(out, "called by ({}{how}): {}", callers.len(), labels(binary, &callers))?;
+    writeln!(out, "called by ({}{how}): {}", callers.len(), labels(binary, &callers, &format!("`xrefs` of {entry:#x} lists all")))?;
 
     writeln!(out, "calls:")?;
     for site in &graph.unresolved_calls {

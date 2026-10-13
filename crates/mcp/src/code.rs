@@ -13,7 +13,7 @@ use recore_decomp::flow::{Kind, Op};
 use serde::Deserialize;
 
 use crate::binary::Binary;
-use crate::tools::{addr_arg, describe, resolve_function};
+use crate::tools::{addr_arg, cut, describe, resolve_function};
 
 /// Instructions shown for a whole function unless the caller sets `count`.
 const FUNCTION_COUNT: usize = 500;
@@ -203,7 +203,7 @@ pub fn pcode(binary: &mut Binary, args: Pcode) -> Result<String> {
         writeln!(out, "block {index} {:#x}-{:#x} -> {}", block.start, block.stop, if successors.is_empty() { "exit".into() } else { successors.join(" ") })?;
         for op in flow.ops.iter().filter(|op| op.block == index).filter(visible) {
             if shown == limit {
-                writeln!(out, "first {limit} of {total} operations shown")?;
+                writeln!(out, "...{}", cut(limit, total, "operations ", &format!("`limit` {total} shows all")))?;
                 return Ok(out);
             }
             shown += 1;
@@ -411,7 +411,7 @@ pub fn trace(binary: &mut Binary, args: Trace) -> Result<String> {
     let (lines, decompiled) = (tracer.lines, tracer.flows.len());
     let mut out = tracer.out;
     if lines > TRACE_LINES {
-        writeln!(out, "{TRACE_LINES} of {lines} lines shown; narrow the trace with a smaller `depth`")?;
+        writeln!(out, "...{}", cut(TRACE_LINES, lines, "lines ", "a smaller `depth` narrows the trace to fit"))?;
     }
     writeln!(out, "{decompiled} functions decompiled, {TRACE_FUNCTIONS} at most. Values that pass through memory are not followed.")?;
     Ok(out)
