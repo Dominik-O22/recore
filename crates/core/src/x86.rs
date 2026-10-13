@@ -48,9 +48,10 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
 
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Instruction>> {
         let mut decoder = Decoder::with_ip(BITS, bytes, addr, DecoderOptions::NONE);
+        let mut instr = Instruction::default();
         std::iter::from_fn(move || {
             decoder.can_decode().then(|| {
-                let instr = decoder.decode();
+                decoder.decode_out(&mut instr);
                 Decoded { addr: instr.ip(), len: instr.len().max(1) as u8, insn: (!instr.is_invalid()).then_some(instr) }
             })
         })
@@ -65,9 +66,10 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
     fn decode_from<'d>((decoder, base): &'d mut Self::Decoder<'_>, offset: usize) -> impl Iterator<Item = Decoded<Instruction>> + 'd {
         decoder.set_position(offset).expect("an offset into the section");
         decoder.set_ip(*base + offset as u64);
+        let mut instr = Instruction::default();
         std::iter::from_fn(move || {
             decoder.can_decode().then(|| {
-                let instr = decoder.decode();
+                decoder.decode_out(&mut instr);
                 Decoded { addr: instr.ip(), len: instr.len().max(1) as u8, insn: (!instr.is_invalid()).then_some(instr) }
             })
         })
