@@ -36,3 +36,20 @@ fn the_first_argument_is_in_dptr_and_the_stack_pointer_by_its_address_is_the_reg
     let code = [0xe5, 0x81, 0x24, 0xfd, 0xf8, 0xe6, 0x25, 0x82, 0xf5, 0x82, 0x22];
     assert_eq!(parameters(&code), ["DPL", "stack:0xfd"]);
 }
+
+#[test]
+fn a_first_argument_of_three_bytes_read_byte_by_byte_is_one_parameter() {
+    #[rustfmt::skip]
+    let code = [
+        0xad, 0x82, 0xae, 0x83, 0xaf, 0xf0, // mov r5, dpl; mov r6, dph; mov r7, b
+        0x90, 0x12, 0x34,                   // mov dptr, #0x1234
+        0xed, 0xf0, 0xa3,                   // mov a, r5; movx @dptr, a; inc dptr
+        0xee, 0xf0, 0xa3,                   // mov a, r6; movx @dptr, a; inc dptr
+        0xef, 0xf0, 0x22,                   // mov a, r7; movx @dptr, a; ret
+    ];
+    let mut session = Session::new(&vendored_spec_dir().unwrap(), Target::I8051Sdcc, &[Section { addr: 0, data: &code, readonly: true, code: true }]).unwrap();
+    let decompiled = session.decompile(0).unwrap();
+    let parameters: Vec<u32> = decompiled.params.iter().map(|param| param.size).collect();
+    assert_eq!(parameters, [3], "{}", decompiled.c_text);
+    assert!(!decompiled.c_text.contains("in_B"), "{}", decompiled.c_text);
+}

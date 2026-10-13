@@ -265,6 +265,7 @@ impl Decompiled {
 /// A program loaded into the decompiler.
 pub struct Session {
     raw: NonNull<ffi::RdSession>,
+    target: Target,
 }
 
 // A session owns all of its C++ state. The engine's globals are written only while a session
@@ -332,7 +333,7 @@ impl Session {
         unsafe { ffi::rd_keep_prototypes_exact(raw.as_ptr(), target.callers_pass_what_is_read().into()) };
         unsafe { ffi::rd_functions_run_on(raw.as_ptr(), target.functions_run_on().into()) };
         // The session frees the engine's side if a space is not there.
-        let session = Session { raw };
+        let session = Session { raw, target };
         for &(base, name) in target.spaces() {
             check(|err, len| unsafe { ffi::rd_map_space(raw.as_ptr(), base, name.as_ptr(), err, len) != 0 })?;
         }
@@ -472,8 +473,7 @@ impl Session {
             self.add_function(function, noreturn)?;
         }
         for &(function, storage) in &facts.storage {
-            let storage = CString::new(storage)?;
-            check(|err, len| unsafe { ffi::rd_set_storage(self.raw.as_ptr(), function, storage.as_ptr(), err, len) != 0 })?;
+            self.set_storage(function, storage)?;
         }
         for &(function, count) in &facts.param_counts {
             check(|err, len| unsafe { ffi::rd_set_param_count(self.raw.as_ptr(), function, count, err, len) != 0 })?;
@@ -678,7 +678,32 @@ impl Session {
 
     /// Runs the session's [`Style`] on the function starting at `addr`. The function need not
     /// have been declared.
+    /// Says where the function at `addr` takes its arguments and leaves its result, when a
+    /// calling convention does not: `ACC(B:DPTR,stack:0xbf/1)` for a result in ACC, an argument
+    /// in B and DPTR and one of a byte on the stack. `?` for the result leaves it to be found.
+    pub fn set_storage(&mut self, addr: u64, storage: &str) -> Result<()> {
+        let storage = CString::new(storage)?;
+        check(|err, len| unsafe { ffi::rd_set_storage(self.raw.as_ptr(), addr, storage.as_ptr(), err, len) != 0 })
+    }
+
+    /// Decompiles the function at `addr`. SDCC passes a first argument of three or four bytes
+    /// in B and ACC beside DPTR, and code reads the bytes one by one, so the engine takes the
+    /// argument for one in DPTR and B for a register nothing passed. Such a function is given
+    /// its first parameter whole and decompiled again; calls to it then pass it whole.
     pub fn decompile(&mut self, addr: u64) -> Result<Decompiled> {
+        let decompiled = self.decompile_as_declared(addr)?;
+        let reads = |register: &str| decompiled.c_text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|word| word.strip_prefix("in_") == Some(register));
+        let in_dptr = decompiled.params.first().is_some_and(|first| first.storage == "DPTR");
+        if self.target != Target::I8051Sdcc || !in_dptr || !reads("B") {
+            return Ok(decompiled);
+        }
+        let first = if reads("ACC") { "ACC:B:DPTR" } else { "B:DPTR" };
+        let rest: String = decompiled.params[1..].iter().map(|param| format!(",{}/{}", param.storage, param.size)).collect();
+        self.set_storage(addr, &format!("?({first}{rest})"))?;
+        self.decompile_as_declared(addr)
+    }
+
+    fn decompile_as_declared(&mut self, addr: u64) -> Result<Decompiled> {
         let mut out = std::mem::MaybeUninit::<ffi::RdDecompiled>::uninit();
         check(|err, len| unsafe { ffi::rd_decompile(self.raw.as_ptr(), addr, out.as_mut_ptr(), err, len) != 0 })?;
         // Everything `out` points to lives in the session until its next call; copy it out now.

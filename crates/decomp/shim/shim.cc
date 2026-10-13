@@ -1128,17 +1128,27 @@ int rd_set_param_count(RdSession *session, uint64_t addr, size_t count, char *er
   });
 }
 
-// Where a value is: a register by name, or several joined with `:`, most significant first.
+// Where a value is: a register by name, several joined with `:`, most significant first, or
+// `<space>:<offset>/<size>` as a parameter's storage is reported, with its size.
 static ParameterPieces stored_in(Architecture *arch, const string &place) {
-  vector<VarnodeData> registers;
-  int4 size = 0;
-  istringstream names(place);
-  for (string name; getline(names, name, ':');) {
-    registers.push_back(arch->translate->getRegister(name));
-    size += registers.back().size;
-  }
   ParameterPieces piece;
-  piece.addr = registers.size() == 1 ? registers[0].getAddr() : arch->findAddJoin(registers, 0)->getUnified().getAddr();
+  int4 size = 0;
+  size_t sized = place.find('/');
+  if (sized != string::npos) {
+    size_t colon = place.find(':');
+    AddrSpace *space = arch->getSpaceByName(place.substr(0, colon));
+    if (colon == string::npos || space == nullptr) throw LowlevelError("no such storage: " + place);
+    piece.addr = Address(space, stoull(place.substr(colon + 1, sized - colon - 1), nullptr, 16));
+    size = stoi(place.substr(sized + 1));
+  } else {
+    vector<VarnodeData> registers;
+    istringstream names(place);
+    for (string name; getline(names, name, ':');) {
+      registers.push_back(arch->translate->getRegister(name));
+      size += registers.back().size;
+    }
+    piece.addr = registers.size() == 1 ? registers[0].getAddr() : arch->findAddJoin(registers, 0)->getUnified().getAddr();
+  }
   piece.type = arch->types->getBase(size, TYPE_UNKNOWN);
   piece.flags = 0;
   return piece;
@@ -1146,7 +1156,7 @@ static ParameterPieces stored_in(Architecture *arch, const string &place) {
 
 // Says where the function at `addr` takes its arguments and leaves its result, for one that
 // keeps to no calling convention: `storage` is `ACC(R3:R2:R1,DPTR)` for a result in ACC and
-// two arguments, and `void(...)` for no result.
+// two arguments, `void(...)` for no result, and `?(...)` to leave the result to be found.
 int rd_set_storage(RdSession *session, uint64_t addr, const char *storage, char *err, size_t errlen) {
   return guarded(err, errlen, [&] {
     Architecture *arch = session->arch;
@@ -1155,12 +1165,13 @@ int rd_set_storage(RdSession *session, uint64_t addr, const char *storage, char 
     if (open == string::npos || close == string::npos) throw LowlevelError("storage is `result(arguments)`: " + text);
     FuncProto &proto = session->function(addr)->getFuncProto();
     string result = text.substr(0, open);
-    if (result != "void") proto.setOutput(stored_in(arch, result));
+    if (result != "void" && result != "?") proto.setOutput(stored_in(arch, result));
     istringstream arguments(text.substr(open + 1, close - open - 1));
+    proto.clearInput();
     int4 count = 0;
     for (string place; getline(arguments, place, ',');) proto.setParam(count++, "", stored_in(arch, place));
     proto.setInputLock(true);
-    proto.setOutputLock(true);
+    proto.setOutputLock(result != "?");
     proto.setModelLock(true);
   });
 }
