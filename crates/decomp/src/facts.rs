@@ -250,8 +250,14 @@ impl Facts {
 fn c51_storage(registers: recore::i8051::registers::Use) -> String {
     let taken = registers.taken;
     let mut arguments: Vec<&str> = Vec::new();
+    // Four bytes in R0 to R3 are the second operand of arithmetic on four, whose first is in
+    // R4 to R7.
+    let long = ["R0", "R1", "R2", "R3"].iter().all(|name| taken.has(name));
+    let first_long = long && ["R4", "R5", "R6", "R7"].iter().all(|name| taken.has(name));
+    arguments.extend(first_long.then_some("R4R5R6R7"));
     for (pair, high, low) in [("R6R7", "R6", "R7"), ("R4R5", "R4", "R5")] {
         arguments.extend(match (taken.has(high), taken.has(low)) {
+            _ if first_long => None,
             (true, true) => Some(pair),
             (false, true) => Some(low),
             (true, false) => Some(high),
@@ -259,6 +265,7 @@ fn c51_storage(registers: recore::i8051::registers::Use) -> String {
         });
     }
     match (taken.has("R3"), taken.has("R2"), taken.has("R1")) {
+        _ if long => arguments.push("R0R1R2R3"),
         (true, true, true) => arguments.push("R3:R2:R1"),
         (third, second, first) => {
             arguments.extend(match (second, third) {
@@ -270,13 +277,15 @@ fn c51_storage(registers: recore::i8051::registers::Use) -> String {
             arguments.extend(first.then_some("R1"));
         }
     }
-    arguments.extend(["ACC", "B", "DPTR", "DPL", "DPH", "R0", "CY"].into_iter().filter(|name| taken.has(name)));
+    arguments.extend(["ACC", "B", "DPTR", "DPL", "DPH", "R0", "CY"].into_iter().filter(|name| taken.has(name) && !(long && *name == "R0")));
     let result = match registers.given {
         // Nothing is known to call it, so nothing says what a caller reads of it.
         None => "?",
         Some(given) => {
             let all = |names: &[&str]| names.iter().all(|name| given.has(name));
-            if all(&["R3", "R2", "R1"]) {
+            if all(&["R0", "R1", "R2", "R3"]) {
+                "R0R1R2R3"
+            } else if all(&["R3", "R2", "R1"]) {
                 "R3:R2:R1"
             } else if all(&["R4", "R5", "R6", "R7"]) {
                 "R4R5R6R7"
