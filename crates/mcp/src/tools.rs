@@ -671,7 +671,9 @@ fn decompile(binary: &mut Binary, args: Decompile) -> Result<String> {
         match (record.status, c_text) {
             (Status::Ok, Some(text)) => {
                 writeln!(out, "// {label} ({:.0} ms)", record.ms)?;
-                for (addr, comment) in comments(binary, &binary.program.body(entry)) {
+                // The decompiler prints a comment beside the code of its instruction. One on
+                // an instruction that left no code of its own is listed here instead.
+                for (addr, comment) in comments(binary, &binary.program.body(entry)).into_iter().filter(|(_, comment)| !text.contains(comment)) {
                     writeln!(out, "// {addr:#x}: {comment}")?;
                 }
                 writeln!(out, "{}\n", text.trim())?;

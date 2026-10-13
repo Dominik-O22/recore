@@ -799,6 +799,17 @@ int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int 
 // function's symbol, so that later decompilations of its callers pass at least those parameters.
 void rd_keep_prototypes(RdSession *session, int keep) { session->keep_prototypes = keep != 0; }
 
+// Puts a note on an instruction of `function`. The C of the function prints it as a comment
+// where that instruction's code is, if the instruction has any left after simplification.
+int rd_add_comment(RdSession *session, uint64_t function, uint64_t addr, const char *text, char *err,
+                   size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    arch->commentdb->addComment(Comment::user2, session->address(function), session->address(addr), text);
+    arch->print->setInstructionComment(arch->print->getInstructionComment() | Comment::user2);
+  });
+}
+
 // Whether a kept prototype says everything a call passes, or only the least: a call then also
 // passes whatever else the call site shows.
 void rd_keep_prototypes_exact(RdSession *session, int exact) { session->kept_are_lower_bounds = exact == 0; }

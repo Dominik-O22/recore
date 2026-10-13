@@ -201,6 +201,13 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
     }
 
+    // A comment goes to the function its address is in, entered where that function starts.
+    for (&addr, text) in &edits.comments {
+        let inside = |function: &&recore::report::AnalyzedFunction| function.ranges.iter().any(|&(start, end)| (start..end).contains(&addr));
+        if let Some(function) = analysis.functions.iter().find(inside) {
+            session.add_comment(function.fragment_of.unwrap_or(function.addr), addr, text)?;
+        }
+    }
     for (&function, names) in &edits.locals {
         for (place, name) in names {
             session.name_local(function, place, name)?;

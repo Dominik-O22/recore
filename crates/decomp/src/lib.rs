@@ -464,6 +464,13 @@ impl Session {
         unsafe { ffi::rd_set_flow(self.raw.as_ptr(), keep.into()) }
     }
 
+    /// Puts a note on the instruction at `addr` of `function`, which the function's C shows
+    /// as a comment beside the code of that instruction, when any of it is left.
+    pub fn add_comment(&mut self, function: u64, addr: u64, text: &str) -> Result<()> {
+        let text = CString::new(text)?;
+        check(|err, len| unsafe { ffi::rd_add_comment(self.raw.as_ptr(), function, addr, text.as_ptr(), err, len) != 0 })
+    }
+
     /// Names the variable of `function` at `place`, one of [`Decompiled::locals`]. The name
     /// shows whenever the function is decompiled and still has a variable there.
     pub fn name_local(&mut self, function: u64, place: &str, name: &str) -> Result<()> {
