@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Writes the lines of a `.lib` list: the routines of a compiler's library, each known by a
-hash of its code. See `crates/decomp/src/library.rs` for what reads them.
+hash of its code. See `crates/core/src/library.rs` for what reads them.
 
 A line is `name storage length hash [offset+count[=routine]]...`. The hash is FNV-1a over the
 first `length` bytes of the routine with the listed bytes taken as zero: those differ from

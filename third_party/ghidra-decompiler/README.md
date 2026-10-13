@@ -104,7 +104,7 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   - No `funcptr` element. Upstream's alignment of 2 has the engine clear the lowest bit of an
     address that code jumps or calls through, and 8051 code starts at any address.
   - A call fixup for each routine of the C51 library that does what C has an operator for,
-    so that a call to one reads as the operator. `crates/decomp/data/keil-c51.lib` has what
+    so that a call to one reads as the operator. `crates/core/data/keil-c51.lib` has what
     each routine is known by.
 
 - `languages/sdcc-mcs51.cspec`: not from upstream. The 8051 as SDCC compiles for it, the

@@ -6,12 +6,12 @@
 //! to one reads as a call that takes nothing and leaves registers behind. The routines are
 //! the same code in every program, and `data/*.lib` lists a hash of each.
 
-use std::collections::HashMap;
+use std::sync::LazyLock;
 
-use recore::Image;
-use recore::report::Analysis;
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
-use crate::Target;
+use crate::image::{Compiler, Image, Machine};
 
 /// One routine of a library.
 pub struct Routine {
@@ -42,37 +42,72 @@ impl Routine {
         Some(Routine { name, storage: Some(storage).filter(|&storage| storage != "-"), length, hash, left_out })
     }
 
-    /// Whether `bytes` start with the routine's code. FNV-1a, as `data/fingerprint.py` has it.
+    /// Whether `bytes` start with the routine's code.
     pub fn is_at(&self, bytes: &[u8]) -> bool {
-        let Some(code) = bytes.get(..self.length) else { return false };
-        let mut left_out = self.left_out.iter().peekable();
-        let mut hash = 0xcbf29ce484222325u64;
-        for (offset, &byte) in code.iter().enumerate() {
-            while left_out.next_if(|&&(start, count, _)| start + count <= offset).is_some() {}
-            let byte = if left_out.peek().is_some_and(|&&(start, _, _)| start <= offset) { 0 } else { byte };
-            hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
-        }
-        hash == self.hash
+        bytes.get(..self.length).is_some_and(|code| hash(code, &self.left_out) == self.hash)
     }
 }
 
-/// The routines of the library that code for `target` calls.
-pub fn routines(target: Target) -> Vec<Routine> {
-    let list = match target {
-        Target::I8051 => include_str!("../data/keil-c51.lib"),
-        Target::I8051Sdcc => include_str!("../data/sdcc-mcs51.lib"),
-        _ => "",
-    };
+/// FNV-1a over `code` with the bytes of `left_out` taken as zero, as `data/fingerprint.py`
+/// has it.
+fn hash(code: &[u8], left_out: &[(usize, usize, Option<&'static str>)]) -> u64 {
+    let mut left_out = left_out.iter().peekable();
+    let mut hash = 0xcbf29ce484222325u64;
+    for (offset, &byte) in code.iter().enumerate() {
+        while left_out.next_if(|&&(start, count, _)| start + count <= offset).is_some() {}
+        let byte = if left_out.peek().is_some_and(|&&(start, _, _)| start <= offset) { 0 } else { byte };
+        hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn parse(list: &'static str) -> Vec<Routine> {
     list.lines().filter(|line| !line.starts_with('#')).filter_map(Routine::parse).collect()
 }
 
-/// The functions of the image that are routines of `library`, by address.
-pub fn recognise<'a>(image: &Image, analysis: &Analysis, library: &'a [Routine]) -> Vec<(u64, &'a Routine)> {
+static KEIL: LazyLock<Vec<Routine>> = LazyLock::new(|| {
+    let routines = parse(include_str!("../data/keil-c51.lib")).into_iter();
+    #[cfg(test)]
+    let routines = routines.chain(STAND_INS.iter().map(|&(name, code)| Routine { name, storage: None, length: code.len(), hash: hash(code, &[]), left_out: Vec::new() }));
+    routines.collect()
+});
+static SDCC: LazyLock<Vec<Routine>> = LazyLock::new(|| parse(include_str!("../data/sdcc-mcs51.lib")));
+
+/// Code the tests of this crate have in place of routines of Keil's library, under the names
+/// of those: the list holds no code to build the real ones from. None does what its routine
+/// does.
+#[cfg(test)]
+pub(crate) const STAND_INS: [(&str, &[u8]); 4] = [
+    // MOV A, R4; ADD A, R5; ADD A, R6; ADD A, R7; MOV R7, A; RET.
+    ("?C?LMUL", &[0xEC, 0x2D, 0x2E, 0x2F, 0xFF, 0x22]),
+    // POP DPH; POP DPL; CLR A; JMP @A+DPTR.
+    ("?C?CCASE", &[0xD0, 0x83, 0xD0, 0x82, 0xE4, 0x73]),
+    // The same with MOV R0, B ahead of CLR A.
+    ("?C?ICASE", &[0xD0, 0x83, 0xD0, 0x82, 0xA8, 0xF0, 0xE4, 0x73]),
+    // POP DPH; POP DPL; four times INC DPTR; CLR A; JMP @A+DPTR.
+    ("?C?LSTKXDATA", &[0xD0, 0x83, 0xD0, 0x82, 0xA3, 0xA3, 0xA3, 0xA3, 0xE4, 0x73]),
+];
+
+/// The routines of the library that code for `machine` calls when `compiler` built it. An
+/// image that names no compiler is taken as Keil's.
+pub fn routines(machine: Machine, compiler: Option<Compiler>) -> &'static [Routine] {
+    match (machine, compiler) {
+        (Machine::I8051, Some(Compiler::Sdcc)) => &SDCC,
+        (Machine::I8051, Some(Compiler::Keil) | None) => &KEIL,
+        _ => &[],
+    }
+}
+
+/// Which of `functions`, the addresses of functions of the image, are routines of `library`.
+pub fn recognise<'a>(image: &Image, functions: &[u64], library: &'a [Routine]) -> Vec<(u64, &'a Routine)> {
     let code_at = |function: u64| image.bytes_from(function).unwrap_or(&[]);
     // What each function may be by its own code. Routines that differ only in what they jump
     // to are told apart after, by what those are.
-    let functions = analysis.functions.iter().filter(|function| function.fragment_of.is_none()).map(|function| function.addr);
-    let alike: HashMap<u64, Vec<&Routine>> = functions.map(|function| (function, library.iter().filter(|routine| routine.is_at(code_at(function))).collect())).filter(|(_, alike): &(_, Vec<_>)| !alike.is_empty()).collect();
+    let alike: FxHashMap<u64, Vec<&Routine>> = functions
+        .par_iter()
+        .map(|&function| (function, library.iter().filter(|routine| routine.is_at(code_at(function))).collect::<Vec<_>>()))
+        .filter(|(_, alike)| !alike.is_empty())
+        .collect();
     let goes_where_it_should = |function: u64, routine: &Routine| {
         routine.left_out.iter().all(|&(offset, _, target)| {
             let Some(target) = target else { return true };
@@ -104,9 +139,10 @@ mod tests {
 
     #[test]
     fn every_line_of_a_list_is_a_routine() {
-        for (target, list) in [(Target::I8051, include_str!("../data/keil-c51.lib")), (Target::I8051Sdcc, include_str!("../data/sdcc-mcs51.lib"))] {
+        for (compiler, list) in [(Compiler::Keil, include_str!("../data/keil-c51.lib")), (Compiler::Sdcc, include_str!("../data/sdcc-mcs51.lib"))] {
             let lines = list.lines().filter(|line| !line.starts_with('#')).count();
-            assert_eq!(routines(target).len(), lines);
+            let stand_ins = if compiler == Compiler::Keil { STAND_INS.len() } else { 0 };
+            assert_eq!(routines(Machine::I8051, Some(compiler)).len(), lines + stand_ins);
         }
     }
 }

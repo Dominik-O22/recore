@@ -14,7 +14,6 @@ pub mod facts;
 mod ffi;
 pub mod flow;
 pub mod isolate;
-pub mod library;
 pub mod pdb;
 pub mod prototypes;
 pub mod types;

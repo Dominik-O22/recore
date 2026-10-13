@@ -770,6 +770,12 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .collect();
         names.extend(recognised.into_iter().map(|(addr, name)| (addr, name.to_string())));
     }
+    // A compiler's own library is known by its code too. A fragment is no routine.
+    let library = crate::library::routines(image.machine, image.compiler);
+    if !library.is_empty() {
+        let unnamed: Vec<u64> = functions.iter().map(|f| f.start).filter(|start| !names.contains_key(start) && !fragment_of.contains_key(start)).collect();
+        names.extend(crate::library::recognise(image, &unnamed, library).into_iter().map(|(addr, routine)| (addr, routine.name.to_string())));
+    }
 
     // A virtual function nothing else names takes the name of its vtable slot, in the class
     // that has the fewest bases among those listing it: the one that introduced it. A class

@@ -6,10 +6,10 @@ use std::ffi::CStr;
 
 use recore::Image;
 use recore::image::Machine;
+use recore::library::Routine;
 use recore::report::{Analysis, CallTarget};
 
 use crate::Target;
-use crate::library::Routine;
 
 /// Control-flow facts for one binary. Each is attributed to the function whose decompilation
 /// it affects: every function that has the instruction in one of its ranges, or the owner
@@ -66,7 +66,7 @@ pub struct Facts {
     /// them.
     pub kept_registers: Vec<(u64, String)>,
     /// `(function, storage)`: where a function takes its arguments and leaves its result, as
-    /// [`crate::Session::set_storage`] takes it: a library routine as its list has it, and a
+    /// [`crate::Session::set_storage`] takes it: a library routine as [`recore::library::Routine::storage`] has it, and a
     /// function of C51 code as its use of the registers says.
     pub storage: Vec<(u64, String)>,
 }
@@ -109,7 +109,7 @@ impl Facts {
             names: analysis.functions.iter().filter(|f| f.fragment_of.is_none()).filter_map(|f| Some((f.addr, f.name.clone()?))).collect(),
             ..Facts::default()
         };
-        let library = Target::of(image).map(crate::library::routines).unwrap_or_default();
+        let library = recore::library::routines(image.machine, image.compiler);
         if image.machine == Machine::I8051 {
             // recore lists a call to one of Keil's library routines that read what follows the
             // call as a jump table at the call: the cases of a `switch`, or for a routine that
@@ -122,17 +122,17 @@ impl Facts {
                 };
                 match table.targets[..] {
                     [after] if after == table.jump + length + 4 => facts.data_after_calls.push((table.jump, 4)),
-                    _ => facts.switch_calls.push(SwitchCall::at(image, &library, table.jump)),
+                    _ => facts.switch_calls.push(SwitchCall::at(image, library, table.jump)),
                 }
             }
         }
-        // A function the image has no name for may be a routine of the compiler's library.
-        {
-            let named: std::collections::HashSet<u64> = facts.names.iter().map(|name| name.0).collect();
-            for (function, routine) in crate::library::recognise(image, analysis, &library).into_iter().filter(|(function, _)| !named.contains(function)) {
-                facts.names.push((function, routine.name.to_string()));
-                facts.storage.extend(routine.storage.map(|storage| (function, storage.to_string())));
-            }
+        // The analysis names a routine of the compiler's library that the image has no name
+        // for. Where such a routine takes its arguments is in the library's list.
+        if !library.is_empty() {
+            let named: HashMap<u64, &str> = facts.names.iter().map(|(function, name)| (*function, name.as_str())).collect();
+            let functions: Vec<u64> = named.keys().copied().collect();
+            let routines = recore::library::recognise(image, &functions, library).into_iter().filter(|(function, routine)| named[function] == routine.name);
+            facts.storage = routines.filter_map(|(function, routine)| Some((function, routine.storage?.to_string()))).collect();
         }
         let fixups: HashMap<String, String> = Target::of(image).map(Target::call_fixups).unwrap_or_default().into_iter().collect();
         // 32-bit C names carry one more leading underscore in some symbol sources than others.

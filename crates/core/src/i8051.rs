@@ -672,6 +672,11 @@ mod tests {
         }
     }
 
+    /// The code the tests have in place of a routine of Keil's library.
+    fn stand_in(name: &str) -> &'static [u8] {
+        crate::library::STAND_INS.iter().find(|stand_in| stand_in.0 == name).unwrap().1
+    }
+
     /// The length and the control flow of the instruction `bytes` holds at `addr`.
     fn decoded(bytes: &[u8], addr: u64) -> (u8, Option<Flow>) {
         let first = I8051::decode(bytes, addr).next().unwrap();
@@ -798,6 +803,19 @@ mod tests {
         // With MOVX A, @DPTR in place of CLR A the address is in external memory.
         code[3] = 0xE0;
         assert!(strings(&code).is_empty());
+    }
+
+    #[test]
+    fn a_function_that_is_a_library_routine_goes_by_its_name() {
+        // 0x0000: LCALL 0x0010; LCALL 0x0020; RET. 0x0010: the routine. 0x0020: INC A; RET.
+        let mut code = vec![0x12, 0x00, 0x10, 0x12, 0x00, 0x20, 0x22];
+        code.resize(0x10, 0x00);
+        code.extend(stand_in("?C?LMUL"));
+        code.resize(0x20, 0x00);
+        code.extend([0x04, 0x22]);
+        let analysis = crate::analyze(&image(&code, 0));
+        let names: Vec<(u64, Option<&str>)> = analysis.functions.iter().map(|function| (function.addr, function.name.as_deref())).collect();
+        assert_eq!(names, [(0x0000, None), (0x0010, Some("?C?LMUL")), (0x0020, None)]);
     }
 
     #[test]
