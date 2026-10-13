@@ -52,6 +52,9 @@ pub struct Facts {
     /// `(call, bytes)`: a call followed by that much data, which the routine it calls reads
     /// before it returns to the code after the data.
     pub data_after_calls: Vec<(u64, u64)>,
+    /// `(function, storage)`: a library routine and where it takes its arguments and leaves
+    /// its result, as [`crate::library::Routine::storage`] has it.
+    pub storage: Vec<(u64, &'static str)>,
 }
 
 impl Facts {
@@ -75,6 +78,15 @@ impl Facts {
                     [after] if after == table.jump + length + 4 => facts.data_after_calls.push((table.jump, 4)),
                     _ => facts.switch_calls.push((table.jump, c"ACC")),
                 }
+            }
+        }
+        // A function the image has no name for may be a routine of the compiler's library.
+        if let Ok(target) = Target::of(image) {
+            let library = crate::library::routines(target);
+            let named: std::collections::HashSet<u64> = facts.names.iter().map(|name| name.0).collect();
+            for (function, routine) in crate::library::recognise(image, analysis, &library).into_iter().filter(|(function, _)| !named.contains(function)) {
+                facts.names.push((function, routine.name.to_string()));
+                facts.storage.extend(routine.storage.map(|storage| (function, storage)));
             }
         }
         let fixups: HashMap<String, String> = Target::of(image).map(Target::call_fixups).unwrap_or_default().into_iter().collect();

@@ -84,4 +84,305 @@
     <varnode space="stack" offset="0" size="2"/>
   </returnaddress>
 
+  <!-- recore: the routines of the C51 library that do what C has an operator for: arithmetic
+       on 16 and 32 bits, which are in R6R7 and R4R5R6R7 with a second operand in R4R5 and
+       R0R1R2R3, and loads and stores of 32 bits and of a pointer, which is in R3, R2 and R1.
+       A call to one reads as the operator. crates/decomp/data/keil-c51.lib has the code each
+       is known by. Each fixup ends by taking off the stack the return address the call
+       pushed. A comparison takes the carry flag as a borrow, as SUBB does. -->
+  <callfixup name="?C?IMUL">
+    <target name="?C?IMUL"/>
+    <pcode>
+      <body><![CDATA[
+      R6R7 = R6R7 * R4R5;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?UIDIV">
+    <target name="?C?UIDIV"/>
+    <pcode>
+      <body><![CDATA[
+      local q:2 = R6R7 / R4R5;
+      R4R5 = R6R7 % R4R5;
+      R6R7 = q;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?SIDIV">
+    <target name="?C?SIDIV"/>
+    <pcode>
+      <body><![CDATA[
+      local q:2 = R6R7 s/ R4R5;
+      R4R5 = R6R7 s% R4R5;
+      R6R7 = q;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?SCDIV">
+    <target name="?C?SCDIV"/>
+    <pcode>
+      <body><![CDATA[
+      local q:1 = ACC s/ B;
+      B = ACC s% B;
+      ACC = q;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LMUL">
+    <target name="?C?LMUL"/>
+    <pcode>
+      <body><![CDATA[
+      R4R5R6R7 = R4R5R6R7 * R0R1R2R3;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?ULDIV">
+    <target name="?C?ULDIV"/>
+    <pcode>
+      <body><![CDATA[
+      local q:4 = R4R5R6R7 / R0R1R2R3;
+      R0R1R2R3 = R4R5R6R7 % R0R1R2R3;
+      R4R5R6R7 = q;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?ULCMP">
+    <target name="?C?ULCMP"/>
+    <pcode>
+      <body><![CDATA[
+      local left:4 = R0R1R2R3;
+      local right:4 = R4R5R6R7;
+      local cy:4 = zext(CY);
+      CY = (left < right) | ((left - right) < cy);
+      ACC = (left - right) != cy;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?SLCMP">
+    <target name="?C?SLCMP"/>
+    <pcode>
+      <body><![CDATA[
+      local left:4 = R0R1R2R3 ^ 0x80000000;
+      local right:4 = R4R5R6R7 ^ 0x80000000;
+      local cy:4 = zext(CY);
+      CY = (left < right) | ((left - right) < cy);
+      ACC = (left - right) != cy;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?ULSHR">
+    <target name="?C?ULSHR"/>
+    <pcode>
+      <body><![CDATA[
+      R4R5R6R7 = R4R5R6R7 >> R0;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?SLSHR">
+    <target name="?C?SLSHR"/>
+    <pcode>
+      <body><![CDATA[
+      R4R5R6R7 = R4R5R6R7 s>> R0;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LSHL">
+    <target name="?C?LSHL"/>
+    <pcode>
+      <body><![CDATA[
+      R4R5R6R7 = R4R5R6R7 << R0;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?OFFXADD">
+    <target name="?C?OFFXADD"/>
+    <pcode>
+      <body><![CDATA[
+      DPTR = DPTR + zext(ACC) * zext(B);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?IILDX">
+    <target name="?C?IILDX"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      local v:2 = *[EXTMEM]:2 p;
+      v = v + ((zext(ACC) << 8) | zext(B));
+      *[EXTMEM]:2 p = v;
+      ACC = v(1);
+      B = v(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?ILDIX">
+    <target name="?C?ILDIX"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      local v:2 = *[EXTMEM]:2 p;
+      *[EXTMEM]:2 p = v + ((zext(ACC) << 8) | zext(B));
+      ACC = v(1);
+      B = v(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LLDXDATA">
+    <target name="?C?LLDXDATA"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      R4R5R6R7 = *[EXTMEM]:4 p;
+      DPTR = DPTR + 3;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LLDXDATA0">
+    <target name="?C?LLDXDATA0"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      R0R1R2R3 = *[EXTMEM]:4 p;
+      DPTR = DPTR + 3;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LSTXDATA">
+    <target name="?C?LSTXDATA"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      *[EXTMEM]:4 p = R4R5R6R7;
+      DPTR = DPTR + 3;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LLDIDATA">
+    <target name="?C?LLDIDATA"/>
+    <pcode>
+      <body><![CDATA[
+      R4R5R6R7 = *[INTMEM]:4 R0;
+      R0 = R0 + 3;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LLDIDATA0">
+    <target name="?C?LLDIDATA0"/>
+    <pcode>
+      <body><![CDATA[
+      R0R1R2R3 = *[INTMEM]:4 R0;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LSTIDATA">
+    <target name="?C?LSTIDATA"/>
+    <pcode>
+      <body><![CDATA[
+      *[INTMEM]:4 R0 = R4R5R6R7;
+      R0 = R0 + 3;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LLDCODE">
+    <target name="?C?LLDCODE"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = (inst_start & 0xff0000) + zext(DPTR);
+      R4R5R6R7 = *[CODE]:4 p;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LLDCODE0">
+    <target name="?C?LLDCODE0"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = (inst_start & 0xff0000) + zext(DPTR);
+      R0R1R2R3 = *[CODE]:4 p;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?PLDXDATA">
+    <target name="?C?PLDXDATA"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      local v:3 = *[EXTMEM]:3 p;
+      R3 = v(2);
+      R2 = v(1);
+      R1 = v(0);
+      DPTR = DPTR + 2;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?PSTXDATA">
+    <target name="?C?PSTXDATA"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      *[EXTMEM]:3 p = (zext(R3) << 16) | (zext(R2) << 8) | zext(R1);
+      DPTR = DPTR + 2;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?PLDIDATA">
+    <target name="?C?PLDIDATA"/>
+    <pcode>
+      <body><![CDATA[
+      local v:3 = *[INTMEM]:3 R0;
+      R3 = v(2);
+      R2 = v(1);
+      R1 = v(0);
+      R0 = R0 + 2;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?PSTIDATA">
+    <target name="?C?PSTIDATA"/>
+    <pcode>
+      <body><![CDATA[
+      *[INTMEM]:3 R0 = (zext(R3) << 16) | (zext(R2) << 8) | zext(R1);
+      R0 = R0 + 2;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?PLDCODE">
+    <target name="?C?PLDCODE"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = (inst_start & 0xff0000) + zext(DPTR);
+      local v:3 = *[CODE]:3 p;
+      R3 = v(2);
+      R2 = v(1);
+      R1 = v(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+
 </compiler_spec>

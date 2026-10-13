@@ -1097,6 +1097,43 @@ int rd_set_param_count(RdSession *session, uint64_t addr, size_t count, char *er
   });
 }
 
+// Where a value is: a register by name, or several joined with `:`, most significant first.
+static ParameterPieces stored_in(Architecture *arch, const string &place) {
+  vector<VarnodeData> registers;
+  int4 size = 0;
+  istringstream names(place);
+  for (string name; getline(names, name, ':');) {
+    registers.push_back(arch->translate->getRegister(name));
+    size += registers.back().size;
+  }
+  ParameterPieces piece;
+  piece.addr = registers.size() == 1 ? registers[0].getAddr() : arch->findAddJoin(registers, 0)->getUnified().getAddr();
+  piece.type = arch->types->getBase(size, TYPE_UNKNOWN);
+  piece.flags = 0;
+  return piece;
+}
+
+// Says where the function at `addr` takes its arguments and leaves its result, for one that
+// keeps to no calling convention: `storage` is `ACC(R3:R2:R1,DPTR)` for a result in ACC and
+// two arguments, and `void(...)` for no result.
+int rd_set_storage(RdSession *session, uint64_t addr, const char *storage, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    string text(storage);
+    size_t open = text.find('('), close = text.rfind(')');
+    if (open == string::npos || close == string::npos) throw LowlevelError("storage is `result(arguments)`: " + text);
+    FuncProto &proto = session->function(addr)->getFuncProto();
+    string result = text.substr(0, open);
+    if (result != "void") proto.setOutput(stored_in(arch, result));
+    istringstream arguments(text.substr(open + 1, close - open - 1));
+    int4 count = 0;
+    for (string place; getline(arguments, place, ',');) proto.setParam(count++, "", stored_in(arch, place));
+    proto.setInputLock(true);
+    proto.setOutputLock(true);
+    proto.setModelLock(true);
+  });
+}
+
 // Replaces every call to the function at `addr` with the p-code of the compiler spec's call
 // fixup `fixup`. Compiler helpers such as the stack-cookie check and `_alloca_probe` break the
 // calling convention, and their fixup says what they really do to the caller.

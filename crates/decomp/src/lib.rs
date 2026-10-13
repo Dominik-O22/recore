@@ -14,6 +14,7 @@ pub mod facts;
 mod ffi;
 pub mod flow;
 pub mod isolate;
+pub mod library;
 pub mod pdb;
 pub mod prototypes;
 pub mod types;
@@ -469,6 +470,10 @@ impl Session {
         }
         for &(function, noreturn) in &facts.functions {
             self.add_function(function, noreturn)?;
+        }
+        for &(function, storage) in &facts.storage {
+            let storage = CString::new(storage)?;
+            check(|err, len| unsafe { ffi::rd_set_storage(self.raw.as_ptr(), function, storage.as_ptr(), err, len) != 0 })?;
         }
         for &(function, count) in &facts.param_counts {
             check(|err, len| unsafe { ffi::rd_set_param_count(self.raw.as_ptr(), function, count, err, len) != 0 })?;

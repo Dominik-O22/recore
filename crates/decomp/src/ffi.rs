@@ -76,6 +76,7 @@ unsafe extern "C" {
     pub fn rd_override_call(session: *mut RdSession, function: u64, call: u64, target: u64, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_declare(session: *mut RdSession, declaration: *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_add_string(session: *mut RdSession, addr: u64, name: *const c_char, count: usize, wide: i32, err: *mut c_char, errlen: usize) -> i32;
+    pub fn rd_set_storage(session: *mut RdSession, addr: u64, storage: *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_set_call_fixup(session: *mut RdSession, addr: u64, fixup: *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_add_pointer_table(session: *mut RdSession, addr: u64, name: *const c_char, count: usize, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_override_tail_call(session: *mut RdSession, function: u64, jump: u64, err: *mut c_char, errlen: usize) -> i32;
