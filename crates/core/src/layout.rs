@@ -38,8 +38,13 @@
 //! stub = "c0 b1 c8 c0 e0 e9 c0 e0 ea 54 0f 53 b1 f0 42 b1 c8 22"
 //! ```
 //!
+//! A layout can leave open what is not yet known of a banked image, for a sweep to
+//! find: which bank a region is, written `bank = "?"` with the 16-bit address its bytes start
+//! at as its `address`, the `common` ranges, and the trampolines.
+//!
 //! [`Image::load`] takes a layout wherever it takes an executable.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -50,46 +55,67 @@ use crate::image::{Banking, Format, Image, Machine, Section};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Layout {
-    machine: Machine,
+pub(crate) struct Layout {
+    pub(crate) machine: Machine,
     /// Where execution starts: the reset address first, then any other the hardware enters,
     /// such as interrupt vectors.
-    entry: Vec<u64>,
-    region: Vec<Region>,
-    banking: Option<BankingLayout>,
+    pub(crate) entry: Vec<u64>,
+    pub(crate) region: Vec<Region>,
+    pub(crate) banking: Option<BankingLayout>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Region {
+pub(crate) struct Region {
     /// Relative to the layout file.
-    file: PathBuf,
-    offset: u64,
-    length: u64,
-    address: u64,
+    pub(crate) file: PathBuf,
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    /// Where the bytes load. For a region whose bank is open, the 16-bit address they start at.
+    pub(crate) address: u64,
+    pub(crate) bank: Option<OpenBank>,
     #[serde(default)]
-    executable: bool,
+    pub(crate) executable: bool,
     #[serde(default)]
-    writable: bool,
+    pub(crate) writable: bool,
     /// The section's name, which is the file's name and the offset when the layout gives none.
-    name: Option<String>,
+    pub(crate) name: Option<String>,
 }
 
-#[derive(Deserialize)]
+/// What a layout writes for the bank of a region when it does not know it.
+#[derive(Deserialize, Clone, Copy)]
+pub(crate) enum OpenBank {
+    #[serde(rename = "?")]
+    Unknown,
+}
+
+impl Region {
+    /// The section that `data`, which lies `skip` bytes into the region, makes at `addr`.
+    pub(crate) fn section(&self, skip: u64, addr: u64, data: &[u8]) -> Section {
+        let offset = self.offset + skip;
+        let name = self.name.clone().unwrap_or_else(|| format!("{}+{offset:#x}", self.file.display()));
+        Section { name, addr, data: data.to_vec(), file_offset: Some(offset), executable: self.executable, writable: self.writable }
+    }
+}
+
+#[derive(Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
-struct BankingLayout {
-    /// `[start, end)` of the 16-bit addresses that are the same in every bank.
-    common: Vec<(u16, u32)>,
+pub(crate) struct BankingLayout {
+    /// `[start, end)` of the 16-bit addresses that are the same in every bank. None when the
+    /// layout leaves them open.
     #[serde(default)]
-    trampoline: Vec<Trampoline>,
+    pub(crate) common: Vec<(u16, u32)>,
+    /// None when the layout leaves them open as well.
+    #[serde(default)]
+    pub(crate) trampoline: Vec<Trampoline>,
 }
 
 /// How code reaches a function in another bank: through bytes that name the function and go on
 /// to a stub, which switches to the function's bank. They say which bank with `bb`. Without
 /// it there is one stub per bank, and in address order they select bank 0, bank 1 and so on.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
-struct Trampoline {
+pub(crate) struct Trampoline {
     /// An entry in the common code, which other code jumps to or calls in place of the function.
     entry: Option<Pattern>,
     /// A call in any code: the instructions that name the function, then the one whose
@@ -114,9 +140,31 @@ enum Unit {
 
 /// A run of bytes with places in it that vary, written as hex bytes and the placeholders `..`,
 /// `hh`, `ll`, `ss` and `bb`.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(try_from = "String")]
 struct Pattern(Vec<Unit>);
+
+impl fmt::Display for Pattern {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let word = |unit: &Unit| match unit {
+            Unit::Byte(byte) => format!("{byte:02x}"),
+            Unit::Any => "..".into(),
+            Unit::TargetHigh => "hh".into(),
+            Unit::TargetLow => "ll".into(),
+            Unit::Stub => "ss".into(),
+            Unit::Bank => "bb".into(),
+        };
+        f.write_str(&self.0.iter().map(word).collect::<Vec<_>>().join(" "))
+    }
+}
+
+/// The trampoline as a layout writes it.
+impl fmt::Display for Trampoline {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let patterns = [("entry", self.entry.as_ref()), ("call", self.call.as_ref()), ("stub", Some(&self.stub))];
+        patterns.into_iter().filter_map(|(key, pattern)| Some((key, pattern?))).try_for_each(|(key, pattern)| writeln!(f, "{key} = \"{pattern}\""))
+    }
+}
 
 impl TryFrom<String> for Pattern {
     type Error = anyhow::Error;
@@ -167,7 +215,7 @@ impl Pattern {
 
 impl BankingLayout {
     /// Finds the trampolines in the common code of `sections`, which are sorted by address.
-    fn resolve(&self, sections: &[Section]) -> Result<Banking> {
+    pub(crate) fn resolve(&self, sections: &[Section]) -> Result<Banking> {
         let mut banking = Banking { common: self.common.iter().map(|&(start, end)| (u64::from(start), u64::from(end))).collect(), ..Banking::default() };
         banking.common.sort_unstable();
         // Every place a pattern can match: each common address with the bytes from there on.
@@ -211,63 +259,74 @@ pub fn is_layout(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension == "toml")
 }
 
+impl Layout {
+    pub(crate) fn read(path: &Path) -> Result<Layout> {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {path:?}"))?;
+        toml::from_str(&text).with_context(|| format!("reading the layout {path:?}"))
+    }
+
+    /// The bytes of each region, read from the files beside the layout at `path`.
+    pub(crate) fn bytes(&self, path: &Path) -> Result<Vec<Vec<u8>>> {
+        let mut files: FxHashMap<&Path, Vec<u8>> = FxHashMap::default();
+        let mut bytes = Vec::new();
+        for region in &self.region {
+            if !files.contains_key(region.file.as_path()) {
+                let file = path.with_file_name(&region.file);
+                files.insert(&region.file, std::fs::read(&file).with_context(|| format!("reading {file:?}"))?);
+            }
+            let data = usize::try_from(region.offset)
+                .ok()
+                .zip(usize::try_from(region.length).ok())
+                .and_then(|(offset, length)| files[region.file.as_path()].get(offset..offset.checked_add(length)?))
+                .with_context(|| format!("{:?} has no {:#x} bytes at {:#x}", region.file, region.length, region.offset))?;
+            bytes.push(data.to_vec());
+        }
+        Ok(bytes)
+    }
+
+    /// The image `sections` make, called `name`, with the trampolines `banking` describes.
+    pub(crate) fn image(&self, name: String, mut sections: Vec<Section>, banking: Option<&BankingLayout>) -> Result<Image> {
+        let (&entry, vectors) = self.entry.split_first().context("the layout names no entry point")?;
+        sections.sort_by_key(|section| section.addr);
+        for pair in sections.windows(2) {
+            ensure!(pair[0].end() <= pair[1].addr, "the regions `{}` and `{}` overlap", pair[0].name, pair[1].name);
+        }
+
+        let banking = banking.map(|banking| banking.resolve(&sections)).transpose()?.unwrap_or_default();
+        // A trampoline exists for each function that another bank calls.
+        let mut exports = vectors.to_vec();
+        exports.extend(banking.trampolines.values().chain(banking.calls.values()));
+        exports.sort_unstable();
+        exports.dedup();
+
+        Ok(Image {
+            name,
+            format: Format::Raw,
+            machine: self.machine,
+            base: 0,
+            branch_targets_marked: false,
+            entry,
+            sections,
+            zero_filled: if self.machine == Machine::I8051 { crate::i8051::memory() } else { Vec::new() },
+            import_slots: FxHashMap::default(),
+            exports,
+            symbol_names: FxHashMap::default(),
+            frames: Vec::new(),
+            relative_targets: Vec::new(),
+            // An 8051 reads its constants and its switch tables from the code space.
+            data_in_code: self.machine == Machine::I8051,
+            banking,
+        })
+    }
+}
+
 /// Loads the image the layout at `path` describes.
 pub fn load(path: &Path) -> Result<Image> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {path:?}"))?;
-    let layout: Layout = toml::from_str(&text).with_context(|| format!("reading the layout {path:?}"))?;
-    let (&entry, vectors) = layout.entry.split_first().context("the layout names no entry point")?;
-
-    let mut files: FxHashMap<&Path, Vec<u8>> = FxHashMap::default();
-    let mut sections = Vec::new();
-    for region in &layout.region {
-        if !files.contains_key(region.file.as_path()) {
-            let file = path.with_file_name(&region.file);
-            files.insert(&region.file, std::fs::read(&file).with_context(|| format!("reading {file:?}"))?);
-        }
-        let data = usize::try_from(region.offset)
-            .ok()
-            .zip(usize::try_from(region.length).ok())
-            .and_then(|(offset, length)| files[region.file.as_path()].get(offset..offset.checked_add(length)?))
-            .with_context(|| format!("{:?} has no {:#x} bytes at {:#x}", region.file, region.length, region.offset))?;
-        sections.push(Section {
-            name: region.name.clone().unwrap_or_else(|| format!("{}+{:#x}", region.file.display(), region.offset)),
-            addr: region.address,
-            data: data.to_vec(),
-            file_offset: Some(region.offset),
-            executable: region.executable,
-            writable: region.writable,
-        });
-    }
-    sections.sort_by_key(|section| section.addr);
-    for pair in sections.windows(2) {
-        ensure!(pair[0].end() <= pair[1].addr, "the regions `{}` and `{}` overlap", pair[0].name, pair[1].name);
-    }
-
-    let banking = layout.banking.map(|banking| banking.resolve(&sections)).transpose()?.unwrap_or_default();
-    // A trampoline exists for each function that another bank calls.
-    let mut exports = vectors.to_vec();
-    exports.extend(banking.trampolines.values().chain(banking.calls.values()));
-    exports.sort_unstable();
-    exports.dedup();
-
-    Ok(Image {
-        name: path.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
-        format: Format::Raw,
-        machine: layout.machine,
-        base: 0,
-        branch_targets_marked: false,
-        entry,
-        sections,
-        zero_filled: if layout.machine == Machine::I8051 { crate::i8051::memory() } else { Vec::new() },
-        import_slots: FxHashMap::default(),
-        exports,
-        symbol_names: FxHashMap::default(),
-        frames: Vec::new(),
-        relative_targets: Vec::new(),
-        // An 8051 reads its constants and its switch tables from the code space.
-        data_in_code: layout.machine == Machine::I8051,
-        banking,
-    })
+    let layout = Layout::read(path)?;
+    let open = layout.region.iter().any(|region| region.bank.is_some()) || layout.banking.as_ref().is_some_and(|banking| banking.common.is_empty());
+    ensure!(!open, "the layout {path:?} leaves banks or the common ranges open: `recore sweep` finds them and writes a layout that says");
+    let sections = layout.region.iter().zip(layout.bytes(path)?).map(|(region, data)| region.section(0, region.address, &data)).collect();
+    layout.image(path.file_stem().unwrap_or_default().to_string_lossy().into_owned(), sections, layout.banking.as_ref())
 }
 
 #[cfg(test)]
