@@ -344,6 +344,8 @@ struct RdSession {
   map<uint64_t, vector<pair<string, string>>> local_names;
   // Where and as what each function decompiled so far returns its value, if it returns one.
   map<uint64_t, ParameterPieces> outputs;
+  // Functions whose result rd_returns_like settled, until they are next decompiled.
+  set<uint64_t> returns_like;
 
   // Backing storage for the last RdDecompiled, listing and type layout.
   string c_text, return_type, flow, locals, text;
@@ -1234,6 +1236,8 @@ int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int 
     } else {
       auto found = session->outputs.find(callee);
       if (found == session->outputs.end()) return;
+      // A call fixup stands in for the callee, and what the function returns shows in that.
+      if (session->function(callee)->getFuncProto().getInjectId() >= 0) return;
       piece = found->second;
     }
     Funcdata *fd = session->function(function);
@@ -1243,6 +1247,7 @@ int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int 
     fd->getFuncProto().setOutputLock(true);
     // Locking the output locks the calling convention with it, which is still to be recovered.
     fd->getFuncProto().setModelLock(model_locked);
+    session->returns_like.insert(function);
     returns = true;
   });
   return ok && returns;
@@ -1679,6 +1684,13 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       fd->getFuncProto().setDotdotdot(session->kept_are_lower_bounds);
       session->kept.insert(addr);
     }
+  }
+  if (fd != nullptr && session->returns_like.erase(addr) != 0 && !session->keep_prototypes) {
+    // A prototype is kept whole or not at all. The engine does not look for an argument of a
+    // call in the place the call is known to return in, and where a convention returns in the
+    // register of its first argument, a result kept without the parameters costs every call
+    // that argument.
+    fd->getFuncProto().setOutputLock(false);
   }
   session->image->current = ~(uint64_t)0;
   // Drop the p-code, varnodes and inferred (unlocked) prototype: they are large, and a failed

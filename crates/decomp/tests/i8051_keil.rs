@@ -42,3 +42,50 @@ fn a_pointer_argument_read_byte_by_byte_is_one_parameter() {
     assert_eq!(parameters, [3], "{}", decompiled.c_text);
     assert!(!decompiled.c_text.contains("in_R1"), "{}", decompiled.c_text);
 }
+
+#[test]
+fn a_call_after_a_library_operation_on_four_bytes_keeps_its_argument() {
+    #[rustfmt::skip]
+    let code = [
+        0x12, 0x00, 0x10,       // 00  LCALL the routine that divides R4 to R7 by R0 to R3
+        0x7e, 0x00, 0x7f, 0x02, // 03  MOV R6,#0; MOV R7,#2
+        0x12, 0x00, 0x11,       // 07  LCALL a function
+        0x22,                   // 0a  RET
+        0, 0, 0, 0, 0,
+        0x22,                   // 10  the routine
+        0x22,                   // 11  the function
+    ];
+    let mut session = Session::new(&vendored_spec_dir().unwrap(), Target::I8051, &[Section { addr: 0, data: &code, readonly: true, code: true }]).unwrap();
+    let facts = Facts {
+        functions: vec![(0, false), (0x10, false), (0x11, false)],
+        names: vec![(0x10, "?C?ULDIV".into())],
+        call_fixups: vec![(0x10, "?C?ULDIV".into())],
+        ..Facts::default()
+    };
+    session.add_functions(&facts).unwrap();
+    let c = session.decompile(0).unwrap().c_text;
+    // Whatever else the registers hold, the first argument is the one the code loads.
+    assert!(c.contains("func_0x000011(2"), "{c}");
+}
+
+#[test]
+fn a_call_to_a_function_that_returns_what_it_jumps_to_keeps_its_argument() {
+    #[rustfmt::skip]
+    let code = [
+        0x7f, 0x05,             // 00  MOV R7,#5
+        0x12, 0x00, 0x10,       // 02  LCALL the function that jumps
+        0x22,                   // 05  RET
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0x02, 0x00, 0x20,       // 10  LJMP the function that returns a value
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0xef, 0x04, 0xff, 0x22, // 20  MOV A,R7; INC A; MOV R7,A; RET
+    ];
+    let mut session = Session::new(&vendored_spec_dir().unwrap(), Target::I8051, &[Section { addr: 0, data: &code, readonly: true, code: true }]).unwrap();
+    let facts = Facts { functions: vec![(0, false), (0x10, false), (0x20, false)], tail_calls: vec![(0x10, 0x10)], ..Facts::default() };
+    session.add_functions(&facts).unwrap();
+    assert!(session.decompile(0x20).unwrap().returns_value);
+    assert!(session.returns_like(0x10, recore::report::CallTarget::Function(0x20)));
+    assert!(session.decompile(0x10).unwrap().returns_value);
+    let c = session.decompile(0).unwrap().c_text;
+    assert!(c.contains("func_0x000010(5)"), "{c}");
+}
