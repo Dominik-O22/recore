@@ -329,9 +329,11 @@ static bool constant_address(const Varnode *vn, uint64_t &addr, int depth = 0) {
   }
 }
 
-// What a printf format takes after it: for each argument, whether it is a floating-point
-// number. Empty for text that is no format, and for one whose conversions cannot be read.
-static vector<bool> format_arguments(const string &format) {
+// What a format takes after it: for each argument, whether it is a floating-point number.
+// Empty for text that is no format, and for one whose conversions cannot be read. A printf
+// format takes an argument for each `*`, where a scanf format, which `scans` says it is,
+// reads and stores nothing for a conversion marked with one.
+static vector<bool> format_arguments(const string &format, bool scans) {
   vector<bool> floats;
   for (size_t i = 0; i < format.size(); ++i) {
     if (format[i] != '%') continue;
@@ -341,15 +343,27 @@ static vector<bool> format_arguments(const string &format) {
       continue;
     }
     size_t stars = 0;
-    while (j < format.size() && strchr("-+ #0", format[j]) != nullptr) ++j;
+    while (j < format.size() && strchr("-+ #0'", format[j]) != nullptr) ++j;
     for (; j < format.size() && (isdigit((unsigned char)format[j]) || format[j] == '*' || format[j] == '.'); ++j)
       stars += format[j] == '*';
     // Length: hh h l ll z j t L, and Microsoft's I, I32, I64 and w.
     if (format.compare(j, 3, "I64") == 0 || format.compare(j, 3, "I32") == 0) j += 3;
     while (j < format.size() && strchr("hlzjtLIwq", format[j]) != nullptr) ++j;
-    if (j >= format.size() || strchr("diouxXeEfFgGaAcCsSpn", format[j]) == nullptr) return {};
-    floats.insert(floats.end(), stars, false);
-    floats.push_back(strchr("eEfFgGaA", format[j]) != nullptr);
+    if (j >= format.size()) return {};
+    if (scans && format[j] == '[') {
+      // A set of characters, which may open with the bracket that would close it.
+      j = format.find(']', j + 2);
+      if (j == string::npos) return {};
+    } else if (strchr("diouxXeEfFgGaAcCsSpn", format[j]) == nullptr) {
+      return {};
+    }
+    if (scans) {
+      // Every argument of a scan is a pointer, whatever it points to.
+      if (stars == 0) floats.push_back(false);
+    } else {
+      floats.insert(floats.end(), stars, false);
+      floats.push_back(strchr("eEfFgGaA", format[j]) != nullptr);
+    }
     i = j;
   }
   return floats;
@@ -386,7 +400,7 @@ static bool follow_formats(RdSession *session, Funcdata *fd) {
       }
       const uint1 *end = (const uint1 *)memchr(bytes, 0, sizeof(bytes));
       if (end == nullptr) continue;
-      vector<bool> floats = format_arguments(string((const char *)bytes, end - bytes));
+      vector<bool> floats = format_arguments(string((const char *)bytes, end - bytes), call->getName().find("scanf") != string::npos);
       if (floats.empty()) continue;
       // The first argument that is a format settles it, whatever the later ones are. A
       // floating-point argument travels in a register of its own, and a call of unknown
