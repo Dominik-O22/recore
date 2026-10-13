@@ -10,6 +10,7 @@ pub mod cfg;
 pub mod diff;
 pub mod discover;
 pub mod edits;
+pub mod hardware;
 pub mod i8051;
 pub mod image;
 pub mod itanium;
@@ -24,8 +25,10 @@ pub mod phase;
 pub mod program;
 pub mod report;
 pub mod rtti;
+pub mod score;
 pub mod signature;
 pub mod strings;
+pub mod sweep;
 pub mod swift;
 pub mod x86;
 
