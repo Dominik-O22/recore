@@ -101,6 +101,13 @@ impl Insn {
         (self.word & 0xFFC0_0000 == 0xF940_0000).then(|| u64::from(self.word >> 10 & 0xFFF) * 8)
     }
 
+    /// 64-bit `ldr xt, [xn], #imm` or `ldr xt, [xn, #imm]!`, which load and move the base, as a
+    /// loop over a table of pointers does: whether the base moves before the load, and by how
+    /// much.
+    fn load_moving_base(self) -> Option<(bool, u64)> {
+        (self.word & 0xFFE0_0400 == 0xF840_0400).then(|| (self.word >> 11 & 1 == 1, sign_extend(self.word >> 12 & 0x1FF, 9) as u64))
+    }
+
     /// A load or store of any width at `[xn, #imm]`, the form that reads and writes globals:
     /// the byte offset.
     fn access_offset(self) -> Option<u64> {
@@ -261,6 +268,18 @@ impl State {
         }
         if insn.moves_stack_pointer() {
             self.spills = Default::default();
+        }
+        if let Some((before, by)) = insn.load_moving_base() {
+            let (loaded, moved) = match self.registers[insn.rn()] {
+                Value::Addr(base) if insn.rn() != 31 => {
+                    let moved = base.wrapping_add(by);
+                    (Value::Slot(if before { moved } else { base }), Value::Addr(moved))
+                }
+                _ => (Value::Unknown, Value::Unknown),
+            };
+            self.set(insn.rn(), moved);
+            self.set(insn.rd(), loaded);
+            return;
         }
         let value = if let Some((is_page, address)) = insn.pc_relative() {
             if is_page { Value::Page(address) } else { Value::Addr(address) }

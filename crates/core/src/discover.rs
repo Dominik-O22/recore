@@ -443,6 +443,15 @@ impl<A: Arch> Explorer<'_, A> {
                     A::step(&mut state, &insn);
                     continue;
                 };
+                // A call or jump through a variable reads it, as an instruction that loads it
+                // does. An import's slot is reported with the call instead.
+                if let Flow::CallIndirect(Some(slot)) | Flow::JumpIndirect(Some(slot)) = flow
+                    && !speculative
+                    && self.is_data(slot)
+                    && !self.image.import_slots.contains_key(&slot)
+                {
+                    self.note_access(decoded.addr, slot);
+                }
                 let ends_flow = match flow {
                     Flow::Call(target) => {
                         if !speculative {
@@ -548,6 +557,11 @@ impl<A: Arch> Explorer<'_, A> {
         self.unresolved.remove(&jump);
         // Tables sit back to back, so each table's address ends the one before it.
         self.data_refs.push(table.address);
+        if !speculative {
+            // The jump reads its table, wherever the compiler put it: MSVC keeps tables among
+            // the code.
+            self.data_ref_sites.push((jump, table.address, true));
+        }
         self.tables.push((jump, table));
     }
 

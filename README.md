@@ -64,7 +64,7 @@ Scored against debug information, on the same binaries as Ghidra.
 | | Ghidra | 99.9% | 96.8% | 487 of 535 |
 | Windows x86 | recore | 99.3% | 98.8% | 6,244 of 6,277 |
 | | Ghidra | 83.1% | 98.5% | 5,834 of 6,277 |
-| Windows x86-64 | recore | 99.8% | 98.2% | 3,137 of 3,159 |
+| Windows x86-64 | recore | 99.8% | 98.2% | 3,151 of 3,159 |
 | | Ghidra | 91.0% | 97.9% | 2,972 of 3,159 |
 
 Ghidra's Linux run covers 110 of that corpus's 184 binaries, so those two rows are not over the same set.
@@ -80,7 +80,7 @@ Decompiled function signatures against PDB records, 8 binaries per corpus:
 
 Each tool's percentages are over the functions it decompiled, and recore decompiles more of them. On the 8,523 32-bit functions both decompiled, recore gets the parameters of 86.5% right and Ghidra 86.1%.
 
-References from code to data have no ground truth, so they are scored against Ghidra's own, on 11 binaries: recore finds 96.3% of them on Linux x86-64, 88.2% on Windows x86, 93.2% on Windows x86-64 and 85.1% on Linux AArch64.
+References from code to data have no ground truth, so they are scored against Ghidra's own, on 11 binaries: recore finds 96.6% of them on Linux x86-64, 91.8% on Windows x86, 96.0% on Windows x86-64 and 85.2% on Linux AArch64. Most of the rest are a later element or field of an object recore refers to the start of, which Ghidra reaches by following a loop or a constant index.
 
 There is no Ghidra run for function recovery on the Linux AArch64 and Mach-O corpora. With unwind tables hidden, recore finds 99.2% of functions on Linux AArch64. With the linker's list of function starts hidden, it finds 99.8% on AArch64 Mach-O and 99.2% on x86-64 Mach-O. It finds every C++ class that has type information in the Linux and macOS corpora, 13,952 of them, at the right vtable address.
 

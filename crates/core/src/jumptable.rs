@@ -238,13 +238,16 @@ impl State {
     /// The base and address of a `[base + index + offset]` operand whose base register holds a
     /// known address: how MSVC reaches its jump tables and the byte tables that index them.
     pub fn based_address(&self, instr: &Instruction) -> Option<(u64, u64)> {
-        let has_memory = instr.op_kinds().any(|kind| kind == OpKind::Memory);
-        match self.get(instr.memory_base()) {
-            Value::Base(base) if has_memory && instr.memory_displacement64() != 0 => {
-                Some((base, base.wrapping_add(instr.memory_displacement64())))
-            }
-            _ => None,
+        if !instr.op_kinds().any(|kind| kind == OpKind::Memory) || instr.memory_displacement64() == 0 {
+            return None;
         }
+        // Unscaled, the two registers of the operand are interchangeable, and the compiler
+        // puts the base in either place.
+        let unscaled = (instr.memory_index_scale() == 1).then(|| instr.memory_index());
+        std::iter::once(instr.memory_base()).chain(unscaled).find_map(|register| match self.get(register) {
+            Value::Base(base) => Some((base, base.wrapping_add(instr.memory_displacement64()))),
+            _ => None,
+        })
     }
 
     /// The largest value an index register can hold, when a bounds check established one.
