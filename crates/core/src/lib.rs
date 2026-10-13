@@ -24,6 +24,7 @@ pub mod phase;
 pub mod program;
 pub mod report;
 pub mod rtti;
+pub mod score;
 pub mod signature;
 pub mod strings;
 pub mod swift;

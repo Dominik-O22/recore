@@ -21,6 +21,9 @@ enum Command {
     Analyze { binary: PathBuf },
     /// Prints what the binary is and how much was recovered.
     Summary { binary: PathBuf },
+    /// Scores the layout of a raw image by where its jumps and calls between regions land,
+    /// which takes no knowledge of the right answer.
+    Score { layout: PathBuf },
     /// Analyzes every file in a directory, writing `<out>/<name>.json`.
     Corpus {
         bin_dir: PathBuf,
@@ -57,6 +60,7 @@ fn main() -> Result<()> {
             }
             println!("analyzed in {:.0} ms", start.elapsed().as_secs_f64() * 1000.0);
         }
+        Command::Score { layout } => print!("{}", recore::score::score(&recore::Image::load(&layout)?)),
         Command::Analyze { binary } => {
             let image = recore::Image::load(&binary)?;
             println!("{}", serde_json::to_string(&recore::analyze(&image))?);
