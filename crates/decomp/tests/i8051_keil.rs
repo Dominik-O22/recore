@@ -27,6 +27,33 @@ fn a_switch_through_a_list_of_cases_after_a_call_has_each_case_by_its_value() {
     assert_eq!(after("default:"), "return 0x33;");
 }
 
+/// A session for `code` as C51 compiled it, loaded at address 0 with the function at 0 as
+/// the entry, told everything the analysis of it says.
+fn analysed(code: &[u8]) -> Session {
+    let image = recore::Image {
+        name: String::new(),
+        format: recore::image::Format::Raw,
+        machine: recore::image::Machine::I8051,
+        base: 0,
+        branch_targets_marked: false,
+        entry: 0,
+        sections: vec![recore::image::Section { name: String::new(), addr: 0, data: code.to_vec(), file_offset: None, executable: true, writable: false }],
+        zero_filled: recore::i8051::memory(),
+        import_slots: Default::default(),
+        exports: Vec::new(),
+        symbol_names: Default::default(),
+        frames: Vec::new(),
+        relative_targets: Vec::new(),
+        data_in_code: true,
+        banking: Default::default(),
+        compiler: None,
+    };
+    let analysis = recore::analyze(&image);
+    let mut session = Session::from_image(&image, &analysis).unwrap();
+    session.add_functions(&Facts::derive(&image, &analysis)).unwrap();
+    session
+}
+
 #[test]
 fn a_pointer_argument_read_byte_by_byte_is_one_parameter() {
     #[rustfmt::skip]
@@ -36,11 +63,31 @@ fn a_pointer_argument_read_byte_by_byte_is_one_parameter() {
         0xea, 0xf0, 0xa3,                   // mov a, r2; movx @dptr, a; inc dptr
         0xe9, 0xf0, 0x22,                   // mov a, r1; movx @dptr, a; ret
     ];
-    let mut session = Session::new(&vendored_spec_dir().unwrap(), Target::I8051, &[Section { addr: 0, data: &code, readonly: true, code: true }]).unwrap();
-    let decompiled = session.decompile(0).unwrap();
+    let decompiled = analysed(&code).decompile(0).unwrap();
     let parameters: Vec<u32> = decompiled.params.iter().map(|param| param.size).collect();
     assert_eq!(parameters, [3], "{}", decompiled.c_text);
     assert!(!decompiled.c_text.contains("in_R1"), "{}", decompiled.c_text);
+}
+
+#[test]
+fn a_call_passes_what_the_function_hands_on_and_what_a_piece_of_shared_code_takes() {
+    #[rustfmt::skip]
+    let code = [
+        0x7f, 0x05,             // 00  MOV R7,#5
+        0x12, 0x00, 0x10,       // 02  LCALL the function that hands R7 on
+        0x22,                   // 05  RET
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0x90, 0x12, 0x34,       // 10  MOV DPTR,#0x1234
+        0x12, 0x00, 0x20,       // 13  LCALL the code that stores R7 where DPTR points
+        0x22,                   // 16  RET
+        0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0xef, 0xf0, 0x22,       // 20  MOV A,R7; MOVX @DPTR,A; RET
+    ];
+    let mut session = analysed(&code);
+    let outer = session.decompile(0).unwrap().c_text;
+    assert!(outer.contains("func_0x000010(5);"), "{outer}");
+    let middle = session.decompile(0x10).unwrap().c_text;
+    assert!(middle.contains("func_0x000020(param_1,0x1234);"), "{middle}");
 }
 
 #[test]

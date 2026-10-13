@@ -61,14 +61,8 @@
         <register name="ACC"/>
         <register name="B"/>
         <register name="DPTR"/>
-        <register name="R0"/>
-        <register name="R1"/>
-        <register name="R2"/>
-        <register name="R3"/>
-        <register name="R4"/>
-        <register name="R5"/>
-        <register name="R6"/>
-        <register name="R7"/>
+        <register name="R0R1R2R3"/>
+        <register name="R4R5R6R7"/>
       </killedbycall>
       <!-- recore: without a range the engine takes half the 8-bit stack space for locals, and
            then keeps every return address a call pushes as a store to one. -->
@@ -77,6 +71,50 @@
       </localrange>
     </prototype>
   </default_proto>
+  <!-- recore: the convention again, but saying nothing of what a call does to R0 to R7. A
+       function that is known to leave some of them alone is declared with this one and its
+       own list for them, which the engine would refuse beside the default's. The default
+       lists them four at a time, so that a call is known to change two or four read as one
+       value as well. -->
+    <prototype name="__registers" extrapop="-2" stackshift="-2" strategy="register">
+      <input>
+        <pentry minsize="1" maxsize="2">
+          <register name="R6R7"/>
+        </pentry>
+        <pentry minsize="1" maxsize="2">
+          <register name="R4R5"/>
+        </pentry>
+        <pentry minsize="1" maxsize="2">
+          <register name="R2R3"/>
+        </pentry>
+      </input>
+      <output>
+        <pentry minsize="1" maxsize="2">
+          <register name="R6R7"/>
+        </pentry>
+        <pentry minsize="3" maxsize="4">
+          <register name="R4R5R6R7"/>
+        </pentry>
+      </output>
+      <unaffected>
+        <register name="SP"/>
+        <register name="RS0"/>
+        <register name="RS1"/>
+        <register name="F0"/>
+        <register name="F1"/>
+      </unaffected>
+      <killedbycall>
+        <register name="CY"/>
+        <register name="AC"/>
+        <register name="OV"/>
+        <register name="ACC"/>
+        <register name="B"/>
+        <register name="DPTR"/>
+      </killedbycall>
+      <localrange>
+        <range space="stack" first="0x0" last="0x3f"/>
+      </localrange>
+    </prototype>
 
   <!-- recore: no funcptr element. Upstream has an alignment of 2, by which the engine clears
        the lowest bit of an address that code jumps or calls through. 8051 code starts at

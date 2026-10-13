@@ -53,9 +53,14 @@ pub struct Facts {
     /// `(call, bytes)`: a call followed by that much data, which the routine it calls reads
     /// before it returns to the code after the data.
     pub data_after_calls: Vec<(u64, u64)>,
-    /// `(function, storage)`: a library routine and where it takes its arguments and leaves
-    /// its result, as [`crate::library::Routine::storage`] has it.
-    pub storage: Vec<(u64, &'static str)>,
+    /// `(function, registers)`: a function and the registers, separated by commas, that it
+    /// and what it calls leave as they were, though the calling convention lets a call change
+    /// them.
+    pub kept_registers: Vec<(u64, String)>,
+    /// `(function, storage)`: where a function takes its arguments and leaves its result, as
+    /// [`crate::Session::set_storage`] takes it: a library routine as its list has it, and a
+    /// function of C51 code as its use of the registers says.
+    pub storage: Vec<(u64, String)>,
 }
 
 /// A call to a library routine that jumps on to one of several places and does not return.
@@ -118,13 +123,32 @@ impl Facts {
             let named: std::collections::HashSet<u64> = facts.names.iter().map(|name| name.0).collect();
             for (function, routine) in crate::library::recognise(image, analysis, &library).into_iter().filter(|(function, _)| !named.contains(function)) {
                 facts.names.push((function, routine.name.to_string()));
-                facts.storage.extend(routine.storage.map(|storage| (function, storage)));
+                facts.storage.extend(routine.storage.map(|storage| (function, storage.to_string())));
             }
         }
         let fixups: HashMap<String, String> = Target::of(image).map(Target::call_fixups).unwrap_or_default().into_iter().collect();
         // 32-bit C names carry one more leading underscore in some symbol sources than others.
         let fixup_of = |name: &str| fixups.get(name).or_else(|| fixups.get(&format!("_{name}"))).cloned();
         facts.call_fixups = facts.names.iter().filter_map(|(function, name)| Some((*function, fixup_of(name)?))).collect();
+        if image.machine == Machine::I8051 {
+            // What the instructions say of each function's registers stands in for a calling
+            // convention, which much of an 8051 program is not held to.
+            let declared: std::collections::HashSet<u64> = facts.functions.iter().map(|function| function.0).collect();
+            let described: std::collections::HashSet<u64> = facts.storage.iter().map(|storage| storage.0).chain(facts.call_fixups.iter().map(|fixup| fixup.0)).collect();
+            let c51 = Target::of(image).is_ok_and(|target| target == Target::I8051);
+            let mut uses: Vec<_> = recore::i8051::registers::uses(image, analysis).into_iter().filter(|(function, _)| declared.contains(function)).collect();
+            uses.sort_unstable_by_key(|&(function, _)| function);
+            for (function, registers) in uses {
+                // The engine takes `DPTR` whole or not at all.
+                let kept: Vec<&str> = registers.changed.others().names().filter(|name| !matches!(*name, "DPL" | "DPH")).collect();
+                if !kept.is_empty() {
+                    facts.kept_registers.push((function, kept.join(",")));
+                }
+                if c51 && !described.contains(&function) {
+                    facts.storage.push((function, c51_storage(registers)));
+                }
+            }
+        }
         let mut entries: Vec<u64> = facts.functions.iter().map(|f| f.0).collect();
         entries.sort_unstable();
         let x86 = matches!(image.machine, Machine::X86 | Machine::X86_64);
@@ -215,6 +239,55 @@ impl Facts {
         facts.names.extend(stub_names);
         facts
     }
+}
+
+/// Where a function of C51 code takes its arguments and leaves its result, as
+/// [`crate::Session::set_storage`] takes it. C51 passes the first three arguments in `R7`,
+/// `R5` and `R3`, each with the register below it for a second byte, and a pointer that says
+/// what memory it points into in `R3`, `R2` and `R1`; it returns in `R7`, in `R6` and `R7`,
+/// in `R4` to `R7`, or a pointer in `R3`, `R2` and `R1`. A library routine or a piece of code
+/// the linker shares takes or returns a value in `A`, `DPTR`, `B`, `R0` or the carry flag.
+fn c51_storage(registers: recore::i8051::registers::Use) -> String {
+    let taken = registers.taken;
+    let mut arguments: Vec<&str> = Vec::new();
+    for (pair, high, low) in [("R6R7", "R6", "R7"), ("R4R5", "R4", "R5")] {
+        arguments.extend(match (taken.has(high), taken.has(low)) {
+            (true, true) => Some(pair),
+            (false, true) => Some(low),
+            (true, false) => Some(high),
+            (false, false) => None,
+        });
+    }
+    match (taken.has("R3"), taken.has("R2"), taken.has("R1")) {
+        (true, true, true) => arguments.push("R3:R2:R1"),
+        (third, second, first) => {
+            arguments.extend(match (second, third) {
+                (true, true) => Some("R2R3"),
+                (false, true) => Some("R3"),
+                (true, false) => Some("R2"),
+                (false, false) => None,
+            });
+            arguments.extend(first.then_some("R1"));
+        }
+    }
+    arguments.extend(["ACC", "B", "DPTR", "DPL", "DPH", "R0", "CY"].into_iter().filter(|name| taken.has(name)));
+    let result = match registers.given {
+        // Nothing is known to call it, so nothing says what a caller reads of it.
+        None => "?",
+        Some(given) => {
+            let all = |names: &[&str]| names.iter().all(|name| given.has(name));
+            if all(&["R3", "R2", "R1"]) {
+                "R3:R2:R1"
+            } else if all(&["R4", "R5", "R6", "R7"]) {
+                "R4R5R6R7"
+            } else if all(&["R6", "R7"]) {
+                "R6R7"
+            } else {
+                ["R7", "ACC", "DPTR", "CY", "B", "R6", "R5", "R4", "R3", "R2", "R1", "R0", "DPL", "DPH"].into_iter().find(|name| given.has(name)).unwrap_or("void")
+            }
+        }
+    };
+    format!("{result}({})", arguments.join(","))
 }
 
 /// A piece of the image as the program sees it once the loader is done.

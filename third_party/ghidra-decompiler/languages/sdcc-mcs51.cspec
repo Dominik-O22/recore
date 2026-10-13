@@ -67,20 +67,64 @@
         <register name="ACC"/>
         <register name="B"/>
         <register name="DPTR"/>
-        <register name="R0"/>
-        <register name="R1"/>
-        <register name="R2"/>
-        <register name="R3"/>
-        <register name="R4"/>
-        <register name="R5"/>
-        <register name="R6"/>
-        <register name="R7"/>
+        <register name="R0R1R2R3"/>
+        <register name="R4R5R6R7"/>
       </killedbycall>
       <localrange>
         <range space="stack" first="0x0" last="0x3f"/>
       </localrange>
     </prototype>
   </default_proto>
+  <!-- recore: the convention again, but saying nothing of what a call does to R0 to R7. A
+       function that is known to leave some of them alone is declared with this one and its
+       own list for them, which the engine would refuse beside the default's. The default
+       lists them four at a time, so that a call is known to change two or four read as one
+       value as well. -->
+    <prototype name="__registers" extrapop="-2" stackshift="-2" strategy="register">
+      <input>
+        <pentry minsize="1" maxsize="2">
+          <register name="DPTR"/>
+        </pentry>
+        <pentry minsize="3" maxsize="3">
+          <addr space="join" piece1="B" piece2="DPTR"/>
+        </pentry>
+        <pentry minsize="4" maxsize="4">
+          <addr space="join" piece1="ACC" piece2="B" piece3="DPTR"/>
+        </pentry>
+        <pentry minsize="1" maxsize="64" align="1">
+          <addr space="stack" offset="0xbf"/>
+        </pentry>
+      </input>
+      <output>
+        <pentry minsize="1" maxsize="2">
+          <register name="DPTR"/>
+        </pentry>
+        <pentry minsize="3" maxsize="3">
+          <addr space="join" piece1="B" piece2="DPTR"/>
+        </pentry>
+        <pentry minsize="4" maxsize="4">
+          <addr space="join" piece1="ACC" piece2="B" piece3="DPTR"/>
+        </pentry>
+      </output>
+      <unaffected>
+        <register name="SP"/>
+        <register name="RS0"/>
+        <register name="RS1"/>
+        <register name="F0"/>
+        <register name="F1"/>
+      </unaffected>
+      <killedbycall>
+        <register name="CY"/>
+        <register name="AC"/>
+        <register name="OV"/>
+        <register name="ACC"/>
+        <register name="B"/>
+        <register name="DPTR"/>
+      </killedbycall>
+      <localrange>
+        <range space="stack" first="0x0" last="0x3f"/>
+      </localrange>
+    </prototype>
 
   <!-- recore: no funcptr element, as in keil-cx51.cspec. -->
   <aggressivetrim signext="true"/>

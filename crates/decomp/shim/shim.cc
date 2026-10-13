@@ -346,6 +346,8 @@ struct RdSession {
   map<uint64_t, ParameterPieces> outputs;
   // Functions whose result rd_returns_like settled, until they are next decompiled.
   set<uint64_t> returns_like;
+  // The registers rd_keep_registers named for each function.
+  map<uint64_t, vector<VarnodeData>> kept_registers;
 
   // Backing storage for the last RdDecompiled, listing and type layout.
   string c_text, return_type, flow, locals, text;
@@ -944,6 +946,9 @@ int rd_register_at(RdSession *session, uint64_t addr, char *err, size_t errlen) 
     symbols->removeRange(symbols->getGlobalScope(), at.getSpace(), at.getOffset(), at.getOffset());
     VarnodeData byte = {at.getSpace(), at.getOffset(), 1};
     session->arch->defaultfp->addEffect(EffectRecord(byte, EffectRecord::unaffected));
+    // And in the convention that carries a function's own list of registers.
+    ProtoModel *carrier = session->arch->getModel("__registers");
+    if (carrier != nullptr) carrier->addEffect(EffectRecord(byte, EffectRecord::unaffected));
   });
 }
 
@@ -1176,6 +1181,77 @@ int rd_set_storage(RdSession *session, uint64_t addr, const char *storage, char 
     proto.setOutputLock(result != "?");
     proto.setModelLock(true);
   });
+}
+
+// Says that the function at `addr` leaves the registers named in `kept`, separated by commas,
+// as they were, whatever the calling convention says a call does to them: a value one of them
+// holds before a call to the function is the value it holds after. To be said before anything
+// else about the function's prototype, which this sets afresh: the engine takes what a single
+// function does to registers only as part of a stored prototype. R0 to R7 are listed in runs,
+// the ones left alone and the ones a call changes, so that two or four of them read as one
+// value have one answer where they are all alike.
+int rd_keep_registers(RdSession *session, uint64_t addr, const char *kept, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    const VarnodeData first = arch->translate->getRegister("R0");
+    vector<VarnodeData> unaffected;
+    bool bank[8] = {};
+    istringstream names(kept);
+    for (string name; getline(names, name, ',');) {
+      VarnodeData reg = arch->translate->getRegister(name);
+      if (reg.space == first.space && reg.offset - first.offset < 8 && reg.size == 1)
+        bank[reg.offset - first.offset] = true;
+      else
+        unaffected.push_back(reg);
+    }
+    vector<VarnodeData> killed;
+    for (int4 start = 0; start < 8;) {
+      int4 end = start + 1;
+      while (end < 8 && bank[end] == bank[start]) ++end;
+      (bank[start] ? unaffected : killed).push_back({first.space, first.offset + start, (uint4)(end - start)});
+      start = end;
+    }
+    auto list = [](ostream &xml, const char *tag, const vector<VarnodeData> &ranges) {
+      xml << "<" << tag << ">";
+      for (const VarnodeData &range : ranges)
+        xml << "<varnode space=\"" << range.space->getName() << "\" offset=\"0x" << hex << range.offset << "\" size=\"" << dec << range.size << "\"/>";
+      xml << "</" << tag << ">";
+    };
+    ostringstream xml;
+    xml << "<prototype model=\"__registers\"><returnsym><addr/><void/></returnsym>";
+    list(xml, "unaffected", unaffected);
+    list(xml, "killedbycall", killed);
+    xml << "</prototype>";
+    unique_ptr<Document> document;
+    {
+      lock_guard<mutex> guard(xml_lock);
+      istringstream text(xml.str());
+      document.reset(xml_tree(text));
+    }
+    XmlDecode decoder(arch, document->getRoot());
+    session->function(addr)->getFuncProto().decode(decoder, arch);
+    // The convention that carries the list is no part of the function's declaration.
+    arch->getModel("__registers")->setPrintInDecl(false);
+    session->kept_registers[addr] = unaffected;
+  });
+}
+
+// Says what a call to the function at `addr` does to the registers rd_keep_registers named for
+// it: leaves them as they were, or with `as_convention` what the calling convention says. The
+// second is for while the function itself is decompiled: a register it only reads is then one
+// it is passed a value in, and no register its caller keeps a value in across the call.
+static void set_kept_registers(RdSession *session, uint64_t addr, bool as_convention) {
+  auto kept = session->kept_registers.find(addr);
+  if (kept == session->kept_registers.end()) return;
+  const FuncProto &proto = session->function(addr)->getFuncProto();
+  for (auto effect = proto.effectBegin(); effect != proto.effectEnd(); ++effect) {
+    for (const VarnodeData &reg : kept->second) {
+      if (effect->getAddress() != reg.getAddr() || effect->getSize() != (int4)reg.size) continue;
+      uint4 type = as_convention ? (uint4)EffectRecord::killedbycall : (uint4)EffectRecord::unaffected;
+      // The engine has no call that changes one record of a prototype's list.
+      const_cast<EffectRecord &>(*effect) = EffectRecord(reg, type);
+    }
+  }
 }
 
 // Replaces every call to the function at `addr` with the p-code of the compiler spec's call
@@ -1575,6 +1651,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       fd->getFuncProto().setDotdotdot(false);
       arch->clearAnalysis(fd);
     }
+    set_kept_registers(session, addr, true);
     Action *root = arch->allacts.getCurrent();
     root->reset(*fd);
     session->image->current = addr;
@@ -1692,6 +1769,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     // that argument.
     fd->getFuncProto().setOutputLock(false);
   }
+  guarded(nullptr, 0, [&] { set_kept_registers(session, addr, false); });
   session->image->current = ~(uint64_t)0;
   // Drop the p-code, varnodes and inferred (unlocked) prototype: they are large, and a failed
   // run leaves them half built. Overrides and the function symbol itself are kept.
