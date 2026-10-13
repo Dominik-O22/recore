@@ -258,7 +258,7 @@ def write_layout(name, memory, cdb, banked):
     # Reset, then the vector of each interrupt that is handled: SDCC writes a jump there only
     # for a handler that the unit with `main` declares.
     entries = [0] + [vector for vector in (3 + 8 * number for number in interrupts(cdb)) if memory.get(vector) == 0x02]
-    layout = f'machine = "8051"\nentry = [{", ".join(f"{entry:#06x}" for entry in entries)}]\n'
+    layout = f'machine = "8051"\ncompiler = "sdcc"\nentry = [{", ".join(f"{entry:#06x}" for entry in entries)}]\n'
     for offset, length, address in regions:
         layout += (f'\n[[region]]\nfile = "../image/{name}.bin"\noffset = {offset:#x}\nlength = {length:#x}\n'
                    f"address = {address:#08x}\nexecutable = true\n")

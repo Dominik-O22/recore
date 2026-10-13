@@ -913,6 +913,18 @@ int rd_map_space(RdSession *session, uint64_t base, const char *name, char *err,
   });
 }
 
+// Says that the byte of memory at `addr` belongs to the function that runs, as a register does,
+// and is no global variable: what a function keeps there, a called function leaves there.
+int rd_register_at(RdSession *session, uint64_t addr, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Address at = session->address(addr);
+    Database *symbols = session->arch->symboltab;
+    symbols->removeRange(symbols->getGlobalScope(), at.getSpace(), at.getOffset(), at.getOffset());
+    VarnodeData byte = {at.getSpace(), at.getOffset(), 1};
+    session->arch->defaultfp->addEffect(EffectRecord(byte, EffectRecord::unaffected));
+  });
+}
+
 // Says that the `len` bytes of code at `addr` are those at `target`: reading them reads those,
 // and a jump or call into them goes to the code at `target`.
 void rd_mirror(RdSession *session, uint64_t addr, uint64_t len, uint64_t target) {

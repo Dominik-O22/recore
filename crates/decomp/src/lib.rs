@@ -27,7 +27,7 @@ use std::ptr::NonNull;
 
 use anyhow::{Context, Result, bail};
 use recore::Image;
-use recore::image::{Format, Machine};
+use recore::image::{Compiler, Format, Machine};
 use recore::report::Analysis;
 
 pub use facts::Facts;
@@ -65,6 +65,26 @@ pub enum Target {
     Aarch64,
     /// The 8051 as Keil's C51 compiles for it, banked or not: code at `bank << 16 | address`.
     I8051,
+    /// The 8051 as SDCC compiles for it.
+    I8051Sdcc,
+}
+
+/// Where SDCC keeps the frame pointer of an 8051 program whose functions have their arguments
+/// and variables on the stack: the byte of internal memory that functions save, load from
+/// `SP` and restore. SDCC has no register to spare for it.
+fn frame_pointer(image: &Image) -> Option<u8> {
+    // PUSH direct; MOV direct, SP
+    let saves = |code: &[u8]| match *code {
+        [0xc0, pushed, 0x85, 0x81, loaded] if pushed == loaded && pushed < 0x80 => Some(pushed),
+        _ => None,
+    };
+    let mut counts = [0usize; 0x80];
+    for section in image.sections.iter().filter(|section| section.executable) {
+        section.data.windows(5).filter_map(saves).for_each(|direct| counts[direct as usize] += 1);
+    }
+    // One function may keep some other byte so. The frame pointer is kept by more.
+    let (direct, &most) = counts.iter().enumerate().max_by_key(|&(_, count)| *count)?;
+    (most >= 2).then_some(direct as u8)
 }
 
 impl Target {
@@ -77,6 +97,7 @@ impl Target {
             // macOS follows the System V convention on x86-64.
             (Machine::X86_64, Format::Elf | Format::MachO | Format::Raw) => Target::X86_64Gcc,
             (Machine::Aarch64, _) => Target::Aarch64,
+            (Machine::I8051, _) if image.compiler == Some(Compiler::Sdcc) => Target::I8051Sdcc,
             (Machine::I8051, _) => Target::I8051,
         })
     }
@@ -90,6 +111,7 @@ impl Target {
             Target::X86_64Gcc => c"x86:LE:64:default:gcc",
             Target::Aarch64 => c"AARCH64:LE:64:v8A:default",
             Target::I8051 => c"8051:BE:24:cip-51:default",
+            Target::I8051Sdcc => c"8051:BE:24:cip-51:sdcc",
         }
     }
 
@@ -102,6 +124,7 @@ impl Target {
             Target::X86_64Gcc => "x86-64-gcc.cspec",
             Target::Aarch64 => "AARCH64.cspec",
             Target::I8051 => "keil-cx51.cspec",
+            Target::I8051Sdcc => "sdcc-mcs51.cspec",
         }
     }
 
@@ -138,7 +161,7 @@ impl Target {
     fn spaces(self) -> &'static [(u64, &'static CStr)] {
         use recore::i8051::{IDATA, SFR, XDATA};
         match self {
-            Target::I8051 => &[(XDATA, c"EXTMEM"), (IDATA, c"INTMEM"), (SFR, c"SFR")],
+            Target::I8051 | Target::I8051Sdcc => &[(XDATA, c"EXTMEM"), (IDATA, c"INTMEM"), (SFR, c"SFR")],
             _ => &[],
         }
     }
@@ -148,14 +171,14 @@ impl Target {
     /// function this way, and what recore makes of it is two functions. Elsewhere such code
     /// follows a call that never returns, and is none of the function's.
     fn functions_run_on(self) -> bool {
-        self == Target::I8051
+        matches!(self, Target::I8051 | Target::I8051Sdcc)
     }
 
     pub fn pointer_bytes(self) -> usize {
         match self {
             Target::X86Windows | Target::X86Gcc => 4,
             Target::X86_64Windows | Target::X86_64Gcc | Target::Aarch64 => 8,
-            Target::I8051 => 2,
+            Target::I8051 | Target::I8051Sdcc => 2,
         }
     }
 }
@@ -328,7 +351,8 @@ impl Session {
     pub fn load(image: &Image) -> Result<Session> {
         let loaded = facts::loaded(image);
         let sections: Vec<Section> = loaded.iter().map(|l| Section { addr: l.addr, data: &l.data, readonly: l.constant, code: l.code }).collect();
-        let mut session = Session::new(&vendored_spec_dir()?, Target::of(image)?, &sections)?;
+        let session_target = Target::of(image)?;
+        let mut session = Session::new(&vendored_spec_dir()?, session_target, &sections)?;
         // Banked code: every bank shows the code all banks share, which the image holds once,
         // as bank 0, and a trampoline entry stands for the function it reaches.
         let banking = &image.banking;
@@ -343,6 +367,11 @@ impl Session {
         for (&entry, &target) in &banking.trampolines {
             session.redirect(entry, target);
         }
+        // Through the frame pointer a function reaches what it was passed on the stack and
+        // what it keeps there, which the engine follows only if a call leaves the pointer be.
+        if let Some(direct) = frame_pointer(image).filter(|_| session_target == Target::I8051Sdcc) {
+            session.register_at(recore::i8051::IDATA + u64::from(direct))?;
+        }
         Ok(session)
     }
 
@@ -350,6 +379,12 @@ impl Session {
     /// those, and a jump or call into them goes to the code at `target`.
     pub fn mirror(&mut self, addr: u64, len: u64, target: u64) {
         unsafe { ffi::rd_mirror(self.raw.as_ptr(), addr, len, target) }
+    }
+
+    /// Says that the byte of memory at `addr` is the running function's own, as a register is,
+    /// and no global variable: what a function keeps there, a function it calls leaves there.
+    pub fn register_at(&mut self, addr: u64) -> Result<()> {
+        check(|err, len| unsafe { ffi::rd_register_at(self.raw.as_ptr(), addr, err, len) != 0 })
     }
 
     /// Says that a jump or call to `from` goes to `to`, because the code at `from` only passes

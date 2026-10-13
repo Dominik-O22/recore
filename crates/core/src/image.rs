@@ -49,6 +49,16 @@ pub enum Machine {
     I8051,
 }
 
+/// The compiler that built an image, where a layout file names it. It decides how functions
+/// pass arguments and return values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compiler {
+    /// Keil's C51.
+    Keil,
+    Sdcc,
+}
+
 impl Machine {
     /// Bytes in a pointer, which is how wide a code or data address stored in the image is.
     pub fn pointer_size(self) -> u64 {
@@ -142,6 +152,8 @@ pub struct Image {
     /// that control flow never reaches cannot be assumed to be instructions.
     pub data_in_code: bool,
     pub banking: Banking,
+    /// What a layout says built the image. Without it the machine and the format decide.
+    pub compiler: Option<Compiler>,
 }
 
 impl Image {
@@ -236,6 +248,7 @@ impl Image {
             relative_targets,
             data_in_code: is_pe,
             banking: Banking::default(),
+            compiler: None,
         })
     }
 

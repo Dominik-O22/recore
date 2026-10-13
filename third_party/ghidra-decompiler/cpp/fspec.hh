@@ -859,6 +859,12 @@ public:
 
   const RangeList &getLocalRange(void) const { return localrange; }	///< Get the range of (possible) local stack variables
   const RangeList &getParamRange(void) const { return paramrange; }	///< Get the range of (possible) stack parameters
+  /// recore: adds a side-effect to the ones the compiler spec lists, for memory that only
+  /// the program at hand says is kept across calls.
+  void addEffect(const EffectRecord &rec) {
+    effectlist.push_back(rec);
+    sort(effectlist.begin(),effectlist.end(),EffectRecord::compareByAddress);
+  }
   vector<EffectRecord>::const_iterator effectBegin(void) const { return effectlist.begin(); }	///< Get an iterator to the first EffectRecord
   vector<EffectRecord>::const_iterator effectEnd(void) const { return effectlist.end(); }	///< Get an iterator to the last EffectRecord
   vector<VarnodeData>::const_iterator trashBegin(void) const { return likelytrash.begin(); }	///< Get an iterator to the first \e likelytrash

@@ -38,6 +38,9 @@
 //! stub = "c0 b1 c8 c0 e0 e9 c0 e0 ea 54 0f 53 b1 f0 42 b1 c8 22"
 //! ```
 //!
+//! `compiler = "sdcc"` at the top says what built the code, where that decides how functions
+//! are called. An 8051 image without it is taken as built by Keil's C51.
+//!
 //! [`Image::load`] takes a layout wherever it takes an executable.
 
 use std::path::{Path, PathBuf};
@@ -46,7 +49,7 @@ use anyhow::{Context, Result, ensure};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
-use crate::image::{Banking, Format, Image, Machine, Section};
+use crate::image::{Banking, Compiler, Format, Image, Machine, Section};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +60,9 @@ struct Layout {
     entry: Vec<u64>,
     region: Vec<Region>,
     banking: Option<BankingLayout>,
+    /// What built the code, `"keil"` or `"sdcc"`, for a machine whose compilers disagree on
+    /// how a function is called.
+    compiler: Option<Compiler>,
 }
 
 #[derive(Deserialize)]
@@ -267,6 +273,7 @@ pub fn load(path: &Path) -> Result<Image> {
         // An 8051 reads its constants and its switch tables from the code space.
         data_in_code: layout.machine == Machine::I8051,
         banking,
+        compiler: layout.compiler,
     })
 }
 
