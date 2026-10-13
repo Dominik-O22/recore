@@ -235,14 +235,17 @@ struct Diff {
 /// the later build, which `in_new` gives, and any other address in the image only says it is one.
 fn comparable(c_text: &str, program: &Program, in_new: &dyn Fn(u64) -> Option<u64>) -> Vec<String> {
     let numbered = regex::Regex::new(r"\b(?:[a-z]{1,3}Var\d+|local_[0-9a-f]+|[a-z]+Stack_[0-9a-f]+|extraout_\w+|in_\w+|unaff_\w+)\b").expect("a valid expression");
-    let address = regex::Regex::new(r"(?:0x|_)(?:r0x)?([0-9a-f]{4,16})\b").expect("a valid expression");
+    let address = regex::Regex::new(r"(0x|_)(?:r0x)?([0-9a-f]{4,16})\b").expect("a valid expression");
+    // A bare number is an address only if the code refers to what is there: in an image
+    // loaded at zero, a line number or a size is inside some section too.
+    let referred_to = |addr: u64| program.refs_to(addr).next().is_some() || program.string_at(addr).is_some();
     let line_key = |line: &str| {
         // `iVar3` and `iVar5` are both an `iVar`: which number a variable got says nothing.
         let line = numbered.replace_all(line.trim(), |found: &regex::Captures| found[0].trim_end_matches(|c: char| c.is_ascii_hexdigit() || c == '_').to_string());
         address
-            .replace_all(&line, |found: &regex::Captures| match u64::from_str_radix(&found[1], 16) {
+            .replace_all(&line, |found: &regex::Captures| match u64::from_str_radix(&found[2], 16) {
                 Ok(addr) if program.function(addr).is_some() => in_new(addr).map_or_else(|| "<function>".to_string(), |entry| format!("<function {entry:#x}>")),
-                Ok(addr) if program.image.section_at(addr).is_some() || program.image.is_zero_filled(addr) => "<address>".to_string(),
+                Ok(addr) if (&found[1] == "_" || referred_to(addr)) && (program.image.section_at(addr).is_some() || program.image.is_zero_filled(addr)) => "<address>".to_string(),
                 _ => found[0].to_string(),
             })
             .into_owned()
