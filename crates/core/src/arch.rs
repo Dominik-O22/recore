@@ -44,6 +44,18 @@ impl<I> Decoded<I> {
     }
 }
 
+/// An address the code may be forming of text that lies among the code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TextPointer {
+    /// The instruction that completes the address.
+    pub from: u64,
+    pub to: u64,
+    /// The code also says that the address is one in the code space: it reads from there, or
+    /// passes the address on with the mark its compiler gives a pointer to code. An address
+    /// without that is two numbers that may mean anything.
+    pub marked: bool,
+}
+
 /// A jump table as read from the image.
 pub struct Table {
     pub address: u64,
@@ -86,6 +98,10 @@ pub trait Arch: 'static {
     /// nothing left over, for a machine whose code shows no other sign of where one starts:
     /// no alignment, no padding between functions, no common opening.
     const TILES_GAPS: bool = false;
+
+    /// Whether the program keeps its text among the code, as a machine does whose code space
+    /// is the only memory that holds anything when it starts.
+    const TEXT_IN_CODE: bool = false;
 
     /// Decodes consecutive instructions from `bytes`, which are loaded at `addr`.
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Self::Insn>>;
@@ -211,6 +227,13 @@ pub trait Arch: 'static {
     /// what it does there: how code uses a field of the structure the register points to.
     fn field_use(_insn: &Self::Insn) -> Option<(u64, FieldUse)> {
         None
+    }
+
+    /// The addresses the code in `[start, end)` may be forming of text that lies among the code.
+    /// Nothing but the text itself says that such an address is one, so each is only a
+    /// candidate until text is found there.
+    fn text_pointers(_image: &Image, _start: u64, _end: u64) -> Vec<TextPointer> {
+        Vec::new()
     }
 
     /// Whether the first real instruction of a block shows it is an exception landing pad.

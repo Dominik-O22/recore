@@ -8,7 +8,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use rayon::prelude::*;
 
-use crate::arch::{Arch, Flow};
+use crate::arch::{Arch, Flow, TextPointer};
 use crate::discover::{discover, is_function_section};
 use crate::image::{Format, Image, Machine};
 use crate::noreturn::is_noreturn_import;
@@ -711,6 +711,18 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     // by an address it computes.
     strings.extend(crate::strings::unreferenced(image, &strings));
     strings.sort_by_key(|string| string.addr);
+    // Text among the code, and the instructions that form its address.
+    let mut text_refs = Vec::new();
+    if A::TEXT_IN_CODE {
+        let pieces = functions.par_iter().chain(&chunks).flat_map_iter(|piece| code_pieces(piece.start, piece.end, inline_tables));
+        let pointers: Vec<TextPointer> = pieces.flat_map_iter(|(start, end)| A::text_pointers(image, start, end)).collect();
+        let (among_code, pointers) = crate::strings::among_code(image, &discovery.code, pointers);
+        text_refs = pointers;
+        strings.extend(among_code);
+        strings.sort_by_key(|string| string.addr);
+        strings.extend(crate::strings::unreferenced_among_code(image, &discovery.code, &strings));
+        strings.sort_by_key(|string| string.addr);
+    }
 
     // A function that is a single jump forwards to its target; an export name on such a thunk
     // is really the target's name.
@@ -804,6 +816,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     data_refs.extend(discovery.uncertain_refs.iter().copied().filter(|&(from, target, access)| {
         in_function(from) && (is_data(target) || (!access && extents.binary_search_by_key(&target, |&(start, _)| start).is_ok()))
     }));
+    data_refs.extend(text_refs.iter().map(|pointer| (pointer.from, pointer.to, false)));
     data_refs.sort_unstable();
     data_refs.dedup();
     Analysis {

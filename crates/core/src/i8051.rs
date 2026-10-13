@@ -9,7 +9,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::arch::{Arch, Decoded, Flow, Table};
+use crate::arch::{Arch, Decoded, Flow, Table, TextPointer};
 use crate::image::{Image, Machine};
 use crate::report::Analysis;
 
@@ -279,6 +279,7 @@ impl Arch for I8051 {
     const ALIGNMENT_IS_EVIDENCE: bool = false;
     const RUNS_ON: bool = true;
     const TILES_GAPS: bool = true;
+    const TEXT_IN_CODE: bool = true;
 
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> {
         let mut offset = 0;
@@ -348,6 +349,100 @@ impl Arch for I8051 {
             (0xE0 | 0xF0, Some(dptr)) => Some(XDATA + u64::from(dptr)),
             _ => insn.direct(),
         }
+    }
+
+    /// An address is sixteen bits and a register eight, so code forms an address in one of
+    /// two ways: `MOV DPTR, #address`, or two instructions with a half each, one soon after the
+    /// other. A pointer that may point to any memory takes a third byte to say which, and that
+    /// byte marks the address as one in the code space: 0xFF before the halves in code from
+    /// Keil's compiler, 0x80 after them in code from SDCC, which puts it in `B` when the
+    /// address is in `DPTR`. So does reading from the address with `MOVC`.
+    fn text_pointers(image: &Image, start: u64, end: u64) -> Vec<TextPointer> {
+        /// How many instructions may lie between two that load bytes of one pointer: those
+        /// that put the first byte where it goes, such as `PUSH ACC` or `MOVX @DPTR, A` and
+        /// `INC DPTR`.
+        const APART: usize = 3;
+        const MARKS: [u8; 2] = [0xFF, 0x80];
+        let Some(bytes) = image.bytes_from(start) else { return Vec::new() };
+        let banking = &image.banking;
+        // Nothing says which bank shows while common code runs, and the text an address
+        // outside the common ranges names is in whichever bank has text there.
+        let from_common = start >> 16 == 0 && banking.is_common(start as u16);
+        let banks: Vec<u64> = if from_common { image.sections.iter().filter(|section| section.executable).map(|section| section.addr >> 16).collect() } else { vec![start >> 16] };
+        let mut found = Vec::new();
+        let mut point = |from: u64, high: u8, low: u8, marked: bool| {
+            let target = u16::from_be_bytes([high, low]);
+            let banks = if banking.is_common(target) { &banks[..1] } else { &banks[..] };
+            found.extend(banks.iter().map(|&bank| TextPointer { from, to: banking.address(bank, target), marked }));
+        };
+        // The bytes the last two such instructions loaded, the older first, with the address
+        // of the instruction, and how many instructions ago the newer was.
+        let (mut older, mut newer, mut since) = (None::<(u64, u8)>, None::<(u64, u8)>, 0);
+        let mut dptr = None::<(u64, [u8; 2])>;
+        // The number each of `R0` to `R7` was loaded with.
+        let mut registers = [None::<u8>; 8];
+        for insn in I8051::decode(&bytes[..bytes.len().min((end - start) as usize)], start).filter_map(|decoded| decoded.insn) {
+            let [opcode, first, second] = insn.bytes;
+            let register = usize::from(opcode & 7);
+            // Nothing is known of what another path or a called function leaves.
+            if insn.transfer().is_some() || matches!(opcode, 0x22 | 0x32 | 0x73) {
+                (older, newer, dptr, registers) = (None, None, None, [None; 8]);
+                continue;
+            }
+            match opcode {
+                0x90 => {
+                    dptr = Some((insn.addr, [first, second]));
+                    point(insn.addr, first, second, false);
+                }
+                0x93 => {
+                    if let Some((from, [high, low])) = dptr {
+                        point(from, high, low, true);
+                    }
+                }
+                _ if opcode == 0xA3 || insn.touches_dptr() => dptr = None,
+                _ => {}
+            }
+            // MOV A, #; ADD A, #; ADDC A, #; MOV direct, #; MOV @Ri, #; MOV Rn, #; and MOV A, Rn
+            // from a register a number was loaded into.
+            let loaded = match opcode {
+                0x74 | 0x24 | 0x34 | 0x76..=0x7F => Some(first),
+                0x75 => Some(second),
+                0xE8..=0xEF => registers[register],
+                _ => None,
+            };
+            match opcode {
+                0x78..=0x7F => registers[register] = Some(first),
+                // INC, DEC, MOV from a direct address, XCH and MOV from A change the register.
+                0x08..=0x0F | 0x18..=0x1F | 0xA8..=0xAF | 0xC8..=0xCF | 0xF8..=0xFF => registers[register] = None,
+                // So does what writes to its address in the first register bank: INC, DEC, ORL,
+                // ANL, XRL, MOV, XCH and POP, and MOV between two addresses.
+                0x05 | 0x15 | 0x42 | 0x43 | 0x52 | 0x53 | 0x62 | 0x63 | 0x75 | 0x86..=0x8F | 0xC5 | 0xD0 | 0xF5 if first < 8 => registers[usize::from(first)] = None,
+                0x85 if second < 8 => registers[usize::from(second)] = None,
+                _ => {}
+            }
+            let Some(byte) = loaded else {
+                since += 1;
+                continue;
+            };
+            if since > APART {
+                (older, newer) = (None, None);
+            }
+            // Unmarked, either half may be the high one: compilers differ, and so does the
+            // order in which code adds a number to an address.
+            if let Some((_, half)) = newer {
+                point(insn.addr, half, byte, older.is_some_and(|(_, mark)| mark == MARKS[0]));
+                point(insn.addr, byte, half, false);
+            }
+            if let (Some((_, low)), Some((from, high)), true) = (older, newer, byte == MARKS[1]) {
+                point(from, high, low, true);
+            }
+            // MOV B, #0x80.
+            if let (Some((from, [high, low])), [0x75, 0xF0, 0x80]) = (dptr, insn.bytes) {
+                point(from, high, low, true);
+            }
+            (older, newer, since) = (newer, Some((insn.addr, byte)), 0);
+        }
+        found
     }
 
     fn is_padding(_: &Insn) -> bool {
@@ -604,6 +699,32 @@ mod tests {
         }
         let expected = [None, None, Some(XDATA + 0x1235), Some(IDATA + 0x30), Some(SFR + 0x90), Some(IDATA + 0x21), Some(SFR + 0x90), Some(SFR + 0x82), None];
         assert_eq!(referred, expected);
+    }
+
+    #[test]
+    fn text_among_the_code_is_a_string_of_the_code_that_forms_its_address() {
+        const CALLEE: u8 = 0x2C;
+        let mut code = vec![
+            // MOV R3, #0xFF; MOV R2, #0x00; MOV R1, #0x2D; LCALL: a pointer as Keil passes it.
+            0x7B, 0xFF, 0x7A, 0x00, 0x79, 0x2D, 0x12, 0x00, CALLEE,
+            // MOV A, #0x30; PUSH ACC; MOV A, #0x00; PUSH ACC; MOV A, #0x80; PUSH ACC; LCALL: one
+            // as SDCC pushes it.
+            0x74, 0x30, 0xC0, 0xE0, 0x74, 0x00, 0xC0, 0xE0, 0x74, 0x80, 0xC0, 0xE0, 0x12, 0x00, CALLEE,
+            // MOV DPTR, #0x0033; CLR A; MOVC A, @A+DPTR; LCALL.
+            0x90, 0x00, 0x33, 0xE4, 0x93, 0x12, 0x00, CALLEE,
+            // MOV R6, #0x35; MOV R7, #0x00; LCALL: two numbers that make an address inside text.
+            0x7E, 0x35, 0x7F, 0x00, 0x12, 0x00, CALLEE,
+            // MOV R6, #0x44; MOV R7, #0x00; RET: two that make the address text begins at.
+            0x7E, 0x44, 0x7F, 0x00, 0x22,
+            // The function called.
+            0x22,
+        ];
+        code.extend(b"ab\0%d\00123456789ABCDEF\0left over\0nobody\0");
+        let analysis = crate::analyze(&image(&code, 0));
+        let strings: Vec<(u64, &str)> = analysis.strings.iter().map(|string| (string.addr, string.text.as_str())).collect();
+        assert_eq!(strings, [(0x2D, "ab"), (0x30, "%d"), (0x33, "0123456789ABCDEF"), (0x44, "left over"), (0x4E, "nobody")]);
+        let users: Vec<(u64, u64)> = analysis.data_refs.iter().filter(|reference| image(&code, 0).is_code(reference.to)).map(|reference| (reference.from, reference.to)).collect();
+        assert_eq!(users, [(0x04, 0x2D), (0x0D, 0x30), (0x18, 0x33), (0x29, 0x44)]);
     }
 
     #[test]
