@@ -541,6 +541,9 @@ pub(crate) fn describe(binary: &Binary, addr: u64) -> String {
     if let Some(string) = binary.program.string_at(addr) {
         return format!("string {}", quoted(&string.text));
     }
+    if let Some(name) = binary.program.image.symbol_names.get(&addr).filter(|_| binary.program.function(addr).is_none()) {
+        return format!("{name}, a name the file carries");
+    }
     if let Some(name) = binary.program.import_name(addr) {
         return format!("import slot of {name}");
     }

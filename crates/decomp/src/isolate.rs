@@ -197,6 +197,13 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             eprintln!("declaration `{declaration}`: {error}");
         }
     }
+    // Data the image has a name for, such as a variable a library exports, goes by that name
+    // in the C. An edit, which follows, has the last word.
+    let is_function = |addr: u64| analysis.functions.binary_search_by_key(&addr, |function| function.addr).is_ok();
+    for (&addr, name) in image.symbol_names.iter().filter(|(addr, _)| !is_function(**addr) && !image.is_code(**addr)) {
+        // One the engine does not take is only left without its name.
+        let _ = session.add_global(addr, name, None);
+    }
     for (addr, name, kind) in edits.globals(&analysis) {
         if let Err(error) = session.add_global(addr, &name, kind) {
             eprintln!("global {name} at {addr:#x}: {error}");
