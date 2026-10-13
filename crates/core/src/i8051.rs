@@ -53,6 +53,12 @@ const LENGTH: [u8; 256] = [
     1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // Fx: MOVX ACALL MOVX CPL MOV
 ];
 
+/// Where the byte at a direct address is: in internal data below 0x80, a special function
+/// register from there.
+fn direct_address(direct: u8) -> u64 {
+    if direct < 0x80 { IDATA + u64::from(direct) } else { SFR + u64::from(direct) }
+}
+
 /// One instruction and where it sits, which every jump but `LJMP` needs for its target.
 #[derive(Clone, Copy)]
 pub struct Insn {
@@ -113,7 +119,7 @@ impl Insn {
     /// the byte it is in: internal data below 0x80, a special function register from there.
     fn direct(self) -> Option<u64> {
         let [opcode, first, _] = self.bytes;
-        let byte = |direct: u8| if direct < 0x80 { IDATA + u64::from(direct) } else { SFR + u64::from(direct) };
+        let byte = direct_address;
         match opcode {
             // The bits below 0x80 are those of the bytes from 0x20; the others are the bits of
             // every eighth register.
@@ -142,6 +148,12 @@ pub struct State {
     compared: Option<(u8, bool)>,
     /// A number the index was found to be below, since when it has only been loaded and scaled.
     below: Option<u8>,
+    /// How many times `RL A` has doubled the index since it was found to be below that.
+    doubled: u8,
+    /// A direct address that a number was stored at straight after it was found to be below
+    /// a bound, and the bound: one half of an index made of two numbers, which `ORL` puts in
+    /// the bits the other half was shifted out of.
+    kept: Option<(u8, u8)>,
     /// The address `A + PC` is at, when `A` is an index that a number was just added to.
     indexed: Option<u16>,
     /// Where the bytes start that `A`, `DPL` and `DPH` were each read from by
@@ -264,7 +276,9 @@ fn jump_slots(bytes: &[u8], count: usize) -> Option<usize> {
     let is_short = |opcode: u8| opcode & 0x1F == 0x01 || opcode == 0x80;
     let size = if is_long(*bytes.first()?) { 3 } else { 2 };
     let slots = bytes.get(..size * count)?;
-    slots.chunks_exact(size).all(|slot| if size == 3 { is_long(slot[0]) } else { is_short(slot[0]) }).then_some(size)
+    // Nothing comes after the last jump, so a table of short jumps may end in a long one.
+    let fits = |(index, slot): (usize, &[u8])| if size == 3 { is_long(slot[0]) } else { is_short(slot[0]) || index + 1 == count && is_long(slot[0]) };
+    slots.chunks_exact(size).enumerate().all(fits).then_some(size)
 }
 
 /// The 8051 and its descendants with the original instruction set.
@@ -462,6 +476,20 @@ impl Arch for I8051 {
         state.settle();
         state.compared = None;
         let called = insn.transfer().and_then(|(transfer, routine)| matches!(transfer, Transfer::Call).then_some(routine));
+        // ORL A, direct, when the index has been shifted left past the bits of the number
+        // kept there: the two are one index, below the product of their bounds.
+        let joined = match (opcode, state.kept, state.below) {
+            (0x45, Some((kept, low)), Some(high)) if kept == first && 1 << state.doubled == u32::from(low) => high.checked_mul(low),
+            _ => None,
+        };
+        state.kept = match (opcode, state.below) {
+            // MOV direct, A.
+            (0xF5, Some(bound)) => Some((first, bound)),
+            // It stays there until a call, or an instruction that names the address or
+            // changes the `DPTR` it is a half of.
+            _ => state.kept.filter(|&(kept, _)| called.is_none() && insn.direct() != Some(direct_address(kept)) && !(matches!(opcode, 0x90 | 0xA3) && [DPL, DPH].contains(&kept))),
+        };
+        state.doubled = if opcode == 0x23 && joined.is_none() { state.doubled.saturating_add(1) } else { state.doubled };
         if let (Some(routine), Some(_)) = (called, state.below) {
             state.scaler = Some(routine);
             return;
@@ -472,7 +500,10 @@ impl Arch for I8051 {
         // elsewhere while it was checked, MOV A and ADD A from a register, a direct address or
         // through R0 or R1, and ADD A, # on the way to its address.
         let scales = matches!(opcode, 0x90 | 0xF8..=0xFF | 0x24..=0x2F | 0x23 | 0xA4 | 0xE5..=0xEF) || matches!((opcode, first), (0x75, 0xF0) | (0xC5, DPH));
-        state.below = state.below.filter(|_| scales);
+        state.below = joined.or(state.below.filter(|_| scales));
+        if joined.is_some() {
+            state.doubled = 0;
+        }
         // ADD A, #n carries unless A is below 256 - n.
         state.compared = (opcode == 0x24 && first != 0).then(|| (first.wrapping_neg(), false));
         // A case's address read in halves: ADD A, #offset; MOVC A, @A+PC; MOV DPL, A, and the
@@ -502,6 +533,7 @@ impl Arch for I8051 {
         state.settle();
         let compared = state.compared.take();
         state.below = None;
+        state.doubled = 0;
         let mut taken = *state;
         (state.indexed, state.read, state.zero) = (None, None, false);
         (taken.indexed, taken.read, taken.zero) = (None, None, false);
@@ -802,6 +834,19 @@ mod tests {
         let analysis = crate::analyze(&image(&code, 0));
         let tables: Vec<(u64, &[u64])> = analysis.jump_tables.iter().map(|table| (table.jump, table.targets.as_slice())).collect();
         assert_eq!(tables, [(0x000A, &[0x000B, 0x000D, 0x000F][..])]);
+    }
+
+    #[test]
+    fn a_switch_on_two_numbers_jumps_into_a_jump_for_each_pair() {
+        // MOV A, R5; CJNE A, #4, next; JNC 0x0038; MOV DPL, A; MOV A, R3; CJNE A, #4, next;
+        // JNC 0x0038; RL A; RL A; ORL A, DPL; RL A; MOV DPTR, #0x0017; JMP @A+DPTR. At 0x0017,
+        // fifteen SJMP 0x0038 and one LJMP 0x0038, where a RET is.
+        let mut code = vec![0xED, 0xB4, 0x04, 0x00, 0x50, 0x32, 0xF5, 0x82, 0xEB, 0xB4, 0x04, 0x00, 0x50, 0x2A, 0x23, 0x23, 0x45, 0x82, 0x23, 0x90, 0x00, 0x17, 0x73];
+        code.extend((0..15).flat_map(|slot| [0x80, 0x38 - (0x17 + 2 * slot + 2)]));
+        code.extend([0x02, 0x00, 0x38, 0x22]);
+        let analysis = crate::analyze(&image(&code, 0));
+        let tables: Vec<(u64, Vec<u64>)> = analysis.jump_tables.iter().map(|table| (table.jump, table.targets.clone())).collect();
+        assert_eq!(tables, [(0x0016, (0..16).map(|slot| 0x0017 + 2 * slot).collect())]);
     }
 
     #[test]
