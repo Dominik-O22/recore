@@ -188,6 +188,10 @@ pub struct Use {
     /// Registers it changes that some code calling it reads afterwards: what it hands back.
     /// `None` for a function no call of which is known.
     pub given: Option<Registers>,
+    /// Registers it has set by the time it returns, whichever way it ran: written by an
+    /// instruction of its own, or set by a function it called, and not handed to a call
+    /// since. A value a function returns is in one of these.
+    pub set: Registers,
 }
 
 /// A function another one calls: by its address, or one the analysis does not know.
@@ -242,7 +246,7 @@ fn stub_writes(image: &Image, entry: u64) -> u16 {
     writes
 }
 
-/// The instructions of each function, by the function's address.
+/// The instructions of each function, the one it starts at first, by the function's address.
 fn steps(image: &Image, analysis: &Analysis) -> FxHashMap<u64, Vec<Step>> {
     let state = super::State::default();
     let call = |at: u64| analysis.calls.binary_search_by_key(&at, |call| call.at).ok().map(|index| &analysis.calls[index]);
@@ -257,7 +261,9 @@ fn steps(image: &Image, analysis: &Analysis) -> FxHashMap<u64, Vec<Step>> {
     let mut all = FxHashMap::default();
     for (&owner, body) in &bodies {
         let mut insns: Vec<(Insn, u64)> = Vec::new();
-        for &(start, end) in body {
+        let mut body = body.clone();
+        body.sort_unstable_by_key(|&(start, end)| (!(start..end).contains(&owner), start));
+        for &(start, end) in &body {
             let Some(bytes) = image.bytes_from(start) else { continue };
             insns.extend(I8051::decode(&bytes[..bytes.len().min((end - start) as usize)], start).filter_map(|decoded| Some((decoded.insn?, decoded.next_addr()))));
         }
@@ -383,7 +389,7 @@ pub fn uses(image: &Image, analysis: &Analysis) -> FxHashMap<u64, Use> {
                     (Some(now), Some(more)) => Some(Registers(now.0 | more.0)),
                     (now, more) => now.or(more),
                 };
-                let all = Use { taken: Registers(now.taken.0 | more.taken.0), changed: Registers(now.changed.0 | more.changed.0), given };
+                let all = Use { taken: Registers(now.taken.0 | more.taken.0), changed: Registers(now.changed.0 | more.changed.0), given, set: Registers(now.set.0 | more.set.0) };
                 grew |= all != *now;
                 *now = all;
             }
@@ -440,6 +446,42 @@ pub fn uses(image: &Image, analysis: &Analysis) -> FxHashMap<u64, Use> {
         }
         more
     });
+    // What it has set when it returns. A call unsets what the callee changes or takes, and
+    // sets what the callee has set.
+    settle(&mut uses, &|uses, function, steps| {
+        let after_call = |set: u16, callee: Callee| match known(uses, callee) {
+            Some(callee) => set & !(callee.changed.0 | callee.taken.0) | callee.set.0,
+            None => 0,
+        };
+        // Before each instruction, on every way to it: everything, until a way there is seen.
+        let mut before = vec![ALL; steps.len()];
+        before[0] = 0;
+        let returned = loop {
+            let (mut shrank, mut at_return) = (false, ALL);
+            for index in 0..steps.len() {
+                let step = &steps[index];
+                let mut set = before[index] | step.writes;
+                if let Some((callee, through)) = step.call {
+                    set = after_call(set, callee) & !through;
+                }
+                match step.leaves {
+                    Leaves::Return => at_return &= set,
+                    Leaves::Jump(callee) => at_return &= after_call(set, callee),
+                    Leaves::No | Leaves::Unknown => {}
+                }
+                for &next in &step.next {
+                    shrank |= before[next as usize] & set != before[next as usize];
+                    before[next as usize] &= set;
+                }
+            }
+            if !shrank {
+                break at_return;
+            }
+        };
+        // A function that never returns has set nothing for a caller.
+        let returns = steps.iter().any(|step| matches!(step.leaves, Leaves::Return | Leaves::Jump(_)));
+        vec![(function, Use { set: Registers(if returns && !steps.is_empty() { returned } else { 0 }), ..Use::default() })]
+    });
     uses
 }
 
@@ -487,7 +529,7 @@ mod tests {
         let image = super::super::tests::image(&code, 0);
         let uses = uses(&image, &crate::analyze(&image));
         let of = |function: u64| {
-            let Use { taken, changed, given } = uses[&function];
+            let Use { taken, changed, given, .. } = uses[&function];
             (taken.names().collect::<Vec<_>>(), changed.names().collect::<Vec<_>>(), given.map(|given| given.names().collect::<Vec<_>>()))
         };
         // The innermost reads R5 and DPTR and changes only A.
@@ -496,5 +538,9 @@ mod tests {
         assert_eq!(of(0x10), (vec!["R5", "R7", "DPTR"], vec!["R7", "ACC"], Some(vec!["R7"])));
         // The outer one sets R7 itself, and nothing calls it.
         assert_eq!(of(0), (vec!["R5", "DPTR"], vec!["R7", "ACC"], None));
+        // The innermost has set A when it returns, and the others R7 as well: the middle one
+        // itself, the outer one by calling it.
+        let set = |function: u64| uses[&function].set.names().collect::<Vec<_>>();
+        assert_eq!((set(0x20), set(0x10), set(0)), (vec!["ACC"], vec!["R7", "ACC"], vec!["R7", "ACC"]));
     }
 }
