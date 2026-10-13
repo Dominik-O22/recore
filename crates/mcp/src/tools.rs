@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use recore::image::{Format, Machine};
 use recore::program::{Pattern, Program, matches, parse_addr};
 use recore::FxHashMap;
-use recore::diff::Evidence;
+use recore::diff::{Change, Evidence};
 use recore::report::CallTarget;
 use recore_decomp::isolate::Status;
 use serde::Deserialize;
@@ -235,9 +235,10 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
     let (old_sizes, new_sizes) = (old.sizes(), new.sizes());
     let size = |sizes: &FxHashMap<u64, u64>, entry: &u64| sizes.get(entry).copied().unwrap_or_default();
     let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
-    let changed: Vec<_> = found.pairs.iter().filter(|pair| pair.changed).collect();
+    let changed: Vec<_> = found.pairs.iter().filter(|pair| pair.change == Some(Change::Code)).collect();
+    let renumbered: Vec<_> = found.pairs.iter().filter(|pair| pair.change == Some(Change::Numbers)).collect();
     let mut out = String::new();
-    writeln!(out, "{} functions before, {} after: {} the same, {} changed, {} removed, {} added", old.functions().count(), new.functions().count(), found.pairs.len() - changed.len(), changed.len(), found.removed.len(), found.added.len())?;
+    writeln!(out, "{} functions before, {} after: {} the same, {} changed, {} removed, {} added", old.functions().count(), new.functions().count(), found.pairs.len() - changed.len() - renumbered.len(), changed.len() + renumbered.len(), found.removed.len(), found.added.len())?;
     // What a function refers to, in terms the two builds share: the functions it calls, as
     // the after build knows them, and the strings it uses.
     let paired: FxHashMap<u64, u64> = found.pairs.iter().map(|pair| (pair.old, pair.new)).collect();
@@ -271,6 +272,11 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
                 }
             }
         }
+    }
+    if !renumbered.is_empty() {
+        writeln!(out, "\nchanged in numbers only, {}: the same instructions with other constants or offsets, as when a structure they all use gained a field", renumbered.len())?;
+        let pairs: Vec<String> = renumbered.iter().take(limit).map(|pair| format!("{} -> {}", old.label(pair.old), new.label(pair.new))).collect();
+        writeln!(out, "{}{}", pairs.join(", "), if renumbered.len() > limit { " ..." } else { "" })?;
     }
     for (title, entries, program, sizes) in [("removed", &found.removed, old, &old_sizes), ("added", &found.added, new, &new_sizes)] {
         writeln!(out, "\n{title}{}{}", shown(entries.len(), limit), if entries.is_empty() { ": none" } else { "" })?;

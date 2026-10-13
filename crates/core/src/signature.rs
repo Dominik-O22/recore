@@ -58,9 +58,9 @@ pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u6
     let bytes = image.bytes_from(start)?;
     let bytes = bytes.get(..(end - start) as usize)?;
     match image.machine {
-        Machine::X86 => x86(32, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS)),
-        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS)),
-        Machine::Aarch64 => aarch64(bytes, start, end, Some(MIN_WORDS)),
+        Machine::X86 => x86(32, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS), true),
+        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS), true),
+        Machine::Aarch64 => aarch64(bytes, start, end, Some(MIN_WORDS), true),
     }
 }
 
@@ -69,11 +69,23 @@ pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u6
 /// padding that aligns their loops. Short functions share theirs, so it identifies nothing by
 /// itself.
 pub fn body_hash(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64) -> Option<u64> {
+    whole(image, pointer_slots, start, end, true)
+}
+
+/// [`body_hash`] with every number in the code left out as well: the constants, and the
+/// offsets of the fields and stack slots it reaches. Two builds of a function with this in
+/// common and not their [`body_hash`] are the same instructions over different numbers, as
+/// when a structure the function uses gained a field.
+pub fn shape_hash(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64) -> Option<u64> {
+    whole(image, pointer_slots, start, end, false)
+}
+
+fn whole(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64, numbers: bool) -> Option<u64> {
     let bytes = image.bytes_from(start)?.get(..end.checked_sub(start)? as usize)?;
     match image.machine {
-        Machine::X86 => x86(32, bytes, pointer_slots, start, end, None),
-        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, None),
-        Machine::Aarch64 => aarch64(bytes, start, end, None),
+        Machine::X86 => x86(32, bytes, pointer_slots, start, end, None, numbers),
+        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, None, numbers),
+        Machine::Aarch64 => aarch64(bytes, start, end, None, numbers),
     }
 }
 
@@ -81,7 +93,7 @@ pub fn body_hash(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64,
 /// instruction pointer and leave the function, or where the loader relocates them.
 /// With a least number of instructions the function must have that many and its padding
 /// counts, as the tables of library functions were built; without one, padding is left out.
-fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64, min_instructions: Option<usize>) -> Option<u64> {
+fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64, min_instructions: Option<usize>, numbers: bool) -> Option<u64> {
     let mut decoder = Decoder::with_ip(bits, bytes, start, DecoderOptions::NONE);
 
     let mut hash = Hash::new();
@@ -114,7 +126,7 @@ fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64,
         if offsets.has_displacement() {
             let at = offsets.displacement_offset();
             let relocated = pointer_slots.contains_key(&(instr.ip() + at as u64));
-            if instr.is_ip_rel_memory_operand() || relocated {
+            if instr.is_ip_rel_memory_operand() || relocated || !numbers {
                 mark(at, offsets.displacement_size());
             }
         }
@@ -129,7 +141,7 @@ fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64,
             // are relative and identical everywhere.
             let external = is_branch && (instr.flow_control() == FlowControl::Call || leaves(instr.near_branch_target()));
             let internal = is_branch && !external && min_instructions.is_none();
-            if relocated || external || internal {
+            if relocated || external || internal || !numbers {
                 mark(at, offsets.immediate_size());
             }
             if internal {
@@ -148,7 +160,7 @@ fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64,
 /// literal loads that leave the function, the address `adr` or `adrp` forms, and the low twelve
 /// bits an `add`, load or store then adds to a page. Which registers hold a page is followed
 /// along the instructions in address order, which is all the pairing compilers emit needs.
-fn aarch64(bytes: &[u8], start: u64, end: u64, min_words: Option<usize>) -> Option<u64> {
+fn aarch64(bytes: &[u8], start: u64, end: u64, min_words: Option<usize>, numbers: bool) -> Option<u64> {
     const OFFSET_26: u32 = 0x03FF_FFFF;
     const OFFSET_19: u32 = 0x00FF_FFE0;
     const OFFSET_14: u32 = 0x0007_FFE0;
@@ -244,6 +256,15 @@ fn aarch64(bytes: &[u8], start: u64, end: u64, min_words: Option<usize>) -> Opti
             pages &= !(1 << rd);
         }
         // One multiplication a word; the rotation carries high bits back into the low ones.
+        // The number in an `add` or `sub` of an immediate, in a load or store at an offset,
+        // and in one of a pair.
+        if !numbers {
+            if word & 0x1F00_0000 == 0x1100_0000 || word & 0x3B00_0000 == 0x3900_0000 {
+                blank |= LOW_12;
+            } else if word & 0x3A00_0000 == 0x2800_0000 {
+                blank |= 0x003F_8000;
+            }
+        }
         let word = match inside {
             Some((field, ordinal)) => u64::from(word & !field) ^ u64::from(ordinal) << 32,
             None => u64::from(word & !blank),
@@ -371,7 +392,7 @@ mod tests {
     fn fingerprint_of(words: &[u32], start: u64) -> Option<u64> {
         let padding = (0..MIN_WORDS as u32).map(|n| 0xD280_0000 | n << 5);
         let bytes: Vec<u8> = words.iter().copied().chain(padding).flat_map(u32::to_le_bytes).collect();
-        aarch64(&bytes, start, start + bytes.len() as u64, Some(MIN_WORDS))
+        aarch64(&bytes, start, start + bytes.len() as u64, Some(MIN_WORDS), true)
     }
 
     #[test]

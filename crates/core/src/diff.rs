@@ -33,8 +33,17 @@ pub struct Pair {
     pub old: u64,
     pub new: u64,
     pub evidence: Evidence,
-    /// Whether the code differs in more than the addresses it holds.
-    pub changed: bool,
+    /// How the code differs, if in more than the addresses it holds.
+    pub change: Option<Change>,
+}
+
+/// How the code of a function differs between two builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// The instructions are the same and only numbers in them differ: a constant, or the
+    /// offsets of fields, as in every function that uses a structure which gained one.
+    Numbers,
+    Code,
 }
 
 /// How two builds of a program differ, function by function.
@@ -58,19 +67,21 @@ enum Callee<'a> {
 /// One build, with what pairing asks of each function.
 struct Side<'a> {
     program: &'a Program,
-    /// Every function's body with its addresses blanked, fragments included.
-    bodies: FxHashMap<u64, u64>,
+    /// Every function's body with its addresses blanked, fragments included, and the same
+    /// with its numbers blanked too.
+    bodies: FxHashMap<u64, (u64, u64)>,
 }
 
 impl<'a> Side<'a> {
     fn new(program: &'a Program) -> Side<'a> {
         let slots: FxHashMap<u64, u64> = program.image.relative_targets.iter().copied().collect();
         let body = |entry: u64| {
-            let mut hash = 0u64;
+            let (mut hash, mut shape) = (0u64, 0u64);
             for (start, end) in program.body(entry) {
                 hash = hash.rotate_left(17) ^ crate::signature::body_hash(&program.image, &slots, start, end)?;
+                shape = shape.rotate_left(17) ^ crate::signature::shape_hash(&program.image, &slots, start, end)?;
             }
-            Some((entry, hash))
+            Some((entry, (hash, shape)))
         };
         Side { program, bodies: program.functions().filter_map(|function| body(function.addr)).collect() }
     }
@@ -167,7 +178,7 @@ pub fn diff(old: &Program, new: &Program) -> Diff {
         let mut progress = false;
         let open_old = |pairing: &Pairing, entry: &u64| !pairing.by_old.contains_key(entry);
         let open_new = |pairing: &Pairing, entry: &u64| !pairing.new.contains(entry);
-        let bodies = |side: &Side, open: Vec<u64>| -> Vec<(u64, u64)> { open.into_iter().filter_map(|entry| Some((*side.bodies.get(&entry)?, entry))).collect() };
+        let bodies = |side: &Side, open: Vec<u64>| -> Vec<(u64, u64)> { open.into_iter().filter_map(|entry| Some((side.bodies.get(&entry)?.0, entry))).collect() };
         let (left_old, left_new): (Vec<u64>, Vec<u64>) = (old.entries().filter(|entry| open_old(&pairing, entry)).collect(), new.entries().filter(|entry| open_new(&pairing, entry)).collect());
         progress |= pairing.pair_unique(bodies(&old, left_old).into_iter(), bodies(&new, left_new).into_iter(), Evidence::Body);
 
@@ -220,7 +231,13 @@ pub fn diff(old: &Program, new: &Program) -> Diff {
         }
     }
 
-    let pairs = pairing.by_old.iter().map(|(&from, &(to, evidence))| Pair { old: from, new: to, evidence, changed: old.bodies.get(&from) != new.bodies.get(&to) }).collect();
+    let change = |from: u64, to: u64| match (old.bodies.get(&from), new.bodies.get(&to)) {
+        (Some(before), Some(after)) if before.0 == after.0 => None,
+        (Some(before), Some(after)) if before.1 == after.1 => Some(Change::Numbers),
+        (None, None) => None,
+        _ => Some(Change::Code),
+    };
+    let pairs = pairing.by_old.iter().map(|(&from, &(to, evidence))| Pair { old: from, new: to, evidence, change: change(from, to) }).collect();
     Diff {
         pairs,
         removed: old.entries().filter(|entry| !pairing.by_old.contains_key(entry)).collect(),
