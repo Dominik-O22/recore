@@ -97,6 +97,11 @@ pub trait Arch: 'static {
     /// merely look like one.
     const ADDRESSES_ARE_RELOCATED: bool = false;
 
+    /// Whether [`Arch::flow`] reads the state: whether what a call or jump goes through can
+    /// depend on earlier instructions. A pass that only classifies control flow need not
+    /// track registers where it cannot.
+    const FLOW_READS_STATE: bool = true;
+
     /// Decodes consecutive instructions from `bytes`, which are loaded at `addr`.
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Self::Insn>>;
 
