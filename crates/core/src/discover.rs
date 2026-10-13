@@ -392,7 +392,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
             }
             let mut after_call = false;
             let decoder = decoders[index].get_or_insert_with(|| A::decoder(&section.data, section.addr));
-            for decoded in A::decode_from(decoder, (start - section.addr) as usize) {
+            A::seek(decoder, (start - section.addr) as usize);
+            while let Some(decoded) = A::decode_next(decoder) {
                 let offset = (decoded.addr - section.addr) as usize;
                 if std::mem::replace(&mut self.regions[index].insn_len[offset], decoded.len.max(1)) != 0 {
                     // Decoded before, and to the same length.
@@ -411,8 +412,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 };
                 after_call = false;
                 self.regions[index].cover(offset, usize::from(decoded.len.max(1)));
-                let Some(flow) = A::flow(&insn, &state) else {
-                    if let Some((base, data)) = A::based_data_address(&insn, &state) {
+                let Some(flow) = A::flow(insn, &state) else {
+                    if let Some((base, data)) = A::based_data_address(insn, &state) {
                         let from_image_base = self.image.base != 0 && base == self.image.base;
                         if from_image_base {
                             self.data_refs.push(data);
@@ -424,9 +425,9 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         }
                     }
                     if self.recording {
-                        self.note_references(&insn, &state, decoded.addr, speculative);
+                        self.note_references(insn, &state, decoded.addr, speculative);
                     }
-                    let taken = A::address_taken(&insn, &state).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
+                    let taken = A::address_taken(insn, &state).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
                     if let Some(target) = taken.filter(|_| !speculative) {
                         if self.region_index(target).is_some() {
                             self.add_start(target, Origin::AddressTaken);
@@ -442,7 +443,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         Some(target) => self.data_ref_sites.push((decoded.addr, target, false)),
                         None => {}
                     }
-                    A::step(&mut state, &insn);
+                    A::step(&mut state, insn);
                     continue;
                 };
                 // A call or jump through a variable reads it, as an instruction that loads it
@@ -478,7 +479,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         true
                     }
                     Flow::Branch(target) => {
-                        let taken = A::branch(&mut state, &insn);
+                        let taken = A::branch(&mut state, insn);
                         if !speculative {
                             self.jumps.push((decoded.addr, target));
                         }
@@ -487,12 +488,12 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     }
                     Flow::JumpIndirect(None) => {
                         let jump = decoded.addr;
-                        let resolved = A::resolve_table(&state, self.image, self.pointer_slots, &insn, &|target| {
+                        let resolved = A::resolve_table(&state, self.image, self.pointer_slots, insn, &|target| {
                             self.is_case_target(jump, target)
                         }, &|target| self.is_case_code(target));
                         let resolved = resolved.map(|table| self.apply_known_length(table));
                         match resolved {
-                            Some(table) => self.accept_table(jump, table, A::after_jump(state, &insn), trusted, speculative),
+                            Some(table) => self.accept_table(jump, table, A::after_jump(state, insn), trusted, speculative),
                             None => {
                                 self.unresolved.insert(jump);
                             }
@@ -510,7 +511,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     break;
                 }
                 if matches!(flow, Flow::Call(_) | Flow::CallIndirect(_)) {
-                    A::step(&mut state, &insn);
+                    A::step(&mut state, insn);
                     after_call = true;
                 }
             }
@@ -910,22 +911,21 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     let mut scanned_to = addr;
                     let mut next = None;
                     let decoder = decoders[index].get_or_insert_with(|| A::decoder(&section.data, section.addr));
-                    let mut decoder = A::decode_from(decoder, offset);
-                    for decoded in decoder.by_ref() {
+                    A::seek(decoder, offset);
+                    while let Some(decoded) = A::decode_next(decoder) {
                         if self.regions[index].insn_len[(decoded.addr - section.addr) as usize] != 0 {
                             break;
                         }
                         scanned_to = decoded.next_addr();
                         let Some(insn) = decoded.insn else { break };
-                        if A::is_padding(&insn) {
+                        if A::is_padding(insn) {
                             skipped_padding = true;
                             continue;
                         }
-                        candidate = Some((decoded.addr, insn));
-                        next = decoder.next().and_then(|d| d.insn);
+                        candidate = Some((decoded.addr, *insn));
+                        next = A::decode_next(decoder).and_then(|d| d.insn.copied());
                         break;
                     }
-                    drop(decoder);
                     // Always make progress, even past bytes that do not decode.
                     offset = ((scanned_to - section.addr) as usize).max(offset + 1);
                     let Some((addr, insn)) = candidate else { continue };

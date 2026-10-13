@@ -106,14 +106,19 @@ pub trait Arch: 'static {
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Self::Insn>>;
 
     /// A decoder over a whole section, for decoding from many places in it: moving one is
-    /// cheaper than making one.
+    /// cheaper than making one. It holds the instruction it decoded last and lends it out, so
+    /// that no instruction is copied on its way to whoever reads it.
     type Decoder<'a>;
 
     /// A decoder over `bytes`, which are loaded at `addr`.
     fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_>;
 
-    /// Decodes consecutive instructions from `offset` into the decoder's bytes.
-    fn decode_from<'d>(decoder: &'d mut Self::Decoder<'_>, offset: usize) -> impl Iterator<Item = Decoded<Self::Insn>> + 'd;
+    /// Moves the decoder to `offset` into its bytes.
+    fn seek(decoder: &mut Self::Decoder<'_>, offset: usize);
+
+    /// Decodes the instruction the decoder is at and moves past it. `None` at the end of the
+    /// bytes.
+    fn decode_next<'d>(decoder: &'d mut Self::Decoder<'_>) -> Option<Decoded<&'d Self::Insn>>;
 
     /// The control-flow effect of `insn`, given the state before it.
     fn flow(insn: &Self::Insn, state: &Self::State) -> Option<Flow>;
