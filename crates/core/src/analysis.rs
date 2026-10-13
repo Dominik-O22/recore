@@ -103,9 +103,21 @@ struct Walk {
     reach_end: u64,
     /// False when an indirect jump could not be followed, so more may be reachable.
     complete: bool,
+    /// Some path ran through code outside the function's own extent.
+    left_extent: bool,
     /// The straight-line stretches of code that were reached, as `[start, end)`, sorted. May
     /// extend outside the function's own extent.
     reached: Vec<(u64, u64)>,
+}
+
+/// A function that may yet turn out never to return, while that is being worked out.
+struct Open<'a> {
+    function: &'a Function,
+    /// Whether what its last walk found may no longer hold.
+    due: bool,
+    /// What its last walk found.
+    may_return: bool,
+    left_extent: bool,
 }
 
 /// The whole program's control-flow instructions and function entries, for following a
@@ -162,7 +174,7 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program) -> Wa
         (None, None) => true,
     };
 
-    let mut result = Walk { may_return: false, reach_end: function.start, complete: true, reached: Vec::new() };
+    let mut result = Walk { may_return: false, reach_end: function.start, complete: true, left_extent: false, reached: Vec::new() };
     let mut visited: FxHashSet<usize> = FxHashSet::default();
     let mut pending = vec![function.start];
     while let Some(addr) = pending.pop() {
@@ -195,6 +207,8 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program) -> Wa
             run_start = control.next;
             if in_extent(control.addr) {
                 result.reach_end = result.reach_end.max(control.next);
+            } else {
+                result.left_extent = true;
             }
             let mut leave = |target: u64, pending: &mut Vec<u64>| {
                 // A PLT stub or another function's entry is a tail call. Anything else is more
@@ -501,16 +515,44 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             })
             .collect();
 
-        // Least fixpoint: a function joins the set once no path through it can return.
+        // Least fixpoint: a function joins the set once no path through it can return. What a
+        // walk finds changes only when a function it asked about joins the set, and it asks at
+        // the calls and jumps it passes. So after the first round only the functions that can
+        // pass a call or jump to one that has just joined are walked again: those with one in
+        // their extent, and those that leave their extent, which may pass any.
         let mut noreturn: FxHashSet<u64> = terminal_callees.into_iter().filter(|target| starts.binary_search(target).is_ok()).collect();
+        let mut open: Vec<Open> = functions
+            .iter()
+            .filter(|f| !noreturn.contains(&f.start))
+            .map(|function| Open { function, due: true, may_return: true, left_extent: false })
+            .collect();
         loop {
-            let added: Vec<u64> = functions
-                .par_iter()
-                .filter(|f| !noreturn.contains(&f.start) && !walk(f, &noreturn, &program).may_return)
-                .map(|f| f.start)
-                .collect();
+            open.par_iter_mut().filter(|open| open.due).for_each(|open| {
+                let walk = walk(open.function, &noreturn, &program);
+                (open.may_return, open.left_extent) = (walk.may_return, walk.left_extent);
+            });
+            let added: FxHashSet<u64> = open.iter().filter(|open| !open.may_return).map(|open| open.function.start).collect();
             if added.is_empty() {
                 break;
+            }
+            // In address order, as the controls are.
+            let asking: Vec<u64> = program
+                .controls
+                .iter()
+                .filter(|control| {
+                    let target = match control.flow {
+                        Flow::Call(target) | Flow::Jump(target) | Flow::Branch(target) => Some(target),
+                        Flow::CallIndirect(Some(slot)) | Flow::JumpIndirect(Some(slot)) => pointer_slots.get(&slot).copied(),
+                        _ => None,
+                    };
+                    target.is_some_and(|target| added.contains(&target))
+                })
+                .map(|control| control.addr)
+                .collect();
+            let passes = |f: &Function| asking.get(asking.partition_point(|&addr| addr < f.start)).is_some_and(|&addr| addr < f.end);
+            open.retain(|open| open.may_return);
+            for open in &mut open {
+                open.due = open.left_extent || passes(open.function);
             }
             noreturn.extend(added);
         }
