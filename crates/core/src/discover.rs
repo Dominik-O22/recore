@@ -255,7 +255,11 @@ struct Explorer<'a, A: Arch> {
     data_sections: Vec<(u64, u64)>,
 }
 
-impl<A: Arch> Explorer<'_, A> {
+/// One decoder per section, made when first needed. Decoding starts in a new place for every
+/// branch target and every gap, and moving a decoder is cheaper than making one.
+type Decoders<'a, A> = Vec<Option<<A as Arch>::Decoder<'a>>>;
+
+impl<'a, A: Arch> Explorer<'a, A> {
     fn region_index(&self, addr: u64) -> Option<usize> {
         self.regions.iter().position(|r| r.section.contains(addr))
     }
@@ -358,9 +362,7 @@ impl<A: Arch> Explorer<'_, A> {
     }
 
     /// Decodes from every pending address until control flow ends or reaches known code.
-    fn drain(&mut self) {
-        // One decoder per section, made when first needed.
-        let mut decoders: Vec<Option<A::Decoder<'_>>> = self.regions.iter().map(|_| None).collect();
+    fn drain(&mut self, decoders: &mut Decoders<'a, A>) {
         loop {
             // Most branch targets have been decoded by the time their turn comes. Those are
             // looked at where they lie: taking one off the queue copies its whole state.
@@ -833,7 +835,7 @@ impl<A: Arch> Explorer<'_, A> {
     /// Finds code that nothing referenced. Code following padding at an aligned address, or
     /// opening with an entry marker, starts a function. Other unreached code continues the
     /// function before it, such as switch cases behind an unresolved indirect jump.
-    fn fill_gaps(&mut self) -> bool {
+    fn fill_gaps(&mut self, decoders: &mut Decoders<'a, A>) -> bool {
         let mut found = false;
         for index in 0..self.regions.len() {
             let section = self.regions[index].section;
@@ -871,11 +873,14 @@ impl<A: Arch> Explorer<'_, A> {
                         after_data = offset;
                         continue;
                     }
-                    // An unreached stretch: step over padding to the first real instruction.
-                    let mut decoder = A::decode(&section.data[offset..], addr);
+                    // An unreached stretch: step over padding to the first real instruction, and
+                    // take the one after it too.
                     let mut skipped_padding = false;
                     let mut candidate = None;
                     let mut scanned_to = addr;
+                    let mut next = None;
+                    let decoder = decoders[index].get_or_insert_with(|| A::decoder(&section.data, section.addr));
+                    let mut decoder = A::decode_from(decoder, offset);
                     for decoded in decoder.by_ref() {
                         if self.regions[index].insn_len[(decoded.addr - section.addr) as usize] != 0 {
                             break;
@@ -887,8 +892,10 @@ impl<A: Arch> Explorer<'_, A> {
                             continue;
                         }
                         candidate = Some((decoded.addr, insn));
+                        next = decoder.next().and_then(|d| d.insn);
                         break;
                     }
+                    drop(decoder);
                     // Always make progress, even past bytes that do not decode.
                     offset = ((scanned_to - section.addr) as usize).max(offset + 1);
                     let Some((addr, insn)) = candidate else { continue };
@@ -900,7 +907,6 @@ impl<A: Arch> Explorer<'_, A> {
                     }
                     let aligned = addr % A::FUNCTION_ALIGN == 0;
                     let marked = A::is_entry_marker(&insn);
-                    let next = decoder.next().and_then(|d| d.insn);
                     // An entry marker right after other code may open a landing pad at the end of a
                     // function.
                     let landing_pad = marked && !skipped_padding && next.as_ref().is_some_and(A::opens_landing_pad);
@@ -937,7 +943,7 @@ impl<A: Arch> Explorer<'_, A> {
                             if self.frame_of(addr).is_some() && !self.in_table(addr) {
                                 self.deferred.push(Pending { addr, state: A::State::default(), trusted: false, speculative: true });
                                 found = true;
-                                self.drain();
+                                self.drain(decoders);
                             }
                             continue;
                         }
@@ -948,7 +954,7 @@ impl<A: Arch> Explorer<'_, A> {
                         self.pending.push(Pending::entry(addr));
                     }
                     found = true;
-                    self.drain();
+                    self.drain(decoders);
                 }
                 self.regions[index].scans[entry.0 / PAGE] = Some(PageScan { time, tables: self.tables.len(), entry, exit: (offset, after_data), found });
                 found |= found_before;
@@ -1076,9 +1082,10 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
             explorer.add_start(seed, origin);
         }
     }
+    let mut decoders: Decoders<A> = explorer.regions.iter().map(|_| None).collect();
     {
         let _phase = phase::scope("discover/drain");
-        explorer.drain();
+        explorer.drain(&mut decoders);
     }
 
     loop {
@@ -1088,10 +1095,10 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         };
         {
             let _phase = phase::scope("discover/drain");
-            explorer.drain();
+            explorer.drain(&mut decoders);
         }
         let _phase = phase::scope("discover/fill gaps");
-        let filled = explorer.fill_gaps();
+        let filled = explorer.fill_gaps(&mut decoders);
         if !promoted && !filled {
             break;
         }
