@@ -205,6 +205,7 @@ struct RdSession {
   const Translate *translator = nullptr;
   bool print_c = true;
   bool keep_prototypes = false;
+  bool kept_are_lower_bounds = true;  // see rd_keep_prototypes_exact
   bool want_flow = false;
   set<uint64_t> kept;  // functions whose prototype this session locked
   // Names given to variables, per function: the variable's place and its name.
@@ -282,6 +283,25 @@ static bool only_spills_register_param(Funcdata *fd) {
   const Varnode *vn = fd->findVarnodeInput(spilled->getSize(), spilled->getAddress());
   set<const Varnode *> seen;
   return vn != nullptr && !vn->hasNoDescend() && never_read(vn, seen);
+}
+
+// Whether a register parameter exists only because the function stores the register and never
+// reads the value: a variadic function saves every argument register so that va_arg can find
+// them, and unoptimized code saves them all whether it has that many parameters or not. How many
+// of them are parameters cannot be told, so the prototype says too much to pass on to callers.
+static bool spills_a_register_param(Funcdata *fd) {
+  // 32-bit conventions pass on the stack; the one register that is pushed there is
+  // `only_spills_register_param`'s to tell.
+  if (fd->getArch()->getDefaultCodeSpace()->getAddrSize() < 8) return false;
+  const FuncProto &proto = fd->getFuncProto();
+  for (int4 i = 0; i < proto.numParams(); ++i) {
+    ProtoParameter *param = proto.getParam(i);
+    if (param->getAddress().getSpace()->getType() == IPTR_SPACEBASE) continue;
+    const Varnode *vn = fd->findVarnodeInput(param->getSize(), param->getAddress());
+    set<const Varnode *> seen;
+    if (vn != nullptr && !vn->hasNoDescend() && never_read(vn, seen)) return true;
+  }
+  return false;
 }
 
 // Whether the function reads a register that its recovered prototype does not account for. Such
@@ -779,6 +799,10 @@ int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int 
 // function's symbol, so that later decompilations of its callers pass at least those parameters.
 void rd_keep_prototypes(RdSession *session, int keep) { session->keep_prototypes = keep != 0; }
 
+// Whether a kept prototype says everything a call passes, or only the least: a call then also
+// passes whatever else the call site shows.
+void rd_keep_prototypes_exact(RdSession *session, int exact) { session->kept_are_lower_bounds = exact == 0; }
+
 // Selects the engine's root action: "decompile" (everything), "normalize" (stops before type
 // recovery and structuring; what Ghidra's switch analysis uses) or "paramid" (what Ghidra's
 // parameter-ID analysis uses). Only "decompile" structures control flow, so only it prints C.
@@ -1009,6 +1033,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
   Architecture *arch = session->arch;
   // A prototype that was declared, not recovered, is the whole truth and stays as it is.
   bool declared = false;
+  bool spills = false;
   bool ok = guarded(err, errlen, [&] {
     fd = session->function(addr);
     declared = fd->getFuncProto().isInputLocked() && session->kept.count(addr) == 0;
@@ -1099,6 +1124,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     }
     out->flow = session->flow.c_str();
     out->locals = session->locals.c_str();
+    spills = spills_a_register_param(fd);
     out->flags = (fd->hasBadData() ? RD_BAD_DATA : 0) |
                  (fd->hasUnimplemented() ? RD_UNIMPLEMENTED : 0) |
                  (proto.getOutputType()->getMetatype() != TYPE_VOID ? RD_RETURNS_VALUE : 0);
@@ -1108,11 +1134,11 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     // eight parameters. Kept, that prototype would make every caller pass them all.
     size_t vector_params = 0;
     for (const RdParam &param : session->params) vector_params += strncmp(param.storage, "XMM", 3) == 0;
-    if (vector_params < 8 && !reads_unexplained_register(fd)) {
+    if (vector_params < 8 && !reads_unexplained_register(fd) && !spills) {
       // Kept as a lower bound: a call passes these parameters and whatever else the call site
       // shows. A variadic function looks like one with only its fixed parameters.
       fd->getFuncProto().setInputLock(true);
-      fd->getFuncProto().setDotdotdot(true);
+      fd->getFuncProto().setDotdotdot(session->kept_are_lower_bounds);
       session->kept.insert(addr);
     }
   }

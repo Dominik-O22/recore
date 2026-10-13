@@ -42,6 +42,10 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
             named.insert(key.to_string(), json!(true));
             continue;
         }
+        // The functions of `decompile` are its plain arguments, with or without the option.
+        if key == "functions" {
+            continue;
+        }
         let Some(value) = rest.next() else { bail!("--{key} needs a value") };
         let number = || value.parse::<u64>().map(Value::from).or_else(|_| value.parse::<f64>().map(Value::from));
         let value = if NUMERIC.contains(&key) { number()? } else { json!(value) };

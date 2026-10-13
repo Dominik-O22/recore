@@ -15,7 +15,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use recore::image::{Format, Machine};
+use recore::image::Format;
 use recore::report::{Analysis, CallTarget};
 use serde::{Deserialize, Serialize};
 
@@ -208,7 +208,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     }
 
     session.set_style(options.style)?;
-    let callees_first = options.callees_first && image.machine == Machine::X86;
+    let callees_first = options.callees_first;
     session.keep_prototypes(callees_first);
     // What each function calls: with debug information, the functions whose prototypes its
     // calls need.

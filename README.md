@@ -89,7 +89,7 @@ Decompiled function signatures against PDB records, 8 binaries per corpus:
 
 | Corpus | | Functions decompiled | Parameters exact | Returns a value or not |
 |---|---|---|---|---|
-| Windows x86-64 | recore | 99.7% | 88.5% | 93.3% |
+| Windows x86-64 | recore | 99.7% | 89.8% | 93.2% |
 | | Ghidra | 91.9% | 82.6% | 92.7% |
 | Windows x86 | recore | 98.8% | 85.8% | 91.0% |
 | | Ghidra | 85.4% | 86.1% | 90.5% |

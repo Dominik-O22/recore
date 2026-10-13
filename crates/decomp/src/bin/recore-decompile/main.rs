@@ -36,7 +36,7 @@ struct WorkerOptions {
     #[arg(long, default_value_t = 4)]
     memory_gb: u64,
     /// Decompile the functions a function calls before the function itself, so that its calls
-    /// pass the parameters they were found to take. Only 32-bit x86 does this.
+    /// pass the parameters they were found to take.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     callees_first: bool,
 }
