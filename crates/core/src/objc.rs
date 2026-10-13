@@ -204,7 +204,7 @@ fn stub_selectors<'a, A: Arch>(image: &Image, metadata: &'a Metadata) -> FxHashM
         let mut start = None;
         for decoded in A::decode(&section.data, section.addr) {
             let Some(insn) = decoded.insn else { continue };
-            match A::flow(&insn, &state) {
+            match A::flow(&insn, &state, image) {
                 // Traps pad the space between stubs.
                 Some(Flow::Halt) => {}
                 Some(_) => {
@@ -382,7 +382,7 @@ pub fn sends<A: Arch>(image: &Image, metadata: &Metadata, swift_methods: &[(u64,
             // Where paths meet: every address a branch in the piece goes to.
             let fresh = A::State::default();
             let joins: FxHashSet<u64> = A::decode(bytes, start)
-                .filter_map(|decoded| match A::flow(&decoded.insn?, &fresh)? {
+                .filter_map(|decoded| match A::flow(&decoded.insn?, &fresh, image)? {
                     Flow::Branch(target) | Flow::Jump(target) => Some(target),
                     _ => None,
                 })
@@ -400,7 +400,7 @@ pub fn sends<A: Arch>(image: &Image, metadata: &Metadata, swift_methods: &[(u64,
                 if joins.contains(&decoded.addr) || join_points.contains(&decoded.addr) {
                     state = A::State::default();
                 }
-                let Some(flow) = A::flow(&insn, &state) else {
+                let Some(flow) = A::flow(&insn, &state, image) else {
                     A::step_following(&mut state, &insn);
                     continue;
                 };

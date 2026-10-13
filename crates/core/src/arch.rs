@@ -87,8 +87,9 @@ pub trait Arch: 'static {
     /// Decodes consecutive instructions from `offset` into the decoder's bytes.
     fn decode_from<'d>(decoder: &'d mut Self::Decoder<'_>, offset: usize) -> impl Iterator<Item = Decoded<Self::Insn>> + 'd;
 
-    /// The control-flow effect of `insn`, given the state before it.
-    fn flow(insn: &Self::Insn, state: &Self::State) -> Option<Flow>;
+    /// The control-flow effect of `insn`, given the state before it. The image says where a
+    /// target really lies when the instruction alone does not, as in banked code.
+    fn flow(insn: &Self::Insn, state: &Self::State, image: &Image) -> Option<Flow>;
 
     /// The address `insn` materialises in a register, if it computes one: how code takes the
     /// address of a function or of data.

@@ -73,7 +73,7 @@ pub fn text_arguments(image: &Image, body: &[(u64, u64)], calls: &[u64], is_text
             A::decode(&bytes[..bytes.len().min((end - start) as usize)], start).filter_map(|decoded| Some((decoded.addr, decoded.insn?)))
         };
         // Where a jump lands, what the registers hold depends on where it came from.
-        let landings: BTreeSet<u64> = body.iter().flat_map(decoded).filter_map(|(_, insn)| match A::flow(&insn, &state)? {
+        let landings: BTreeSet<u64> = body.iter().flat_map(decoded).filter_map(|(_, insn)| match A::flow(&insn, &state, image)? {
             Flow::Jump(target) | Flow::Branch(target) => Some(target),
             _ => None,
         }).collect();
@@ -87,7 +87,7 @@ pub fn text_arguments(image: &Image, body: &[(u64, u64)], calls: &[u64], is_text
                 if calls.binary_search(&addr).is_ok() {
                     found.extend(held.iter().enumerate().find_map(|(position, held)| Some((addr, position, held.filter(|&text| is_text(text))?))));
                 }
-                match (A::flow(&insn, &state), A::argument_write(&insn)) {
+                match (A::flow(&insn, &state, image), A::argument_write(&insn)) {
                     (Some(_), _) => held = [None; 8],
                     (None, Some((position, address))) => held[position] = address,
                     (None, None) => {}
@@ -138,7 +138,7 @@ fn cfg_with<A: Arch>(image: &Image, analysis: &Analysis, body: &[(u64, u64)]) ->
     for &(start, end) in body {
         let Some(bytes) = image.bytes_from(start) else { continue };
         let bytes = &bytes[..bytes.len().min((end - start) as usize)];
-        instructions.extend(A::decode(bytes, start).map(|decoded| (decoded.addr, decoded.next_addr(), decoded.insn.and_then(|insn| A::flow(&insn, &state)))));
+        instructions.extend(A::decode(bytes, start).map(|decoded| (decoded.addr, decoded.next_addr(), decoded.insn.and_then(|insn| A::flow(&insn, &state, image)))));
     }
     let table = |jump: u64| analysis.jump_tables.iter().find(|table| table.jump == jump).map(|table| &table.targets);
     let call = |at: u64| analysis.calls.binary_search_by_key(&at, |call| call.at).ok().map(|index| &analysis.calls[index]);

@@ -396,7 +396,7 @@ impl<A: Arch> Explorer<'_, A> {
                 };
                 after_call = false;
                 self.regions[index].cover(offset, usize::from(decoded.len.max(1)));
-                let Some(flow) = A::flow(&insn, &state) else {
+                let Some(flow) = A::flow(&insn, &state, self.image) else {
                     if let Some((base, data)) = A::based_data_address(&insn, &state) {
                         if self.image.base != 0 && base == self.image.base {
                             self.data_refs.push(data);
@@ -580,7 +580,7 @@ impl<A: Arch> Explorer<'_, A> {
         let section = self.regions[index].section;
         for decoded in A::decode(&section.data[(addr - section.addr) as usize..], addr) {
             let Some(insn) = decoded.insn else { return };
-            match A::flow(&insn, &state) {
+            match A::flow(&insn, &state, self.image) {
                 None => A::step(&mut state, &insn),
                 Some(Flow::JumpIndirect(None)) if decoded.addr == jump => {
                     let resolved = A::resolve_table(&state, self.image, self.pointer_slots, &insn, &|target| {
@@ -777,7 +777,7 @@ impl<A: Arch> Explorer<'_, A> {
             if inside || A::is_padding(&insn) || self.frame_of(decoded.addr).is_some() {
                 return false;
             }
-            match A::flow(&insn, &state) {
+            match A::flow(&insn, &state, self.image) {
                 Some(Flow::Call(target)) if !may_call || self.region_index(target).is_none() => return false,
                 Some(Flow::CallIndirect(_)) if !may_call => return false,
                 Some(Flow::Halt | Flow::JumpIndirect(None)) => return false,

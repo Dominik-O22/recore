@@ -399,7 +399,7 @@ pub fn decode_floor(binary: &Path, runs: usize) -> Result<()> {
                 let Some(insn) = std::hint::black_box(decoded).insn else { continue };
                 instructions += 1;
                 if level >= 1 {
-                    found += u64::from(A::flow(&insn, &state).is_some());
+                    found += u64::from(A::flow(&insn, &state, image).is_some());
                 }
                 if level >= 2 {
                     A::step(&mut state, &insn);

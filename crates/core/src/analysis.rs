@@ -50,7 +50,7 @@ fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool) -> Function 
         if !A::is_padding(&insn) {
             body_end = decoded.next_addr();
         }
-        match A::flow(&insn, &state) {
+        match A::flow(&insn, &state, image) {
             Some(flow) => {
                 function.controls.push(Control { addr: decoded.addr, next: decoded.next_addr(), flow });
                 // The state only matters for resolving slots, so a fresh one after any control
@@ -261,7 +261,7 @@ fn code_end<A: Arch>(image: &Image, start: u64, bound: u64, tables: &FxHashMap<u
     let mut furthest_target = start;
     for decoded in A::decode(bytes, start) {
         let Some(insn) = decoded.insn else { return decoded.addr };
-        match A::flow(&insn, &state) {
+        match A::flow(&insn, &state, image) {
             Some(Flow::Branch(target)) if target > decoded.addr && target < bound => {
                 furthest_target = furthest_target.max(target);
             }
@@ -494,7 +494,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                     // been trimmed from its extent.
                     let trap_follows = || {
                         let insn = A::decode(image.bytes_from(control.next)?, control.next).next()?.insn?;
-                        Some(A::flow(&insn, &A::State::default()) == Some(Flow::Halt))
+                        Some(A::flow(&insn, &A::State::default(), image) == Some(Flow::Halt))
                     };
                     (ends_function || trap_follows() == Some(true)).then_some(target)
                 })

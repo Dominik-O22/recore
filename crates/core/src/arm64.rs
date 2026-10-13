@@ -389,7 +389,7 @@ impl Arch for Arm64 {
         Self::decode(&bytes[offset..], base + offset as u64)
     }
 
-    fn flow(insn: &Insn, state: &State) -> Option<Flow> {
+    fn flow(insn: &Insn, state: &State, _: &Image) -> Option<Flow> {
         let slot = |register: usize| match state.registers[register] {
             Value::Slot(slot) => Some(slot),
             _ => None,
@@ -609,7 +609,7 @@ impl Arch for Arm64 {
             for decoded in Self::decode(&section.data, section.addr) {
                 let Some(insn) = decoded.insn else { continue };
                 // Padding and traps separate stubs.
-                if insn.word == NOP || Self::flow(&insn, &state) == Some(Flow::Halt) {
+                if insn.word == NOP || Self::flow(&insn, &state, image) == Some(Flow::Halt) {
                     continue;
                 }
                 let start = *stub_start.get_or_insert(decoded.addr);
