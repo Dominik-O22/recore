@@ -48,3 +48,5 @@ __pycache__/
 corpus*/ghidra-refs/
 untrusted/
 dist/
+corpus-arm64/ghidra/
+corpus-macho*/ghidra*/

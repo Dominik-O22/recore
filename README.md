@@ -90,18 +90,30 @@ It reads ELF, Windows PE and Mach-O for x86, x86-64 and AArch64.
 
 ## Fast is not sloppy
 
-Scored against debug information, on the same binaries as Ghidra.
+Scored against debug information, on the same binaries as Ghidra. Mach-O binaries have none, so their truth is the symbol table of the unstripped original plus the linker's list of function starts.
 
 | Corpus | | Functions found | Precision | Jump tables exact |
 |---|---|---|---|---|
 | Linux x86-64 | recore | 100.0% | 100.0% | 535 of 535 |
-| | Ghidra | 99.9% | 96.8% | 487 of 535 |
+| | Ghidra | 99.7% | 97.1% | 487 of 535 |
+| Linux AArch64 | recore | 100.0% | 99.9% | |
+| | Ghidra | 100.0% | 99.9% | |
 | Windows x86 | recore | 99.3% | 98.8% | 6,244 of 6,277 |
 | | Ghidra | 83.1% | 98.5% | 5,834 of 6,277 |
 | Windows x86-64 | recore | 99.8% | 98.2% | 3,151 of 3,159 |
 | | Ghidra | 91.0% | 97.9% | 2,972 of 3,159 |
+| AArch64 Mach-O | recore | 100.0% | 100.0% | |
+| | Ghidra | 100.0% | 99.7% | |
+| AArch64 Mach-O, function starts hidden | recore | 99.8% | 99.9% | |
+| | Ghidra | 75.5% | 99.2% | |
+| x86-64 Mach-O | recore | 100.0% | 100.0% | |
+| | Ghidra | 99.9% | 99.1% | |
+| x86-64 Mach-O, function starts hidden | recore | 99.2% | 99.2% | |
+| | Ghidra | 72.0% | 98.2% | |
 
-Ghidra's Linux run covers 110 of that corpus's 184 binaries, so those two rows are not over the same set.
+The Linux AArch64 and Mach-O corpora have no jump table truth. A stripped Mach-O binary keeps the linker's list of function starts and both tools read it, so the rows with it hidden show what each finds on its own.
+
+Three of Ghidra's exports give a jump table target as a negative number, which the scorer rejects along with the whole binary. They were scored with those targets written as unsigned.
 
 Decompiled function signatures against PDB records, 8 binaries per corpus:
 
@@ -116,7 +128,7 @@ Each tool's percentages are over the functions it decompiled, and recore decompi
 
 References from code to data have no ground truth, so they are scored against Ghidra's own, on 11 binaries: recore finds 96.6% of them on Linux x86-64, 91.8% on Windows x86, 96.0% on Windows x86-64 and 85.2% on Linux AArch64. Most of the rest are a later element or field of an object recore refers to the start of, which Ghidra reaches by following a loop or a constant index.
 
-There is no Ghidra run for function recovery on the Linux AArch64 and Mach-O corpora. With unwind tables hidden, recore finds 99.2% of functions on Linux AArch64. With the linker's list of function starts hidden, it finds 99.8% on AArch64 Mach-O and 99.2% on x86-64 Mach-O. It finds every C++ class that has type information in the Linux and macOS corpora, 13,952 of them, at the right vtable address.
+With unwind tables hidden, recore finds 99.8% of functions on Linux x86-64 and 99.2% on Linux AArch64. It finds every C++ class that has type information in the Linux and macOS corpora, 13,952 of them, at the right vtable address.
 
 ## What Ghidra does that recore does not
 
