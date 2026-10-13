@@ -85,6 +85,9 @@ pub struct Banking {
     /// The address of each call that names a function and its bank and goes through a stub,
     /// which switches banks on the way, to the address of that function.
     pub calls: FxHashMap<u64, u64>,
+    /// `[start, end)` of each run of trampoline entries that lie back to back, sorted. A run is
+    /// one table: code, but no function for each entry.
+    pub tables: Vec<(u64, u64)>,
 }
 
 impl Banking {
@@ -128,9 +131,11 @@ pub struct Image {
     pub import_slots: FxHashMap<u64, String>,
     /// Exported function addresses from the dynamic symbol table. In a Mach-O image, also the
     /// methods its Objective-C metadata lists, which the runtime calls by name. In a raw image,
-    /// the entry points its layout lists after the first, and the functions its trampolines reach.
+    /// the entry points its layout lists after the first, the functions its trampolines reach,
+    /// and the stubs they go through.
     pub exports: Vec<u64>,
-    /// Names the image itself carries for addresses in it: exports, as written in the file.
+    /// Names the image itself carries for addresses in it: exports, as written in the file. In
+    /// a raw image, what its layout says the trampoline tables and stubs are.
     pub symbol_names: FxHashMap<u64, String>,
     /// `[start, end)` of every function the image describes: a frame description entry in
     /// `.eh_frame`, a PE `RUNTIME_FUNCTION`, or a Mach-O function start up to the next one.

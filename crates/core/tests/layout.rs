@@ -61,7 +61,7 @@ fn banked_code_calls_through_a_trampoline_into_the_bank_it_names() {
     let mut place = |at: usize, code: &[u8]| bytes[at..at + code.len()].copy_from_slice(code);
     // Common code. Reset: LJMP 0x0010. The stubs of bank 0 and bank 1.
     place(0x00, &[0x02, 0x00, 0x10]);
-    place(0x03, &[0xE5, 0x49, 0x02, 0x46, 0x00, 0xE5, 0x49, 0x02, 0x46, 0x04]);
+    place(0x03, &[0xE5, 0x49, 0x22, 0x00, 0x00, 0xE5, 0x49, 0x22, 0x00, 0x04]);
     // LCALL 0x0020, the entry; LCALL 0x0050, which no bank is named for; RET.
     place(0x10, &[0x12, 0x00, 0x20, 0x12, 0x00, 0x50, 0x22]);
     // The entry: 0x0040 by way of the stub of bank 1.
@@ -94,14 +94,30 @@ fn banked_code_calls_through_a_trampoline_into_the_bank_it_names() {
 
         [[banking.trampoline]]
         entry = "90 hh ll 02 ss ss"
-        stub = "e5 49 02 46 .."
+        stub = "e5 49 22 00 .."
     "#;
     let image = Image::load(&write("banked", layout, &bytes)).unwrap();
     let analysis = recore::analyze(&image);
-    let functions: Vec<u64> = analysis.functions.iter().map(|function| function.addr).collect();
-    assert_eq!(functions, [0x0000, 0x0010, 0x0030, 0x0050, 0x1_0040]);
+    // The stubs are code too, named for what they are.
+    let functions: Vec<(u64, Option<&str>)> = analysis.functions.iter().map(|function| (function.addr, function.name.as_deref())).collect();
+    let expected = [
+        (0x0000, None),
+        (0x0003, Some("bank_switch_0")),
+        (0x0008, Some("bank_switch_1")),
+        (0x0010, None),
+        (0x0030, None),
+        (0x0050, None),
+        (0x1_0040, None),
+    ];
+    assert_eq!(functions, expected);
     let calls: Vec<(u64, CallTarget)> = analysis.calls.iter().map(|call| (call.at, call.target)).collect();
     let function = CallTarget::Function;
-    assert_eq!(calls, [(0x0000, function(0x0010)), (0x0010, function(0x1_0040)), (0x0013, function(0x0050)), (0x1_0040, function(0x0030))]);
+    let expected = [
+        (0x0000, function(0x0010)),
+        (0x0010, function(0x1_0040)),
+        (0x0013, function(0x0050)),
+        (0x1_0040, function(0x0030)),
+    ];
+    assert_eq!(calls, expected);
     assert_eq!(recore::i8051::unbanked_transfers(&image, &analysis), [(0x0013, 0x0050)]);
 }

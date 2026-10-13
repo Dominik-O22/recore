@@ -29,7 +29,8 @@
 //! ```
 //!
 //! That is a table of entries in the common code, one per function, each of which goes on to
-//! the stub of the function's bank. Where the caller itself names the bank and calls the one
+//! the stub of the function's bank. The image names each stub `bank_switch_N` and each table
+//! `bank_trampolines`. Where the caller itself names the bank and calls the one
 //! stub there is, the pattern is that of the call, with `bb` for the bank:
 //!
 //! ```toml
@@ -166,8 +167,9 @@ impl Pattern {
 }
 
 impl BankingLayout {
-    /// Finds the trampolines in the common code of `sections`, which are sorted by address.
-    fn resolve(&self, sections: &[Section]) -> Result<Banking> {
+    /// Finds the trampolines in the common code of `sections`, which are sorted by address,
+    /// and names the code that is their machinery: each table of entries and each stub.
+    fn resolve(&self, sections: &[Section]) -> Result<(Banking, Vec<(u64, String)>)> {
         let mut banking = Banking { common: self.common.iter().map(|&(start, end)| (u64::from(start), u64::from(end))).collect(), ..Banking::default() };
         banking.common.sort_unstable();
         // Every place a pattern can match: each common address with the bytes from there on.
@@ -176,6 +178,7 @@ impl BankingLayout {
             common.flat_map(|(section, start, end)| (start..end).map(move |addr| (addr, &section.data[(addr - section.addr) as usize..(end - section.addr) as usize])))
         };
         let (mut trampolines, mut calls) = (FxHashMap::default(), FxHashMap::default());
+        let (mut tables, mut names) = (Vec::new(), Vec::new());
         for trampoline in &self.trampoline {
             let Trampoline { entry, call, stub } = trampoline;
             let pattern = match (entry, call) {
@@ -191,8 +194,18 @@ impl BankingLayout {
                 let bank = *bank_of.get(&u64::from(found.stub))?;
                 Some(banking.address(found.bank.map_or(bank, u64::from), found.target))
             };
+            // A stub that the caller tells the bank switches to any; otherwise to its own.
+            names.extend(bank_of.iter().map(|(&stub, bank)| (stub, if pattern.count(Unit::Bank) == 1 { "bank_switch".to_string() } else { format!("bank_switch_{bank}") })));
             if entry.is_some() {
-                trampolines.extend(places().filter_map(|(addr, bytes)| Some((addr, reached(bytes)?))));
+                let found: Vec<(u64, u64)> = places().filter_map(|(addr, bytes)| Some((addr, reached(bytes)?))).collect();
+                // `places` goes up through the addresses, so entries back to back follow each other.
+                for &(addr, _) in &found {
+                    match tables.last_mut() {
+                        Some((_, end)) if *end == addr => *end += pattern.0.len() as u64,
+                        _ => tables.push((addr, addr + pattern.0.len() as u64)),
+                    }
+                }
+                trampolines.extend(found);
             } else {
                 // The instruction that calls is the one before the stub's address.
                 let call = pattern.0.iter().position(|&unit| unit == Unit::Stub).and_then(|stub| stub.checked_sub(1)).context("a call names its stub after an instruction")?;
@@ -200,9 +213,11 @@ impl BankingLayout {
                 calls.extend(anywhere.filter_map(|(addr, bytes)| Some((addr + call as u64, reached(bytes)?))));
             }
         }
-        banking.trampolines = trampolines;
-        banking.calls = calls;
-        Ok(banking)
+        tables.sort_unstable();
+        names.extend(tables.iter().map(|&(start, _)| (start, "bank_trampolines".to_string())));
+        names.sort_unstable();
+        (banking.trampolines, banking.calls, banking.tables) = (trampolines, calls, tables);
+        Ok((banking, names))
     }
 }
 
@@ -243,10 +258,12 @@ pub fn load(path: &Path) -> Result<Image> {
         ensure!(pair[0].end() <= pair[1].addr, "the regions `{}` and `{}` overlap", pair[0].name, pair[1].name);
     }
 
-    let banking = layout.banking.map(|banking| banking.resolve(&sections)).transpose()?.unwrap_or_default();
-    // A trampoline exists for each function that another bank calls.
+    let (banking, machinery) = layout.banking.map(|banking| banking.resolve(&sections)).transpose()?.unwrap_or_default();
+    // A trampoline exists for each function that another bank calls. Nothing calls a stub
+    // that discovery sees, since a call through one counts as a call of the function.
     let mut exports = vectors.to_vec();
     exports.extend(banking.trampolines.values().chain(banking.calls.values()));
+    exports.extend(machinery.iter().map(|&(addr, _)| addr).filter(|addr| banking.tables.binary_search_by_key(addr, |&(start, _)| start).is_err()));
     exports.sort_unstable();
     exports.dedup();
 
@@ -261,7 +278,7 @@ pub fn load(path: &Path) -> Result<Image> {
         zero_filled: if layout.machine == Machine::I8051 { crate::i8051::memory() } else { Vec::new() },
         import_slots: FxHashMap::default(),
         exports,
-        symbol_names: FxHashMap::default(),
+        symbol_names: machinery.into_iter().collect(),
         frames: Vec::new(),
         relative_targets: Vec::new(),
         // An 8051 reads its constants and its switch tables from the code space.
@@ -298,10 +315,13 @@ mod tests {
         code[0x8000..0x8006].copy_from_slice(&[0x90, 0x80, 0x10, 0x02, 0x00, 0x05]);
         let section = Section { name: String::new(), addr: 0, data: code, file_offset: None, executable: true, writable: false };
 
-        let banking = layout.resolve(&[section]).unwrap();
+        let (banking, names) = layout.resolve(&[section]).unwrap();
         let mut trampolines: Vec<(u64, u64)> = banking.trampolines.iter().map(|(&entry, &target)| (entry, target)).collect();
         trampolines.sort_unstable();
         assert_eq!(trampolines, [(0x0A, 0x1_8010), (0x10, 0x8010), (0x16, 0x0020)]);
+        // The three entries are one table, and each stub is named for its bank.
+        assert_eq!(banking.tables, [(0x0A, 0x1C)]);
+        assert_eq!(names, [(0x00, "bank_switch_0".to_string()), (0x05, "bank_switch_1".to_string()), (0x0A, "bank_trampolines".to_string())]);
         // From bank 2: a call to an entry, to common code, and to code of its own.
         assert_eq!([banking.reach(0x2_9000, 0x000A), banking.reach(0x2_9000, 0x0030), banking.reach(0x2_9000, 0x9100)], [0x1_8010, 0x0030, 0x2_9100]);
     }
@@ -328,10 +348,11 @@ mod tests {
         bank.extend([0x78, 0x23, 0x79, 0x01, 0x7A, 0x01, 0x12, 0x00, 0x10]);
         let section = |addr, data| Section { name: String::new(), addr, data, file_offset: None, executable: true, writable: false };
 
-        let banking = layout.resolve(&[section(0, common), section(0x2_8000, bank)]).unwrap();
+        let (banking, names) = layout.resolve(&[section(0, common), section(0x2_8000, bank)]).unwrap();
         let mut calls: Vec<(u64, u64)> = banking.calls.iter().map(|(&call, &target)| (call, target)).collect();
         calls.sort_unstable();
         assert_eq!(calls, [(0x26, 0x2_9000), (0x2_8006, 0x1_8123), (0x2_800F, 0x0123)]);
-        assert!(banking.trampolines.is_empty());
+        assert!(banking.trampolines.is_empty() && banking.tables.is_empty());
+        assert_eq!(names, [(0x10, "bank_switch".to_string())]);
     }
 }
