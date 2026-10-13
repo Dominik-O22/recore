@@ -39,6 +39,7 @@ pub struct RdDecompiled {
     pub jump_targets: *const u64,
     pub flags: u32,
     pub flow: *const c_char,
+    pub locals: *const c_char,
 }
 
 unsafe extern "C" {
@@ -76,6 +77,7 @@ unsafe extern "C" {
     pub fn rd_set_param_count(session: *mut RdSession, addr: u64, count: usize, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_returns_like(session: *mut RdSession, function: u64, callee: u64, import_slot: i32, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_set_flow(session: *mut RdSession, on: i32);
+    pub fn rd_name_local(session: *mut RdSession, function: u64, place: *const c_char, name: *const c_char);
     pub fn rd_listing(session: *mut RdSession, start: u64, end: u64, pcode: i32, out: *mut *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_add_global(session: *mut RdSession, addr: u64, name: *const c_char, type_name: *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_add_types(session: *mut RdSession, xml: *const c_char, out: *mut *const c_char, err: *mut c_char, errlen: usize) -> i32;

@@ -28,6 +28,10 @@ pub struct Edits {
     /// `extern` prototypes of named functions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declarations: Vec<String>,
+    /// Names given to variables inside functions: function entry, then the variable's place as
+    /// the decompiler reports it, then the name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub locals: BTreeMap<u64, BTreeMap<String, String>>,
     /// The C type of the data at an address.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub types: BTreeMap<u64, String>,

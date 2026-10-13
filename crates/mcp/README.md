@@ -22,7 +22,7 @@ Every tool takes `path`, the binary to analyze, and answers with text. Addresses
 | `pcode` | `function`, `limit`? (400), `timeout`? | The function's data flow after the decompiler has simplified it: blocks, and operations over values assigned once each. |
 | `trace` | `function`, then `param`, `returns`, or `call` with `arg`; `depth`? (2), `timeout`? | One value followed through the code and across calls: a parameter forward, or a returned value or call argument back to where it comes from. |
 | `symbols` | `pattern`?, `limit`? (100) | Every named address: functions, import slots, vtables, exported data, and names given with `rename`. |
-| `rename` | `addr` and `name`, or `names` (list of both) | Names a function entry or a data address. An empty name removes it. |
+| `rename` | `addr` and `name`, `var`?, or `names` (list of these) | Names a function entry or a data address. With `var`, names a parameter or local variable of the function at `addr`, given as `decompile` spells it now. An empty name removes it. |
 | `comment` | `addr`, `text` | Attaches a note to an address. `function`, `disassemble` and `decompile` show it. Empty text removes it. |
 | `declare` | `code`, or `addr` and `type` | `code` is C: `struct`, `union`, `enum`, `typedef`, and `extern` prototypes that set a named function's parameters and return type. `addr` with `type` says what the data at an address is. |
 | `type` | `name`? | Size, alignment and fields with offsets of a struct or union, or the values of an enum. Without `name`, what `declare` has recorded. |
@@ -41,7 +41,7 @@ In decompiled C a send through one of the linker's selector stubs reads `objc_ms
 
 An edit replaces the decompiler process with one that starts from the new edits, so the first decompilation after an edit waits for that process to load the binary again. Several renames in one `names` list cost one restart.
 
-A name goes on a function entry or on data. A place inside a function takes a comment, not a name.
+A name goes on a function entry, on data, or on a variable of a function. A variable is remembered by where it is stored, so its name holds when other edits change how the function decompiles, and is dropped only if the variable itself is gone. An address inside a function takes a comment, not a name.
 
 ## Debug information
 
@@ -65,6 +65,7 @@ recore-mcp addr firmware.dll --offset 0x280cc
 recore-mcp disassemble firmware.dll 0x10001260 --count 40 --pcode
 recore-mcp trace firmware.dll 0x10001260 --param 1
 recore-mcp rename firmware.dll 0x10001260 parse_header
+recore-mcp rename firmware.dll parse_header param_1 header
 recore-mcp declare firmware.dll 'struct Header { uint4 magic; uint2 version; };'
 recore-mcp declare firmware.dll 0x1002abd0 Header
 ```

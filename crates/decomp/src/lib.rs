@@ -152,6 +152,16 @@ pub struct JumpTable {
     pub targets: Vec<u64>,
 }
 
+/// A variable of a decompiled function: a parameter, a stack variable or a temporary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Local {
+    /// As the C spells it.
+    pub name: String,
+    /// The storage that identifies the variable when the function is decompiled again, as
+    /// [`Session::name_local`] takes it.
+    pub place: String,
+}
+
 /// The result of decompiling one function.
 #[derive(Debug, Clone)]
 pub struct Decompiled {
@@ -167,6 +177,7 @@ pub struct Decompiled {
     pub jump_tables: Vec<JumpTable>,
     /// The function's data flow, if [`Session::keep_flow`] asked for it.
     pub flow: Option<Flow>,
+    pub locals: Vec<Local>,
 }
 
 /// One disassembled instruction.
@@ -411,6 +422,14 @@ impl Session {
         unsafe { ffi::rd_set_flow(self.raw.as_ptr(), keep.into()) }
     }
 
+    /// Names the variable of `function` at `place`, one of [`Decompiled::locals`]. The name
+    /// shows whenever the function is decompiled and still has a variable there.
+    pub fn name_local(&mut self, function: u64, place: &str, name: &str) -> Result<()> {
+        let (place, name) = (CString::new(place)?, CString::new(name)?);
+        unsafe { ffi::rd_name_local(self.raw.as_ptr(), function, place.as_ptr(), name.as_ptr()) };
+        Ok(())
+    }
+
     /// Disassembles `[start, end)` linearly, with each instruction's raw p-code if `pcode`.
     pub fn listing(&mut self, start: u64, end: u64, pcode: bool) -> Result<Vec<Instruction>> {
         let mut out = std::ptr::null();
@@ -497,7 +516,9 @@ impl Session {
                 })
                 .collect();
             let flow = text(out.flow);
+            let locals = text(out.locals).lines().filter_map(|line| line.split_once('\t')).map(|(name, place)| Local { name: name.into(), place: place.into() }).collect();
             Ok(Decompiled {
+                locals,
                 flow: if flow.is_empty() { None } else { Some(Flow::parse(&flow)?) },
                 c_text: text(out.c_text),
                 params,

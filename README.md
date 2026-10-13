@@ -37,6 +37,7 @@ recore-mcp strings program.exe 'license|serial'
 recore-mcp decompile program.exe 0x401260
 recore-mcp trace program.exe 0x401260 --param 1
 recore-mcp rename program.exe 0x401260 check_license
+recore-mcp rename program.exe check_license param_1 serial
 ```
 
 | | Tools |
@@ -89,7 +90,7 @@ There is no Ghidra run for function recovery on the Linux AArch64 and Mach-O cor
 - **Types.** Ghidra ships struct layouts for the common libraries and lets a user edit types in a GUI. recore knows the types a caller declares, the prototypes of Windows, C library and macOS functions, classes from MSVC and Itanium type information and Objective-C metadata, and, when a binary has DWARF or a PDB, the structs, prototypes and globals in it.
 - **A GUI**, a debugger, scripting, and a database of everything it found.
 
-Other limits: a Swift method that is only in a vtable is named by its kind and place, as `Type.getter_2`, because the image holds no name for it; `trace` does not follow a value through memory; a name goes on a function or on data, not on a place inside a function; arm64e Mach-O loads but is untested.
+Other limits: a Swift method that is only in a vtable is named by its kind and place, as `Type.getter_2`, because the image holds no name for it; `trace` does not follow a value through memory; a name goes on a function, on data or on a variable of a function, not on an address inside a function; arm64e Mach-O loads but is untested.
 
 ## Building
 

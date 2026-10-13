@@ -141,11 +141,12 @@ pub fn list() -> Value {
         ),
         tool(
             "rename",
-            "Names a function (at its entry address) or a data address. The name is saved for this binary and used everywhere from then on, the decompiler's C included. An empty name removes it. Give `addr` and `name`, or several in `names`.",
+            "Names a function (at its entry address), a data address, or with `var` a variable inside a function. The name is saved for this binary and used everywhere from then on, the decompiler's C included. An empty name removes it. Give `addr` and `name`, or several in `names`.",
             json!({
-                "addr": addr("A function entry or a data address"),
+                "addr": addr("A function entry or a data address; with `var`, the function, by address or name"),
+                "var": { "type": "string", "description": "A parameter or local variable of the function, as `decompile` spells it now: `param_1`, `local_18`, `uVar3`." },
                 "name": { "type": "string", "description": "The new name; empty to remove." },
-                "names": { "type": "array", "items": { "type": "object", "properties": { "addr": { "type": "string" }, "name": { "type": "string" } }, "required": ["addr", "name"] }, "description": "Several renames at once, which restarts the decompiler only once." },
+                "names": { "type": "array", "items": { "type": "object", "properties": { "addr": { "type": "string" }, "var": { "type": "string" }, "name": { "type": "string" } }, "required": ["addr", "name"] }, "description": "Several renames at once, which restarts the decompiler only once." },
             }),
             &[],
         ),

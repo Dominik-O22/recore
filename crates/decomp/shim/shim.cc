@@ -58,6 +58,8 @@ struct RdDecompiled {
   uint32_t flags;
   // The function's data flow after simplification, if rd_set_flow asked for it: see `dump_flow`.
   const char *flow;
+  // The function's variables, a line each: the name, a tab, and the place rd_name_local takes.
+  const char *locals;
 };
 
 }  // extern "C"
@@ -205,11 +207,13 @@ struct RdSession {
   bool keep_prototypes = false;
   bool want_flow = false;
   set<uint64_t> kept;  // functions whose prototype this session locked
+  // Names given to variables, per function: the variable's place and its name.
+  map<uint64_t, vector<pair<string, string>>> local_names;
   // Where and as what each function decompiled so far returns its value, if it returns one.
   map<uint64_t, ParameterPieces> outputs;
 
   // Backing storage for the last RdDecompiled, listing and type layout.
-  string c_text, return_type, flow, text;
+  string c_text, return_type, flow, locals, text;
   vector<string> strings;
   vector<RdParam> params;
   vector<uint64_t> jump_addrs, jump_targets;
@@ -345,6 +349,67 @@ class ListingPcode : public PcodeEmit {
     out << "\n";
   }
 };
+
+// Whether a symbol of a function's own scope is one of its variables, not a label or a constant.
+static bool is_variable(const Symbol *symbol) {
+  return symbol->getCategory() <= Symbol::function_parameter &&
+         dynamic_cast<const LabSymbol *>(symbol) == nullptr &&
+         dynamic_cast<const FunctionSymbol *>(symbol) == nullptr;
+}
+
+// Where a variable lives, in a form that names the same variable when the function is
+// decompiled again: `<space>:<offset>:<size>`, and for a variable that holds its storage only
+// from one instruction on, `@` and that instruction's address. All numbers are hexadecimal.
+static string local_place(const MapEntry *entry) {
+  ostringstream s;
+  s << entry->getAddr().getSpace()->getName() << ':' << hex << entry->getAddr().getOffset() << ':'
+    << entry->getSize();
+  Address use = entry->getFirstUseAddress();
+  if (!use.isInvalid()) s << '@' << use.getOffset();
+  return s.str();
+}
+
+// The variable at a place written by `local_place`, or null if the function has none there now.
+static Symbol *local_at(Funcdata *fd, const string &place) {
+  char space_name[64];
+  unsigned long long offset = 0, use_offset = 0;
+  unsigned size = 0;
+  int fields = sscanf(place.c_str(), "%63[^:]:%llx:%x@%llx", space_name, &offset, &size, &use_offset);
+  if (fields < 3) return nullptr;
+  AddrSpace *space = fd->getArch()->getSpaceByName(space_name);
+  if (space == nullptr) return nullptr;
+  Address addr(space, offset);
+  Address use = fields == 4 ? Address(fd->getArch()->getDefaultCodeSpace(), use_offset) : Address();
+  ScopeLocal *scope = fd->getScopeLocal();
+  MapEntry *entry = scope->findAddr(addr, use);
+  if (entry != nullptr && entry->getSize() == (int4)size) return entry->getSymbol();
+  // The variable may be recorded from another of its assignments this time.
+  Varnode *vn = fields == 4 ? fd->findVarnodeWritten(size, addr, use) : nullptr;
+  if (vn == nullptr || vn->getHigh()->getSymbolOffset() > 0) return nullptr;
+  Symbol *symbol = vn->getHigh()->getSymbol();
+  return symbol != nullptr && symbol->getScope() == scope ? symbol : nullptr;
+}
+
+// Gives the variables of a decompiled function the names rd_name_local recorded, then lists
+// every variable under the name it now has.
+static string name_locals(RdSession *session, uint64_t addr, Funcdata *fd) {
+  ScopeLocal *scope = fd->getScopeLocal();
+  auto named = session->local_names.find(addr);
+  if (named != session->local_names.end()) {
+    for (const pair<string, string> &local : named->second) {
+      Symbol *symbol = local_at(fd, local.first);
+      if (symbol != nullptr && is_variable(symbol)) scope->renameSymbol(symbol, local.second);
+    }
+  }
+  ostringstream out;
+  for (MapIterator it = scope->begin(); it != scope->end(); ++it) {
+    const MapEntry *entry = *it;
+    const Symbol *symbol = entry->getSymbol();
+    if (is_variable(symbol) && symbol->getFirstWholeMap() == entry)
+      out << symbol->getName() << '\t' << local_place(entry) << '\n';
+  }
+  return out.str();
+}
 
 // The name of a data type as C spells it. getName() is empty for pointers and arrays.
 static string type_name(const Datatype *type) {
@@ -727,6 +792,12 @@ int rd_set_style(RdSession *session, const char *name, char *err, size_t errlen)
 // With `on`, each rd_decompile also fills RdDecompiled::flow.
 void rd_set_flow(RdSession *session, int on) { session->want_flow = on != 0; }
 
+// Names the variable of `function` at `place`, as RdDecompiled::locals gives places. The name
+// shows in every later decompilation of the function in which the variable is still there.
+void rd_name_local(RdSession *session, uint64_t function, const char *place, const char *name) {
+  session->local_names[function].push_back({place, name});
+}
+
 // Disassembles `[start, end)` into `*out`, one line per instruction: its address and length in
 // hex and its text, tab-separated. Bytes that do not decode give a line with the text `(bad)`.
 // With `pcode`, each instruction is followed by its raw p-code, one operation per line, each
@@ -962,6 +1033,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
     }
 
+    session->locals = name_locals(session, addr, fd);
     ostringstream text;
     if (session->print_c) {
       // The pretty printer numbers its tokens from one unsynchronized static counter
@@ -1026,6 +1098,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       session->outputs[addr] = piece;
     }
     out->flow = session->flow.c_str();
+    out->locals = session->locals.c_str();
     out->flags = (fd->hasBadData() ? RD_BAD_DATA : 0) |
                  (fd->hasUnimplemented() ? RD_UNIMPLEMENTED : 0) |
                  (proto.getOutputType()->getMetatype() != TYPE_VOID ? RD_RETURNS_VALUE : 0);

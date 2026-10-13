@@ -56,9 +56,12 @@ impl Client {
         reply
     }
 
-    /// Calls a tool on the server's own executable. `Err` is a tool error's message.
+    /// Calls a tool on the server's own executable, or on the binary `arguments` names. `Err`
+    /// is a tool error's message.
     fn tool(&mut self, name: &str, mut arguments: Value) -> Result<String, String> {
-        arguments["path"] = SERVER.into();
+        if arguments["path"].is_null() {
+            arguments["path"] = SERVER.into();
+        }
         let reply = self.request("tools/call", json!({ "name": name, "arguments": arguments }));
         let text = reply["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{reply}")).to_string();
         if reply["result"]["isError"] == true { Err(text) } else { Ok(text) }
@@ -165,4 +168,21 @@ fn edits_reach_every_view_and_outlive_the_server() {
     let function = Client::start_in(&edits).tool("function", json!({ "name": "program_start" })).unwrap();
     assert!(function.starts_with(&format!("function {entry}(program_start):")), "{function}");
     assert!(Client::start().tool("function", json!({ "name": "program_start" })).unwrap_err().contains("no function is named"));
+}
+
+#[test]
+fn a_variable_keeps_the_name_it_is_given() {
+    // `total` of the decompiler's fixture: a loop over a list that sums into one temporary.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/types.elf");
+    let edits = edits_dir();
+    let mut client = Client::start_in(&edits);
+    let renamed = client.tool("rename", json!({ "path": path, "names": [{ "addr": "0x401000", "var": "iVar1", "name": "sum" }, { "addr": "0x401000", "var": "list", "name": "item" }] })).unwrap();
+    assert!(renamed.starts_with("iVar1 in 0x401000 is now sum\nlist in 0x401000 is now item\n"), "{renamed}");
+    assert!(client.tool("rename", json!({ "path": path, "addr": "0x401000", "var": "scale", "name": "sum" })).unwrap_err().contains("already has a variable `sum`"));
+    assert!(client.tool("rename", json!({ "path": path, "addr": "0x401000", "var": "iVar1", "name": "x" })).unwrap_err().contains("it has sum, scale, item"));
+
+    drop(client);
+    let c_text = Client::start_in(&edits).tool("decompile", json!({ "path": path, "functions": ["0x401000"] })).unwrap();
+    assert!(c_text.contains("int4 total(node *item,int4 scale)"), "{c_text}");
+    assert!(c_text.contains("sum = sum + scale * item->value;"), "{c_text}");
 }

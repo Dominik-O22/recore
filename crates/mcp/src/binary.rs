@@ -9,10 +9,10 @@ use recore::Image;
 use recore::edits::Edits;
 use recore::program::Program;
 use recore_decomp::isolate::{FunctionRecord, Options, Worker};
-use recore_decomp::{Flow, Instruction};
+use recore_decomp::{Flow, Instruction, Local};
 
 /// How long the decompiler process gets for a request that is not a decompilation.
-const QUICK: Duration = Duration::from_secs(30);
+pub const QUICK: Duration = Duration::from_secs(30);
 
 /// Binaries kept at once. Each holds its analysis and a decompiler process.
 const KEPT: usize = 8;
@@ -87,6 +87,11 @@ impl Binary {
     /// The data flow of the function at `addr`, which costs one decompilation.
     pub fn flow(&mut self, addr: u64, timeout: Duration) -> Result<Flow> {
         self.worker.flow(addr, timeout).map_err(anyhow::Error::msg)
+    }
+
+    /// The variables of the function at `addr`, which costs one decompilation.
+    pub fn locals(&mut self, addr: u64, timeout: Duration) -> Result<Vec<Local>> {
+        self.worker.locals(addr, timeout).map_err(anyhow::Error::msg)
     }
 
     /// Checks a C declaration against the decompiler without saving it.

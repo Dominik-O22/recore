@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use recore::edits::Edits;
 
-use crate::{Facts, Flow, Instruction, Session, Style};
+use crate::{Facts, Flow, Instruction, Local, Session, Style};
 
 /// Where switch targets come from.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -103,6 +103,7 @@ enum Event {
     Callees(Vec<u64>),
     Listing(Result<Vec<Instruction>, String>),
     Flow(Result<Flow, String>),
+    Locals(Result<Vec<Local>, String>),
     /// The answer to [`Request::Declare`], empty, or to [`Request::Type`].
     Text(Result<String, String>),
 }
@@ -119,6 +120,8 @@ enum Request {
     Listing { start: u64, end: u64, pcode: bool },
     /// Decompile the function for its data flow.
     Flow(u64),
+    /// Decompile the function for its variables.
+    Locals(u64),
     /// Parse a C declaration, to learn whether the engine takes it.
     Declare(String),
     /// Describe a data type.
@@ -198,6 +201,12 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
     }
 
+    for (&function, names) in &edits.locals {
+        for (place, name) in names {
+            session.name_local(function, place, name)?;
+        }
+    }
+
     session.set_style(options.style)?;
     let callees_first = options.callees_first && image.machine == Machine::X86;
     session.keep_prototypes(callees_first);
@@ -261,6 +270,13 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 let flow = session.decompile(addr).map(|function| function.flow.unwrap_or_default());
                 session.keep_flow(false);
                 send(&Event::Flow(flow.map_err(|error| error.to_string())))?;
+                continue;
+            }
+            Request::Locals(addr) => {
+                if let Some(importer) = &mut importer {
+                    importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
+                }
+                send(&Event::Locals(session.decompile(addr).map(|function| function.locals).map_err(|error| error.to_string())))?;
                 continue;
             }
             Request::Declare(ref declaration) => {
@@ -555,6 +571,15 @@ impl Worker {
         self.callees_first(addr, timeout);
         match self.ask(Request::Flow(addr), timeout) {
             Ok(Event::Flow(flow)) => flow,
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// The variables of the function at `addr`, which costs one decompilation.
+    pub fn locals(&mut self, addr: u64, timeout: Duration) -> Result<Vec<Local>, String> {
+        self.callees_first(addr, timeout);
+        match self.ask(Request::Locals(addr), timeout) {
+            Ok(Event::Locals(locals)) => locals,
             other => Err(unexpected(other)),
         }
     }

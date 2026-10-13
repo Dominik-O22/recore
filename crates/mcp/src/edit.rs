@@ -6,21 +6,32 @@ use anyhow::{Context, Result, bail, ensure};
 use recore::program::{Pattern, matches};
 use serde::Deserialize;
 
-use crate::binary::Binary;
-use crate::tools::{DEFAULT_LIMIT, addr_arg, describe, shown};
+use crate::binary::{Binary, QUICK};
+use crate::tools::{DEFAULT_LIMIT, addr_arg, describe, resolve_function, shown};
 
 #[derive(Deserialize)]
 struct Naming {
     addr: String,
+    /// The variable of the function at `addr` to name, by its present name.
+    var: Option<String>,
     name: String,
 }
 
 #[derive(Deserialize)]
 pub struct Rename {
     addr: Option<String>,
+    var: Option<String>,
     name: Option<String>,
     #[serde(default)]
     names: Vec<Naming>,
+}
+
+/// What one renaming names.
+enum Named {
+    /// A function entry or data.
+    Address(u64),
+    /// A variable of the function at `function`, at the place the decompiler reports for it.
+    Local { function: u64, place: String, was: String },
 }
 
 /// Checks that `addr` can carry a name: a function entry, or data.
@@ -29,43 +40,76 @@ fn nameable(binary: &Binary, addr: u64) -> Result<()> {
     ensure!(program.image.section_at(addr).is_some(), "{addr:#x} is not in any section of the file");
     if program.image.is_code(addr) && program.function(addr).is_none() {
         match program.function_at(addr) {
-            Ok(entry) => bail!("{addr:#x} is inside function {}; name the function at its entry, or use `comment` for a place inside it", program.label(entry)),
+            Ok(entry) => bail!("{addr:#x} is inside function {}; name the function at its entry, a variable of it with `var`, or use `comment` for a place inside it", program.label(entry)),
             Err(_) => bail!("{addr:#x} is code in no function the analysis found"),
         }
     }
     Ok(())
 }
 
+/// Finds the variable called `var` in the function `function` names, and checks that `name` is
+/// free there.
+fn local(binary: &mut Binary, function: &str, var: &str, name: &str) -> Result<Named> {
+    let function = resolve_function(binary, function)?;
+    let label = binary.program.label(function);
+    let locals = binary.locals(function, QUICK).with_context(|| format!("{label} was not decompiled"))?;
+    ensure!(name.is_empty() || name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.starts_with(|c: char| c.is_ascii_digit()), "`{name}` is not a C identifier");
+    ensure!(name == var || locals.iter().all(|local| local.name != name), "{label} already has a variable `{name}`");
+    let Some(found) = locals.iter().find(|local| local.name == var) else {
+        let names: Vec<&str> = locals.iter().map(|local| local.name.as_str()).collect();
+        bail!("{label} has no variable `{var}`; it has {}", names.join(", "));
+    };
+    Ok(Named::Local { function, place: found.place.clone(), was: var.to_string() })
+}
+
 pub fn rename(binary: &mut Binary, args: Rename) -> Result<String> {
     let mut namings = args.names;
     match (args.addr, args.name) {
-        (Some(addr), Some(name)) => namings.push(Naming { addr, name }),
+        (Some(addr), Some(name)) => namings.push(Naming { addr, var: args.var, name }),
         (None, None) => {}
         _ => bail!("`rename` needs `addr` and `name` together"),
     }
     ensure!(!namings.is_empty(), "`rename` needs `addr` and `name`, or `names`");
     let mut changes = Vec::new();
     for naming in &namings {
-        let addr = addr_arg(&naming.addr)?;
-        nameable(binary, addr)?;
         let name = naming.name.trim();
         ensure!(!name.chars().any(char::is_control), "a name cannot contain control characters");
-        changes.push((addr, name.to_string()));
+        let named = match &naming.var {
+            Some(var) => local(binary, &naming.addr, var.trim(), name)?,
+            None => {
+                let addr = addr_arg(&naming.addr)?;
+                nameable(binary, addr)?;
+                Named::Address(addr)
+            }
+        };
+        changes.push((named, name.to_string()));
     }
     binary.edit(|edits| {
-        for (addr, name) in &changes {
-            if name.is_empty() {
-                edits.names.remove(addr);
-            } else {
-                edits.names.insert(*addr, name.clone());
+        for (named, name) in &changes {
+            match named {
+                Named::Address(addr) if name.is_empty() => drop(edits.names.remove(addr)),
+                Named::Address(addr) => drop(edits.names.insert(*addr, name.clone())),
+                Named::Local { function, place, .. } => {
+                    let names = edits.locals.entry(*function).or_default();
+                    if name.is_empty() {
+                        names.remove(place);
+                    } else {
+                        names.insert(place.clone(), name.clone());
+                    }
+                    if names.is_empty() {
+                        edits.locals.remove(function);
+                    }
+                }
             }
         }
     })?;
     let mut out = String::new();
-    for (addr, name) in &changes {
-        match name.as_str() {
-            "" => writeln!(out, "{addr:#x} has the name the analysis gives it again: {}", describe(binary, *addr))?,
-            name => writeln!(out, "{addr:#x} is now {name}")?,
+    for (named, name) in &changes {
+        match (named, name.as_str()) {
+            (Named::Address(addr), "") => writeln!(out, "{addr:#x} has the name the analysis gives it again: {}", describe(binary, *addr))?,
+            (Named::Address(addr), name) => writeln!(out, "{addr:#x} is now {name}")?,
+            (Named::Local { function, was, .. }, "") => writeln!(out, "{was} in {} has the name the decompiler gives it again", binary.program.label(*function))?,
+            (Named::Local { function, was, .. }, name) => writeln!(out, "{was} in {} is now {name}", binary.program.label(*function))?,
         }
     }
     writeln!(out, "saved; the decompiler is starting again with the new names")?;

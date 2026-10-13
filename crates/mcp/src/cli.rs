@@ -55,6 +55,11 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
             named.insert("addr".into(), json!(addr));
             named.insert("name".into(), json!(name));
         }
+        ("rename", [function, var, name]) => {
+            named.insert("addr".into(), json!(function));
+            named.insert("var".into(), json!(var));
+            named.insert("name".into(), json!(name));
+        }
         ("comment", [addr, text]) => {
             named.insert("addr".into(), json!(addr));
             named.insert("text".into(), json!(text));
