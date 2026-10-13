@@ -1,0 +1,7 @@
+@define CIP51 ""
+
+# recore: a code address is 24 bits wide, `bank << 16 | address`, as 8051.ldefs has it for this
+# language. Upstream leaves the width at the 16 bits that 8051_main.sinc defaults to.
+@define PTRSIZE "3"
+
+@include "8051_main.sinc"

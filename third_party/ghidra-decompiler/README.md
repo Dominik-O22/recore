@@ -1,7 +1,7 @@
 # Ghidra decompiler engine (vendored)
 
 The C++ decompiler from Ghidra, built as a static library by `build.rs` and used by
-`crates/decomp`. Five source files and two language files are modified, see below.
+`crates/decomp`. Five source files, two language files and the SLEIGH sources of the 8051 language are modified, see below.
 
 Source: `Ghidra/Features/Decompiler/src/decompile/` of the Ghidra repository at commit
 `918d44ebc2` (12.3 DEV), copied from `~/Work/tries/ghidra-profile/master`.
@@ -9,8 +9,9 @@ Source: `Ghidra/Features/Decompiler/src/decompile/` of the Ghidra repository at 
 | Directory | Contents |
 |---|---|
 | `cpp/` | The `CORE`, `DECCORE` and `SLEIGH` groups of the upstream `Makefile`, plus `sleigh_arch` and `inject_sleigh`, and every header they include. The bison outputs (`xml.cc`, `grammar.cc`, `pcodeparse.cc`) are checked in upstream and copied as they are, next to their `.y` sources. |
+| `slaspec/` | The SLEIGH sources of the 8051 language, from `Ghidra/Processors/8051/data/languages/`, modified: see below. Not built by `build.rs`. |
 | `zlib/` | Ghidra's subset of zlib 1.3.1, used to read `.sla` files. Built with `NO_GZIP`, like Ghidra's own build. |
-| `languages/` | From `Ghidra/Processors/{x86,AARCH64,8051}/data/languages/`: the `.ldefs` language lists, the processor specs (`x86.pspec`, `x86-64.pspec`, `AARCH64.pspec`, `cip-51.pspec`) and the compiler specs for the targets `crates/decomp` supports (`x86win`, `x86gcc`, `x86-64-win`, `x86-64-gcc`, `AARCH64`, `keil-cx51`). The `.sla` files (`x86.sla`, `x86-64.sla`, `AARCH64.sla`) are build output: the SLEIGH compiler's result for the matching `.slaspec`, taken from the built distribution `dist-master/ghidra_12.3_DEV`. `cip-51.sla` is built here, and two of the 8051 files are modified, see below. |
+| `languages/` | From `Ghidra/Processors/{x86,AARCH64,8051}/data/languages/`: the `.ldefs` language lists, the processor specs (`x86.pspec`, `x86-64.pspec`, `AARCH64.pspec`, `cip-51.pspec`) and the compiler specs for the targets `crates/decomp` supports (`x86win`, `x86gcc`, `x86-64-win`, `x86-64-gcc`, `AARCH64`, `keil-cx51`). The `.sla` files (`x86.sla`, `x86-64.sla`, `AARCH64.sla`) are build output: the SLEIGH compiler's result for the matching `.slaspec`, taken from the built distribution `dist-master/ghidra_12.3_DEV`. `cip-51.sla` is built from `slaspec/`, and two of the 8051 files are modified, see below. |
 
 Left out: the console (`consolemain`, `ifacedecomp`, `interface`), the Ghidra client protocol
 (`*_ghidra`, `ghidra_process`), the BFD and XML image loaders, the SLEIGH compiler, and the tests.
@@ -42,12 +43,18 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   print each line of C with the address of the instruction it came from. Marked with a
   `recore:` comment.
 
-- `languages/cip-51.sla`: built from upstream's unmodified `cip-51.slaspec` with `PTRSIZE`
-  defined as 3, which `8051_main.sinc` provides for. The distribution's own `cip-51.sla` has a
-  16-bit code space, though `8051.ldefs` lists the language as 24 bits wide. With 24 bits a
-  code address is `bank << 16 | address`, and `LJMP`, `LCALL`, `AJMP` and `ACALL` stay in the
-  bank of their instruction. To rebuild, in a copy of the 8051 language directory:
-  `support/sleigh -DPTRSIZE=3 cip-51.slaspec cip-51.sla`.
+- `languages/cip-51.sla`: built from `slaspec/`, upstream's `cip-51.slaspec` and
+  `8051_main.sinc` with three changes, each marked with a `recore:` comment. To rebuild, run
+  `support/sleigh cip-51.slaspec cip-51.sla` of the distribution in a copy of `slaspec/`.
+  - `PTRSIZE` is 3. The distribution's own `cip-51.sla` has a 16-bit code space, though
+    `8051.ldefs` lists the language as 24 bits wide. With 24 bits a code address is
+    `bank << 16 | address`, and `LJMP`, `LCALL`, `AJMP` and `ACALL` stay in the bank of their
+    instruction.
+  - `@A+DPTR` is an address in the bank of its instruction too, where upstream has bank 0: a
+    table read with `MOVC` lies in the bank of the code that reads it.
+  - The direct addresses 0 to 7 are the registers `R0` to `R7`. Upstream has them as internal
+    memory, apart from the registers, so a value that C51 moves from one register to another
+    by its address was lost.
 
 - `languages/cip-51.pspec`: of the special function registers and their bits, only those
   every 8051 has are named, `SCON` and `SBUF` under their usual names. Upstream names the
@@ -69,6 +76,6 @@ SLEIGH compiler. The `.sla` format version must match the engine.
 
 - `cpp/`: Apache License 2.0 (`LICENSE`, `NOTICE`). Every file carries the Apache header. The three bison-generated parsers also carry the GPLv3 bison skeleton notice
   with its special exception, which permits distributing the generated parser under other terms.
-- `languages/`: the files carry no header. Upstream's `Ghidra/Processors/x86/certification.manifest`
+- `languages/` and `slaspec/`: the files carry no header. Upstream's `Ghidra/Processors/x86/certification.manifest`
   lists them as `GHIDRA`, its tag for Apache 2.0, and so do the ones for `AARCH64` and `8051`.
 - `zlib/`: zlib licence (`zlib/LICENSE`).

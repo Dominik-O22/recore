@@ -282,3 +282,17 @@ fn an_8051_function_that_runs_into_the_next_one_calls_it() {
     assert!(!function.bad_data, "{}", function.c_text);
     assert!(function.c_text.contains("next(1);\n  return;"), "{}", function.c_text);
 }
+
+#[test]
+fn an_8051_register_copied_by_its_address_keeps_its_value() {
+    // MOV 0x05, 0x07 (R5 from R7, by their addresses); MOV A, R5; INC A; MOV R7, A; RET
+    let function = banked_session(&[(0, &[0x85, 0x07, 0x05, 0xed, 0x04, 0xff, 0x22])]).decompile(0).unwrap();
+    assert!(function.c_text.contains("return param_1 + '\\x01';"), "{}", function.c_text);
+}
+
+#[test]
+fn an_8051_table_is_read_in_the_bank_of_the_code_that_reads_it() {
+    // In bank 2: MOV DPTR, #0x9000; MOV A, R7; MOVC A, @A+DPTR; MOV R7, A; RET
+    let function = session_8051(&[0x90, 0x90, 0x00, 0xef, 0x93, 0xff, 0x22], 0x02_8000).decompile(0x02_8000).unwrap();
+    assert!(function.c_text.contains("+ 0x29000)"), "{}", function.c_text);
+}
