@@ -9,7 +9,9 @@
 //!
 //! A `switch` over a dense range is `MOV DPTR, #table` and `JMP @A+DPTR` into a run of jumps, one
 //! per case. The listing of each module at its final addresses (`.rst`) shows the run: the lines
-//! from the label the `MOV` names to the next label.
+//! from the label the `MOV` names to the next label. Where that would not fit, the jump follows
+//! two runs of bytes, the low and then the high halves of the cases' addresses, which the code
+//! reads into `DPTR` with `MOVC A, @A+PC`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -126,12 +128,8 @@ pub fn extract(layout: &Path, cdb_path: &Path) -> Result<Truth> {
 fn listed(line: &str) -> Option<(u64, Vec<u8>, &str)> {
     // The address is six digits after six spaces. A line without one starts with more spaces.
     let addr = line.get(6..12).filter(|_| line.starts_with("      ")).and_then(|word| u64::from_str_radix(word, 16).ok())?;
-    let mut words = line[12..].split_whitespace().peekable();
-    let mut bytes = Vec::new();
-    while let Some(byte) = words.peek().filter(|word| word.len() == 2).and_then(|word| u8::from_str_radix(word, 16).ok()) {
-        bytes.push(byte);
-        words.next();
-    }
+    // The bytes have the columns up to the cycle count or, in a line of data, the line number.
+    let bytes = line.get(12..30).unwrap_or(&line[12..]).split_whitespace().map_while(|word| u8::from_str_radix(word, 16).ok()).collect();
     // After the bytes come the cycle count in brackets, the line number, and the source text,
     // which a tab sets off unless it is a label.
     let text = line.split_once('\t').map_or_else(|| line.rsplit(' ').next().unwrap_or(""), |(_, text)| text);
@@ -155,24 +153,42 @@ fn listed_tables(rst: &str) -> (Vec<JumpTable>, Vec<Rejected>, usize) {
             continue;
         }
         let (table, _, label) = lines[index + 1];
-        let slots: Vec<&(u64, Vec<u8>, &str)> = lines[index + 2..].iter().take_while(|(_, bytes, _)| !bytes.is_empty()).collect();
-        let is_jump = |slot: &&(u64, Vec<u8>, &str)| ["ljmp\t", "sjmp\t", "ajmp\t"].iter().any(|jump| slot.2.starts_with(jump));
-        if slots.is_empty() || !is_jump(&slots[0]) {
-            continue;
-        }
-        listed += 1;
-        let loads_table = format!("mov\tdptr,#{}", label.trim_end_matches(':'));
-        let reason = if !lines[index.saturating_sub(8)..index].iter().any(|(_, _, text)| *text == loads_table) {
-            Some("the code before the jump does not load the table's address")
-        } else if !slots.iter().all(is_jump) {
-            Some("something other than a jump lies among the table's jumps")
-        } else {
-            None
-        };
-        match reason {
-            Some(reason) => rejected.push(Rejected { table, reason: reason.to_string() }),
-            // The jump lands on one of the table's jumps, which goes on to the case.
-            None => tables.push(JumpTable { jump: *jump, table, targets: slots.iter().map(|slot| slot.0).collect(), unreachable: None }),
+        let run = |from: usize| -> Vec<&(u64, Vec<u8>, &str)> { lines.get(from..).unwrap_or_default().iter().take_while(|(_, bytes, _)| !bytes.is_empty()).collect() };
+        let slots = run(index + 2);
+        let starts_with = |slot: &&(u64, Vec<u8>, &str), words: &[&str]| words.iter().any(|word| slot.2.starts_with(word));
+        let is_jump = |slot: &&(u64, Vec<u8>, &str)| starts_with(slot, &["ljmp\t", "sjmp\t", "ajmp\t"]);
+        let is_byte = |slot: &&(u64, Vec<u8>, &str)| starts_with(slot, &[".db\t"]);
+        let before = &lines[index.saturating_sub(10)..index];
+        let label = label.trim_end_matches(':');
+        if slots.first().is_some_and(is_jump) {
+            listed += 1;
+            let loads_table = format!("mov\tdptr,#{label}");
+            if !before.iter().any(|(_, _, text)| *text == loads_table) {
+                rejected.push(Rejected { table, reason: "the code before the jump does not load the table's address".to_string() });
+            } else if !slots.iter().all(is_jump) {
+                rejected.push(Rejected { table, reason: "something other than a jump lies among the table's jumps".to_string() });
+            } else {
+                // The jump lands on one of the table's jumps, which goes on to the case.
+                tables.push(JumpTable { jump: *jump, table, targets: slots.iter().map(|slot| slot.0).collect(), unreachable: None });
+            }
+        } else if slots.first().is_some_and(is_byte) {
+            listed += 1;
+            // The low halves, a label, and as many high halves.
+            let low: Vec<u8> = slots.iter().flat_map(|slot| slot.1.iter().copied()).collect();
+            let second = index + 2 + slots.len();
+            let high: Vec<u8> = run(second + 1).iter().flat_map(|slot| slot.1.iter().copied()).take(low.len()).collect();
+            let reads = |label: &str| before.iter().any(|(_, _, text)| *text == format!("add\ta,#({label}-3-.)"));
+            if !slots.iter().all(is_byte) || !is_label(second) || high.len() != low.len() {
+                rejected.push(Rejected { table, reason: "the bytes after the jump are not two runs of one length".to_string() });
+            } else if !reads(label) || !reads(lines[second].2.trim_end_matches(':')) {
+                rejected.push(Rejected { table, reason: "the code before the jump does not read both runs".to_string() });
+            } else {
+                // A case is in the function, and so in the bank, of the jump.
+                let mut targets: Vec<u64> = low.iter().zip(&high).map(|(&low, &high)| jump & !0xFFFF | u64::from(u16::from_be_bytes([high, low]))).collect();
+                targets.sort_unstable();
+                targets.dedup();
+                tables.push(JumpTable { jump: *jump, table, targets, unreachable: None });
+            }
         }
     }
     tables.sort_by_key(|table| table.jump);
@@ -189,6 +205,26 @@ mod tests {
                    L:G$P0$0_0$0:80\nL:G$pick$0$0:B9\nL:XG$pick$0$0:F3\nL:Fmod$local$0$0:18000\nL:XFmod$local$0$0:1801A\nL:C$t.c$6$1_0$45:B9\n";
         let functions: Vec<_> = c_functions(cdb).into_iter().collect();
         assert_eq!(functions, [(0xB9, ("pick".to_string(), Some(0xF3))), (0x1_8000, ("local".to_string(), Some(0x1_801A)))]);
+    }
+
+    #[test]
+    fn a_table_is_two_runs_of_bytes_where_the_code_reads_them() {
+        let rst = "      0018DF 24 08            [12] 1285 \tadd\ta,#(00182$-3-.)\n\
+                   \x20     0018E5 24 05            [12] 1289 \tadd\ta,#(00183$-3-.)\n\
+                   \x20     0018EA 73               [24] 1293 \tjmp\t@a+dptr\n\
+                   \x20     0018EB                       1294 00182$:\n\
+                   \x20     0018EB 36                    1295 \t.db\t00101$\n\
+                   \x20     0018EC B9                    1296 \t.db\t00102$\n\
+                   \x20     0018ED 36                    1297 \t.db\t00101$\n\
+                   \x20     0018EE                       1298 00183$:\n\
+                   \x20     0018EE 19                    1299 \t.db\t00101$>>8\n\
+                   \x20     0018EF 1A                    1300 \t.db\t00102$>>8\n\
+                   \x20     0018F0 19                    1301 \t.db\t00101$>>8\n\
+                   \x20     0018F1                       1302 00101$:\n";
+        let (tables, rejected, listed) = listed_tables(rst);
+        let tables: Vec<_> = tables.iter().map(|table| (table.jump, table.table, table.targets.as_slice())).collect();
+        assert_eq!(tables, [(0x18EA, 0x18EB, &[0x1936, 0x1AB9][..])]);
+        assert_eq!((rejected.len(), listed), (0, 1));
     }
 
     #[test]
