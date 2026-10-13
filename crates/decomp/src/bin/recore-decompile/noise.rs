@@ -10,8 +10,9 @@ use crate::report::BinaryReport;
 /// What is looked for in a function's C, by the name it is reported under. Each stands for a
 /// value the engine could not explain: a flag kept as a bit of the status register, a wide value
 /// seen only as its bytes, or a register a convention does not account for.
-const MARKS: [(&str, fn(&str) -> bool); 7] = [
-    ("flag arithmetic", |c| c.lines().any(|line| line.contains("PSW") && !declares(line))),
+const MARKS: [(&str, fn(&str) -> bool); 8] = [
+    ("flag arithmetic", |c| c.lines().any(|line| !declares(line) && words(line).any(is_flag))),
+    ("carry call", |c| ["CARRY1(", "SCARRY1(", "SBORROW1("].iter().any(|call| c.contains(call))),
     ("CONCAT", |c| c.contains("CONCAT")),
     ("extraout_", |c| c.contains("extraout_")),
     ("in_ register", |c| words(c).any(|word| word.starts_with("in_"))),
@@ -24,6 +25,13 @@ const MARKS: [(&str, fn(&str) -> bool); 7] = [
 fn declares(line: &str) -> bool {
     let mut words = line.trim().strip_suffix(';').unwrap_or("=").split(' ');
     words.clone().count() == 2 && words.all(|word| word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// Whether a word of C names the 8051's status register, or a flag of it that the function
+/// did not compute itself: one it was entered with or a call left it.
+fn is_flag(word: &str) -> bool {
+    let unexplained = ["in_", "extraout_", "unaff_"].iter().find_map(|prefix| word.strip_prefix(prefix));
+    word.contains("PSW") || unexplained.is_some_and(|register| ["CY", "AC", "OV", "F0", "F1", "RS0", "RS1"].iter().any(|flag| register.split('_').next() == Some(flag)))
 }
 
 fn words(c: &str) -> impl Iterator<Item = &str> {
@@ -79,11 +87,13 @@ mod tests {
         assert!(!found("  char extraout_PSW;\n  uint1 in_PSW;\n"));
         assert!(found("  uVar1 = in_PSW & 0x7f | 0x80;\n"));
         assert!(found("  if (-1 < extraout_PSW) break;\n"));
+        assert!(found("  if (extraout_CY_00 != '\\0') {\n"));
+        assert!(!found("  bool in_CY;\n  if (param_1 < 3) {\n"));
     }
 
     #[test]
     fn an_input_register_is_a_word_of_its_own() {
-        let found = MARKS[3].1;
+        let found = MARKS[4].1;
         assert!(found("  return in_DPL;\n"));
         assert!(!found("  main_loop();\n"));
     }

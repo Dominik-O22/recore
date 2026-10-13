@@ -44,12 +44,20 @@
       <!-- recore: upstream has PSW as unaffected and nothing as killed. C51 keeps no register
            across a call, a function returns a bit in the carry flag, and the library's
            routines return in A, B, DPTR and R0 to R3 as well. Code that reads one of these
-           after a call reads what the call left, not what was there before it. -->
+           after a call reads what the call left, not what was there before it. Of the flags,
+           which are registers of their own in this language, a call leaves the ones
+           arithmetic sets changed, and the register bank and the user's flags as they were. -->
       <unaffected>
         <register name="SP"/>
+        <register name="RS0"/>
+        <register name="RS1"/>
+        <register name="F0"/>
+        <register name="F1"/>
       </unaffected>
       <killedbycall>
-        <register name="PSW"/>
+        <register name="CY"/>
+        <register name="AC"/>
+        <register name="OV"/>
         <register name="ACC"/>
         <register name="B"/>
         <register name="DPTR"/>

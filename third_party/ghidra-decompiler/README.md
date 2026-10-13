@@ -44,7 +44,7 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   `recore:` comment.
 
 - `languages/cip-51.sla`: built from `slaspec/`, upstream's `cip-51.slaspec` and
-  `8051_main.sinc` with three changes, each marked with a `recore:` comment. To rebuild, run
+  `8051_main.sinc` with four changes, each marked with a `recore:` comment. To rebuild, run
   `support/sleigh cip-51.slaspec cip-51.sla` of the distribution in a copy of `slaspec/`.
   - `PTRSIZE` is 3. The distribution's own `cip-51.sla` has a 16-bit code space, though
     `8051.ldefs` lists the language as 24 bits wide. With 24 bits a code address is
@@ -55,6 +55,16 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   - The direct addresses 0 to 7 are the registers `R0` to `R7`. Upstream has them as internal
     memory, apart from the registers, so a value that C51 moves from one register to another
     by its address was lost.
+  - Each flag is a register of its own, `CY`, `AC`, `F0`, `RS1`, `RS0`, `OV` and `F1`, as in the
+    x86 and AArch64 languages. Upstream keeps them as bits of one register `PSW`, so a test of
+    the carry flag is a shift and a mask in the C. The status word is put together where code
+    reads it whole and taken apart where code writes it; a bit address in it is its flag, and
+    `P` is the parity of `A`. Three things upstream has wrong went with the rewrite: `ADDC`
+    and `SUBB` lost the carry out when operand plus carry wrapped, `ADD`, `ADDC` and `SUBB`
+    left the overflow flag alone, and `ADD` and `ANL` wrote a sign and a zero flag into `F0`
+    and `F1`. `AC` is still set by no instruction. `crates/decomp/tests/i8051_flags.rs` runs
+    the p-code of every instruction that touches a flag against the processor's rules. The
+    other variants `8051_main.sinc` serves upstream are not kept working.
 
 - `languages/cip-51.pspec`: of the special function registers and their bits, only those
   every 8051 has are named, `SCON` and `SBUF` under their usual names. Upstream names the
@@ -69,8 +79,9 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   - Parameters are in `R6R7`, `R4R5` and `R2R3`, of one or two bytes, and the result is in
     `R6R7` or `R4R5R6R7`, as in upstream's `mx51.cspec` for the same compiler. Upstream lists
     single registers, `R4` and `R5` first.
-  - `PSW`, `ACC`, `B`, `DPTR` and `R0` to `R7` are killed by a call, and `PSW` is no longer
-    unaffected. Upstream has a test of the carry flag after a call test the flag from before it.
+  - `CY`, `AC`, `OV`, `ACC`, `B`, `DPTR` and `R0` to `R7` are killed by a call, and the register
+    bank and the user's flags are unaffected. Upstream has all of `PSW` unaffected, so a test
+    of the carry flag after a call tests the flag from before it.
 
 ## Licences
 
