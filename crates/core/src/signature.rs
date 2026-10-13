@@ -58,15 +58,27 @@ pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u6
     let bytes = image.bytes_from(start)?;
     let bytes = bytes.get(..(end - start) as usize)?;
     match image.machine {
-        Machine::X86 => x86(32, bytes, pointer_slots, start, end),
-        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end),
-        Machine::Aarch64 => aarch64(bytes, start, end),
+        Machine::X86 => x86(32, bytes, pointer_slots, start, end, MIN_INSTRUCTIONS),
+        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, MIN_INSTRUCTIONS),
+        Machine::Aarch64 => aarch64(bytes, start, end, MIN_WORDS),
+    }
+}
+
+/// The fingerprint of the code in `[start, end)` however short it is: equal for two builds of
+/// one function that differ only in where they and what they refer to were linked. Short
+/// functions share theirs, so it identifies nothing by itself.
+pub fn body_hash(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64) -> Option<u64> {
+    let bytes = image.bytes_from(start)?.get(..end.checked_sub(start)? as usize)?;
+    match image.machine {
+        Machine::X86 => x86(32, bytes, pointer_slots, start, end, 0),
+        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, 0),
+        Machine::Aarch64 => aarch64(bytes, start, end, 0),
     }
 }
 
 /// An x86 function: displacements and immediates are blanked where they are relative to the
 /// instruction pointer and leave the function, or where the loader relocates them.
-fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64) -> Option<u64> {
+fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64, min_instructions: usize) -> Option<u64> {
     let mut decoder = Decoder::with_ip(bits, bytes, start, DecoderOptions::NONE);
 
     let mut hash = Hash::new();
@@ -112,14 +124,14 @@ fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64,
             hash.feed(if blank[index] { 0 } else { byte });
         }
     }
-    (instructions >= MIN_INSTRUCTIONS).then_some(hash.0)
+    (instructions >= min_instructions).then_some(hash.0)
 }
 
 /// An AArch64 function, a word at a time. Blanked are the offsets of calls and of branches and
 /// literal loads that leave the function, the address `adr` or `adrp` forms, and the low twelve
 /// bits an `add`, load or store then adds to a page. Which registers hold a page is followed
 /// along the instructions in address order, which is all the pairing compilers emit needs.
-fn aarch64(bytes: &[u8], start: u64, end: u64) -> Option<u64> {
+fn aarch64(bytes: &[u8], start: u64, end: u64, min_words: usize) -> Option<u64> {
     const OFFSET_26: u32 = 0x03FF_FFFF;
     const OFFSET_19: u32 = 0x00FF_FFE0;
     const OFFSET_14: u32 = 0x0007_FFE0;
@@ -128,7 +140,7 @@ fn aarch64(bytes: &[u8], start: u64, end: u64) -> Option<u64> {
     /// The registers a call may change: `x0` to `x18` and the link register.
     const CALLER_SAVED: u32 = 0x4007_FFFF;
 
-    if bytes.len() / 4 < MIN_WORDS {
+    if bytes.len() / 4 < min_words {
         return None;
     }
     let mut hash: u64 = 0;
@@ -321,7 +333,7 @@ mod tests {
     fn fingerprint_of(words: &[u32], start: u64) -> Option<u64> {
         let padding = (0..MIN_WORDS as u32).map(|n| 0xD280_0000 | n << 5);
         let bytes: Vec<u8> = words.iter().copied().chain(padding).flat_map(u32::to_le_bytes).collect();
-        aarch64(&bytes, start, start + bytes.len() as u64)
+        aarch64(&bytes, start, start + bytes.len() as u64, MIN_WORDS)
     }
 
     #[test]

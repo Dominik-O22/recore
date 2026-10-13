@@ -8,6 +8,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use recore::image::{Format, Machine};
 use recore::program::{Pattern, Program, matches, parse_addr};
+use recore::FxHashMap;
+use recore::diff::Evidence;
 use recore::report::CallTarget;
 use recore_decomp::isolate::Status;
 use serde::Deserialize;
@@ -140,6 +142,15 @@ pub fn list() -> Value {
             &[],
         ),
         tool(
+            "diff",
+            "Compares two builds of one program, such as before and after a patch: which functions changed, which are new and which are gone. Functions are paired by name, by code and by their place among callers and callees, so it works on stripped binaries. `path` is the earlier build.",
+            json!({
+                "to": { "type": "string", "description": "Path of the later build." },
+                "limit": limit,
+            }),
+            &["to"],
+        ),
+        tool(
             "rename",
             "Names a function (at its entry address), a data address, or with `var` a variable inside a function. The name is saved for this binary and used everywhere from then on, the decompiler's C included. An empty name removes it. Give `addr` and `name`, or several in `names`.",
             json!({
@@ -198,12 +209,53 @@ pub fn call(cache: &mut Cache, name: &str, arguments: Value) -> Option<Result<St
         "pcode" => run(cache, name, arguments, code::pcode),
         "trace" => run(cache, name, arguments, code::trace),
         "symbols" => run(cache, name, arguments, edit::symbols),
+        "diff" => diff(cache, arguments),
         "rename" => run(cache, name, arguments, edit::rename),
         "comment" => run(cache, name, arguments, edit::comment),
         "declare" => run(cache, name, arguments, edit::declare),
         "type" => run(cache, name, arguments, edit::type_),
         _ => return None,
     })
+}
+
+#[derive(Deserialize)]
+struct Diff {
+    path: PathBuf,
+    to: PathBuf,
+    limit: Option<usize>,
+}
+
+/// What changed between the build at `path` and the one at `to`.
+fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
+    let args: Diff = serde_json::from_value(arguments).map_err(|error| anyhow!("invalid arguments for `diff`: {error}"))?;
+    let (old, new) = cache.pair(&args.path, &args.to)?;
+    let (old, new) = (&old.program, &new.program);
+    ensure!(old.image.machine == new.image.machine, "the two are built for different processors, which leaves no code in common");
+    let found = recore::diff::diff(old, new);
+    let (old_sizes, new_sizes) = (old.sizes(), new.sizes());
+    let size = |sizes: &FxHashMap<u64, u64>, entry: &u64| sizes.get(entry).copied().unwrap_or_default();
+    let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
+    let changed: Vec<_> = found.pairs.iter().filter(|pair| pair.changed).collect();
+    let mut out = String::new();
+    writeln!(out, "{} functions before, {} after: {} the same, {} changed, {} removed, {} added", old.functions().count(), new.functions().count(), found.pairs.len() - changed.len(), changed.len(), found.removed.len(), found.added.len())?;
+    writeln!(out, "\nchanged, as before -> after with bytes of code{}", shown(changed.len(), limit))?;
+    for pair in changed.iter().take(limit) {
+        let how = match pair.evidence {
+            Evidence::Name => "same name",
+            Evidence::Body => "same code",
+            Evidence::Callee => "called from the same place",
+            Evidence::Callers => "same callers",
+            Evidence::Order => "same place among its neighbours",
+        };
+        writeln!(out, "{} {} -> {} {}  ({how})", old.label(pair.old), size(&old_sizes, &pair.old), new.label(pair.new), size(&new_sizes, &pair.new))?;
+    }
+    for (title, entries, program, sizes) in [("removed", &found.removed, old, &old_sizes), ("added", &found.added, new, &new_sizes)] {
+        writeln!(out, "\n{title}{}", shown(entries.len(), limit))?;
+        for entry in entries.iter().take(limit) {
+            writeln!(out, "{} {}", program.label(*entry), size(sizes, entry))?;
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn addr_arg(text: &str) -> Result<u64> {

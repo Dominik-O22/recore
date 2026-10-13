@@ -44,6 +44,7 @@ recore-mcp rename program.exe check_license param_1 serial
 |---|---|
 | Look around | `summary`, `functions`, `strings`, `imports`, `symbols`, `classes`, `addr`, `bytes` |
 | Read code | `function`, `xrefs`, `disassemble`, `decompile`, `pcode`, `trace` |
+| Compare builds | `diff` |
 | Record findings | `rename`, `comment`, `declare`, `type` |
 
 [crates/mcp/README.md](crates/mcp/README.md) describes each one.

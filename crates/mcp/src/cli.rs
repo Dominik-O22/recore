@@ -64,6 +64,7 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
             named.insert("addr".into(), json!(addr));
             named.insert("text".into(), json!(text));
         }
+        ("diff", [to]) => drop(named.insert("to".into(), json!(to))),
         ("declare", [code]) => drop(named.insert("code".into(), json!(code))),
         ("declare", [addr, kind]) => {
             named.insert("addr".into(), json!(addr));

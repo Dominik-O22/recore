@@ -134,4 +134,12 @@ impl Cache {
         self.binaries.truncate(KEPT);
         Ok(&mut self.binaries[0])
     }
+
+    /// Two binaries at once, for a tool that compares them.
+    pub fn pair(&mut self, first: &Path, second: &Path) -> Result<(&Binary, &Binary)> {
+        anyhow::ensure!(first != second, "{} is given twice", first.display());
+        self.get(first)?;
+        self.get(second)?;
+        Ok((&self.binaries[1], &self.binaries[0]))
+    }
 }

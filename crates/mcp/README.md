@@ -22,6 +22,7 @@ Every tool takes `path`, the binary to analyze, and answers with text. Addresses
 | `pcode` | `function`, `limit`? (400), `timeout`? | The function's data flow after the decompiler has simplified it: blocks, and operations over values assigned once each. |
 | `trace` | `function`, then `param`, `returns`, or `call` with `arg`; `depth`? (2), `timeout`? | One value followed through the code and across calls: a parameter forward, or a returned value or call argument back to where it comes from. |
 | `symbols` | `pattern`?, `limit`? (100) | Every named address: functions, import slots, vtables, exported data, and names given with `rename`. |
+| `diff` | `to`, `limit`? (100) | Compares the build at `path` with a later one at `to`: the functions that changed, with their size before and after, and those removed and added. |
 | `rename` | `addr` and `name`, `var`?, or `names` (list of these) | Names a function entry or a data address. With `var`, names a parameter or local variable of the function at `addr`, given as `decompile` spells it now. An empty name removes it. |
 | `comment` | `addr`, `text` | Attaches a note to an address. `function`, `disassemble` and `decompile` show it. Empty text removes it. |
 | `declare` | `code`, or `addr` and `type` | `code` is C: `struct`, `union`, `enum`, `typedef`, and `extern` prototypes that set a named function's parameters and return type. `addr` with `type` says what the data at an address is. |
@@ -49,6 +50,8 @@ When a binary has debug information, the decompiler uses it: functions take thei
 
 ## Data flow
 
+`diff` pairs the functions of two builds by name, then by code that is the same but for the addresses in it, then by their place among the callers and callees already paired, and last by their order between paired neighbours. A paired function counts as changed when its code differs. That suits a patch or a point release built with the same compiler; two builds by different compilers have little code in common and come out as mostly changed.
+
 `pcode` and `trace` read the decompiler's own intermediate form, the one its C is printed from. Stack bookkeeping and dead code are gone, every value has one definition, and a call lists its arguments in order. `trace` follows a value through at most 16 functions and does not follow it through memory: a value stored to a global or the heap and read back elsewhere is reported at the store and no further.
 
 ## From a shell
@@ -64,6 +67,7 @@ recore-mcp bytes firmware.dll 0x1002abd0 64
 recore-mcp addr firmware.dll --offset 0x280cc
 recore-mcp disassemble firmware.dll 0x10001260 --count 40 --pcode
 recore-mcp trace firmware.dll 0x10001260 --param 1
+recore-mcp diff firmware-1.0.dll firmware-1.1.dll
 recore-mcp rename firmware.dll 0x10001260 parse_header
 recore-mcp rename firmware.dll parse_header param_1 header
 recore-mcp declare firmware.dll 'struct Header { uint4 magic; uint2 version; };'

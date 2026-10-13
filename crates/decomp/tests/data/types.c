@@ -1,6 +1,8 @@
 // The source of types.elf and types.exe with types.pdb, which tests/debug_types.rs reads.
 //   gcc -g -O1 -nostdlib -static -fno-stack-protector -fno-asynchronous-unwind-tables -Wl,--build-id=none -Wl,-e,start -o types.elf types.c
 //   x86_64-w64-mingw32-clang -g -gcodeview -O1 -nostdlib -Wl,--pdb=types.pdb -Wl,-e,start -o types.exe types.c
+// With -DPATCHED and without -g it is types-patched.elf, a later build of the same program for
+// the `diff` tool: `total` has a check it lacked, and `clamp` is new.
 struct node {
     int value;
     struct node *next;
@@ -24,8 +26,17 @@ struct shape {
 
 struct node *head;
 
+#ifdef PATCHED
+__attribute__((noinline)) int clamp(int value) {
+    return value > 1000 ? 1000 : value;
+}
+#endif
+
 __attribute__((noinline)) int total(struct node *list, int scale) {
     int sum = 0;
+#ifdef PATCHED
+    if (scale > 100) return clamp(scale);
+#endif
     for (; list; list = list->next) sum += list->value * scale;
     return sum;
 }
