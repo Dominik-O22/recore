@@ -7,14 +7,11 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::arch::{Arch, Decoded, FieldUse, Flow, Table};
+use crate::arch::{Arch, Decoded, FieldUse, Flow, Limit, MAX_ENTRIES, Table};
 use crate::image::Image;
 
 /// How many spilled values are tracked per path.
 const SPILL_SLOTS: usize = 4;
-
-/// Upper bound on entries when no bounds check is found.
-const MAX_ENTRIES: usize = 4096;
 
 const NOP: u32 = 0xD503_201F;
 const BTI_C: u32 = 0xD503_245F;
@@ -211,10 +208,13 @@ enum Value {
     /// An index proven to be at most this value by an unsigned bounds check.
     Bounded(u64),
     /// An entry loaded from a jump table.
-    Entry { table: u64, size: u64, signed: bool, max_index: Option<u64> },
+    Entry { table: u64, size: u8, signed: bool, limit: Option<Limit> },
     /// A jump target formed as `base + (entry << shift)`.
-    Target { table: u64, size: u64, signed: bool, max_index: Option<u64>, base: u64, shift: u32 },
+    Target { table: u64, size: u8, signed: bool, limit: Option<Limit>, base: u64, shift: u8 },
 }
+
+// A state is copied at every branch that is followed, so its size is part of the analysis time.
+const _: () = assert!(size_of::<Value>() == 24);
 
 /// Register contents at one program point.
 #[derive(Clone, Copy, Default)]
@@ -301,11 +301,11 @@ impl State {
         } else if let Some((size, signed)) = insn.indexed_load() {
             match self.registers[insn.rn()] {
                 Value::Addr(table) => {
-                    let max_index = match self.registers[insn.rm()] {
-                        Value::Bounded(max) => Some(max),
+                    let limit = match self.registers[insn.rm()] {
+                        Value::Bounded(max) => Some(Limit::of(max)),
                         _ => None,
                     };
-                    Value::Entry { table, size, signed, max_index }
+                    Value::Entry { table, size: size as u8, signed, limit }
                 }
                 _ => Value::Unknown,
             }
@@ -313,20 +313,20 @@ impl State {
             // `add xd, xn, wm, <extend> #shift`: base plus scaled entry, GCC's dispatch.
             let signed = insn.word >> 15 & 1 == 1;
             match (self.registers[insn.rn()], self.registers[insn.rm()]) {
-                (Value::Addr(base), Value::Entry { table, size, signed: loaded_signed, max_index }) => {
-                    Value::Target { table, size, signed: signed || loaded_signed, max_index, base, shift: insn.word >> 10 & 7 }
+                (Value::Addr(base), Value::Entry { table, size, signed: loaded_signed, limit }) => {
+                    Value::Target { table, size, signed: signed || loaded_signed, limit, base, shift: (insn.word >> 10 & 7) as u8 }
                 }
                 _ => Value::Unknown,
             }
         } else if insn.word & 0xFF20_0000 == 0x8B00_0000 {
             // `add xd, xn, xm, lsl #shift`: table address plus entry, Clang's dispatch.
-            let shift = insn.word >> 10 & 63;
+            let shift = (insn.word >> 10 & 63) as u8;
             match (self.registers[insn.rn()], self.registers[insn.rm()]) {
-                (Value::Addr(base), Value::Entry { table, size, signed, max_index })
-                | (Value::Entry { table, size, signed, max_index }, Value::Addr(base))
+                (Value::Addr(base), Value::Entry { table, size, signed, limit })
+                | (Value::Entry { table, size, signed, limit }, Value::Addr(base))
                     if shift <= 2 =>
                 {
-                    Value::Target { table, size, signed, max_index, base, shift }
+                    Value::Target { table, size, signed, limit, base, shift }
                 }
                 _ => Value::Unknown,
             }
@@ -559,8 +559,8 @@ impl Arch for Arm64 {
         is_target: &dyn Fn(u64) -> bool,
         _is_code: &dyn Fn(u64) -> bool,
     ) -> Option<Table> {
-        let (table, size, signed, max_index, base, shift) = match state.registers[jump.rn()] {
-            Value::Target { table, size, signed, max_index, base, shift } => (table, size, signed, max_index, base, shift),
+        let (table, size, signed, limit, base, shift) = match state.registers[jump.rn()] {
+            Value::Target { table, size, signed, limit, base, shift } => (table, u64::from(size), signed, limit, base, shift),
             // A 64-bit entry jumped to as it is: a table of absolute code pointers, as computed
             // goto uses. It runs for as long as consecutive slots hold relocated code pointers.
             Value::Entry { table, size: 8, .. } => {
@@ -573,20 +573,19 @@ impl Arch for Arm64 {
             _ => return None,
         };
         let bytes = image.bytes_from(table)?;
-        let limit = max_index.map_or(MAX_ENTRIES, |max| (max as usize).saturating_add(1).min(MAX_ENTRIES));
         let mut entries = Vec::new();
-        for entry in bytes.chunks_exact(size as usize).take(limit) {
+        for entry in bytes.chunks_exact(size as usize).take(Limit::entries(limit)) {
             let target = base.wrapping_add_signed(read_entry(entry, size, signed) << shift);
             if !is_target(target) {
                 // A bounded table with an impossible entry is a misread, not a short table.
-                if max_index.is_some() {
+                if limit.is_some() {
                     return None;
                 }
                 break;
             }
             entries.push(target);
         }
-        (!entries.is_empty()).then_some(Table { address: table, entry_size: size, entries, bounded: max_index.is_some() })
+        (!entries.is_empty()).then_some(Table { address: table, entry_size: size, entries, bounded: limit.is_some() })
     }
 
     fn marked_jump_target(image: &Image, target: u64) -> Option<bool> {

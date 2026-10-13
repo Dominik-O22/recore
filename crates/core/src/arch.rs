@@ -2,6 +2,8 @@
 //! register tracking that resolves jump tables. Discovery and analysis are written once against
 //! this trait.
 
+use std::num::NonZeroU16;
+
 use rustc_hash::FxHashMap;
 
 use crate::image::Image;
@@ -41,6 +43,27 @@ pub struct Decoded<I> {
 impl<I> Decoded<I> {
     pub fn next_addr(&self) -> u64 {
         self.addr + u64::from(self.len)
+    }
+}
+
+/// Upper bound on the entries read from one table.
+pub const MAX_ENTRIES: usize = 4096;
+
+/// How many entries of a table a bounds check on its index allows, at most [`MAX_ENTRIES`].
+/// Two bytes, because every tracked register carries one along every path that is followed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Limit(NonZeroU16);
+
+impl Limit {
+    /// For an index proven to be at most `max_index`.
+    pub fn of(max_index: u64) -> Limit {
+        let entries = (max_index as usize).saturating_add(1).min(MAX_ENTRIES);
+        Limit(NonZeroU16::new(entries as u16).expect("at least one entry"))
+    }
+
+    /// How many entries to read: `limit`'s, or as many as any table may have.
+    pub fn entries(limit: Option<Limit>) -> usize {
+        limit.map_or(MAX_ENTRIES, |limit| usize::from(limit.0.get()))
     }
 }
 

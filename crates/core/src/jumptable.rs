@@ -19,14 +19,11 @@ use rustc_hash::FxHashMap;
 
 use iced_x86::{ConditionCode, Instruction, Mnemonic, OpKind, Register};
 
-use crate::arch::Table;
+use crate::arch::{Limit, Table};
 use crate::image::Image;
 
 /// How many spilled values are tracked per path.
 const SPILL_SLOTS: usize = 4;
-
-/// Upper bound on entries when no bounds check is found.
-const MAX_ENTRIES: usize = 4096;
 
 /// What a register is known to hold.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -37,23 +34,26 @@ enum Value {
     Base(u64),
     /// An index proven to be at most this value by an unsigned bounds check.
     Bounded(u64),
-    /// A sign-extended entry loaded from a table, with the index bound if known.
+    /// A sign-extended entry loaded from a table, with the limit on its index if known.
     /// `anchor` is the address the entry is an offset from: the table itself in GCC and Clang
     /// output, the image base in MSVC output.
-    Entry { table: u64, anchor: u64, max_index: Option<u64> },
+    Entry { table: u64, anchor: u64, limit: Option<Limit> },
     /// Entry plus base: the jump target.
-    Target { table: u64, anchor: u64, max_index: Option<u64> },
+    Target { table: u64, anchor: u64, limit: Option<Limit> },
     /// An entry loaded through a base register whose value is not known. If the same register
     /// is then added to it, the register holds the image base: that is the only way MSVC forms
     /// a jump target, and it often sets the base far from the dispatch.
-    BasedEntry { base_register: usize, table_offset: u64, max_index: Option<u64> },
+    BasedEntry { base_register: u8, table_offset: u64, limit: Option<Limit> },
     /// A `BasedEntry` plus its base register.
-    BasedTarget { table_offset: u64, max_index: Option<u64> },
+    BasedTarget { table_offset: u64, limit: Option<Limit> },
     /// A code pointer loaded from a table of absolute addresses, as computed goto uses.
-    Pointer { table: u64, max_index: Option<u64> },
+    Pointer { table: u64, limit: Option<Limit> },
     /// A pointer loaded from the slot at this address.
     Slot(u64),
 }
+
+// A state is copied at every branch that is followed, so its size is part of the analysis time.
+const _: () = assert!(size_of::<Value>() == 24);
 
 /// Register contents relevant to jump tables at one program point.
 #[derive(Clone, Copy, Default)]
@@ -132,7 +132,7 @@ impl State {
             }
             Mnemonic::Mov if instr.op1_kind() == OpKind::Memory && instr.memory_index_scale() == 8 => {
                 match self.absolute_table(instr) {
-                    Some(table) => Value::Pointer { table, max_index: self.bound_of(instr.memory_index()) },
+                    Some(table) => Value::Pointer { table, limit: self.bound_of(instr.memory_index()) },
                     None => Value::Unknown,
                 }
             }
@@ -141,16 +141,16 @@ impl State {
             }
             Mnemonic::Movsxd if instr.op1_kind() == OpKind::Memory => self.load(instr),
             Mnemonic::Add => match (dest.map(|d| self.get(d)), source.map(|s| self.get(s))) {
-                (Some(Value::BasedEntry { base_register, table_offset, max_index }), _)
-                    if source.and_then(index_of) == Some(base_register) =>
+                (Some(Value::BasedEntry { base_register, table_offset, limit }), _)
+                    if source.and_then(index_of) == Some(usize::from(base_register)) =>
                 {
-                    Value::BasedTarget { table_offset, max_index }
+                    Value::BasedTarget { table_offset, limit }
                 }
-                (Some(Value::Entry { table, anchor, max_index }), Some(Value::Base(base)))
-                | (Some(Value::Base(base)), Some(Value::Entry { table, anchor, max_index }))
+                (Some(Value::Entry { table, anchor, limit }), Some(Value::Base(base)))
+                | (Some(Value::Base(base)), Some(Value::Entry { table, anchor, limit }))
                     if anchor == base =>
                 {
-                    Value::Target { table, anchor, max_index }
+                    Value::Target { table, anchor, limit }
                 }
                 _ => Value::Unknown,
             },
@@ -201,13 +201,13 @@ impl State {
         }
         match self.get(instr.memory_base()) {
             Value::Base(anchor) => {
-                let max_index = self.bound_of(instr.memory_index());
-                Value::Entry { table: anchor.wrapping_add(instr.memory_displacement64()), anchor, max_index }
+                let limit = self.bound_of(instr.memory_index());
+                Value::Entry { table: anchor.wrapping_add(instr.memory_displacement64()), anchor, limit }
             }
             // An unknown base with a non-zero offset: possibly the image base.
             _ => match (index_of(instr.memory_base()), instr.memory_displacement64()) {
                 (Some(base_register), table_offset) if table_offset != 0 => {
-                    Value::BasedEntry { base_register, table_offset, max_index: self.bound_of(instr.memory_index()) }
+                    Value::BasedEntry { base_register: base_register as u8, table_offset, limit: self.bound_of(instr.memory_index()) }
                 }
                 _ => Value::Unknown,
             },
@@ -250,10 +250,10 @@ impl State {
         })
     }
 
-    /// The largest value an index register can hold, when a bounds check established one.
-    fn bound_of(&self, index: Register) -> Option<u64> {
+    /// How many entries an index register can reach, when a bounds check established that.
+    fn bound_of(&self, index: Register) -> Option<Limit> {
         match self.get(index) {
-            Value::Bounded(max) => Some(max),
+            Value::Bounded(max) => Some(Limit::of(max)),
             _ => None,
         }
     }
@@ -321,39 +321,39 @@ impl State {
                     && u64::from(jump.memory_index_scale()) == pointer_size
                     && jump.memory_displacement64() != 0 =>
             {
-                Value::Pointer { table: jump.memory_displacement64(), max_index: self.bound_of(jump.memory_index()) }
+                Value::Pointer { table: jump.memory_displacement64(), limit: self.bound_of(jump.memory_index()) }
             }
             // `jmp [base + index*8]` dispatches through absolute pointers directly.
             OpKind::Memory if stack_slot(jump, 0).is_some() => stack_slot(jump, 0).map_or(Value::Unknown, |at| self.spilled(at)),
             OpKind::Memory if jump.memory_index_scale() == 8 => {
                 self.absolute_table(jump)
-                    .map_or(Value::Unknown, |table| Value::Pointer { table, max_index: self.bound_of(jump.memory_index()) })
+                    .map_or(Value::Unknown, |table| Value::Pointer { table, limit: self.bound_of(jump.memory_index()) })
             }
             _ => Value::Unknown,
         };
         match value {
             // Only images that have a base to be relative to.
-            Value::BasedTarget { table_offset, max_index } if image.base != 0 => {
-                read_relative(image, image.base.wrapping_add(table_offset), image.base, max_index, is_target)
+            Value::BasedTarget { table_offset, limit } if image.base != 0 => {
+                read_relative(image, image.base.wrapping_add(table_offset), image.base, limit, is_target)
             }
-            Value::Target { table, anchor, max_index } => {
-                read_relative(image, table, anchor, max_index, if max_index.is_some() { is_code } else { is_target })
+            Value::Target { table, anchor, limit } => {
+                read_relative(image, table, anchor, limit, if limit.is_some() { is_code } else { is_target })
             }
-            Value::Pointer { table, max_index } => {
+            Value::Pointer { table, limit: bound } => {
                 // Without a bounds check, the table runs for as long as consecutive slots hold
                 // relocated code pointers.
-                let limit = max_index.map_or(MAX_ENTRIES, |max| (max as usize).saturating_add(1).min(MAX_ENTRIES));
+                let limit = Limit::entries(bound);
                 let entries: Vec<u64> = (0..limit as u64)
                     .map_while(|i| pointer_slots.get(&(table + pointer_size * i)).copied())
-                    .take_while(|&target| if max_index.is_some() { is_code(target) } else { is_target(target) })
+                    .take_while(|&target| if bound.is_some() { is_code(target) } else { is_target(target) })
                     .collect();
                 // A bounded table that stops short was misread.
-                let complete = max_index.is_none() || entries.len() == limit;
+                let complete = bound.is_none() || entries.len() == limit;
                 (!entries.is_empty() && complete).then_some(Table {
                     address: table,
                     entry_size: pointer_size,
                     entries,
-                    bounded: max_index.is_some(),
+                    bounded: bound.is_some(),
                 })
             }
             _ => None,
@@ -362,23 +362,22 @@ impl State {
 }
 
 /// Reads a table of 4-byte offsets relative to `anchor`.
-fn read_relative(image: &Image, table: u64, anchor: u64, max_index: Option<u64>, is_target: &dyn Fn(u64) -> bool) -> Option<Table> {
+fn read_relative(image: &Image, table: u64, anchor: u64, limit: Option<Limit>, is_target: &dyn Fn(u64) -> bool) -> Option<Table> {
     let bytes = image.bytes_from(table)?;
-    let limit = max_index.map_or(MAX_ENTRIES, |max| (max as usize).saturating_add(1).min(MAX_ENTRIES));
     let mut entries = Vec::new();
-    for entry in bytes.chunks_exact(4).take(limit) {
+    for entry in bytes.chunks_exact(4).take(Limit::entries(limit)) {
         let offset = i32::from_le_bytes(entry.try_into().unwrap());
         let target = anchor.wrapping_add_signed(offset as i64);
         if !is_target(target) {
             // A bounded table with an impossible entry is a misread, not a short table.
-            if max_index.is_some() {
+            if limit.is_some() {
                 return None;
             }
             break;
         }
         entries.push(target);
     }
-    (!entries.is_empty()).then_some(Table { address: table, entry_size: 4, entries, bounded: max_index.is_some() })
+    (!entries.is_empty()).then_some(Table { address: table, entry_size: 4, entries, bounded: limit.is_some() })
 }
 
 /// The offset of a plain `[rsp + disp]` memory operand in position `operand`.
