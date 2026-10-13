@@ -6,7 +6,7 @@
 //! one that uses it. So a reference counts as found when recore has one to the same address
 //! from anywhere in the same function.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -15,7 +15,7 @@ use recore::program::Program;
 use recore::report::CallTarget;
 
 /// What a reference points at.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Kind {
     /// Bytes of a data section.
     Data,
@@ -34,8 +34,8 @@ struct Tally {
 }
 
 /// Scores every binary of `corpus` that has `ghidra-refs/<name>.refs`, as `ghidra/run-refs.sh`
-/// writes them.
-pub fn score(corpus: &Path) -> Result<()> {
+/// writes them. With `misses`, each reference recore lacks is printed too.
+pub fn score(corpus: &Path, misses: bool) -> Result<()> {
     let dir = corpus.join("ghidra-refs");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .with_context(|| format!("no {}; run ghidra/run-refs.sh first", dir.display()))?
@@ -45,7 +45,7 @@ pub fn score(corpus: &Path) -> Result<()> {
     let mut total: BTreeMap<Kind, Tally> = BTreeMap::new();
     for name in &names {
         let program = Program::load(&corpus.join("bin").join(name))?;
-        let tallies = score_one(&program, &std::fs::read_to_string(dir.join(format!("{name}.refs")))?);
+        let tallies = score_one(&program, &std::fs::read_to_string(dir.join(format!("{name}.refs")))?, misses.then_some(name.as_str()));
         for (kind, tally) in &tallies {
             let sum = total.entry(*kind).or_default();
             sum.ghidra += tally.ghidra;
@@ -66,28 +66,38 @@ fn kind(image: &Image, addr: u64) -> Kind {
     }
 }
 
-fn score_one(program: &Program, ghidra: &str) -> BTreeMap<Kind, Tally> {
+/// Tallies Ghidra's references by whether recore has them. Under `misses`, a binary's name,
+/// those it lacks are printed with one of the instructions Ghidra puts them on.
+fn score_one(program: &Program, ghidra: &str, misses: Option<&str>) -> BTreeMap<Kind, Tally> {
     let owner = |site: u64| program.owners(site).first().copied();
     // `(function, address referred to)`, for recore's references and the targets of its calls.
-    let mut ours: HashSet<(u64, u64)> = program.analysis.data_refs.iter().filter_map(|reference| Some((owner(reference.from)?, reference.to))).collect();
+    let mut ours: BTreeSet<(u64, u64)> = program.analysis.data_refs.iter().filter_map(|reference| Some((owner(reference.from)?, reference.to))).collect();
     ours.extend(program.analysis.calls.iter().filter_map(|call| {
         let (CallTarget::Function(target) | CallTarget::Import(target)) = call.target;
         Some((owner(call.at)?, target))
     }));
-    let theirs: HashSet<(u64, u64)> = ghidra
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split(' ');
-            let (from, to) = (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?);
-            // An instruction recore puts in no function cannot be matched by function.
-            Some((owner(from)?, to))
-        })
-        .collect();
+    // `(function, address referred to)` to the first instruction Ghidra has the reference on.
+    let mut theirs: BTreeMap<(u64, u64), u64> = BTreeMap::new();
+    for line in ghidra.lines() {
+        let mut fields = line.split(' ');
+        let Some((from, to)) = fields.next().and_then(|from| Some((from.parse().ok()?, fields.next()?.parse().ok()?))) else { continue };
+        // An instruction recore puts in no function cannot be matched by function.
+        if let Some(function) = owner(from) {
+            theirs.entry((function, to)).or_insert(from);
+        }
+    }
     let mut tallies: BTreeMap<Kind, Tally> = BTreeMap::new();
-    for pair in &theirs {
-        let tally = tallies.entry(kind(&program.image, pair.1)).or_default();
+    for (pair, from) in &theirs {
+        let kind = kind(&program.image, pair.1);
+        let tally = tallies.entry(kind).or_default();
         tally.ghidra += 1;
         tally.found += usize::from(ours.contains(pair));
+        if let Some(name) = misses.filter(|_| !ours.contains(pair)) {
+            // How far past the nearest address recore does refer to from this function: a small
+            // distance is a later element or field of an object recore has the start of.
+            let before = ours.range((pair.0, 0)..*pair).next_back().map_or_else(|| "-".to_string(), |near| (pair.1 - near.1).to_string());
+            println!("{name} {from:#x} {:#x} {kind:?} {before}", pair.1);
+        }
     }
     tallies
 }

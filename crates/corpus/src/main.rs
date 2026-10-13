@@ -45,7 +45,12 @@ enum Command {
     ScoreSignatures { dirs: Vec<PathBuf> },
     /// Compares recore's data references with Ghidra's in `<corpus>/ghidra-refs`, which
     /// `ghidra/run-refs.sh` writes.
-    ScoreReferences,
+    ScoreReferences {
+        /// Print each reference of Ghidra's that recore lacks, as `<binary> <from> <to> <kind>` and
+        /// how far it is past the nearest address recore refers to from the same function.
+        #[arg(long)]
+        misses: bool,
+    },
     /// Scores the C++ classes recore recovers against the symbols and DWARF of each debug file.
     ScoreClasses {
         /// Print each class that is missing or differs.
@@ -236,7 +241,7 @@ fn main() -> Result<()> {
         Command::SignatureTruth => signatures_score::write_truth(&cli.corpus),
         Command::ScoreSignatures { dirs } => signatures_score::score(&cli.corpus, &dirs),
         Command::Jumptables => run_jumptables(&cli.corpus),
-        Command::ScoreReferences => references::score(&cli.corpus),
+        Command::ScoreReferences { misses } => references::score(&cli.corpus, misses),
         Command::ScoreClasses { detail } => classes::score(&cli.corpus, detail),
         Command::PeFacts { detail } => run_pe_facts(&cli.corpus, detail),
         Command::Score { dirs, detail } => dirs.iter().try_for_each(|dir| run_score(&cli.corpus, dir, detail)),
