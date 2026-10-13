@@ -9,6 +9,7 @@ use recore::image::Machine;
 use recore::report::{Analysis, CallTarget};
 
 use crate::Target;
+use crate::library::Routine;
 
 /// Control-flow facts for one binary. Each is attributed to the function whose decompilation
 /// it affects: every function that has the instruction in one of its ranges, or the owner
@@ -48,13 +49,44 @@ pub struct Facts {
     /// `(call, register)`: a call that is the indirect jump of a jump table. The routine it
     /// calls takes its return address as the address of a table that follows the call, and
     /// jumps to the entry the value in the register picks.
-    pub switch_calls: Vec<(u64, &'static CStr)>,
+    pub switch_calls: Vec<SwitchCall>,
     /// `(call, bytes)`: a call followed by that much data, which the routine it calls reads
     /// before it returns to the code after the data.
     pub data_after_calls: Vec<(u64, u64)>,
     /// `(function, storage)`: a library routine and where it takes its arguments and leaves
     /// its result, as [`crate::library::Routine::storage`] has it.
     pub storage: Vec<(u64, &'static str)>,
+}
+
+/// A call to a library routine that jumps on to one of several places and does not return.
+#[derive(Debug)]
+pub struct SwitchCall {
+    pub call: u64,
+    /// The register that holds the value switched on.
+    pub selector: &'static CStr,
+    /// When the cases are listed after the call in a way the compiler spec has a jump assist
+    /// for: the assist's name, the number of cases and the address of the list. The engine
+    /// then finds the places itself, and the value of each case with them.
+    pub cases: Option<(&'static CStr, u64, u64)>,
+}
+
+impl SwitchCall {
+    fn at(image: &Image, library: &[Routine], call: u64) -> SwitchCall {
+        let cases = (|| {
+            let &[0x12, high, low, ref list @ ..] = image.bytes_from(call)? else { return None };
+            // The library is in the memory all banks share.
+            let routine = image.bytes_from(u64::from(u16::from_be_bytes([high, low])))?;
+            let (assist, selector, entry) = match library.iter().find(|known| known.is_at(routine))?.name {
+                "?C?CCASE" => (c"byteCases", c"ACC", 3),
+                // The high byte of the value is in B.
+                "?C?ICASE" => (c"wordCases", c"AB", 4),
+                _ => return None,
+            };
+            let count = list.chunks(entry).position(|case| case.starts_with(&[0, 0]))?;
+            Some((selector, (assist, count as u64, call + 3)))
+        })();
+        SwitchCall { call, selector: cases.map_or(c"ACC", |cases| cases.0), cases: cases.map(|cases| cases.1) }
+    }
 }
 
 impl Facts {
@@ -64,6 +96,7 @@ impl Facts {
             names: analysis.functions.iter().filter(|f| f.fragment_of.is_none()).filter_map(|f| Some((f.addr, f.name.clone()?))).collect(),
             ..Facts::default()
         };
+        let library = Target::of(image).map(crate::library::routines).unwrap_or_default();
         if image.machine == Machine::I8051 {
             // recore lists a call to one of Keil's library routines that read what follows the
             // call as a jump table at the call: the cases of a `switch`, or for a routine that
@@ -76,13 +109,12 @@ impl Facts {
                 };
                 match table.targets[..] {
                     [after] if after == table.jump + length + 4 => facts.data_after_calls.push((table.jump, 4)),
-                    _ => facts.switch_calls.push((table.jump, c"ACC")),
+                    _ => facts.switch_calls.push(SwitchCall::at(image, &library, table.jump)),
                 }
             }
         }
         // A function the image has no name for may be a routine of the compiler's library.
-        if let Ok(target) = Target::of(image) {
-            let library = crate::library::routines(target);
+        {
             let named: std::collections::HashSet<u64> = facts.names.iter().map(|name| name.0).collect();
             for (function, routine) in crate::library::recognise(image, analysis, &library).into_iter().filter(|(function, _)| !named.contains(function)) {
                 facts.names.push((function, routine.name.to_string()));

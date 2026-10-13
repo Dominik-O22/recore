@@ -253,6 +253,10 @@ define context contextReg
 
 define pcodeop decimal_adjust;
 define pcodeop nop;
+# recore: what a call to a routine that jumps on to one of the cases listed after the call is
+# read as. The compiler spec says how each list is laid out.
+define pcodeop byteCases;
+define pcodeop wordCases;
 
 @if BIT_OPS == "PCODEOPS"
 define pcodeop get;

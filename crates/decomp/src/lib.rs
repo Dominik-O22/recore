@@ -490,8 +490,9 @@ impl Session {
         for &(function, call, target) in &facts.local_calls {
             check(|err, len| unsafe { ffi::rd_override_call(self.raw.as_ptr(), function, call, target, err, len) != 0 })?;
         }
-        for &(call, selector) in &facts.switch_calls {
-            check(|err, len| unsafe { ffi::rd_call_switches(self.raw.as_ptr(), call, selector.as_ptr(), err, len) != 0 })?;
+        for switch in &facts.switch_calls {
+            let (assist, count, list) = switch.cases.map_or((std::ptr::null(), 0, 0), |(assist, count, list)| (assist.as_ptr(), count, list));
+            check(|err, len| unsafe { ffi::rd_call_switches(self.raw.as_ptr(), switch.call, switch.selector.as_ptr(), assist, count, list, err, len) != 0 })?;
         }
         for &(call, len) in &facts.data_after_calls {
             unsafe { ffi::rd_call_skips(self.raw.as_ptr(), call, len) };
@@ -658,6 +659,10 @@ impl Session {
     pub fn override_jump_tables(&mut self, analysis: &Analysis, facts: &Facts) -> Result<()> {
         for &(function, index) in &facts.jump_tables {
             let table = &analysis.jump_tables[index];
+            // The engine finds the cases of this one itself, each with its value.
+            if facts.switch_calls.iter().any(|switch| switch.call == table.jump && switch.cases.is_some()) {
+                continue;
+            }
             self.override_jump_table(function, table.jump, &table.targets)?;
         }
         Ok(())

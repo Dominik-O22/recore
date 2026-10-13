@@ -53,7 +53,7 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   pointer in, which differs from program to program. Marked with a `recore:` comment.
 
 - `languages/cip-51.sla`: built from `slaspec/`, upstream's `cip-51.slaspec` and
-  `8051_main.sinc` with five changes, each marked with a `recore:` comment. To rebuild, run
+  `8051_main.sinc` with six changes, each marked with a `recore:` comment. To rebuild, run
   `support/sleigh cip-51.slaspec cip-51.sla` of the distribution in a copy of `slaspec/`.
   - `PTRSIZE` is 3. The distribution's own `cip-51.sla` has a 16-bit code space, though
     `8051.ldefs` lists the language as 24 bits wide. With 24 bits a code address is
@@ -77,13 +77,18 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   - The direct address 0x81 is the register `SP` that `PUSH`, `POP` and calls use. Upstream
     has a special function register there that they do not touch, so a frame that code sets
     up with `MOV A, SP` and `MOV SP, A` was no part of the stack.
+  - Two operations more, `byteCases` and `wordCases`, which no instruction uses. `crates/decomp`
+    reads a call to a routine of the C51 library that jumps to one of the cases listed after
+    the call as a jump to what one of them gives, and a jump assist in `cip-51.pspec` says
+    how the list is laid out, so a `switch` has each case by its value.
 
 - `languages/cip-51.pspec`: of the special function registers and their bits, only those
   every 8051 has are named, `SCON` and `SBUF` under their usual names. Upstream names the
   registers of the Silicon Labs parts. The bits of internal memory have no names, where
   upstream's, such as `20.0`, read as numbers in C. The bytes 8 to 0x1f have no names either:
   upstream names them as the registers of banks 1 to 3, where most programs keep variables.
-  Marked with `recore:` comments.
+  The jump assists `byteCases` and `wordCases` say how C51 lists the cases of a `switch`;
+  the engine reads a jump assist from the processor spec only. Marked with `recore:` comments.
 
 - `languages/keil-cx51.cspec`, each change marked with a `recore:` comment:
   - The stack is in `INTMEM`, where the language's pushes and calls keep it, with the stack
@@ -96,6 +101,11 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   - `CY`, `AC`, `OV`, `ACC`, `B`, `DPTR` and `R0` to `R7` are killed by a call, and the register
     bank and the user's flags are unaffected. Upstream has all of `PSW` unaffected, so a test
     of the carry flag after a call tests the flag from before it.
+  - No `funcptr` element. Upstream's alignment of 2 has the engine clear the lowest bit of an
+    address that code jumps or calls through, and 8051 code starts at any address.
+  - A call fixup for each routine of the C51 library that does what C has an operator for,
+    so that a call to one reads as the operator. `crates/decomp/data/keil-c51.lib` has what
+    each routine is known by.
 
 - `languages/sdcc-mcs51.cspec`: not from upstream. The 8051 as SDCC compiles for it, the
   `sdcc` compiler of the language in `8051.ldefs`: the first argument and the result in

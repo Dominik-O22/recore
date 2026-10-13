@@ -78,7 +78,9 @@
     </prototype>
   </default_proto>
 
-  <funcptr align="2" />
+  <!-- recore: no funcptr element. Upstream has an alignment of 2, by which the engine clears
+       the lowest bit of an address that code jumps or calls through. 8051 code starts at
+       any address. -->
   <aggressivetrim signext="true"/>
   <returnaddress>
     <varnode space="stack" offset="0" size="2"/>

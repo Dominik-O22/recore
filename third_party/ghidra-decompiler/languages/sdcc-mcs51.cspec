@@ -82,7 +82,7 @@
     </prototype>
   </default_proto>
 
-  <funcptr align="2" />
+  <!-- recore: no funcptr element, as in keil-cx51.cspec. -->
   <aggressivetrim signext="true"/>
   <returnaddress>
     <varnode space="stack" offset="0" size="2"/>

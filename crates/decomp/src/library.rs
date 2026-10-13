@@ -43,7 +43,7 @@ impl Routine {
     }
 
     /// Whether `bytes` start with the routine's code. FNV-1a, as `data/fingerprint.py` has it.
-    fn is_at(&self, bytes: &[u8]) -> bool {
+    pub fn is_at(&self, bytes: &[u8]) -> bool {
         let Some(code) = bytes.get(..self.length) else { return false };
         let mut left_out = self.left_out.iter().peekable();
         let mut hash = 0xcbf29ce484222325u64;
