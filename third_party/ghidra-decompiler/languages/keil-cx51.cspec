@@ -127,7 +127,7 @@
   <!-- recore: the routines of the C51 library that do what C has an operator for: arithmetic
        on 16 and 32 bits, which are in R6R7 and R4R5R6R7 with a second operand in R4R5 and
        R0R1R2R3, and loads and stores of 32 bits and of a pointer, which is in R3, R2 and R1.
-       A call to one reads as the operator. crates/decomp/data/keil-c51.lib has the code each
+       A call to one reads as the operator. crates/core/data/keil-c51.lib has the code each
        is known by. Each fixup ends by taking off the stack the return address the call
        pushed. A comparison takes the carry flag as a borrow, as SUBB does. A fixup reads and
        writes the registers one by one and never R4R5R6R7 or R6R7 whole: the engine looks for
