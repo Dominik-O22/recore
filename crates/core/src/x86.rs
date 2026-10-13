@@ -57,21 +57,22 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         })
     }
 
-    type Decoder<'a> = (Decoder<'a>, u64);
+    /// The decoder, the address its bytes are loaded at, and the instruction decoded last.
+    type Decoder<'a> = (Decoder<'a>, u64, Instruction);
 
     fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_> {
-        (Decoder::with_ip(BITS, bytes, addr, DecoderOptions::NONE), addr)
+        (Decoder::with_ip(BITS, bytes, addr, DecoderOptions::NONE), addr, Instruction::default())
     }
 
-    fn decode_from<'d>((decoder, base): &'d mut Self::Decoder<'_>, offset: usize) -> impl Iterator<Item = Decoded<Instruction>> + 'd {
+    fn seek((decoder, base, _): &mut Self::Decoder<'_>, offset: usize) {
         decoder.set_position(offset).expect("an offset into the section");
         decoder.set_ip(*base + offset as u64);
-        let mut instr = Instruction::default();
-        std::iter::from_fn(move || {
-            decoder.can_decode().then(|| {
-                decoder.decode_out(&mut instr);
-                Decoded { addr: instr.ip(), len: instr.len().max(1) as u8, insn: (!instr.is_invalid()).then_some(instr) }
-            })
+    }
+
+    fn decode_next<'d>((decoder, _, instr): &'d mut Self::Decoder<'_>) -> Option<Decoded<&'d Instruction>> {
+        decoder.can_decode().then(|| {
+            decoder.decode_out(instr);
+            Decoded { addr: instr.ip(), len: instr.len().max(1) as u8, insn: (!instr.is_invalid()).then_some(&*instr) }
         })
     }
 

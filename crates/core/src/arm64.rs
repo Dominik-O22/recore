@@ -409,14 +409,23 @@ impl Arch for Arm64 {
         })
     }
 
-    type Decoder<'a> = (&'a [u8], u64);
+    /// The bytes, the address they are loaded at, the offset to decode at next, and the
+    /// instruction decoded last.
+    type Decoder<'a> = (&'a [u8], u64, usize, Insn);
 
     fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_> {
-        (bytes, addr)
+        (bytes, addr, 0, Insn { word: 0, addr })
     }
 
-    fn decode_from<'d>(&mut (bytes, base): &'d mut Self::Decoder<'_>, offset: usize) -> impl Iterator<Item = Decoded<Insn>> + 'd {
-        Self::decode(&bytes[offset..], base + offset as u64)
+    fn seek(decoder: &mut Self::Decoder<'_>, offset: usize) {
+        decoder.2 = offset;
+    }
+
+    fn decode_next<'d>((bytes, base, offset, insn): &'d mut Self::Decoder<'_>) -> Option<Decoded<&'d Insn>> {
+        let word = u32::from_le_bytes(bytes.get(*offset..*offset + 4)?.try_into().unwrap());
+        *insn = Insn { word, addr: *base + *offset as u64 };
+        *offset += 4;
+        Some(Decoded { addr: insn.addr, len: 4, insn: Some(&*insn) })
     }
 
     fn flow(insn: &Insn, state: &State) -> Option<Flow> {
