@@ -192,3 +192,55 @@ fn every_8051_opcode_is_as_long_as_recore_decodes_it() {
         assert_eq!((listed.len, listed.text == "(bad)"), (expected, decoded.insn.is_none()), "opcode {opcode:#04x}: {}", listed.text);
     }
 }
+
+/// 8051 code in pieces, each at its `bank << 16 | address`.
+fn banked_session(pieces: &[(u64, &[u8])]) -> Session {
+    let sections: Vec<Section> = pieces.iter().map(|&(addr, data)| Section { addr, data, readonly: true, code: true }).collect();
+    Session::new(&vendored_spec_dir().unwrap(), Target::I8051, &sections).unwrap()
+}
+
+#[test]
+fn a_call_from_a_bank_reaches_shared_code_and_what_a_trampoline_stands_for() {
+    // Shared by every bank: 0x0100: RET, and at 0x0200 a trampoline entry, which is never run:
+    // MOV DPTR, #0x9000; LJMP 0x0300.
+    let mut shared = vec![0x00; 0x100];
+    shared.push(0x22);
+    shared.resize(0x200, 0x00);
+    shared.extend([0x90, 0x90, 0x00, 0x02, 0x03, 0x00]);
+    // Bank 1, 0x8000: LCALL 0x0100; LCALL 0x0200; RET. Bank 2, 0x9000: RET.
+    let mut session = banked_session(&[(0, &shared), (0x01_8000, &[0x12, 0x01, 0x00, 0x12, 0x02, 0x00, 0x22]), (0x02_9000, &[0x22])]);
+    session.mirror(0x01_0000, 0x4000, 0);
+    session.redirect(0x0200, 0x02_9000);
+    session.name_function(0x0100, "shared").unwrap();
+    session.name_function(0x02_9000, "far").unwrap();
+    let function = session.decompile(0x01_8000).unwrap();
+    assert!(function.c_text.contains("shared();\n  far();"), "{}", function.c_text);
+}
+
+#[test]
+fn flow_stops_at_another_8051_function() {
+    // 0x0000: LCALL 0x0010, then fall through into 0x0003: MOV R7, #7; RET. 0x0010: RET.
+    let mut code = vec![0x12, 0x00, 0x10, 0x7f, 0x07, 0x22];
+    code.resize(0x10, 0x00);
+    code.push(0x22);
+    assert!(!banked_session(&[(0, &code)]).decompile(0).unwrap().bad_data);
+
+    let mut informed = banked_session(&[(0, &code)]);
+    informed.add_function(0x0003, false).unwrap();
+    assert!(informed.decompile(0).unwrap().bad_data);
+    assert!(!informed.decompile(0x0003).unwrap().bad_data);
+}
+
+#[test]
+fn memory_outside_the_code_is_named_in_its_own_address_space() {
+    use recore::i8051::{IDATA, SFR, XDATA};
+    // MOV DPTR, #0x1234; MOVX A, @DPTR; ADD A, 0x30; ADD A, 0xC1; MOV R7, A; RET
+    let code = [0x90, 0x12, 0x34, 0xe0, 0x25, 0x30, 0x25, 0xc1, 0xff, 0x22];
+    let mut session = banked_session(&[(0, &code)]);
+    session.add_global(XDATA + 0x1234, "reading", None).unwrap();
+    session.add_global(IDATA + 0x30, "offset", None).unwrap();
+    session.add_global(SFR + 0xc1, "port", None).unwrap();
+    let function = session.decompile(0).unwrap();
+    // A register is read once, into a variable, since reading it may change it.
+    assert!(function.c_text.contains("= port;") && function.c_text.contains("return reading + offset + "), "{}", function.c_text);
+}

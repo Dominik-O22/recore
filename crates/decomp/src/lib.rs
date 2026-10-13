@@ -133,6 +133,16 @@ impl Target {
         matches!(self, Target::X86_64Gcc | Target::Aarch64)
     }
 
+    /// The address spaces the target has besides the one its code is in: the address recore
+    /// gives the first byte of each, and the engine's name for the space.
+    fn spaces(self) -> &'static [(u64, &'static CStr)] {
+        use recore::i8051::{IDATA, SFR, XDATA};
+        match self {
+            Target::I8051 => &[(XDATA, c"EXTMEM"), (IDATA, c"INTMEM"), (SFR, c"SFR")],
+            _ => &[],
+        }
+    }
+
     pub fn pointer_bytes(self) -> usize {
         match self {
             Target::X86Windows | Target::X86Gcc => 4,
@@ -288,7 +298,12 @@ impl Session {
         })?;
         let raw = NonNull::new(raw).expect("checked above");
         unsafe { ffi::rd_keep_prototypes_exact(raw.as_ptr(), target.callers_pass_what_is_read().into()) };
-        Ok(Session { raw })
+        // The session frees the engine's side if a space is not there.
+        let session = Session { raw };
+        for &(base, name) in target.spaces() {
+            check(|err, len| unsafe { ffi::rd_map_space(raw.as_ptr(), base, name.as_ptr(), err, len) != 0 })?;
+        }
+        Ok(session)
     }
 
     /// Loads a recore image as it looks after relocation, with the vendored language files, and
@@ -304,7 +319,34 @@ impl Session {
     pub fn load(image: &Image) -> Result<Session> {
         let loaded = facts::loaded(image);
         let sections: Vec<Section> = loaded.iter().map(|l| Section { addr: l.addr, data: &l.data, readonly: l.constant, code: l.code }).collect();
-        Session::new(&vendored_spec_dir()?, Target::of(image)?, &sections)
+        let mut session = Session::new(&vendored_spec_dir()?, Target::of(image)?, &sections)?;
+        // Banked code: every bank shows the code all banks share, which the image holds once,
+        // as bank 0, and a trampoline entry stands for the function it reaches.
+        let banking = &image.banking;
+        let mut banks: Vec<u64> = image.sections.iter().filter(|section| section.executable && !banking.common.is_empty()).map(|section| section.addr >> 16).collect();
+        banks.sort_unstable();
+        banks.dedup();
+        for bank in banks.into_iter().filter(|&bank| bank != 0) {
+            for &(start, end) in &banking.common {
+                session.mirror(bank << 16 | start, end - start, start);
+            }
+        }
+        for (&entry, &target) in &banking.trampolines {
+            session.redirect(entry, target);
+        }
+        Ok(session)
+    }
+
+    /// Says that the `len` bytes of code at `addr` are those at `target`: reading them reads
+    /// those, and a jump or call into them goes to the code at `target`.
+    pub fn mirror(&mut self, addr: u64, len: u64, target: u64) {
+        unsafe { ffi::rd_mirror(self.raw.as_ptr(), addr, len, target) }
+    }
+
+    /// Says that a jump or call to `from` goes to `to`, because the code at `from` only passes
+    /// control on.
+    pub fn redirect(&mut self, from: u64, to: u64) {
+        unsafe { ffi::rd_redirect(self.raw.as_ptr(), from, to) }
     }
 
     /// Declares the imports the code calls, with prototypes for the well-known ones.
