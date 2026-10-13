@@ -218,17 +218,15 @@ fn a_call_from_a_bank_reaches_shared_code_and_what_a_trampoline_stands_for() {
 }
 
 #[test]
-fn flow_stops_at_another_8051_function() {
-    // 0x0000: LCALL 0x0010, then fall through into 0x0003: MOV R7, #7; RET. 0x0010: RET.
-    let mut code = vec![0x12, 0x00, 0x10, 0x7f, 0x07, 0x22];
-    code.resize(0x10, 0x00);
-    code.push(0x22);
+fn a_branch_stops_at_another_8051_function() {
+    // 0x0000: MOV A, R7; JZ 0x0004; RET. 0x0004: MOV R7, #7; RET.
+    let code = [0xef, 0x60, 0x01, 0x22, 0x7f, 0x07, 0x22];
     assert!(!banked_session(&[(0, &code)]).decompile(0).unwrap().bad_data);
 
     let mut informed = banked_session(&[(0, &code)]);
-    informed.add_function(0x0003, false).unwrap();
+    informed.add_function(0x0004, false).unwrap();
     assert!(informed.decompile(0).unwrap().bad_data);
-    assert!(!informed.decompile(0x0003).unwrap().bad_data);
+    assert!(!informed.decompile(0x0004).unwrap().bad_data);
 }
 
 #[test]
@@ -273,4 +271,14 @@ fn memory_outside_the_code_is_named_in_its_own_address_space() {
     let function = session.decompile(0).unwrap();
     // A register is read once, into a variable, since reading it may change it.
     assert!(function.c_text.contains("= port;") && function.c_text.contains("return reading + offset + "), "{}", function.c_text);
+}
+
+#[test]
+fn an_8051_function_that_runs_into_the_next_one_calls_it() {
+    // 0x0000: MOV R7, #1, and then the function at 0x0002: MOV A, R7; MOV R6, A; RET.
+    let mut session = banked_session(&[(0, &[0x7f, 0x01, 0xef, 0xfe, 0x22])]);
+    session.name_function(0x0002, "next").unwrap();
+    let function = session.decompile(0).unwrap();
+    assert!(!function.bad_data, "{}", function.c_text);
+    assert!(function.c_text.contains("next(1);\n  return;"), "{}", function.c_text);
 }

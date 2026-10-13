@@ -251,7 +251,12 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     }
 
     session.set_style(options.style)?;
-    let callees_first = options.callees_first;
+    // An 8051 function hands the registers it was passed on to the functions it calls without
+    // reading them. Decompiled with those unknown it seems to take fewer parameters than it
+    // does, and a call to it then lists what it passes out of order. So there no function's
+    // parameters are kept for its callers.
+    let hands_on_registers = image.machine == Machine::I8051;
+    let callees_first = options.callees_first && !hands_on_registers;
     session.keep_prototypes(callees_first);
     // What each function calls: with debug information, the functions whose prototypes its
     // calls need.
@@ -384,7 +389,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         // out as it would when asked for, so the result is kept for then.
         let keep = matches!(request, Request::Parameters(_)) && unknown(addr).iter().all(|callee| jumped_first.contains(callee));
         for target in jumped_first {
-            session.keep_prototypes(true);
+            session.keep_prototypes(!hands_on_registers);
             if let Some(importer) = &mut importer {
                 importer.functions(&mut session, std::iter::once(target));
             }
@@ -398,7 +403,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 break;
             }
         }
-        session.keep_prototypes(callees_first || jumped_to.contains(&addr));
+        session.keep_prototypes(callees_first || (jumped_to.contains(&addr) && !hands_on_registers));
         if let Some(importer) = &mut importer {
             importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
         }

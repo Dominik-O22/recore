@@ -51,11 +51,19 @@ SLEIGH compiler. The `.sla` format version must match the engine.
 
 - `languages/cip-51.pspec`: of the special function registers and their bits, only those
   every 8051 has are named, `SCON` and `SBUF` under their usual names. Upstream names the
-  registers of the Silicon Labs parts. Marked with a `recore:` comment.
+  registers of the Silicon Labs parts. The bits of internal memory have no names, where
+  upstream's, such as `20.0`, read as numbers in C. Marked with `recore:` comments.
 
-- `languages/keil-cx51.cspec`: the stack is in `INTMEM`, where the language's pushes and calls
-  keep it, with the stack change of a call and a range for locals to match. Upstream names
-  `RAM`, which leaves every pushed return address in the C. Marked with `recore:` comments.
+- `languages/keil-cx51.cspec`, each change marked with a `recore:` comment:
+  - The stack is in `INTMEM`, where the language's pushes and calls keep it, with the stack
+    change of a call and a range for locals to match. Upstream names `RAM`, which leaves every
+    pushed return address in the C.
+  - `EXTMEM` is global. Upstream leaves it out, and every store to external memory is dropped.
+  - Parameters are in `R6R7`, `R4R5` and `R2R3`, of one or two bytes, and the result is in
+    `R6R7` or `R4R5R6R7`, as in upstream's `mx51.cspec` for the same compiler. Upstream lists
+    single registers, `R4` and `R5` first.
+  - `PSW`, `ACC`, `B`, `DPTR` and `R0` to `R7` are killed by a call, and `PSW` is no longer
+    unaffected. Upstream has a test of the carry flag after a call test the flag from before it.
 
 ## Licences
 

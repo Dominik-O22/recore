@@ -110,6 +110,9 @@ class SectionImage : public LoadImage {
   // Calls followed by data that the routine they call reads and returns past: each with the
   // number of bytes.
   unordered_map<uint64_t, int4> data_after;
+  // Code runs from the end of one function into the start of the next on purpose, to share
+  // that one's code: see rd_functions_run_on.
+  bool functions_run_on = false;
 
   SectionImage(const string &lang, const RdSection *secs, size_t count)
       : LoadImage("recore"), language(lang) {
@@ -198,8 +201,11 @@ class Retargeted : public PcodeEmit {
   const VarnodeData *selector;  // set for a call that is a jump through a table
 
  public:
+  bool runs_on = true;  // whether control passes on to the next instruction
+
   Retargeted(PcodeEmit &o, const SectionImage &i, const VarnodeData *s) : out(o), image(i), selector(s) {}
   void dump(const Address &addr, OpCode opc, VarnodeData *outvar, VarnodeData *vars, int4 isize) override {
+    runs_on = opc != CPUI_BRANCH && opc != CPUI_BRANCHIND && opc != CPUI_RETURN && selector == nullptr;
     if (selector != nullptr) {
       // All the instruction does is hand control to the routine, which jumps on. The return
       // address it pushes for the routine to find its table by is not left on the stack.
@@ -224,13 +230,23 @@ class SectionSleigh : public Sleigh {
   int4 oneInstruction(PcodeEmit &emit, const Address &addr) const override {
     uintb at = addr.getOffset();
     if (image.hidden(at)) throw BadDataError("The instruction is the entry of another function");
-    if (image.mirrors.empty() && image.redirects.empty() && image.switch_calls.empty() && image.data_after.empty())
+    if (image.mirrors.empty() && image.redirects.empty() && image.switch_calls.empty() && image.data_after.empty() &&
+        !image.functions_run_on)
       return Sleigh::oneInstruction(emit, addr);
     auto jump = image.switch_calls.find(at);
     Retargeted retargeted(emit, image, jump == image.switch_calls.end() ? nullptr : &jump->second);
     int4 length = Sleigh::oneInstruction(retargeted, addr);
     auto data = image.data_after.find(at);
-    return data == image.data_after.end() ? length : length + data->second;
+    if (data != image.data_after.end()) length += data->second;
+    if (image.functions_run_on && retargeted.runs_on && image.hidden(at + length)) {
+      // The function ends by running into the next one: it calls that one and returns, as the
+      // engine has it for a jump that is a tail call.
+      VarnodeData next = {image.space, at + length, 1};
+      emit.dump(addr, CPUI_CALL, nullptr, &next, 1);
+      VarnodeData nowhere = {getConstantSpace(), 0, 1};
+      emit.dump(addr, CPUI_RETURN, nullptr, &nowhere, 1);
+    }
+    return length;
   }
 };
 
@@ -914,6 +930,11 @@ void rd_redirect(RdSession *session, uint64_t from, uint64_t to) { session->imag
 int rd_call_switches(RdSession *session, uint64_t call, const char *selector, char *err, size_t errlen) {
   return guarded(err, errlen, [&] { session->image->switch_calls[call] = session->arch->translate->getRegister(selector); });
 }
+
+// Says that code which runs from the end of one function into the start of the next is meant
+// to: the first function then ends in a call to the second and a return. Without this such
+// flow is cut off, as what follows a call that was not known to never return.
+void rd_functions_run_on(RdSession *session, int on) { session->image->functions_run_on = on != 0; }
 
 // Says that `len` bytes of data follow the call at `call`, and that it returns past them.
 void rd_call_skips(RdSession *session, uint64_t call, uint64_t len) { session->image->data_after[call] = (int4)len; }

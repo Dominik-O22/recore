@@ -6,6 +6,9 @@
     <range space="INTMEM"/>
     <range space="SFR"/>
     <range space="XRAM"/>
+    <!-- recore: external memory is EXTMEM in this language. Left out, as upstream has it, every
+         store to it is dropped as one to a variable nothing reads. -->
+    <range space="EXTMEM"/>
     <range space="RAM"/>
     <range space="BITS"/>
   </global>
@@ -15,59 +18,50 @@
   <stackpointer register="SP" space="INTMEM" growth="positive"/>
   <default_proto>
     <prototype name="__stdcall" extrapop="-2" stackshift="-2" strategy="register">
+      <!-- recore: C51 passes the first three arguments in R7, R5 and R3, each with the register
+           below it for a second byte, and returns in R7, in R6 and R7, or in R4 to R7.
+           Upstream lists single registers with R4 and R5 first, which shows a call's
+           arguments out of order and a 16-bit one as two. -->
       <input>
-        <pentry minsize="1" maxsize="1" metatype="float">
-          <register name="R4"/>
+        <pentry minsize="1" maxsize="2">
+          <register name="R6R7"/>
         </pentry>
-        <pentry minsize="1" maxsize="1" metatype="float">
-          <register name="R5"/>
+        <pentry minsize="1" maxsize="2">
+          <register name="R4R5"/>
         </pentry>
-        <pentry minsize="1" maxsize="1">
-          <register name="R7"/>
-        </pentry>
-        <pentry minsize="1" maxsize="1">
-          <register name="R6"/>
-        </pentry>
-        <pentry minsize="1" maxsize="1">
-          <register name="R5"/>
-        </pentry>
-        <pentry minsize="1" maxsize="1">
-          <register name="R4"/>
-        </pentry>
-        <pentry minsize="1" maxsize="1">
-          <register name="R3"/>
-        </pentry>
-        <pentry minsize="1" maxsize="4">
-          <addr space="RAM" offset="0"/>
+        <pentry minsize="1" maxsize="2">
+          <register name="R2R3"/>
         </pentry>
       </input>
       <output>
-        <pentry minsize="1" maxsize="1">
-          <register name="R7"/>
+        <pentry minsize="1" maxsize="2">
+          <register name="R6R7"/>
         </pentry>
-        <pentry minsize="1" maxsize="1">
-          <register name="R6"/>
-        </pentry>
-        <pentry minsize="1" maxsize="1">
-          <register name="R7"/>
-        </pentry>
-        <pentry minsize="1" maxsize="1">
-          <register name="R4"/>
-        </pentry>
-        <pentry minsize="1" maxsize="1">
-          <register name="R5"/>
-        </pentry>
-        <pentry minsize="1" maxsize="1">
-          <register name="R6"/>
-        </pentry>
-        <pentry minsize="1" maxsize="1">
-          <register name="R7"/>
+        <pentry minsize="3" maxsize="4">
+          <register name="R4R5R6R7"/>
         </pentry>
       </output>
+      <!-- recore: upstream has PSW as unaffected and nothing as killed. C51 keeps no register
+           across a call, a function returns a bit in the carry flag, and the library's
+           routines return in A, B, DPTR and R0 to R3 as well. Code that reads one of these
+           after a call reads what the call left, not what was there before it. -->
       <unaffected>
         <register name="SP"/>
-        <register name="PSW"/>
       </unaffected>
+      <killedbycall>
+        <register name="PSW"/>
+        <register name="ACC"/>
+        <register name="B"/>
+        <register name="DPTR"/>
+        <register name="R0"/>
+        <register name="R1"/>
+        <register name="R2"/>
+        <register name="R3"/>
+        <register name="R4"/>
+        <register name="R5"/>
+        <register name="R6"/>
+        <register name="R7"/>
+      </killedbycall>
       <!-- recore: without a range the engine takes half the 8-bit stack space for locals, and
            then keeps every return address a call pushes as a store to one. -->
       <localrange>

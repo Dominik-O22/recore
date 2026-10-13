@@ -143,6 +143,14 @@ impl Target {
         }
     }
 
+    /// Whether code that runs from the end of one function into the start of the next is meant
+    /// to, and the first function ends by calling the second. 8051 code shares the end of a
+    /// function this way, and what recore makes of it is two functions. Elsewhere such code
+    /// follows a call that never returns, and is none of the function's.
+    fn functions_run_on(self) -> bool {
+        self == Target::I8051
+    }
+
     pub fn pointer_bytes(self) -> usize {
         match self {
             Target::X86Windows | Target::X86Gcc => 4,
@@ -298,6 +306,7 @@ impl Session {
         })?;
         let raw = NonNull::new(raw).expect("checked above");
         unsafe { ffi::rd_keep_prototypes_exact(raw.as_ptr(), target.callers_pass_what_is_read().into()) };
+        unsafe { ffi::rd_functions_run_on(raw.as_ptr(), target.functions_run_on().into()) };
         // The session frees the engine's side if a space is not there.
         let session = Session { raw };
         for &(base, name) in target.spaces() {
