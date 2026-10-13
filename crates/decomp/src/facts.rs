@@ -147,8 +147,10 @@ impl Facts {
                     let bytes = bytes.strip_prefix(&[0x3e]).unwrap_or(bytes);
                     let through_slot = bytes.first() == Some(&0xff);
                     match (call.tail, call.target) {
-                        // The engine can only turn an unconditional jump into a call and return.
-                        (true, _) if !call.conditional => facts.tail_calls.push((owner, call.at)),
+                        // The engine can only turn an unconditional jump into a call and return,
+                        // and a trampoline entry is listed at its first instruction, which loads
+                        // what its jump goes by.
+                        (true, _) if !call.conditional && !image.banking.trampolines.contains_key(&call.at) => facts.tail_calls.push((owner, call.at)),
                         (false, CallTarget::Import(slot)) if through_slot => facts.import_calls.push((owner, call.at, slot)),
                         (false, CallTarget::Function(target)) if through_slot => facts.local_calls.push((owner, call.at, target)),
                         _ => {}
