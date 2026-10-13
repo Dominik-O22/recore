@@ -51,18 +51,36 @@ recore-mcp rename program.exe check_license param_1 serial
 
 ## One session
 
-A stripped program that checks a licence key, which the agent had never seen, and nothing to read it with but `recore-mcp`. Claude found a key the program accepts in 35 seconds. Six calls did it:
+A stripped program that checks a licence key, and two stripped builds of Lua 5.4.8 that differ by a small patch. A fresh agent got one tool and no hints: find a key the program accepts, then say what the patch changed. The same two tasks went to Claude Haiku once with `recore-mcp` and once with Ghidra 12.1.4 headless. Both found the key and described every change correctly.
+
+| | recore | Ghidra |
+|---|---|---|
+| Find the key | 54 s, 10 calls | 101 s, 4 runs |
+| Explain the patch | 182 s, 22 calls | 445 s, 9 runs |
+| Scripts the agent had to write | none | 5 |
+| Tokens used | 104,000 | 164,000 |
+
+That is one run each, so the times are an illustration and not a benchmark. With Ghidra the agent wrote Java scripts to list strings, decompile and compare, rewrote its comparison twice because addresses inside the decompiled text made unchanged functions look changed, and ended with five functions to rule out by hand. With recore it called `diff`:
 
 ```
-recore-mcp summary gate                          9 functions, 3 strings
-recore-mcp strings gate                          "access granted" is used by 0x1060
-recore-mcp imports gate                          strlen is called from 0x1200
-recore-mcp functions gate                        0x1060, 0x11c0 and 0x1200 are the program's own
-recore-mcp decompile gate 0x1060 0x1200 0x11c0   the check: 16 bytes against a table, then a hash
-recore-mcp bytes gate 0x2000 --len 96            the two tables
+$ recore-mcp diff lua-before lua-after
+786 functions before, 787 after: 782 the same, 4 changed, 0 removed, 1 added
+
+changed, as before -> after with bytes of code
+0xa5f0 78 -> 0xa630 94  (same place among its neighbours, listed as "rawlen")
+    now calls 0x5bb0
+0x19b10 100 -> 0x19b50 116  (same place among its neighbours, listed as "abs")
+0x22ad0 185 -> 0x22b10 185  (same place among its neighbours, listed as "reverse")
+0x283f0 289 -> 0x28430 337  (same place among its neighbours, listed as "insert")
+    now uses "too many arguments"
+
+removed: none
+
+added
+0x5bb0 71
 ```
 
-Each call answered in under a second. Given two stripped builds of Lua 5.4.8 next, `diff` named the four functions a patch had touched and the one it had added, of 786, and the agent explained each change from the decompiled C in 30 seconds.
+The key took six calls that mattered: `summary`, `strings`, `imports`, `functions`, one `decompile` of three functions, and `bytes` for the two tables the check reads. The run above is from before `diff` printed the calls, strings and table names of each change, which that run's report asked for.
 
 ## How
 
