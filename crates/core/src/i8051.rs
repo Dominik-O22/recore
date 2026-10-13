@@ -379,7 +379,8 @@ impl Arch for I8051 {
     /// other. A pointer that may point to any memory takes a third byte to say which, and that
     /// byte marks the address as one in the code space: 0xFF before the halves in code from
     /// Keil's compiler, 0x80 after them in code from SDCC, which puts it in `B` when the
-    /// address is in `DPTR`. So does reading from the address with `MOVC`.
+    /// address is in `DPTR`. So does reading from the address with `MOVC`, and reading or
+    /// writing there with `MOVX` says the address is none in the code space.
     fn text_pointers(image: &Image, start: u64, end: u64) -> Vec<TextPointer> {
         /// How many instructions may lie between two that load bytes of one pointer: those
         /// that put the first byte where it goes, such as `PUSH ACC` or `MOVX @DPTR, A` and
@@ -393,7 +394,7 @@ impl Arch for I8051 {
         let from_common = start >> 16 == 0 && banking.is_common(start as u16);
         let banks: Vec<u64> = if from_common { image.sections.iter().filter(|section| section.executable).map(|section| section.addr >> 16).collect() } else { vec![start >> 16] };
         let mut found = Vec::new();
-        let mut point = |from: u64, high: u8, low: u8, marked: bool| {
+        let point = |found: &mut Vec<TextPointer>, from: u64, high: u8, low: u8, marked: bool| {
             let target = u16::from_be_bytes([high, low]);
             let banks = if banking.is_common(target) { &banks[..1] } else { &banks[..] };
             found.extend(banks.iter().map(|&bank| TextPointer { from, to: banking.address(bank, target), marked }));
@@ -415,11 +416,18 @@ impl Arch for I8051 {
             match opcode {
                 0x90 => {
                     dptr = Some((insn.addr, [first, second]));
-                    point(insn.addr, first, second, false);
+                    point(&mut found, insn.addr, first, second, false);
                 }
                 0x93 => {
                     if let Some((from, [high, low])) = dptr {
-                        point(from, high, low, true);
+                        point(&mut found, from, high, low, true);
+                    }
+                }
+                // MOVX through DPTR: the address is one in external memory, whatever the code
+                // space holds at the same number.
+                0xE0 | 0xF0 => {
+                    if let Some((from, _)) = dptr.take() {
+                        found.retain(|pointer| pointer.from != from);
                     }
                 }
                 _ if opcode == 0xA3 || insn.touches_dptr() => dptr = None,
@@ -453,15 +461,15 @@ impl Arch for I8051 {
             // Unmarked, either half may be the high one: compilers differ, and so does the
             // order in which code adds a number to an address.
             if let Some((_, half)) = newer {
-                point(insn.addr, half, byte, older.is_some_and(|(_, mark)| mark == MARKS[0]));
-                point(insn.addr, byte, half, false);
+                point(&mut found, insn.addr, half, byte, older.is_some_and(|(_, mark)| mark == MARKS[0]));
+                point(&mut found, insn.addr, byte, half, false);
             }
             if let (Some((_, low)), Some((from, high)), true) = (older, newer, byte == MARKS[1]) {
-                point(from, high, low, true);
+                point(&mut found, from, high, low, true);
             }
             // MOV B, #0x80.
             if let (Some((from, [high, low])), [0x75, 0xF0, 0x80]) = (dptr, insn.bytes) {
-                point(from, high, low, true);
+                point(&mut found, from, high, low, true);
             }
             (older, newer, since) = (newer, Some((insn.addr, byte)), 0);
         }
@@ -776,6 +784,17 @@ mod tests {
         assert_eq!(strings, [(0x2D, "ab"), (0x30, "%d"), (0x33, "0123456789ABCDEF"), (0x44, "left over"), (0x4E, "nobody")]);
         let users: Vec<(u64, u64)> = analysis.data_refs.iter().filter(|reference| image(&code, 0).is_code(reference.to)).map(|reference| (reference.from, reference.to)).collect();
         assert_eq!(users, [(0x04, 0x2D), (0x0D, 0x30), (0x18, 0x33), (0x29, 0x44)]);
+    }
+
+    #[test]
+    fn an_address_used_for_external_memory_is_not_one_of_text() {
+        // MOV DPTR, #0x0006; CLR A; RET, a zero byte, and four characters at 0x0006.
+        let mut code = [0x90, 0x00, 0x06, 0xE4, 0x22, 0x00, b'a', b'b', b'c', b'd', 0x00];
+        let strings = |code: &[u8]| crate::analyze(&image(code, 0)).strings.iter().map(|string| string.addr).collect::<Vec<_>>();
+        assert_eq!(strings(&code), [0x0006]);
+        // With MOVX A, @DPTR in place of CLR A the address is in external memory.
+        code[3] = 0xE0;
+        assert!(strings(&code).is_empty());
     }
 
     #[test]
