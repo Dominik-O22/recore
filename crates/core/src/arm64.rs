@@ -237,17 +237,82 @@ impl State {
 
     fn step(&mut self, insn: Insn) {
         self.compare = None;
-        if let Some(compare) = insn.compare_immediate() {
-            self.compare = Some(compare);
-            return;
-        }
-        if insn.direct().is_some_and(|(is_call, _)| is_call) || insn.register_branch() == Some(1) {
-            // A call may change every caller-saved register.
-            for register in (0..=18).chain([30]) {
-                self.registers[register] = Value::Unknown;
+        // Bits 28 to 25 name the class of an instruction, and every form that is told apart
+        // here belongs to one class. Looking only for the forms of the instruction's own class
+        // spares most of the tests.
+        match insn.word >> 25 & 0xF {
+            // Arithmetic with an immediate, and addresses relative to the program counter.
+            0b1000 => {
+                if let Some(compare) = insn.compare_immediate() {
+                    self.compare = Some(compare);
+                    return;
+                }
+                if insn.moves_stack_pointer() {
+                    self.spills = Default::default();
+                }
+                let value = if let Some((is_page, address)) = insn.pc_relative() {
+                    if is_page { Value::Page(address) } else { Value::Addr(address) }
+                } else if let Some(immediate) = insn.add_immediate() {
+                    match self.registers[insn.rn()] {
+                        Value::Page(base) | Value::Addr(base) => Value::Addr(base + immediate),
+                        _ => Value::Unknown,
+                    }
+                } else {
+                    Value::Unknown
+                };
+                self.set(insn.rd(), value);
             }
-            return;
+            // Branches.
+            0b1010 | 0b1011 => {
+                if insn.direct().is_some_and(|(is_call, _)| is_call) || insn.register_branch() == Some(1) {
+                    // A call may change every caller-saved register.
+                    for register in (0..=18).chain([30]) {
+                        self.registers[register] = Value::Unknown;
+                    }
+                    return;
+                }
+                self.set(insn.rd(), Value::Unknown);
+            }
+            // Loads and stores.
+            0b0100 | 0b0110 | 0b1100 | 0b1110 => self.step_memory(insn),
+            // Arithmetic on registers.
+            0b0101 => {
+                let value = if let Some(source) = insn.register_move() {
+                    self.registers[source]
+                } else if insn.word & 0xFFE0_0000 == 0x8B20_0000 {
+                    // `add xd, xn, wm, <extend> #shift`: base plus scaled entry, GCC's dispatch.
+                    let signed = insn.word >> 15 & 1 == 1;
+                    match (self.registers[insn.rn()], self.registers[insn.rm()]) {
+                        (Value::Addr(base), Value::Entry { table, size, signed: loaded_signed, limit }) => {
+                            Value::Target { table, size, signed: signed || loaded_signed, limit, base, shift: (insn.word >> 10 & 7) as u8 }
+                        }
+                        _ => Value::Unknown,
+                    }
+                } else if insn.word & 0xFF20_0000 == 0x8B00_0000 {
+                    // `add xd, xn, xm, lsl #shift`: table address plus entry, Clang's dispatch.
+                    let shift = (insn.word >> 10 & 63) as u8;
+                    match (self.registers[insn.rn()], self.registers[insn.rm()]) {
+                        (Value::Addr(base), Value::Entry { table, size, signed, limit })
+                        | (Value::Entry { table, size, signed, limit }, Value::Addr(base))
+                            if shift <= 2 =>
+                        {
+                            Value::Target { table, size, signed, limit, base, shift }
+                        }
+                        _ => Value::Unknown,
+                    }
+                } else {
+                    Value::Unknown
+                };
+                self.set(insn.rd(), value);
+            }
+            // Vector and floating-point operations.
+            0b0111 | 0b1111 if insn.writes_vector_only() => {}
+            _ => self.set(insn.rd(), Value::Unknown),
         }
+    }
+
+    /// [`State::step`] for a load or a store.
+    fn step_memory(&mut self, insn: Insn) {
         if let Some(offset) = insn.store_to_stack() {
             // Remember addresses, which are all a later dispatch needs back, and what
             // another pass follows.
@@ -261,9 +326,6 @@ impl State {
                 }
                 (None, false) => {}
             }
-            return;
-        }
-        if insn.writes_vector_only() {
             return;
         }
         if insn.moves_stack_pointer() {
@@ -281,14 +343,7 @@ impl State {
             self.set(insn.rd(), loaded);
             return;
         }
-        let value = if let Some((is_page, address)) = insn.pc_relative() {
-            if is_page { Value::Page(address) } else { Value::Addr(address) }
-        } else if let Some(immediate) = insn.add_immediate() {
-            match self.registers[insn.rn()] {
-                Value::Page(base) | Value::Addr(base) => Value::Addr(base + immediate),
-                _ => Value::Unknown,
-            }
-        } else if let Some(offset) = insn.load_offset() {
+        let value = if let Some(offset) = insn.load_offset() {
             match self.registers[insn.rn()] {
                 _ if insn.rn() == 31 => self.spills.iter().find(|(at, _)| *at == offset).map_or(Value::Unknown, |&(_, value)| value),
                 Value::Page(base) | Value::Addr(base) => Value::Slot(base + offset),
@@ -296,8 +351,6 @@ impl State {
             }
         } else if let Some(slot) = insn.load_literal() {
             Value::Slot(slot)
-        } else if let Some(source) = insn.register_move() {
-            self.registers[source]
         } else if let Some((size, signed)) = insn.indexed_load() {
             match self.registers[insn.rn()] {
                 Value::Addr(table) => {
@@ -309,28 +362,7 @@ impl State {
                 }
                 _ => Value::Unknown,
             }
-        } else if insn.word & 0xFFE0_0000 == 0x8B20_0000 {
-            // `add xd, xn, wm, <extend> #shift`: base plus scaled entry, GCC's dispatch.
-            let signed = insn.word >> 15 & 1 == 1;
-            match (self.registers[insn.rn()], self.registers[insn.rm()]) {
-                (Value::Addr(base), Value::Entry { table, size, signed: loaded_signed, limit }) => {
-                    Value::Target { table, size, signed: signed || loaded_signed, limit, base, shift: (insn.word >> 10 & 7) as u8 }
-                }
-                _ => Value::Unknown,
-            }
-        } else if insn.word & 0xFF20_0000 == 0x8B00_0000 {
-            // `add xd, xn, xm, lsl #shift`: table address plus entry, Clang's dispatch.
-            let shift = (insn.word >> 10 & 63) as u8;
-            match (self.registers[insn.rn()], self.registers[insn.rm()]) {
-                (Value::Addr(base), Value::Entry { table, size, signed, limit })
-                | (Value::Entry { table, size, signed, limit }, Value::Addr(base))
-                    if shift <= 2 =>
-                {
-                    Value::Target { table, size, signed, limit, base, shift }
-                }
-                _ => Value::Unknown,
-            }
-        } else if insn.word >> 25 & 0b0101 == 0b0100 {
+        } else {
             // Other loads and stores: the transfer registers, and the base when it is updated.
             self.set(insn.rd(), Value::Unknown);
             let is_pair = insn.word & 0x3A00_0000 == 0x2800_0000;
@@ -342,8 +374,6 @@ impl State {
                 self.set(insn.rn(), Value::Unknown);
             }
             return;
-        } else {
-            Value::Unknown
         };
         self.set(insn.rd(), value);
     }
