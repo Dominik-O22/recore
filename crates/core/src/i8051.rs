@@ -99,6 +99,16 @@ impl Insn {
         })
     }
 
+    /// The 16-bit address of the block the jump after the instruction skips: what begins behind
+    /// that jump. A call of it stays in the function, since the function goes on beyond the
+    /// block. SDCC calls through a pointer this way: the block pushes the pointer and returns
+    /// into it.
+    fn skipped_block(self, image: &Image) -> Option<u16> {
+        let after = self.addr + u64::from(LENGTH[usize::from(self.opcode())]);
+        let next = I8051::decode(image.bytes_from(after)?, after).next()?.insn?;
+        matches!(next.transfer(), Some((Transfer::Jump, beyond)) if beyond > next.next()).then(|| next.next())
+    }
+
     /// The direct address or the bit the instruction names in its second byte, as the address of
     /// the byte it is in: internal data below 0x80, a special function register from there.
     fn direct(self) -> Option<u64> {
@@ -306,8 +316,11 @@ impl Arch for I8051 {
             return Some(Flow::Call(target));
         }
         if let Some((transfer, target)) = insn.transfer() {
+            let calls_own_block = matches!(transfer, Transfer::Call) && insn.skipped_block(image) == Some(target);
             let target = image.banking.reach(insn.addr, target);
             return Some(match transfer {
+                // The function calls a block of its own, which it then jumps over.
+                Transfer::Call if calls_own_block => Flow::Branch(target),
                 // A call that hands its return address to a library routine comes back
                 // elsewhere or not at all: it is an indirect jump, and its data follows it.
                 Transfer::Call if Inline::after_call_to(image, target).is_some() => Flow::JumpIndirect(None),
@@ -623,6 +636,18 @@ mod tests {
         let functions: Vec<(u64, &[(u64, u64)])> = analysis.functions.iter().map(|function| (function.addr, function.ranges.as_slice())).collect();
         assert_eq!(functions, [(0x0000, &[(0x0000, 0x0003), (0x0007, 0x0008)][..])]);
         assert!(analysis.calls.is_empty());
+    }
+
+    #[test]
+    fn a_call_of_the_block_the_next_jump_skips_stays_in_the_function() {
+        // LCALL 0x0005; SJMP 0x000A; at 0x0005, PUSH DPL; PUSH DPH; RET; at 0x000A, RET. Then a
+        // function that calls the one after it, with no jump between: LCALL 0x000F; RET; RET.
+        let code = [0x12, 0x00, 0x05, 0x80, 0x05, 0xC0, 0x82, 0xC0, 0x83, 0x22, 0x22, 0x12, 0x00, 0x0F, 0x22, 0x22];
+        let mut image = image(&code, 0);
+        image.exports = vec![0x000B];
+        let analysis = crate::analyze(&image);
+        let functions: Vec<(u64, &[(u64, u64)])> = analysis.functions.iter().map(|function| (function.addr, function.ranges.as_slice())).collect();
+        assert_eq!(functions, [(0x0000, &[(0x0000, 0x000B)][..]), (0x000B, &[(0x000B, 0x000F)][..]), (0x000F, &[(0x000F, 0x0010)][..])]);
     }
 
     #[test]
