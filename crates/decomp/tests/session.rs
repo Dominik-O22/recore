@@ -1,5 +1,6 @@
 //! Sessions over hand-assembled code, so the tests need no corpus binary.
 
+use recore_decomp::facts::SwitchCall;
 use recore_decomp::{Facts, Section, Session, Target, vendored_spec_dir};
 
 fn session(code: &[u8]) -> Session {
@@ -237,7 +238,7 @@ fn a_call_to_a_switch_routine_is_a_switch_over_its_table() {
     code.resize(0x100, 0x00);
     code.push(0x22);
     let mut session = banked_session(&[(0, &code)]);
-    session.add_functions(&Facts { functions: vec![(0, false), (0x100, false)], switch_calls: vec![(0x0001, c"ACC")], ..Facts::default() }).unwrap();
+    session.add_functions(&Facts { functions: vec![(0, false), (0x100, false)], switch_calls: vec![SwitchCall { call: 0x0001, selector: c"ACC", cases: None }], ..Facts::default() }).unwrap();
     session.override_jump_table(0, 0x0001, &[0x0008, 0x000b]).unwrap();
     let function = session.decompile(0).unwrap();
     assert!(!function.bad_data, "{}", function.c_text);

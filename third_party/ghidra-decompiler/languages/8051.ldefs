@@ -61,5 +61,7 @@
             id="8051:BE:24:cip-51">
     <description>Silicon Labs CIP-51 Microcontroller Family</description>
     <compiler name="default" spec="keil-cx51.cspec" id="default"/>
+    <!-- recore: SDCC, which has its own calling convention. -->
+    <compiler name="SDCC" spec="sdcc-mcs51.cspec" id="sdcc"/>
   </language>
 </language_definitions>

@@ -19,6 +19,9 @@ struct Cli {
     /// Corpus directory containing `bin/` and `debug/`.
     #[arg(long, default_value = "corpus")]
     corpus: PathBuf,
+    /// Where function signatures are kept, `<corpus>/signatures` unless given.
+    #[arg(long)]
+    signatures: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -39,9 +42,10 @@ enum Command {
     Signatures { out: PathBuf },
     /// Checks fingerprint naming by leaving each project out of the database in turn.
     SignatureCheck,
-    /// Reads function signatures from the PDBs into `<corpus>/signatures`.
+    /// Reads function signatures from the PDBs, or from SDCC's debug records, into the
+    /// signatures directory.
     SignatureTruth,
-    /// Scores decompiler corpus reports in `dirs` against the PDB signatures.
+    /// Scores decompiler corpus reports in `dirs` against those signatures.
     ScoreSignatures { dirs: Vec<PathBuf> },
     /// Compares recore's data references with Ghidra's in `<corpus>/ghidra-refs`, which
     /// `ghidra/run-refs.sh` writes.
@@ -241,12 +245,13 @@ fn run_score(corpus: &Path, dir: &Path, detail: bool) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let signatures = cli.signatures.clone().unwrap_or_else(|| cli.corpus.join("signatures"));
     match cli.command {
         Command::Truth => run_truth(&cli.corpus),
         Command::Signatures { out } => signatures::build(&cli.corpus, &out),
         Command::SignatureCheck => signatures::evaluate(&cli.corpus),
-        Command::SignatureTruth => signatures_score::write_truth(&cli.corpus),
-        Command::ScoreSignatures { dirs } => signatures_score::score(&cli.corpus, &dirs),
+        Command::SignatureTruth => signatures_score::write_truth(&cli.corpus, &signatures),
+        Command::ScoreSignatures { dirs } => signatures_score::score(&signatures, &dirs),
         Command::Jumptables => run_jumptables(&cli.corpus),
         Command::ScoreReferences { misses } => references::score(&cli.corpus, misses),
         Command::ScoreClasses { detail } => classes::score(&cli.corpus, detail),

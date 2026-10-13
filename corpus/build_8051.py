@@ -254,7 +254,7 @@ def write_layout(name, memory, entries, banked):
         image += bytes(memory.get(address, 0xFF) for address in range(start, end))
     (CORPUS / "image" / f"{name}.bin").write_bytes(image)
     # Reset. recore reads the interrupt vectors from their slots.
-    layout = f'machine = "8051"\nentry = [{", ".join(f"{entry:#06x}" for entry in [0, *entries])}]\n'
+    layout = f'machine = "8051"\ncompiler = "sdcc"\nentry = [{", ".join(f"{entry:#06x}" for entry in [0, *entries])}]\n'
     for offset, length, address in regions:
         layout += (f'\n[[region]]\nfile = "../image/{name}.bin"\noffset = {offset:#x}\nlength = {length:#x}\n'
                    f"address = {address:#08x}\nexecutable = true\n")

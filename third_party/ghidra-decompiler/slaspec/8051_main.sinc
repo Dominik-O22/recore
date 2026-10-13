@@ -200,7 +200,13 @@ define register offset=0x82  size=1 [ DPX DPH DPL ];
 
 define register offset=0x40  size=$(SP_SIZE) [ SP ];
 define register offset=0x44  size=$(PTRSIZE) [ PC ];
-define register offset=0x48  size=1 [ PSW ];
+# recore: each flag is a register of its own, holding 0 or 1, as the flags of other processors
+# are in their languages. Upstream has them as bits of one register PSW, so every instruction
+# that sets a flag reads and rewrites all of them, and a test of the carry flag is a shift and
+# a mask of the byte they share. The byte is put together where code reads the status word as
+# a whole and taken apart where code writes it: see packpsw and unpackpsw. P, the parity of A,
+# is no register: it is worked out where it is read.
+define register offset=0x48  size=1 [ CY AC F0 RS1 RS0 OV F1 ];
 @if defined(DUAL_DPTR)
 # Dual DPTR
 # Rather than model it as context, we're just going
@@ -210,13 +216,6 @@ define register offset=0x4a  size=2 [ DPTR2 ];
 define register offset=$(DPS_REG_NUM) size=1 [ AUXR1 ]; # Bit 0 is DPS
 @endif
 
-@define CY 		"PSW[7,1]"
-@define AC  	"PSW[6,1]"
-@define N   	"PSW[5,1]"
-@define RS1  	"PSW[4,1]"
-@define RS0  	"PSW[3,1]"
-@define OV		"PSW[2,1]"
-@define Z  		"PSW[1,1]"
 
 @if defined(MX51)
 # remap these into the normal register file for decompiler use.
@@ -254,6 +253,10 @@ define context contextReg
 
 define pcodeop decimal_adjust;
 define pcodeop nop;
+# recore: what a call to a routine that jumps on to one of the cases listed after the call is
+# read as. The compiler spec says how each list is laid out.
+define pcodeop byteCases;
+define pcodeop wordCases;
 
 @if BIT_OPS == "PCODEOPS"
 define pcodeop get;
@@ -325,6 +328,8 @@ define token BitByte (8)
    sfrbit  = (0,2) dec
    lowbyte = (3,6)
    bitaddr0 = (0,0)
+# recore: a bit of PSW, which is one of the flags.
+   flagbit  = (0,2)
 ;
 define token AddrTwo (16)
    addr16 = (0,15)
@@ -370,6 +375,8 @@ attach variables  rn [ R0 R1 R2 R3 R4 R5 R6 R7 ];
 attach variables  [ dreg dreg2 ] [ R0 R1 R2 R3 R4 R5 R6 R7 ];
 @endif
 attach variables  ri [ R0 R1 ];
+# recore: the bits of PSW from bit 1 up. Bit 0 is P, which is no register.
+attach variables  flagbit [ _ F1 OV RS0 RS1 F0 AC CY ];
 
 # flags macros
 
@@ -390,23 +397,57 @@ attach variables  ri [ R0 R1 ];
 # PSW = PSW | ((op1 < op2) << 7);
 #}
 
-macro addflags(op1, op2) {   # Flags set by add instructions
-$(CY) = (carry(op1,op2));        # Check for carry
- #OV = (scarry(op1,op2));      # Check for signed carry
+# recore: these replace addflags, subflags, compflags and resultflags. Upstream's ADDC and SUBB
+# add the carry to the operand first, which loses the carry out when that wraps, and leave the
+# overflow flag alone. Its resultflags kept a sign and a zero flag in bits 5 and 1 of PSW,
+# which on an 8051 are the user flags F0 and F1 and which no instruction sets.
+macro add8(op) {
+  local v:1 = op;
+  CY = carry(ACC, v);
+  OV = scarry(ACC, v);
+  ACC = ACC + v;
 }
 
-macro subflags(op1, op2) {   # Flags set by sub instructions
-$(CY) = (op1 < op2);        # Check for carry
- #OV = sborrow(op1,op2);      # Check for signed carry
+macro addc8(op) {
+  local v:1 = op;
+  local c:1 = CY;
+  CY = carry(ACC, v);
+  OV = scarry(ACC, v);
+  local sum:1 = ACC + v;
+  CY = CY || carry(sum, c);
+  OV = OV ^^ scarry(sum, c);
+  ACC = sum + c;
+}
+
+macro subb8(op) {
+  local v:1 = op;
+  local c:1 = CY;
+  CY = ACC < v;
+  OV = sborrow(ACC, v);
+  local difference:1 = ACC - v;
+  CY = CY || (difference < c);
+  OV = OV ^^ sborrow(difference, c);
+  ACC = difference - c;
 }
 
 macro compflags(op1, op2) {  # Flags set by the compare instructions
-$(CY) = (op1 < op2);        # Check for carry
+CY = (op1 < op2);        # Check for carry
 }
 
-macro resultflags(op1) { # Set N,Z flag for results
- $(N) = op1 s< 0;
- $(Z) = op1 == 0;
+# recore: the status word as code reads it whole, and the flags as a write to it leaves them.
+macro packpsw(psw) {
+  local parity:1 = popcount(ACC);
+  psw = (CY << 7) | (AC << 6) | (F0 << 5) | (RS1 << 4) | (RS0 << 3) | (OV << 2) | (F1 << 1) | (parity & 1);
+}
+
+macro unpackpsw(psw) {
+  CY = psw >> 7;
+  AC = (psw >> 6) & 1;
+  F0 = (psw >> 5) & 1;
+  RS1 = (psw >> 4) & 1;
+  RS0 = (psw >> 3) & 1;
+  OV = (psw >> 2) & 1;
+  F1 = (psw >> 1) & 1;
 }
 
 macro push8(val) {
@@ -566,7 +607,8 @@ macro pop16(val) {
 
 
 # Operand display only
-CY:      "CY"    is epsilon          { }
+# recore: named Carry, since CY is a register now.
+Carry:   "CY"    is epsilon          { }
 
 Areg:    "A"     is ophi             { export ACC; }
 ABreg:   AB      is ophi & AB   	 { export AB; }
@@ -639,9 +681,15 @@ Direct:  mainreg   is bank=0 & mainreg	{ export *[INTMEM]:1 mainreg; }
 Direct:  dreg      is dregfill=0 & dreg	{ export dreg; }
 @endif
 Direct:  direct    is bank=1 & direct 	{ export *[SFR]:1 direct; }
-Direct:  PSW       is bank=1 & direct=0xD0 & PSW  { export PSW;  }
+# recore: PSW read whole is put together from the flags. An instruction that writes it has a
+# constructor of its own below, since what is exported here is a copy.
+Direct:  "PSW"     is bank=1 & direct=0xD0  { local psw:1; packpsw(psw); export psw; }
 Direct:  "A"       is bank=1 & direct=0xE0 	{ export ACC; }
 Direct:  B         is bank=1 & direct=0xF0 & B  { export B;  }
+# recore: the stack pointer by its address is the register that PUSH, POP and calls use.
+# Upstream has the special function register there, which they do not touch, so the frame a
+# function sets up with MOV A, SP and MOV SP, A was no part of the stack.
+Direct:  SP        is bank=1 & direct=0x81 & SP 	{ export SP; }
 Direct:  DPL       is bank=1 & direct=0x82 & DPL 	{ export DPL; }
 Direct:  DPH       is bank=1 & direct=0x83 & DPH  { export DPH;  }
 @if defined(MCS80390)
@@ -663,9 +711,10 @@ Direct2:  mainreg2  is bank2=0 & mainreg2	{ export *[INTMEM]:1 mainreg2; }
 Direct2: dreg2     is dreg2fill=0 & dreg2	{ export dreg2; }
 @endif
 Direct2: direct2   is bank2=1 & direct2  	{ export *[SFR]:1 direct2; }
-Direct2: PSW       is bank2=1 & direct2=0xD0 & PSW  { export PSW;  }
+Direct2: "PSW"     is bank2=1 & direct2=0xD0  { local psw:1; packpsw(psw); export psw; }
 Direct2: "A"       is bank2=1 & direct2=0xE0	{ export ACC; }
 Direct2:  B        is bank2=1 & direct2=0xF0 & B  { export B;  }
+Direct2:  SP       is bank2=1 & direct2=0x81 & SP 	{ export SP; }
 Direct2:  DPL      is bank2=1 & direct2=0x82 & DPL 	{ export DPL; }
 Direct2:  DPH      is bank2=1 & direct2=0x83 & DPH  { export DPH;  }
 @if defined(MCS80390)
@@ -692,11 +741,17 @@ BitAddr:  bitaddr is bitbank=0 & lowbyte & sfrbit [ bitaddr =(lowbyte << 3)+sfrb
 BitAddr2: "/"bitaddr is bitbank=1 & sfrbyte & sfrbit	 [ bitaddr =(sfrbyte << 3)+sfrbit; ] { export *[BITS]:1 bitaddr; }
 BitAddr2: "/"bitaddr is bitbank=0 & lowbyte & sfrbit [ bitaddr =(lowbyte << 3)+sfrbit; ] { export *[BITS]:1 bitaddr; }
 @endif
+# recore: a bit address in PSW is the flag's register, and P is the parity of A. Upstream has
+# these in the BITS space like any other bit, apart from PSW, so that SETB 0xD7 did not set
+# the carry flag that JC tests.
+BitAddr:  flagbit    is bitbank=1 & sfrbyte=0x1A & flagbit   { export flagbit; }
+BitAddr:  "P"        is bitbank=1 & sfrbyte=0x1A & sfrbit=0  { local parity:1 = popcount(ACC); parity = parity & 1; export parity; }
+BitAddr2: "/"flagbit is bitbank=1 & sfrbyte=0x1A & flagbit   { export flagbit; }
+BitAddr2: "/P"       is bitbank=1 & sfrbyte=0x1A & sfrbit=0  { local parity:1 = popcount(ACC); parity = parity & 1; export parity; }
 
 BitByteAddr: byteaddr 	is bitbank=1 & sfrbyte & sfrbit [ byteaddr =(sfrbyte << 3); ] { export *[SFR]:1 byteaddr; }
 BitByteAddr: "A" 		is bitbank=1 & sfrbyte=0x1C & sfrbit { export ACC; }
 BitByteAddr: B 			is bitbank=1 & sfrbyte=0x1E & sfrbit & B { export B; }
-BitByteAddr: PSW 	    is bitbank=1 & sfrbyte=0x1A & sfrbit & PSW { export PSW; }
 @if defined(MCS251)
 BitByteAddr: byteaddr 	is bitbank=0 & lowbyte & sfrbit [ byteaddr = lowbyte + 0x20; ] { export *[RAM]:1 byteaddr; }
 @elif defined(MX51)
@@ -731,15 +786,15 @@ Rel16:   relAddr is rel16		     [ relAddr=inst_next+rel16; ] { export *:1 relAdd
 :ACALL  Addr11 is  $(GROUP1) & aaddrfill=1 & aoplo=1 & Addr11   { ret:2 = inst_next; push16(ret); call Addr11; }
 @endif
 
-:ADD Areg,rn      is $(GROUP2) & ophi=2          & Areg & rnfill=1 & rn 	 { addflags(ACC,rn); ACC = ACC + rn; resultflags(ACC); }
-:ADD Areg,Direct  is $(GROUP1) & ophi=2 & oplo=5 & Areg; Direct  { addflags(ACC,Direct); ACC = ACC + Direct; resultflags(ACC); }
-:ADD Areg,Ri      is $(GROUP2) & ophi=2          & Areg & rifill=3 & Ri	 { addflags(ACC,Ri); ACC = ACC + Ri; resultflags(ACC); }
-:ADD Areg,Data    is $(GROUP1) & ophi=2 & oplo=4 & Areg; Data    { addflags(ACC,Data); ACC = ACC + Data; resultflags(ACC); }
+:ADD Areg,rn      is $(GROUP2) & ophi=2          & Areg & rnfill=1 & rn 	 { add8(rn); }
+:ADD Areg,Direct  is $(GROUP1) & ophi=2 & oplo=5 & Areg; Direct  { add8(Direct); }
+:ADD Areg,Ri      is $(GROUP2) & ophi=2          & Areg & rifill=3 & Ri	 { add8(Ri); }
+:ADD Areg,Data    is $(GROUP1) & ophi=2 & oplo=4 & Areg; Data    { add8(Data); }
 
-:ADDC Areg,rn     is $(GROUP2) & ophi=3          & Areg & rnfill=1 & rn	   { tmp:1 =$(CY)+ rn; addflags(ACC,tmp); ACC = ACC + tmp; resultflags(ACC); }
-:ADDC Areg,Direct is $(GROUP1) & ophi=3 & oplo=5 & Areg; Direct    { tmp:1 =$(CY)+ Direct; addflags(ACC,tmp); ACC = ACC + tmp; resultflags(ACC); }
-:ADDC Areg,Ri     is $(GROUP2) & ophi=3          & Areg & rifill=3 & Ri	   { tmp:1 =$(CY)+ Ri; addflags(ACC,tmp); ACC = ACC + tmp; resultflags(ACC); }
-:ADDC Areg,Data   is $(GROUP1) & ophi=3 & oplo=4 & Areg; Data      {  tmp:1 =$(CY)+ Data; addflags(ACC,tmp); ACC = ACC + tmp; resultflags(ACC); }
+:ADDC Areg,rn     is $(GROUP2) & ophi=3          & Areg & rnfill=1 & rn	   { addc8(rn); }
+:ADDC Areg,Direct is $(GROUP1) & ophi=3 & oplo=5 & Areg; Direct    { addc8(Direct); }
+:ADDC Areg,Ri     is $(GROUP2) & ophi=3          & Areg & rifill=3 & Ri	   { addc8(Ri); }
+:ADDC Areg,Data   is $(GROUP1) & ophi=3 & oplo=4 & Areg; Data      { addc8(Data); }
 
 #TODO: which GROUP does AJMP belong to ??
 @if defined(MCS80390)
@@ -748,24 +803,24 @@ Rel16:   relAddr is rel16		     [ relAddr=inst_next+rel16; ] { export *:1 relAdd
 :AJMP Addr11 is  $(GROUP1) & aaddrfill=0 & aoplo=1 & Addr11			 { goto Addr11; }
 @endif
 
-:ANL Areg,rn     is $(GROUP2) & ophi=5 & Areg & rnfill=1 & rn					 { ACC = ACC & rn; resultflags(ACC); }
-:ANL Areg,Direct is $(GROUP1) & ophi=5 & oplo=5 & Areg; Direct		 { ACC = ACC & Direct; resultflags(ACC); }
-:ANL Areg,Ri     is $(GROUP2) & ophi=5 & Areg & rifill=3 & Ri					 { ACC = ACC & Ri; resultflags(ACC); }
-:ANL Areg,Data   is $(GROUP1) & ophi=5 & oplo=4 & Areg; Data		 { ACC = ACC & Data; resultflags(ACC); }
-:ANL Direct,Areg is $(GROUP1) & ophi=5 & oplo=2 & Areg; Direct		 { tmp:1 = Direct & ACC; Direct = tmp; resultflags(tmp); }
-:ANL Direct,Data is $(GROUP1) & ophi=5 & oplo=3; Direct; Data		 { tmp:1 = Direct & Data; Direct = tmp; resultflags(tmp); }
+:ANL Areg,rn     is $(GROUP2) & ophi=5 & Areg & rnfill=1 & rn					 { ACC = ACC & rn; }
+:ANL Areg,Direct is $(GROUP1) & ophi=5 & oplo=5 & Areg; Direct		 { ACC = ACC & Direct; }
+:ANL Areg,Ri     is $(GROUP2) & ophi=5 & Areg & rifill=3 & Ri					 { ACC = ACC & Ri; }
+:ANL Areg,Data   is $(GROUP1) & ophi=5 & oplo=4 & Areg; Data		 { ACC = ACC & Data; }
+:ANL Direct,Areg is $(GROUP1) & ophi=5 & oplo=2 & Areg; Direct		 { tmp:1 = Direct & ACC; Direct = tmp; }
+:ANL Direct,Data is $(GROUP1) & ophi=5 & oplo=3; Direct; Data		 { tmp:1 = Direct & Data; Direct = tmp; }
 
-:ANL CY,BitAddr   is $(GROUP1) & CY & ophi=8  & oplo=2; BitAddr  & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr {tmp:1 = BitByteAddr; $(CY)=$(CY)& ((tmp>>sfrbit)&1); resultflags(tmp); }
-:ANL CY,BitAddr2  is $(GROUP1) & CY & ophi=11 & oplo=0; BitAddr2 & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr {tmp:1 = BitByteAddr; $(CY)=$(CY)& (~((tmp>>sfrbit)&1));  }
+:ANL Carry,BitAddr   is $(GROUP1) & Carry & ophi=8  & oplo=2; BitAddr  & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr {tmp:1 = BitByteAddr; CY=CY& ((tmp>>sfrbit)&1); }
+:ANL Carry,BitAddr2  is $(GROUP1) & Carry & ophi=11 & oplo=0; BitAddr2 & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr {tmp:1 = BitByteAddr; CY=CY& (~((tmp>>sfrbit)&1));  }
 @if BIT_OPS == "BIT_ADDRS"
-:ANL CY,BitAddr   is $(GROUP1) & CY & ophi=8  & oplo=2; BitAddr  & sfrbit & BitByteAddr {$(CY)=$(CY)& BitAddr; }
-:ANL CY,BitAddr2  is $(GROUP1) & CY & ophi=11 & oplo=0; BitAddr2 & sfrbit & BitByteAddr {$(CY)=$(CY)& ~BitAddr2; }
+:ANL Carry,BitAddr   is $(GROUP1) & Carry & ophi=8  & oplo=2; BitAddr  & sfrbit & BitByteAddr {CY=CY& BitAddr; }
+:ANL Carry,BitAddr2  is $(GROUP1) & Carry & ophi=11 & oplo=0; BitAddr2 & sfrbit & BitByteAddr {CY=CY& ~BitAddr2; }
 @elif BIT_OPS == "PCODEOPS"
-:ANL CY,BitAddr   is $(GROUP1) & CY & ophi=8  & oplo=2; BitAddr  & sfrbit & BitByteAddr {$(CY)=$(CY)& get(BitAddr, BitByteAddr); }
-:ANL CY,BitAddr2  is $(GROUP1) & CY & ophi=11 & oplo=0; BitAddr2 & sfrbit & BitByteAddr {$(CY)=$(CY)& (get(BitAddr2, BitByteAddr)^1); }
+:ANL Carry,BitAddr   is $(GROUP1) & Carry & ophi=8  & oplo=2; BitAddr  & sfrbit & BitByteAddr {CY=CY& get(BitAddr, BitByteAddr); }
+:ANL Carry,BitAddr2  is $(GROUP1) & Carry & ophi=11 & oplo=0; BitAddr2 & sfrbit & BitByteAddr {CY=CY& (get(BitAddr2, BitByteAddr)^1); }
 @elif BIT_OPS == "SHIFTS"
-:ANL CY,BitAddr   is $(GROUP1) & CY & ophi=8  & oplo=2; BitAddr  & sfrbit	& BitByteAddr {$(CY)=$(CY)& ((BitByteAddr>>sfrbit)&1);  }
-:ANL CY,BitAddr2  is $(GROUP1) & CY & ophi=11 & oplo=0; BitAddr2 & sfrbit	& BitByteAddr {$(CY)=$(CY)& (~((BitByteAddr>>sfrbit)&1));  }
+:ANL Carry,BitAddr   is $(GROUP1) & Carry & ophi=8  & oplo=2; BitAddr  & sfrbit	& BitByteAddr {CY=CY& ((BitByteAddr>>sfrbit)&1);  }
+:ANL Carry,BitAddr2  is $(GROUP1) & Carry & ophi=11 & oplo=0; BitAddr2 & sfrbit	& BitByteAddr {CY=CY& (~((BitByteAddr>>sfrbit)&1));  }
 @endif
 
 :CJNE Areg,Direct,Rel8 is $(GROUP1) & ophi=11 & oplo=5 & Areg; Direct; Rel8	 { compflags(ACC,Direct); if (ACC!=Direct) goto Rel8; }
@@ -774,7 +829,7 @@ Rel16:   relAddr is rel16		     [ relAddr=inst_next+rel16; ] { export *:1 relAdd
 :CJNE Ri,Data,Rel8     is $(GROUP2) & ophi=11 & rifill=3 & Ri; Data; Rel8				 { compflags(Ri,Data); if (Ri!=Data) goto Rel8; }
 
 :CLR Areg is $(GROUP1) & ophi=14 & oplo=4 & Areg    			 { ACC = 0; }
-:CLR CY    is $(GROUP1) & CY & ophi=12 & oplo=3				     {$(CY)= 0; }
+:CLR Carry    is $(GROUP1) & Carry & ophi=12 & oplo=3				     {CY= 0; }
 
 :CLR BitAddr  is $(GROUP1) & ophi=12 & oplo=2; BitAddr & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr {  local tmp = ~(1<<sfrbit); BitByteAddr = BitByteAddr & tmp; }
 @if BIT_OPS == "BIT_ADDRS"
@@ -787,7 +842,7 @@ Rel16:   relAddr is rel16		     [ relAddr=inst_next+rel16; ] { export *:1 relAdd
 @endif
 
 :CPL Areg is $(GROUP2) & ophi=15 & oplo=4 & Areg					 { ACC = ~ACC; }
-:CPL CY    is $(GROUP2) & CY & ophi=11 & oplo=3					     {$(CY)=$(CY)^ 1; }
+:CPL Carry    is $(GROUP2) & Carry & ophi=11 & oplo=3					     {CY=CY^ 1; }
 
 :CPL BitAddr  is $(GROUP1) & ophi=11 & oplo=2; BitAddr & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr { tmp:1 = (1<<sfrbit); BitByteAddr = BitByteAddr ^ tmp; }
 @if BIT_OPS == "BIT_ADDRS"
@@ -805,7 +860,7 @@ Rel16:   relAddr is rel16		     [ relAddr=inst_next+rel16; ] { export *:1 relAdd
 :DEC Direct is $(GROUP1) & ophi=1 & oplo=5; Direct	  { Direct = Direct - 1; }
 :DEC Ri     is $(GROUP2) & ophi=1 & rifill=3 & Ri			      { Ri = Ri - 1; }
 
-:DIV ABreg     is $(GROUP1) & ophi=8 & oplo=4 & ABreg		  { PSW = PSW & 0x7b;  tmp : 1 = (B == 0)<<2; PSW = PSW | tmp; if (B==0) goto inst_next;  tmp2 : 1 = ACC; ACC = tmp2 / B; B = tmp2 % B; }
+:DIV ABreg     is $(GROUP1) & ophi=8 & oplo=4 & ABreg		  { CY = 0; OV = (B == 0); if (B==0) goto inst_next;  tmp2 : 1 = ACC; ACC = tmp2 / B; B = tmp2 % B; }
 
 # Specifying rnfill here is a temporary to allow distinguishing DJNZ1 and XCHD
 :DJNZ rn,Rel8     is $(GROUP2) & ophi=13 & rnfill=1 & rnfill=1 & rn; Rel8	 { rn = rn - 1; if (rn!=0) goto Rel8; }
@@ -837,7 +892,7 @@ Rel16:   relAddr is rel16		     [ relAddr=inst_next+rel16; ] { export *:1 relAdd
 :JB  BitAddr,Rel8 is $(GROUP1) & ophi=2 & oplo=0; BitAddr & sfrbit & BitByteAddr; Rel8	 { if (((BitByteAddr>>sfrbit)&1) == 1:1) goto Rel8; }
 :JBC BitAddr,Rel8 is $(GROUP1) & ophi=1 & oplo=0; BitAddr & sfrbit & BitByteAddr; Rel8	 {  tmp:1 = 1<<sfrbit; if ((BitByteAddr & tmp)==0) goto inst_next; BitByteAddr = BitByteAddr & ~tmp; goto Rel8; }
 @endif
-:JC  Rel8  is $(GROUP1) & ophi=4 & oplo=0; Rel8						 { if ($(CY) != 0) goto Rel8; }
+:JC  Rel8  is $(GROUP1) & ophi=4 & oplo=0; Rel8						 { if (CY != 0) goto Rel8; }
 :JMP ADPTR is $(GROUP1) & ophi=7 & oplo=3 & ADPTR					 { goto [ADPTR]; }
 
 :JNB BitAddr,Rel8 is $(GROUP1) & ophi=3 & oplo=0; BitAddr & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr; Rel8  { if (((BitByteAddr>>sfrbit)&1)==0:1) goto Rel8; }
@@ -849,7 +904,7 @@ Rel16:   relAddr is rel16		     [ relAddr=inst_next+rel16; ] { export *:1 relAdd
 :JNB BitAddr,Rel8 is $(GROUP1) & ophi=3 & oplo=0; BitAddr & sfrbit & BitByteAddr; Rel8  { if (((BitByteAddr>>sfrbit)&1)==0:1) goto Rel8; }
 @endif
 
-:JNC Rel8 is $(GROUP1) & ophi=5 & oplo=0; Rel8					 { if ($(CY)   == 0) goto Rel8; }
+:JNC Rel8 is $(GROUP1) & ophi=5 & oplo=0; Rel8					 { if (CY   == 0) goto Rel8; }
 :JNZ Rel8 is $(GROUP1) & ophi=7 & oplo=0; Rel8					 { if (ACC != 0) goto Rel8; }
 :JZ Rel8  is $(GROUP1) & ophi=6 & oplo=0; Rel8					 { if (ACC == 0) goto Rel8; }
 
@@ -885,17 +940,17 @@ Rel16:   relAddr is rel16		     [ relAddr=inst_next+rel16; ] { export *:1 relAdd
 :MOV DPTRreg,Data16 is $(GROUP1) & ophi=9 & oplo=0 & DPTRreg; Data16	 { DPTR = Data16; }
 @endif
 
-:MOV CY,BitAddr is $(GROUP1) & CY & ophi=10 & oplo=2;  BitAddr & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr {$(CY)= (BitByteAddr>>sfrbit)&1; }
-:MOV BitAddr,CY is $(GROUP1) & CY & ophi=9  & oplo=2;  BitAddr & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr { BitByteAddr = BitByteAddr & (~(1<<sfrbit)); BitByteAddr = BitByteAddr | ($(CY)<<sfrbit); }
+:MOV Carry,BitAddr is $(GROUP1) & Carry & ophi=10 & oplo=2;  BitAddr & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr {CY= (BitByteAddr>>sfrbit)&1; }
+:MOV BitAddr,Carry is $(GROUP1) & Carry & ophi=9  & oplo=2;  BitAddr & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr { BitByteAddr = BitByteAddr & (~(1<<sfrbit)); BitByteAddr = BitByteAddr | (CY<<sfrbit); }
 @if BIT_OPS == "BIT_ADDRS"
-:MOV CY,BitAddr is $(GROUP1) & CY & ophi=10 & oplo=2;  BitAddr & sfrbit & BitByteAddr {$(CY)= BitAddr; }
-:MOV BitAddr,CY is $(GROUP1) & CY & ophi=9  & oplo=2;  BitAddr & sfrbit & BitByteAddr { BitAddr = $(CY); }
+:MOV Carry,BitAddr is $(GROUP1) & Carry & ophi=10 & oplo=2;  BitAddr & sfrbit & BitByteAddr {CY= BitAddr; }
+:MOV BitAddr,Carry is $(GROUP1) & Carry & ophi=9  & oplo=2;  BitAddr & sfrbit & BitByteAddr { BitAddr = CY; }
 @elif BIT_OPS == "PCODEOPS"
-:MOV CY,BitAddr is $(GROUP1) & CY & ophi=10 & oplo=2;  BitAddr & sfrbit & BitByteAddr {$(CY) = get(BitAddr, BitByteAddr); }
-:MOV BitAddr,CY is $(GROUP1) & CY & ophi=9  & oplo=2;  BitAddr & sfrbit & BitByteAddr { BitByteAddr = set_bit_value(BitAddr, $(CY), BitByteAddr); }
+:MOV Carry,BitAddr is $(GROUP1) & Carry & ophi=10 & oplo=2;  BitAddr & sfrbit & BitByteAddr {CY = get(BitAddr, BitByteAddr); }
+:MOV BitAddr,Carry is $(GROUP1) & Carry & ophi=9  & oplo=2;  BitAddr & sfrbit & BitByteAddr { BitByteAddr = set_bit_value(BitAddr, CY, BitByteAddr); }
 @elif BIT_OPS == "SHIFTS"
-:MOV CY,BitAddr is $(GROUP1) & CY & ophi=10 & oplo=2;  BitAddr & sfrbit & BitByteAddr{$(CY)= (BitByteAddr>>sfrbit)&1; }
-:MOV BitAddr,CY is $(GROUP1) & CY & ophi=9  & oplo=2;  BitAddr & sfrbit & BitByteAddr { BitByteAddr = BitByteAddr & (~(1<<sfrbit)); BitByteAddr = BitByteAddr | ($(CY)<<sfrbit); }
+:MOV Carry,BitAddr is $(GROUP1) & Carry & ophi=10 & oplo=2;  BitAddr & sfrbit & BitByteAddr{CY= (BitByteAddr>>sfrbit)&1; }
+:MOV BitAddr,Carry is $(GROUP1) & Carry & ophi=9  & oplo=2;  BitAddr & sfrbit & BitByteAddr { BitByteAddr = BitByteAddr & (~(1<<sfrbit)); BitByteAddr = BitByteAddr | (CY<<sfrbit); }
 @endif
 
 :MOVC  Areg,ADPTR is $(GROUP1) & ophi=9 & oplo=3 & ADPTR & Areg		{ ACC = *:1 ADPTR; }
@@ -906,8 +961,7 @@ Rel16:   relAddr is rel16		     [ relAddr=inst_next+rel16; ] { export *:1 relAdd
 :MOVX  RiX,Areg     is $(GROUP2) & ophi=15 & rifill=1 & RiX & Areg	{ RiX = ACC; }
 :MOVX  ATDPTR,Areg  is $(GROUP1) & ophi=15 & oplo=0 & Areg & ATDPTR	{ ATDPTR = ACC; }
 
-:MUL ABreg         is $(GROUP1) & ophi=10 & oplo=4 & ABreg	   { PSW = PSW & 0x7b; tmp:2 = zext(ACC) * zext(B); ACC = tmp(0); B = tmp(1); PSW = PSW | ((B!=0)<<2); }
-#:MUL Areg,Breg   is $(GROUP1) & ophi=10 & oplo=4 & Areg & Breg { PSW = PSW & 0x7b; tmp:2 = zext(ACC) * zext(B); ACC = tmp(0); B = tmp(1); PSW = PSW | ((B!=0)<<2); }
+:MUL ABreg         is $(GROUP1) & ophi=10 & oplo=4 & ABreg	   { CY = 0; tmp:2 = zext(ACC) * zext(B); ACC = tmp(0); B = tmp(1); OV = (B != 0); }
 
 :NOP             is $(GROUP1) & ophi=0  & oplo=0	{ nop(); }
 
@@ -918,17 +972,17 @@ Rel16:   relAddr is rel16		     [ relAddr=inst_next+rel16; ] { export *:1 relAdd
 :ORL Direct,Areg is $(GROUP1) & ophi=4 & oplo=2 & Areg; Direct		 { Direct = Direct | ACC; }
 :ORL Direct,Data is $(GROUP1) & ophi=4 & oplo=3 & Areg; Direct; Data { Direct = Direct | Data; }
 
-:ORL CY,BitAddr  is $(GROUP1) & CY & ophi=7  & oplo=2; BitAddr  & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr {$(CY)=$(CY)| ((BitByteAddr>>sfrbit)&1); }
-:ORL CY,BitAddr2 is $(GROUP1) & CY & ophi=10 & oplo=0; BitAddr2 & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr {$(CY)=$(CY)| (((BitByteAddr>>sfrbit)&1)^1); }
+:ORL Carry,BitAddr  is $(GROUP1) & Carry & ophi=7  & oplo=2; BitAddr  & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr {CY=CY| ((BitByteAddr>>sfrbit)&1); }
+:ORL Carry,BitAddr2 is $(GROUP1) & Carry & ophi=10 & oplo=0; BitAddr2 & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr {CY=CY| (((BitByteAddr>>sfrbit)&1)^1); }
 @if BIT_OPS == "BIT_ADDRS"
-:ORL CY,BitAddr  is $(GROUP1) & CY & ophi=7  & oplo=2; BitAddr  & sfrbit & BitByteAddr {$(CY)=$(CY)| BitAddr; }
-:ORL CY,BitAddr2 is $(GROUP1) & CY & ophi=10 & oplo=0; BitAddr2 & sfrbit & BitByteAddr {$(CY)=$(CY)| (BitAddr2^1); }
+:ORL Carry,BitAddr  is $(GROUP1) & Carry & ophi=7  & oplo=2; BitAddr  & sfrbit & BitByteAddr {CY=CY| BitAddr; }
+:ORL Carry,BitAddr2 is $(GROUP1) & Carry & ophi=10 & oplo=0; BitAddr2 & sfrbit & BitByteAddr {CY=CY| (BitAddr2^1); }
 @elif BIT_OPS == "PCODEOPS"
-:ORL CY,BitAddr  is $(GROUP1) & CY & ophi=7  & oplo=2; BitAddr  & sfrbit & BitByteAddr {$(CY)=$(CY)| get(BitAddr, BitByteAddr); }
-:ORL CY,BitAddr2 is $(GROUP1) & CY & ophi=10 & oplo=0; BitAddr2 & sfrbit & BitByteAddr {$(CY)=$(CY)| (get(BitAddr2, BitByteAddr)^1); }
+:ORL Carry,BitAddr  is $(GROUP1) & Carry & ophi=7  & oplo=2; BitAddr  & sfrbit & BitByteAddr {CY=CY| get(BitAddr, BitByteAddr); }
+:ORL Carry,BitAddr2 is $(GROUP1) & Carry & ophi=10 & oplo=0; BitAddr2 & sfrbit & BitByteAddr {CY=CY| (get(BitAddr2, BitByteAddr)^1); }
 @elif BIT_OPS == "SHIFTS"
-:ORL CY,BitAddr  is $(GROUP1) & CY & ophi=7  & oplo=2; BitAddr  & sfrbit & BitByteAddr {$(CY)=$(CY)| ((BitByteAddr>>sfrbit)&1); }
-:ORL CY,BitAddr2 is $(GROUP1) & CY & ophi=10 & oplo=0; BitAddr2 & sfrbit & BitByteAddr {$(CY)=$(CY)| (((BitByteAddr>>sfrbit)&1)^1); }
+:ORL Carry,BitAddr  is $(GROUP1) & Carry & ophi=7  & oplo=2; BitAddr  & sfrbit & BitByteAddr {CY=CY| ((BitByteAddr>>sfrbit)&1); }
+:ORL Carry,BitAddr2 is $(GROUP1) & Carry & ophi=10 & oplo=0; BitAddr2 & sfrbit & BitByteAddr {CY=CY| (((BitByteAddr>>sfrbit)&1)^1); }
 @endif
 
 :POP  Direct is $(GROUP1) & ophi=13 & oplo=0; Direct	{ pop8(Direct); }
@@ -956,11 +1010,11 @@ pc:3 = 0; pop24(pc); return[pc];
 }
 
 :RL   Areg is $(GROUP1) & ophi=2 & oplo=3 & Areg	        { ACC = (ACC<<1) | (ACC>>7); }
-:RLC  Areg is $(GROUP1) & ophi=3 & oplo=3 & Areg	        {  tmp : 1 = (ACC&0x80)>>7; ACC = (ACC<<1) | $(CY);$(CY)= tmp; }
+:RLC  Areg is $(GROUP1) & ophi=3 & oplo=3 & Areg	        {  tmp : 1 = (ACC&0x80)>>7; ACC = (ACC<<1) | CY;CY= tmp; }
 :RR   Areg is $(GROUP1) & ophi=0 & oplo=3 & Areg	        { ACC = (ACC>>1) | (ACC<<7); }
-:RRC  Areg is $(GROUP1) & ophi=1 & oplo=3 & Areg	        {  tmp : 1 = ACC&1; ACC = (ACC>>1) | ($(CY)<<7);$(CY)= tmp; }
+:RRC  Areg is $(GROUP1) & ophi=1 & oplo=3 & Areg	        {  tmp : 1 = ACC&1; ACC = (ACC>>1) | (CY<<7);CY= tmp; }
 
-:SETB  CY is $(GROUP1) & CY & ophi=13 & oplo=3					 { $(CY)=1; }
+:SETB  Carry is $(GROUP1) & Carry & ophi=13 & oplo=3					 { CY=1; }
 
 :SETB BitAddr is $(GROUP1) & ophi=13 & oplo=2; BitAddr & bitaddr57=7 & sfrbit3=0 & sfrbit & BitByteAddr { BitByteAddr = BitByteAddr | (1<<sfrbit); }
 @if BIT_OPS == "BIT_ADDRS"
@@ -973,10 +1027,10 @@ pc:3 = 0; pop24(pc); return[pc];
 
 :SJMP Rel8        is $(GROUP1) & ophi=8 & oplo=0; Rel8			{ goto Rel8; }
 
-:SUBB Areg,rn     is $(GROUP2) & ophi=9 & rnfill=1 & rn & Areg				{  tmp : 1 = rn+$(CY); subflags(ACC,tmp); ACC = ACC - tmp; }
-:SUBB Areg,Direct is $(GROUP1) & ophi=9 & oplo=5 & Areg; Direct	{  tmp:1 = Direct+$(CY); subflags(ACC,tmp); ACC = ACC - tmp; }
-:SUBB Areg,Ri     is $(GROUP2) & ophi=9 & Areg & rifill=3 & Ri				{  local tmp = Ri+$(CY); subflags(ACC,tmp); ACC = ACC - tmp; }
-:SUBB Areg,Data   is $(GROUP1) & ophi=9 & oplo=4 & Areg; Data	{ tmp:1 = Data+$(CY); subflags(ACC,tmp); ACC = ACC - tmp; }
+:SUBB Areg,rn     is $(GROUP2) & ophi=9 & rnfill=1 & rn & Areg				{ subb8(rn); }
+:SUBB Areg,Direct is $(GROUP1) & ophi=9 & oplo=5 & Areg; Direct	{ subb8(Direct); }
+:SUBB Areg,Ri     is $(GROUP2) & ophi=9 & Areg & rifill=3 & Ri				{ subb8(Ri); }
+:SUBB Areg,Data   is $(GROUP1) & ophi=9 & oplo=4 & Areg; Data	{ subb8(Data); }
 
 :SWAP  Areg       is $(GROUP1) & ophi=12 & oplo=4 & Areg		{ ACC = (ACC>>4) | (ACC<<4); }
 
@@ -994,3 +1048,21 @@ pc:3 = 0; pop24(pc); return[pc];
 :XRL Direct,Areg is $(GROUP1) & ophi=6 & oplo=2 & Areg; Direct	{ Direct = Direct ^ ACC; }
 :XRL Direct,Data is $(GROUP1) & ophi=6 & oplo=3; Direct; Data	{ Direct = Direct ^ Data; }
 
+# recore: the instructions that write a directly addressed byte, for PSW. Each works on the
+# status word put together from the flags and takes the result apart again.
+:INC "PSW"        is $(GROUP1) & ophi=0  & oplo=5; direct=0xD0         { local psw:1; packpsw(psw); psw = psw + 1; unpackpsw(psw); }
+:DEC "PSW"        is $(GROUP1) & ophi=1  & oplo=5; direct=0xD0         { local psw:1; packpsw(psw); psw = psw - 1; unpackpsw(psw); }
+:ORL "PSW",Areg   is $(GROUP1) & ophi=4  & oplo=2 & Areg; direct=0xD0  { local psw:1; packpsw(psw); psw = psw | ACC; unpackpsw(psw); }
+:ORL "PSW",Data   is $(GROUP1) & ophi=4  & oplo=3; direct=0xD0; Data   { local psw:1; packpsw(psw); psw = psw | Data; unpackpsw(psw); }
+:ANL "PSW",Areg   is $(GROUP1) & ophi=5  & oplo=2 & Areg; direct=0xD0  { local psw:1; packpsw(psw); psw = psw & ACC; unpackpsw(psw); }
+:ANL "PSW",Data   is $(GROUP1) & ophi=5  & oplo=3; direct=0xD0; Data   { local psw:1; packpsw(psw); psw = psw & Data; unpackpsw(psw); }
+:XRL "PSW",Areg   is $(GROUP1) & ophi=6  & oplo=2 & Areg; direct=0xD0  { local psw:1; packpsw(psw); psw = psw ^ ACC; unpackpsw(psw); }
+:XRL "PSW",Data   is $(GROUP1) & ophi=6  & oplo=3; direct=0xD0; Data   { local psw:1; packpsw(psw); psw = psw ^ Data; unpackpsw(psw); }
+:MOV "PSW",Areg   is $(GROUP1) & ophi=15 & oplo=5 & Areg; direct=0xD0  { unpackpsw(ACC); }
+:MOV "PSW",rn     is $(GROUP2) & ophi=8  & rnfill=1 & rn; direct=0xD0  { unpackpsw(rn); }
+:MOV "PSW",Direct is $(GROUP1) & ophi=8  & oplo=5; Direct; direct2=0xD0 { local psw:1 = Direct; unpackpsw(psw); }
+:MOV "PSW",Ri     is $(GROUP2) & ophi=8  & rifill=3 & Ri; direct=0xD0  { local psw:1 = Ri; unpackpsw(psw); }
+:MOV "PSW",Data   is $(GROUP1) & ophi=7  & oplo=5; direct=0xD0; Data   { local psw:1 = Data; unpackpsw(psw); }
+:XCH Areg,"PSW"   is $(GROUP1) & ophi=12 & oplo=5 & Areg; direct=0xD0  { local psw:1; packpsw(psw); local a:1 = ACC; ACC = psw; unpackpsw(a); }
+:POP "PSW"        is $(GROUP1) & ophi=13 & oplo=0; direct=0xD0         { local psw:1; pop8(psw); unpackpsw(psw); }
+:DJNZ "PSW",Rel8  is $(GROUP1) & ophi=13 & oplo=5; direct=0xD0; Rel8   { local psw:1; packpsw(psw); psw = psw - 1; unpackpsw(psw); if (psw != 0) goto Rel8; }

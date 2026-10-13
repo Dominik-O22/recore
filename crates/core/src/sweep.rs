@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
 
-use crate::image::{Image, Section};
+use crate::image::{Compiler, Image, Section};
 use crate::layout::{BankingLayout, Layout, SCHEMES, Trampoline};
 use crate::program::Program;
 use crate::score::{Score, landing, score};
@@ -394,6 +394,11 @@ impl Sweep {
         writeln!(text, "entry = [{}]", self.layout.entry.iter().map(|entry| format!("{entry:#06x}")).collect::<Vec<_>>().join(", "))?;
         if let Some(names) = &self.layout.names {
             writeln!(text, "names = {}", file(names)?)?;
+        }
+        match self.layout.compiler {
+            Some(Compiler::Keil) => writeln!(text, "compiler = \"keil\"")?,
+            Some(Compiler::Sdcc) => writeln!(text, "compiler = \"sdcc\"")?,
+            None => {}
         }
         writeln!(text)?;
         for placement in best.placements.iter().filter(|placement| placement.bank.is_none()) {

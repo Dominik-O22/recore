@@ -666,6 +666,7 @@ mod tests {
             relative_targets: Vec::new(),
             data_in_code: true,
             banking: Banking::default(),
+            compiler: None,
         }
     }
 

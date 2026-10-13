@@ -19,38 +19,13 @@
     <symbol name="BANK0_R5" address="INTMEM:05"/>
     <symbol name="BANK0_R6" address="INTMEM:06"/>
     <symbol name="BANK0_R7" address="INTMEM:07"/>
-    
-    <symbol name="BANK1_R0" address="INTMEM:08"/>
-    <symbol name="BANK1_R1" address="INTMEM:09"/>
-    <symbol name="BANK1_R2" address="INTMEM:0a"/>
-    <symbol name="BANK1_R3" address="INTMEM:0b"/>
-    <symbol name="BANK1_R4" address="INTMEM:0c"/>
-    <symbol name="BANK1_R5" address="INTMEM:0d"/>
-    <symbol name="BANK1_R6" address="INTMEM:0e"/>
-    <symbol name="BANK1_R7" address="INTMEM:0f"/>
-    
-    <symbol name="BANK2_R0" address="INTMEM:10"/>
-    <symbol name="BANK2_R1" address="INTMEM:11"/>
-    <symbol name="BANK2_R2" address="INTMEM:12"/>
-    <symbol name="BANK2_R3" address="INTMEM:13"/>
-    <symbol name="BANK2_R4" address="INTMEM:14"/>
-    <symbol name="BANK2_R5" address="INTMEM:15"/>
-    <symbol name="BANK2_R6" address="INTMEM:16"/>
-    <symbol name="BANK2_R7" address="INTMEM:17"/>
-    
-    <symbol name="BANK3_R0" address="INTMEM:18"/>
-    <symbol name="BANK3_R1" address="INTMEM:19"/>
-    <symbol name="BANK3_R2" address="INTMEM:1a"/>
-    <symbol name="BANK3_R3" address="INTMEM:1b"/>
-    <symbol name="BANK3_R4" address="INTMEM:1c"/>
-    <symbol name="BANK3_R5" address="INTMEM:1d"/>
-    <symbol name="BANK3_R6" address="INTMEM:1e"/>
-    <symbol name="BANK3_R7" address="INTMEM:1f"/>
-  
+
+    <!-- recore: upstream names the 24 bytes after these as the registers of banks 1 to 3. A
+         program that selects no other bank, as most do, keeps variables there, and SDCC its
+         frame pointer. -->
     <!-- recore: only the registers every 8051 has, under their usual names. Upstream names
          the registers of the Silicon Labs parts here. -->
     <symbol name="P0" address="SFR:80"/>
-    <symbol name="SP" address="SFR:81"/>
     <symbol name="DPL" address="SFR:82"/>
     <symbol name="DPH" address="SFR:83"/>
     <symbol name="PCON" address="SFR:87"/>
@@ -173,5 +148,68 @@
     <memory_block name="SFR-BITS" start_address="BITS:80" bit_mapped_address="SFR:80" length="0x80"/>
     
   </default_memory_blocks>
-  
+  <!-- recore: a switch calls ?C?CCASE or ?C?ICASE with a list after the call: for each case
+       the address of its code and its value, of one byte or two, then a zero address and the
+       address of the default case. The routine jumps to the case and does not return.
+       crates/decomp reads such a call as a jump to what byteCases or wordCases gives for the
+       value switched on, the number of cases and the address of the list. The engine reads
+       a jump assist from the processor spec only. -->
+  <jumpassist name="byteCases">
+    <case_pcode>
+      <input name="index" size="3"/>
+      <input name="count" size="3"/>
+      <input name="list" size="3"/>
+      <output name="value" size="3"/>
+      <body><![CDATA[
+      value = zext(*[CODE]:1 (list + index * 3 + 2));
+      ]]></body>
+    </case_pcode>
+    <addr_pcode>
+      <input name="index" size="3"/>
+      <input name="count" size="3"/>
+      <input name="list" size="3"/>
+      <output name="case" size="3"/>
+      <body><![CDATA[
+      case = (list & 0xff0000) + zext(*[CODE]:2 (list + index * 3));
+      ]]></body>
+    </addr_pcode>
+    <default_pcode>
+      <input name="index" size="3"/>
+      <input name="count" size="3"/>
+      <input name="list" size="3"/>
+      <output name="case" size="3"/>
+      <body><![CDATA[
+      case = (list & 0xff0000) + zext(*[CODE]:2 (list + count * 3 + 2));
+      ]]></body>
+    </default_pcode>
+  </jumpassist>
+  <jumpassist name="wordCases">
+    <case_pcode>
+      <input name="index" size="3"/>
+      <input name="count" size="3"/>
+      <input name="list" size="3"/>
+      <output name="value" size="3"/>
+      <body><![CDATA[
+      value = zext(*[CODE]:2 (list + index * 4 + 2));
+      ]]></body>
+    </case_pcode>
+    <addr_pcode>
+      <input name="index" size="3"/>
+      <input name="count" size="3"/>
+      <input name="list" size="3"/>
+      <output name="case" size="3"/>
+      <body><![CDATA[
+      case = (list & 0xff0000) + zext(*[CODE]:2 (list + index * 4));
+      ]]></body>
+    </addr_pcode>
+    <default_pcode>
+      <input name="index" size="3"/>
+      <input name="count" size="3"/>
+      <input name="list" size="3"/>
+      <output name="case" size="3"/>
+      <body><![CDATA[
+      case = (list & 0xff0000) + zext(*[CODE]:2 (list + count * 4 + 2));
+      ]]></body>
+    </default_pcode>
+  </jumpassist>
 </processor_spec>

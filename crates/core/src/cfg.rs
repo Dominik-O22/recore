@@ -223,6 +223,7 @@ mod tests {
             relative_targets: Vec::new(),
             data_in_code: false,
             banking: Default::default(),
+            compiler: None,
         }
     }
 

@@ -46,6 +46,9 @@
 //! find: which bank a region is, written `bank = "?"` with the 16-bit address its bytes start
 //! at as its `address`, the `common` ranges, and the trampolines.
 //!
+//! `compiler = "sdcc"` at the top says what built the code, where that decides how functions
+//! are called. An 8051 image without it is taken as built by Keil's C51.
+//!
 //! [`Image::load`] takes a layout wherever it takes an executable.
 
 use std::fmt;
@@ -55,7 +58,7 @@ use anyhow::{Context, Result, ensure};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
-use crate::image::{Banking, Format, Image, Machine, Section};
+use crate::image::{Banking, Compiler, Format, Image, Machine, Section};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +73,9 @@ pub(crate) struct Layout {
     /// A file of names for the hardware's addresses, relative to the layout file: see
     /// [`crate::hardware`].
     pub(crate) names: Option<PathBuf>,
+    /// What built the code, `"keil"` or `"sdcc"`, for a machine whose compilers disagree on
+    /// how a function is called.
+    pub(crate) compiler: Option<Compiler>,
 }
 
 #[derive(Deserialize)]
@@ -353,6 +359,7 @@ impl Layout {
             // An 8051 reads its constants and its switch tables from the code space.
             data_in_code: self.machine == Machine::I8051,
             banking,
+            compiler: self.compiler,
         })
     }
 }

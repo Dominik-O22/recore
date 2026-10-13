@@ -1,6 +1,7 @@
 //! Decompiles whole corpora with Ghidra's engine, one disposable child process per shard.
 
 mod imports;
+mod noise;
 mod params;
 mod report;
 mod run;
@@ -121,6 +122,15 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         list: usize,
     },
+    /// Prints how much of the C of a `corpus` run with `--emit-c` is hard to read: flags kept as
+    /// bits of a status register, values seen only as their bytes, registers no convention
+    /// accounts for.
+    Noise {
+        out_dir: PathBuf,
+        /// Also list the functions that carry this mark, by the name the report gives it.
+        #[arg(long)]
+        list: Option<String>,
+    },
     /// Prints how many calls to imported functions in a directory of binaries have a prototype,
     /// and from which table.
     Imports {
@@ -150,6 +160,7 @@ fn main() -> Result<()> {
             run::functions(&binary, &functions, all, jobs, Duration::from_secs_f64(timeout), &(&worker).into())
         }
         Command::Params { out_dir, debug_dir, jobs, list } => params::compare(&out_dir, &debug_dir, jobs, list),
+        Command::Noise { out_dir, list } => noise::report(&out_dir, list.as_deref()),
         Command::Imports { bin_dir, list } => imports::coverage(&bin_dir, list),
         Command::DebugInfo { binary } => imports::debug_info(&binary),
         Command::Worker { binary, options } => isolate::serve(&binary, &options),

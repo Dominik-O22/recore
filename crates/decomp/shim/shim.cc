@@ -89,6 +89,8 @@ class SectionImage : public LoadImage {
  public:
   string language;             // SLEIGH language and compiler id, such as x86:LE:32:default:windows
   AddrSpace *space = nullptr;  // the space the code is in, known once the translator exists
+  AddrSpace *constant = nullptr;
+  VarnodeData assist_place;  // a temporary no instruction and no analysis uses, known with it
   // While a function is being decompiled, no other function's entry decodes: see `hidden`.
   unordered_set<uint64_t> entries;  // every declared function start
   set<pair<uint64_t, uint64_t>> allowed;  // (function, entry) pairs exempt from the above
@@ -106,7 +108,14 @@ class SectionImage : public LoadImage {
   // Calls that never return to the code after them, because the routine they call takes its
   // return address as the address of a table and jumps to an entry of it: each with the
   // register the routine picks the entry by.
-  unordered_map<uint64_t, VarnodeData> switch_calls;
+  // A call that is a jump to one of several places, picked by `selector`. With `cases`, the
+  // compiler spec's jump assist `assist` says where from `count` cases listed at `list`.
+  struct SwitchCall {
+    VarnodeData selector;
+    bool cases;
+    uintb assist, count, list;
+  };
+  unordered_map<uint64_t, SwitchCall> switch_calls;
   // Calls followed by data that the routine they call reads and returns past: each with the
   // number of bytes.
   unordered_map<uint64_t, int4> data_after;
@@ -198,19 +207,28 @@ class SectionImage : public LoadImage {
 class Retargeted : public PcodeEmit {
   PcodeEmit &out;
   const SectionImage &image;
-  const VarnodeData *selector;  // set for a call that is a jump through a table
+  const SectionImage::SwitchCall *selector;  // set for a call that is a jump through a table
 
  public:
   bool runs_on = true;  // whether control passes on to the next instruction
 
-  Retargeted(PcodeEmit &o, const SectionImage &i, const VarnodeData *s) : out(o), image(i), selector(s) {}
+  Retargeted(PcodeEmit &o, const SectionImage &i, const SectionImage::SwitchCall *s) : out(o), image(i), selector(s) {}
   void dump(const Address &addr, OpCode opc, VarnodeData *outvar, VarnodeData *vars, int4 isize) override {
     runs_on = opc != CPUI_BRANCH && opc != CPUI_BRANCHIND && opc != CPUI_RETURN && selector == nullptr;
     if (selector != nullptr) {
       // All the instruction does is hand control to the routine, which jumps on. The return
       // address it pushes for the routine to find its table by is not left on the stack.
       if (opc != CPUI_CALL) return;
-      VarnodeData input = *selector;
+      VarnodeData input = selector->selector;
+      if (selector->cases) {
+        // Where the jump goes is what the assist makes of the selector. The engine works the
+        // places and the value of each case out from that, and switches on the selector.
+        uint4 wide = image.assist_place.size;
+        VarnodeData place = image.assist_place;
+        VarnodeData inputs[4] = {{image.constant, selector->assist, 4}, input, {image.constant, selector->count, wide}, {image.constant, selector->list, wide}};
+        out.dump(addr, CPUI_CALLOTHER, &place, inputs, 4);
+        input = place;
+      }
       out.dump(addr, CPUI_BRANCHIND, nullptr, &input, 1);
       return;
     }
@@ -266,6 +284,8 @@ class SectionArchitecture : public SleighArchitecture {
   void postSpecFile() override {
     Architecture::postSpecFile();
     image->space = getDefaultCodeSpace();
+    image->constant = translate->getConstantSpace();
+    image->assist_place = {translate->getUniqueSpace(), translate->getUniqueStart(Translate::RUNTIME_RETURN_LOCATION), image->space->getAddrSize()};
   }
 
  public:
@@ -913,6 +933,18 @@ int rd_map_space(RdSession *session, uint64_t base, const char *name, char *err,
   });
 }
 
+// Says that the byte of memory at `addr` belongs to the function that runs, as a register does,
+// and is no global variable: what a function keeps there, a called function leaves there.
+int rd_register_at(RdSession *session, uint64_t addr, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Address at = session->address(addr);
+    Database *symbols = session->arch->symboltab;
+    symbols->removeRange(symbols->getGlobalScope(), at.getSpace(), at.getOffset(), at.getOffset());
+    VarnodeData byte = {at.getSpace(), at.getOffset(), 1};
+    session->arch->defaultfp->addEffect(EffectRecord(byte, EffectRecord::unaffected));
+  });
+}
+
 // Says that the `len` bytes of code at `addr` are those at `target`: reading them reads those,
 // and a jump or call into them goes to the code at `target`.
 void rd_mirror(RdSession *session, uint64_t addr, uint64_t len, uint64_t target) {
@@ -927,8 +959,19 @@ void rd_redirect(RdSession *session, uint64_t from, uint64_t to) { session->imag
 
 // Says that the call at `call` does not come back: the routine it calls jumps on, to one of the
 // places rd_override_jump_table gives for `call`, which it picks by the register `selector`.
-int rd_call_switches(RdSession *session, uint64_t call, const char *selector, char *err, size_t errlen) {
-  return guarded(err, errlen, [&] { session->image->switch_calls[call] = session->arch->translate->getRegister(selector); });
+// With `assist`, the places are not given: the jump assist of that name in the compiler spec
+// finds them and the value of each case, from `count` cases listed at `list`.
+int rd_call_switches(RdSession *session, uint64_t call, const char *selector, const char *assist, uint64_t count, uint64_t list, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    SectionImage::SwitchCall jump = {arch->translate->getRegister(selector), assist != nullptr, 0, count, list};
+    if (assist != nullptr) {
+      UserPcodeOp *op = arch->userops.getOp(assist);
+      if (op == nullptr || op->getType() != UserPcodeOp::jumpassist) throw LowlevelError(string("no jump assist ") + assist);
+      jump.assist = op->getIndex();
+    }
+    session->image->switch_calls[call] = jump;
+  });
 }
 
 // Says that code which runs from the end of one function into the start of the next is meant
@@ -1082,6 +1125,54 @@ int rd_set_param_count(RdSession *session, uint64_t addr, size_t count, char *er
     fd->getFuncProto().setPieces(pieces);
     fd->getFuncProto().removeParam(1);
     fd->getFuncProto().setOutputLock(false);
+  });
+}
+
+// Where a value is: a register by name, several joined with `:`, most significant first, or
+// `<space>:<offset>/<size>` as a parameter's storage is reported, with its size.
+static ParameterPieces stored_in(Architecture *arch, const string &place) {
+  ParameterPieces piece;
+  int4 size = 0;
+  size_t sized = place.find('/');
+  if (sized != string::npos) {
+    size_t colon = place.find(':');
+    AddrSpace *space = arch->getSpaceByName(place.substr(0, colon));
+    if (colon == string::npos || space == nullptr) throw LowlevelError("no such storage: " + place);
+    piece.addr = Address(space, stoull(place.substr(colon + 1, sized - colon - 1), nullptr, 16));
+    size = stoi(place.substr(sized + 1));
+  } else {
+    vector<VarnodeData> registers;
+    istringstream names(place);
+    for (string name; getline(names, name, ':');) {
+      registers.push_back(arch->translate->getRegister(name));
+      size += registers.back().size;
+    }
+    piece.addr = registers.size() == 1 ? registers[0].getAddr() : arch->findAddJoin(registers, 0)->getUnified().getAddr();
+  }
+  piece.type = arch->types->getBase(size, TYPE_UNKNOWN);
+  piece.flags = 0;
+  return piece;
+}
+
+// Says where the function at `addr` takes its arguments and leaves its result, for one that
+// keeps to no calling convention: `storage` is `ACC(R3:R2:R1,DPTR)` for a result in ACC and
+// two arguments, `void(...)` for no result, and `?(...)` to leave the result to be found.
+int rd_set_storage(RdSession *session, uint64_t addr, const char *storage, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    string text(storage);
+    size_t open = text.find('('), close = text.rfind(')');
+    if (open == string::npos || close == string::npos) throw LowlevelError("storage is `result(arguments)`: " + text);
+    FuncProto &proto = session->function(addr)->getFuncProto();
+    string result = text.substr(0, open);
+    if (result != "void" && result != "?") proto.setOutput(stored_in(arch, result));
+    istringstream arguments(text.substr(open + 1, close - open - 1));
+    proto.clearInput();
+    int4 count = 0;
+    for (string place; getline(arguments, place, ',');) proto.setParam(count++, "", stored_in(arch, place));
+    proto.setInputLock(true);
+    proto.setOutputLock(result != "?");
+    proto.setModelLock(true);
   });
 }
 
