@@ -127,11 +127,20 @@ impl Insn {
 #[derive(Clone, Copy, Default)]
 pub struct State {
     dptr: Option<u16>,
-    /// The number `A` was just compared with by `CJNE A, #n`, which leaves carry set when `A`
-    /// is the smaller.
-    compared: Option<u8>,
-    /// A number the index in `A` was found to be below, and has only been scaled since.
+    /// A number the index in `A` was just compared with, and whether carry is set or clear when
+    /// the index is the smaller: `CJNE A, #n` sets it then, and `ADD A, #256 - n` clears it.
+    compared: Option<(u8, bool)>,
+    /// A number the index was found to be below, since when it has only been loaded and scaled.
     below: Option<u8>,
+    /// The address `A + PC` is at, when `A` is an index that a number was just added to.
+    indexed: Option<u16>,
+    /// Where the bytes start that `A`, `DPL` and `DPH` were each read from by
+    /// `MOVC A, @A+PC`, at an index.
+    read: Option<u16>,
+    low: Option<u16>,
+    high: Option<u16>,
+    /// `A` was just cleared.
+    zero: bool,
     /// The routine called last, if the index was below a number when it was. It may be the one
     /// that scales an index, which the jump checks; nothing else holds after the call.
     scaler: Option<u16>,
@@ -238,10 +247,11 @@ impl Inline {
 }
 
 /// The jump instructions a `switch` over a dense range jumps into with `JMP @A+DPTR`: `count`
-/// of one kind, back to back, at the start of `bytes`. Returns the length of each.
+/// of one length, back to back, at the start of `bytes`. Returns the length of each.
 fn jump_slots(bytes: &[u8], count: usize) -> Option<usize> {
     let is_long = |opcode: u8| opcode == 0x02;
-    let is_short = |opcode: u8| opcode & 0x1F == 0x01;
+    // `AJMP` and `SJMP`.
+    let is_short = |opcode: u8| opcode & 0x1F == 0x01 || opcode == 0x80;
     let size = if is_long(*bytes.first()?) { 3 } else { 2 };
     let slots = bytes.get(..size * count)?;
     slots.chunks_exact(size).all(|slot| if size == 3 { is_long(slot[0]) } else { is_short(slot[0]) }).then_some(size)
@@ -347,11 +357,27 @@ impl Arch for I8051 {
             state.scaler = Some(routine);
             return;
         }
-        // What scales an index and what loads the table's address leave the index below what
-        // it was below: MOV DPTR, #; MOV Rn, A; ADD A, Rn; RL A; ADD A, ACC; and for an index
-        // too large to triple in A, MOV B, #3; MUL AB; XCH A, DPH; ADD A, B.
-        let scales = matches!(opcode, 0x90 | 0xF8..=0xFF | 0x28..=0x2F | 0x23 | 0xA4) || matches!((opcode, first), (0x25, 0xE0 | 0xF0) | (0x75, 0xF0) | (0xC5, DPH));
+        // What loads or scales an index and what loads the table's address leave the index
+        // below what it was below: MOV DPTR, #; MOV Rn, A; ADD A, Rn; RL A; for an index too
+        // large to triple in A, MOV B, #3; MUL AB; XCH A, DPH; ADD A, B; and for an index kept
+        // elsewhere while it was checked, MOV A and ADD A from a register, a direct address or
+        // through R0 or R1, and ADD A, # on the way to its address.
+        let scales = matches!(opcode, 0x90 | 0xF8..=0xFF | 0x24..=0x2F | 0x23 | 0xA4 | 0xE5..=0xEF) || matches!((opcode, first), (0x75, 0xF0) | (0xC5, DPH));
         state.below = state.below.filter(|_| scales);
+        // ADD A, #n carries unless A is below 256 - n.
+        state.compared = (opcode == 0x24 && first != 0).then(|| (first.wrapping_neg(), false));
+        // A case's address read in halves: ADD A, #offset; MOVC A, @A+PC; MOV DPL, A, and the
+        // same for DPH. The bytes read start `offset` after the MOVC.
+        let read = if opcode == 0x83 { state.indexed } else { None };
+        state.indexed = (opcode == 0x24).then(|| insn.next().wrapping_add(1).wrapping_add(u16::from(first)));
+        match (opcode, first) {
+            (0xF5, DPL) => state.low = state.read,
+            (0xF5, DPH) => state.high = state.read,
+            _ if called.is_some() || insn.touches_dptr() => (state.low, state.high) = (None, None),
+            _ => {}
+        }
+        state.read = read;
+        state.zero = opcode == 0xE4;
         state.dptr = match opcode {
             0x90 => Some(u16::from_be_bytes([first, second])),
             0xA3 => state.dptr.map(|dptr| dptr.wrapping_add(1)),
@@ -368,12 +394,14 @@ impl Arch for I8051 {
         let compared = state.compared.take();
         state.below = None;
         let mut taken = *state;
-        match insn.opcode() {
+        (state.indexed, state.read, state.zero) = (None, None, false);
+        (taken.indexed, taken.read, taken.zero) = (None, None, false);
+        match (insn.opcode(), compared) {
             // CJNE A, #n: carry says whether A is below n, on both ways out.
-            0xB4 => (state.compared, taken.compared) = (Some(insn.bytes[1]), Some(insn.bytes[1])),
+            (0xB4, _) => (state.compared, taken.compared) = (Some((insn.bytes[1], true)), Some((insn.bytes[1], true))),
             // JC is taken, and JNC is not, when carry is set.
-            0x40 => taken.below = compared,
-            0x50 => state.below = compared,
+            (0x40, Some((bound, true))) | (0x50, Some((bound, false))) => taken.below = Some(bound),
+            (0x40, Some((bound, false))) | (0x50, Some((bound, true))) => state.below = Some(bound),
             _ => {}
         }
         taken
@@ -394,7 +422,14 @@ impl Arch for I8051 {
     ) -> Option<Table> {
         // Cases are in the function that switches, so in its bank, and never behind a trampoline.
         let here = |target: u16| image.banking.address(jump.addr >> 16, target);
-        let table = if jump.opcode() == 0x73 {
+        let table = if let (0x73, Some(low), Some(high), true) = (jump.opcode(), state.low, state.high, state.zero) {
+            // `JMP @A+DPTR` with A clear and DPTR read from two runs of bytes after the jump: the
+            // low halves of the cases' addresses, and straight after them as many high halves.
+            let count = usize::from(high.checked_sub(low).filter(|_| u64::from(low) == (jump.addr + 1) & 0xFFFF)?);
+            let bytes = image.bytes_from(jump.addr + 1)?.get(..2 * count)?;
+            let entries = (0..count).map(|index| here(u16::from_be_bytes([bytes[count + index], bytes[index]]))).collect();
+            Table { address: jump.addr + 1, entry_size: 2, entries, bounded: true, inline_end: Some(jump.addr + 1 + 2 * count as u64) }
+        } else if jump.opcode() == 0x73 {
             // `JMP @A+DPTR` into a table of jumps, one per value below the bound.
             let (address, count) = (here(state.dptr?), u64::from(state.below.filter(|&count| count > 0)?));
             if let Some(routine) = state.scaler {
@@ -588,6 +623,29 @@ mod tests {
         let functions: Vec<(u64, &[(u64, u64)])> = analysis.functions.iter().map(|function| (function.addr, function.ranges.as_slice())).collect();
         assert_eq!(functions, [(0x0000, &[(0x0000, 0x0003), (0x0007, 0x0008)][..])]);
         assert!(analysis.calls.is_empty());
+    }
+
+    #[test]
+    fn a_switch_whose_index_is_checked_by_adding_jumps_into_short_jumps() {
+        // MOV A, R7; ADD A, #0xFD; JC 0x0011; MOV A, R7; ADD A, R7; MOV DPTR, #0x000B;
+        // JMP @A+DPTR. At 0x000B: SJMP 0x0011; SJMP 0x0012; SJMP 0x0013. Then three RETs.
+        let code = [0xEF, 0x24, 0xFD, 0x40, 0x0C, 0xEF, 0x2F, 0x90, 0x00, 0x0B, 0x73, 0x80, 0x04, 0x80, 0x03, 0x80, 0x02, 0x22, 0x22, 0x22];
+        let analysis = crate::analyze(&image(&code, 0));
+        let tables: Vec<(u64, &[u64])> = analysis.jump_tables.iter().map(|table| (table.jump, table.targets.as_slice())).collect();
+        assert_eq!(tables, [(0x000A, &[0x000B, 0x000D, 0x000F][..])]);
+    }
+
+    #[test]
+    fn a_switch_reads_the_halves_of_a_case_address_from_the_bytes_after_its_jump() {
+        // MOV A, R7; ADD A, #0x0A; MOVC A, @A+PC; MOV DPL, A; MOV A, R7; ADD A, #0x06;
+        // MOVC A, @A+PC; MOV DPH, A; CLR A; JMP @A+DPTR. At 0x000E the low halves of 0x0012 and
+        // 0x0013, which would be a call, and at 0x0010 the high halves. Then two RETs.
+        let code = [0xEF, 0x24, 0x0A, 0x83, 0xF5, 0x82, 0xEF, 0x24, 0x06, 0x83, 0xF5, 0x83, 0xE4, 0x73, 0x12, 0x13, 0x00, 0x00, 0x22, 0x22];
+        let analysis = crate::analyze(&image(&code, 0));
+        let tables: Vec<(u64, &[u64])> = analysis.jump_tables.iter().map(|table| (table.jump, table.targets.as_slice())).collect();
+        assert_eq!(tables, [(0x000D, &[0x0012, 0x0013][..])]);
+        let functions: Vec<(u64, &[(u64, u64)])> = analysis.functions.iter().map(|function| (function.addr, function.ranges.as_slice())).collect();
+        assert_eq!(functions, [(0x0000, &[(0x0000, 0x000E), (0x0012, 0x0014)][..])]);
     }
 
     #[test]
