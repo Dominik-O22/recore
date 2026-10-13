@@ -3,9 +3,10 @@
 //! The linker's debug records (`.cdb`) give each C function's start and the address of its last
 //! instruction: `L:G$name$0$0:ADDR` and `L:XG$name$0$0:ADDR`, with `F<module>` in place of `G`
 //! for a static function. Routines written in assembly have no such records. They come from the
-//! linker's map, which lists each global label of a code area, and have no size. A label is a
-//! function where a C function calls it. One that code only jumps to or runs into is a piece
-//! of some routine with no agreed owner, which scoring neither demands nor penalises.
+//! linker's map, which lists each global label of a code area. A label is a function where a C
+//! function calls it. One that code only jumps to or runs into is a piece of some routine with
+//! no agreed owner, which scoring neither demands nor penalises. Either has the code up to the
+//! next label or function.
 //!
 //! A `switch` over a dense range is `MOV DPTR, #table` and `JMP @A+DPTR` into a run of jumps, one
 //! per case. The listing of each module at its final addresses (`.rst`) shows the run: the lines
@@ -81,6 +82,7 @@ pub fn extract(layout: &Path, cdb_path: &Path) -> Result<Truth> {
     // labels are functions.
     let (mut instructions, mut undecodable_bytes) = (0, 0);
     let mut called = HashSet::new();
+    let c_ranges: Vec<(u64, u64)> = by_addr.values().map(|function| (function.addr, function.addr + function.size)).collect();
     for function in by_addr.values() {
         let Some(bytes) = image.bytes_from(function.addr).and_then(|bytes| bytes.get(..function.size as usize)) else { continue };
         for decoded in I8051::decode(bytes, function.addr) {
@@ -108,6 +110,15 @@ pub fn extract(layout: &Path, cdb_path: &Path) -> Result<Truth> {
         by_addr.entry(addr).or_insert(Function { addr, size: 0, name: format!("vector_{addr:02x}"), fragment: thunk, noreturn: false, thunk });
     }
 
+    // Assembly has no record of where a routine ends: it has what follows its label, up to the
+    // next label or function, within its section.
+    let starts: Vec<u64> = by_addr.keys().copied().collect();
+    for (function, next) in by_addr.values_mut().zip(starts.iter().skip(1).copied().chain([u64::MAX])) {
+        if c_ranges.binary_search_by_key(&function.addr, |&(start, _)| start).is_err() {
+            let section_end = image.sections.iter().find(|section| section.contains(function.addr)).map_or(function.addr, |section| section.end());
+            function.size = next.min(section_end) - function.addr;
+        }
+    }
     let exec: Vec<(u64, u64)> = image.sections.iter().filter(|section| section.executable).map(|section| (section.addr, section.end())).collect();
     Ok(Truth {
         name: name(layout),
