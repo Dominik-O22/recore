@@ -145,23 +145,31 @@ pub struct Discovery {
 struct AddrSet {
     base: u64,
     bits: Vec<u64>,
-    sorted: Vec<u64>,
+    /// Per word of `bits`, the number of members in the words before it.
+    before: Vec<u32>,
 }
 
 impl AddrSet {
-    /// A range longer than this is looked up in the sorted list instead of scanned bit by bit.
-    const SCAN: u64 = 4096;
-
     /// `addrs` in ascending order.
     fn new(addrs: impl Iterator<Item = u64>) -> AddrSet {
         let sorted: Vec<u64> = addrs.collect();
         let base = sorted.first().copied().unwrap_or(0);
         let span = sorted.last().map_or(0, |last| last - base + 1);
         let mut bits = vec![0u64; span.div_ceil(64) as usize];
+        let mut before = vec![0u32; bits.len()];
         for addr in &sorted {
-            bits[((addr - base) / 64) as usize] |= 1 << ((addr - base) % 64);
+            let word = ((addr - base) / 64) as usize;
+            bits[word] |= 1 << ((addr - base) % 64);
+            if let Some(next) = before.get_mut(word + 1) {
+                *next += 1;
+            }
         }
-        AddrSet { base, bits, sorted }
+        let mut count = 0;
+        for word in &mut before {
+            count += *word;
+            *word = count;
+        }
+        AddrSet { base, bits, before }
     }
 
     fn contains(&self, addr: u64) -> bool {
@@ -170,16 +178,12 @@ impl AddrSet {
 
     /// Whether a member lies in `low..=high`.
     fn any_in(&self, low: u64, high: u64) -> bool {
-        let Some(&last) = self.sorted.last() else { return false };
-        let (low, high) = (low.max(self.base), high.min(last));
-        if low > high {
+        let Some(last) = (self.bits.len() as u64 * 64).checked_sub(1) else { return false };
+        let low = low.max(self.base);
+        if low > high || low - self.base > last {
             return false;
         }
-        if high - low > Self::SCAN {
-            let index = self.sorted.partition_point(|&addr| addr < low);
-            return self.sorted.get(index).is_some_and(|&addr| addr <= high);
-        }
-        let (first, end) = (low - self.base, high - self.base);
+        let (first, end) = (low - self.base, (high - self.base).min(last));
         let (first_word, end_word) = ((first / 64) as usize, (end / 64) as usize);
         // Bits from `first` up in the first word, bits up to `end` in the last.
         let from = u64::MAX << (first % 64);
@@ -187,7 +191,7 @@ impl AddrSet {
         if first_word == end_word {
             return self.bits[first_word] & from & upto != 0;
         }
-        self.bits[first_word] & from != 0 || self.bits[end_word] & upto != 0 || self.bits[first_word + 1..end_word].iter().any(|&word| word != 0)
+        self.bits[first_word] & from != 0 || self.bits[end_word] & upto != 0 || self.before[end_word] != self.before[first_word + 1]
     }
 }
 
