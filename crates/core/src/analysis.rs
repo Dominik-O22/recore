@@ -418,22 +418,35 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         }
     }
 
+    // Functions by the entry and the bound they were decoded from. A round of the loop below
+    // that adds entry points starts over, and all but the functions next to the new entry
+    // points come out as they did before.
+    let mut decoded: FxHashMap<(u64, u64), Function> = FxHashMap::default();
     let (starts, functions, chunks, noreturn, controls, extents) = loop {
         _phase = phase::scope("decode functions");
         let starts: Vec<u64> = discovery.starts.keys().copied().collect();
-        let functions: Vec<Function> = starts
-            .par_iter()
+        // A frame gives a function's end; otherwise the next entry point bounds it.
+        let spans: Vec<(u64, u64)> = starts
+            .iter()
             .enumerate()
             .map(|(index, &start)| match frame_end.get(&start) {
-                Some(&end) => decode::<A>(image, start, end, false),
+                Some(&end) => (start, end),
                 None => {
                     let section_end = image.section_at(start).map_or(start, |s| s.end());
-                    let mut bound = starts.get(index + 1).copied().unwrap_or(section_end).min(section_end);
-                    if image.data_in_code {
-                        bound = code_end::<A>(image, start, bound, &tables);
-                    }
-                    decode::<A>(image, start, bound, true)
+                    (start, starts.get(index + 1).copied().unwrap_or(section_end).min(section_end))
                 }
+            })
+            .collect();
+        let reused: Vec<Option<Function>> = spans.iter().map(|span| decoded.remove(span)).collect();
+        let functions: Vec<Function> = spans
+            .par_iter()
+            .zip(reused)
+            .map(|(&(start, bound), reused)| {
+                reused.unwrap_or_else(|| match frame_end.contains_key(&start) {
+                    true => decode::<A>(image, start, bound, false),
+                    false if image.data_in_code => decode::<A>(image, start, code_end::<A>(image, start, bound, &tables), true),
+                    false => decode::<A>(image, start, bound, true),
+                })
             })
             .collect();
 
@@ -480,6 +493,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             for addr in tail_called {
                 discovery.starts.entry(addr).or_insert(Origin::TailCall);
             }
+            decoded = spans.into_iter().zip(functions).collect();
             continue;
         }
 
@@ -579,6 +593,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         for addr in splits {
             discovery.starts.entry(addr).or_insert(Origin::Unreachable);
         }
+        decoded = spans.into_iter().zip(functions).collect();
     };
 
     // The chunks each function reaches become further ranges of its body.
