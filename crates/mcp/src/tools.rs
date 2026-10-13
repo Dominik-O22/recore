@@ -413,7 +413,8 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
             Evidence::Name => "same name",
             Evidence::Body => "same code",
             Evidence::Callee => "called from the same place",
-            Evidence::Callers => "same callers",
+            // Being called from the same places does not make it the same function.
+            Evidence::Callers => "same callers: this function changed, or another took its place",
             Evidence::Order => "same place among its neighbours",
         };
         let listed = table_names(new, pair.new).first().map_or_else(String::new, |(_, name)| format!(", listed as {name:?}"));
@@ -467,21 +468,34 @@ pub(crate) fn resolve_function(binary: &Binary, text: &str) -> Result<u64> {
     }
 }
 
-/// The names a function is listed under in tables of the program's data: for each slot that
-/// holds a pointer to it, the text the slot before points to. A scripting language's library
-/// and a command table pair each function with its name this way.
+/// The names something is listed under in tables of the program's data: for each slot that
+/// holds a pointer to it, the text its partner in the table points to. A scripting language's
+/// library pairs each function with its name this way, and a table of types each type with
+/// its. Which neighbour is the partner shows from where the run of pointers begins: the slots
+/// pair up from there, name first in one table and second in another.
 pub(crate) fn table_names(program: &Program, entry: u64) -> Vec<(u64, String)> {
     let image = &program.image;
     let pointer = if image.machine == Machine::X86 { 4 } else { 8 };
     let target_of = |slot: u64| image.relative_targets.iter().find(|&&(at, _)| at == slot).map(|&(_, target)| target);
-    // Read as it lies: a name of two or three letters is too short for `strings` to take.
-    let text = |addr: u64| {
-        let bytes = image.bytes_from(addr).filter(|_| image.section_at(addr).is_some_and(|section| !section.executable))?;
-        let end = bytes.iter().take(64).position(|&byte| byte == 0).filter(|&length| length > 0)?;
-        std::str::from_utf8(&bytes[..end]).ok().filter(|text| text.chars().all(|c| c.is_ascii_graphic())).map(str::to_string)
+    let name_at = |slot: u64| short_text(image, target_of(slot)?);
+    let partner = |slot: u64| {
+        let before = (1..).take_while(|back| slot.checked_sub(back * pointer).is_some_and(|earlier| target_of(earlier).is_some())).count() as u64;
+        // An even number of pointers before it: the slot opens a pair, and its partner follows.
+        // Where that one holds no name, as in a record with a number among its pointers, the
+        // other neighbour is tried.
+        let (first, second) = if before % 2 == 0 { (slot + pointer, slot - pointer) } else { (slot - pointer, slot + pointer) };
+        name_at(first).or_else(|| name_at(second))
     };
     let slots = image.relative_targets.iter().filter(|&&(slot, target)| target == entry && image.section_at(slot).is_some_and(|section| !section.executable));
-    slots.filter_map(|&(slot, _)| Some((slot, text(target_of(slot.checked_sub(pointer)?)?)?))).collect()
+    slots.filter_map(|&(slot, _)| Some((slot, partner(slot)?))).collect()
+}
+
+/// The text at `addr` read as it lies in data, when it is a short run of printable characters
+/// that ends in a zero: a name of two or three letters is too short for `strings` to take.
+fn short_text(image: &recore::Image, addr: u64) -> Option<String> {
+    let bytes = image.bytes_from(addr).filter(|_| image.section_at(addr).is_some_and(|section| !section.executable))?;
+    let end = bytes.iter().take(64).position(|&byte| byte == 0).filter(|&length| length > 0)?;
+    std::str::from_utf8(&bytes[..end]).ok().filter(|text| text.chars().all(|c| c.is_ascii_graphic())).map(str::to_string)
 }
 
 /// The function names a function's failed assertions would report: `assert` passes the name
@@ -561,30 +575,34 @@ pub(crate) fn describe(binary: &Binary, addr: u64) -> String {
     }
 }
 
-/// The run of pointers stored from the data address `addr` on, as `(slot, target)`: a vtable,
-/// or a table of strings or handlers. A slot counts while it holds an address inside the image,
-/// and is relocated if the image relocates its pointers. The run ends where pointers to code
-/// give way to pointers to data or the reverse, which is where one vtable ends and the type
-/// information of the next begins.
-fn pointer_table(binary: &Binary, addr: u64) -> Vec<(u64, u64)> {
-    /// Entries shown. Longer tables can be read on from the last slot.
-    const LONGEST: usize = 64;
-    let image = &binary.program.image;
+/// What the data at `addr` holds, a pointer-sized slot at a time: `Ok` a pointer the loader
+/// relocates and `Err` any other value, such as a count, a flag or the null that ends a list.
+/// Stops at `longest` slots, after two that are not pointers in a row, or where something
+/// else in the program begins. Empty when no slot is a pointer.
+fn pointer_table(binary: &Binary, addr: u64, longest: usize) -> Vec<(u64, Result<u64, u64>)> {
+    let program = &binary.program;
+    let image = &program.image;
     if image.section_at(addr).is_none_or(|section| section.executable) {
         return Vec::new();
     }
     let size = if image.machine == Machine::X86 { 4 } else { 8 };
-    let relocated: BTreeSet<u64> = image.relative_targets.iter().map(|&(slot, _)| slot).collect();
-    let mut to_code = None;
-    (0..LONGEST as u64)
-        .map(|index| addr + index * size)
-        .map_while(|slot| {
-            let bytes = image.bytes_from(slot)?.get(..size as usize)?;
-            let target = bytes.iter().rev().fold(0, |value, &byte| value << 8 | u64::from(byte));
-            let section = image.section_at(target).filter(|_| relocated.is_empty() || relocated.contains(&slot))?;
-            (*to_code.get_or_insert(section.executable) == section.executable).then_some((slot, target))
-        })
-        .collect()
+    let relocated: FxHashMap<u64, u64> = image.relative_targets.iter().copied().collect();
+    let begins_another = |slot: u64| slot != addr && (program.refs_to(slot).next().is_some() || program.string_at(slot).is_some());
+    let mut slots = Vec::new();
+    for slot in (0..longest as u64).map(|index| addr + index * size) {
+        let Some(bytes) = image.bytes_from(slot).and_then(|bytes| bytes.get(..size as usize)).filter(|_| !begins_another(slot)) else { break };
+        let value = bytes.iter().rev().fold(0, |value, &byte| value << 8 | u64::from(byte));
+        // Without relocations to say so, a value that lies in the image is taken for a pointer.
+        let pointer = if relocated.is_empty() { image.section_at(value).is_some() } else { relocated.contains_key(&slot) };
+        slots.push((slot, if pointer { Ok(value) } else { Err(value) }));
+        if matches!(slots.as_slice(), [.., (_, Err(_)), (_, Err(_))]) {
+            break;
+        }
+    }
+    while matches!(slots.last(), Some((_, Err(_)))) {
+        slots.pop();
+    }
+    slots
 }
 
 #[derive(Deserialize)]
@@ -829,36 +847,45 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
         (None, Some(offset)) => return field_xrefs(binary, addr_arg(offset)?, args.function.as_deref(), args.limit.unwrap_or(DEFAULT_LIMIT)),
         _ => bail!("`xrefs` needs either `addr` or `offset`"),
     };
-    let mut out = String::new();
-    writeln!(out, "{addr:#x}: {}", describe(binary, addr))?;
-    let mut count = 0;
-    for call in binary.program.calls_to(addr) {
-        writeln!(out, "{:#x} in {} {} it", call.at, binary.program.site_label(call.at), if call.tail { "tail-calls" } else { "calls" })?;
-        count += 1;
-    }
-    for send in binary.program.sends_to(addr) {
-        writeln!(out, "{:#x} in {} sends {}, which only it implements", send.at, binary.program.site_label(send.at), send.label())?;
-        count += 1;
-    }
-    for reference in binary.program.refs_to(addr) {
-        let how = if reference.access { "reads or writes it" } else { "takes its address" };
-        writeln!(out, "{:#x} in {} {how}", reference.from, binary.program.site_label(reference.from))?;
-        count += 1;
-    }
-    // Relocated pointers in data: tables of strings, of functions, of methods. Those inside
-    // instructions are the references above.
-    for &(slot, _) in binary.program.image.relative_targets.iter().filter(|&&(_, target)| target == addr) {
-        if let Some(section) = binary.program.image.section_at(slot).filter(|section| !section.executable) {
-            let named = table_names(&binary.program, addr).into_iter().find(|listed| listed.0 == slot).map_or_else(String::new, |(_, name)| format!(", next to the name {name:?}"));
-            writeln!(out, "{slot:#x} in {} holds a pointer to it{named}", section.name)?;
-            count += 1;
+    let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
+    let program = &binary.program;
+    // What refers to it, the fewest and most telling first: pointers in data, which are tables
+    // of strings, of functions, of methods, then calls, then the instructions that use it.
+    let mut lines = Vec::new();
+    for &(slot, _) in program.image.relative_targets.iter().filter(|&&(_, target)| target == addr) {
+        if let Some(section) = program.image.section_at(slot).filter(|section| !section.executable) {
+            let named = table_names(program, addr).into_iter().find(|listed| listed.0 == slot).map_or_else(String::new, |(_, name)| format!(", paired with the name {name:?}"));
+            lines.push(format!("{slot:#x} in {} holds a pointer to it{named}", section.name));
         }
     }
-    let table = pointer_table(binary, addr);
+    lines.extend(program.calls_to(addr).map(|call| format!("{:#x} in {} {} it", call.at, program.site_label(call.at), if call.tail { "tail-calls" } else { "calls" })));
+    lines.extend(program.sends_to(addr).map(|send| format!("{:#x} in {} sends {}, which only it implements", send.at, program.site_label(send.at), send.label())));
+    lines.extend(program.refs_to(addr).map(|reference| format!("{:#x} in {} {}", reference.from, program.site_label(reference.from), if reference.access { "reads or writes it" } else { "takes its address" })));
+    let count = lines.len();
+    let mut out = String::new();
+    writeln!(out, "{addr:#x}: {}", describe(binary, addr))?;
+    if count > 0 {
+        writeln!(out, "{count} references{}", shown(count, limit))?;
+    }
+    for line in lines.iter().take(limit) {
+        writeln!(out, "{line}")?;
+    }
+    let table = pointer_table(binary, addr, limit.min(64));
     if !table.is_empty() {
-        writeln!(out, "it holds {} pointer{}:", table.len(), if table.len() == 1 { "" } else { "s" })?;
-        for (slot, target) in table {
-            writeln!(out, "  {slot:#x} -> {target:#x} {}", describe(binary, target))?;
+        writeln!(out, "it holds, a slot at a time:")?;
+        for (slot, held) in &table {
+            match held {
+                // A name too short to be among the strings is still read where a table points to it.
+                Ok(target) => match short_text(&program.image, *target).filter(|_| program.string_at(*target).is_none() && program.function(*target).is_none()) {
+                    Some(text) => writeln!(out, "  {slot:#x} -> {target:#x} text {text:?}")?,
+                    None => writeln!(out, "  {slot:#x} -> {target:#x} {}", describe(binary, *target))?,
+                },
+                Err(value) => writeln!(out, "  {slot:#x} {value:#x}, not a pointer")?,
+            }
+        }
+        if table.len() == limit.min(64) {
+            let next = table.last().expect("not empty").0 + if program.image.machine == Machine::X86 { 4 } else { 8 };
+            writeln!(out, "  ... the table may go on; `xrefs` of {next:#x} reads on")?;
         }
     }
     if count == 0 {
