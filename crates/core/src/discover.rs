@@ -816,8 +816,9 @@ impl<A: Arch> Explorer<'_, A> {
     /// Whether the unreached bytes from `addr` to the next known code divide into functions with
     /// nothing left over: decoded one after the other they are all instructions, each stretch
     /// ends in a return or a jump, the last of them where the known code begins, every jump
-    /// lands on one of the instructions or on known code, and every call on a function. Bytes
-    /// that are data seldom do all of that.
+    /// lands on one of the instructions or on known code, and every call on a function. A
+    /// stretch of a single return has to be one the code before it jumps to. Bytes that are
+    /// data seldom do all of that.
     fn tiles_gap(&self, index: usize, addr: u64) -> bool {
         let region = &self.regions[index];
         let section = region.section;
@@ -825,6 +826,8 @@ impl<A: Arch> Explorer<'_, A> {
         let state = A::State::default();
         // Where each instruction and each stretch begins, in order, and where the code goes.
         let (mut instructions, mut stretches, mut jumps, mut calls) = (Vec::new(), vec![addr], Vec::new(), Vec::new());
+        // The stretches too short to be functions.
+        let mut tails = Vec::new();
         let mut ended = false;
         for decoded in A::decode(&section.data[(addr - section.addr) as usize..], addr) {
             if known(decoded.addr) {
@@ -856,12 +859,14 @@ impl<A: Arch> Explorer<'_, A> {
             if ended {
                 // A lone `ret` is more often the tail of the function before it.
                 if decoded.next_addr() - stretches[stretches.len() - 1] < 3 {
-                    return false;
+                    tails.push(stretches[stretches.len() - 1]);
                 }
                 stretches.push(decoded.next_addr());
             }
         }
+        // Here it is that tail only if the code before it jumps to it.
         ended
+            && tails.iter().all(|tail| *tail != addr && jumps.contains(tail))
             && jumps.iter().all(|target| instructions.binary_search(target).is_ok() || known(*target))
             && calls.iter().all(|target| self.starts.contains_key(target) || stretches.binary_search(target).is_ok())
     }
