@@ -470,6 +470,12 @@ impl Session {
         unsafe { ffi::rd_set_flow(self.raw.as_ptr(), keep.into()) }
     }
 
+    /// Says that the function at `addr` takes a variable number of arguments. A call that
+    /// passes it a printf format is then given the arguments the format asks for.
+    pub fn takes_variable_arguments(&mut self, addr: u64) {
+        unsafe { ffi::rd_takes_variable_arguments(self.raw.as_ptr(), addr) }
+    }
+
     /// Puts a note on the instruction at `addr` of `function`, which the function's C shows
     /// as a comment beside the code of that instruction, when any of it is left.
     pub fn add_comment(&mut self, function: u64, addr: u64, text: &str) -> Result<()> {

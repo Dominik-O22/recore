@@ -54,6 +54,8 @@ When a binary has debug information, the decompiler uses it: functions take thei
 
 `xrefs` with `offset` answers who sets or uses a field: it lists the functions that reach memory at that offset from a register, whatever structure the register points to, so a large offset is telling and a small one is not. `function` and `decompile` say which function names a function's assertions carry, which is its own name unless the assertion came in with an inlined function.
 
+A call that passes a printf format to a function taking a variable number of arguments is shown with the arguments the format asks for. The decompiler by itself judges from the registers around the call, and leaves out a value the caller also looked at. A format with a floating-point conversion is not followed, since those arguments travel in registers of their own.
+
 An answer that leaves something out says so where it does: how many of how many it shows, and the argument that shows the rest.
 
 `pcode` and `trace` read the decompiler's own intermediate form, the one its C is printed from. Stack bookkeeping and dead code are gone, every value has one definition, and a call lists its arguments in order. `trace` follows a value through at most 16 functions and does not follow it through memory: a value stored to a global or the heap and read back elsewhere is reported at the store and no further.

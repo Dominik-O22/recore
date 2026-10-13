@@ -60,6 +60,24 @@ pub fn field_uses(image: &Image, body: &[(u64, u64)], offset: u64) -> Vec<(u64, 
     }
 }
 
+/// Whether the function in `[start, end)` begins as one that takes a variable number of
+/// arguments does, by saving the registers they arrive in.
+pub fn takes_variable_arguments(image: &Image, start: u64, end: u64) -> bool {
+    /// Instructions looked at: the saving is done before anything else.
+    const OPENING: usize = 40;
+    fn with<A: Arch>(image: &Image, start: u64, end: u64) -> bool {
+        let Some(bytes) = image.bytes_from(start) else { return false };
+        let bytes = &bytes[..bytes.len().min((end - start) as usize)];
+        let insns: Vec<A::Insn> = A::decode(bytes, start).take(OPENING).map_while(|decoded| decoded.insn).collect();
+        A::takes_variable_arguments(&insns)
+    }
+    match image.machine {
+        Machine::X86_64 => with::<X86<64, false>>(image, start, end),
+        Machine::X86 => false,
+        Machine::Aarch64 => with::<crate::arm64::Arm64>(image, start, end),
+    }
+}
+
 /// The control-flow graph of the function whose body is `body`, as `[start, end)` ranges.
 pub fn cfg(image: &Image, analysis: &Analysis, body: &[(u64, u64)]) -> Cfg {
     match image.machine {

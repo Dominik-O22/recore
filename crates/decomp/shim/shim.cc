@@ -209,6 +209,9 @@ struct RdSession {
   bool want_flow = false;
   bool want_addresses = false;
   set<uint64_t> kept;  // functions whose prototype this session locked
+  // Functions that save their argument registers as one taking a variable number of arguments
+  // does: those rd_takes_variable_arguments named, and those spills_a_register_param found.
+  set<uint64_t> saves_arguments;
   // Names given to variables, per function: the variable's place and its name.
   map<uint64_t, vector<pair<string, string>>> local_names;
   // Where and as what each function decompiled so far returns its value, if it returns one.
@@ -303,6 +306,115 @@ static bool spills_a_register_param(Funcdata *fd) {
     if (vn != nullptr && !vn->hasNoDescend() && never_read(vn, seen)) return true;
   }
   return false;
+}
+
+// The address a varnode holds, when it is a constant or the address of a global.
+static bool constant_address(const Varnode *vn, uint64_t &addr, int depth = 0) {
+  if (vn->isConstant()) {
+    addr = vn->getOffset();
+    return true;
+  }
+  if (!vn->isWritten() || depth > 3) return false;
+  const PcodeOp *def = vn->getDef();
+  switch (def->code()) {
+    case CPUI_COPY:
+    case CPUI_CAST:
+      return constant_address(def->getIn(0), addr, depth + 1);
+    case CPUI_PTRSUB:
+      if (!def->getIn(1)->isConstant()) return false;
+      addr = def->getIn(1)->getOffset();
+      return true;
+    default:
+      return false;
+  }
+}
+
+// What a printf format takes after it: for each argument, whether it is a floating-point
+// number. Empty for text that is no format, and for one whose conversions cannot be read.
+static vector<bool> format_arguments(const string &format) {
+  vector<bool> floats;
+  for (size_t i = 0; i < format.size(); ++i) {
+    if (format[i] != '%') continue;
+    size_t j = i + 1;
+    if (j < format.size() && format[j] == '%') {
+      i = j;
+      continue;
+    }
+    size_t stars = 0;
+    while (j < format.size() && strchr("-+ #0", format[j]) != nullptr) ++j;
+    for (; j < format.size() && (isdigit((unsigned char)format[j]) || format[j] == '*' || format[j] == '.'); ++j)
+      stars += format[j] == '*';
+    // Length: hh h l ll z j t L, and Microsoft's I, I32, I64 and w.
+    if (format.compare(j, 3, "I64") == 0 || format.compare(j, 3, "I32") == 0) j += 3;
+    while (j < format.size() && strchr("hlzjtLIwq", format[j]) != nullptr) ++j;
+    if (j >= format.size() || strchr("diouxXeEfFgGaAcCsSpn", format[j]) == nullptr) return {};
+    floats.insert(floats.end(), stars, false);
+    floats.push_back(strchr("eEfFgGaA", format[j]) != nullptr);
+    i = j;
+  }
+  return floats;
+}
+
+// Gives each call that passes a printf format to a function taking a variable number of
+// arguments the arguments its format asks for, where the call was recovered with another
+// number. The engine decides what a call passes from the registers and stack around it, and
+// leaves out a register that the caller also reads, and takes in one it merely happens to
+// have written. The format says how many there are. Returns whether any call was changed,
+// which shows once the function is decompiled again.
+static bool follow_formats(RdSession *session, Funcdata *fd) {
+  /// A format asking for more than this is not believed.
+  const size_t most = 12;
+  Architecture *arch = session->arch;
+  int4 word = arch->getDefaultCodeSpace()->getAddrSize();
+  bool changed = false;
+  for (int4 i = 0; i < fd->numCalls(); ++i) {
+    FuncCallSpecs *call = fd->getCallSpecs(i);
+    PcodeOp *op = call->getOp();
+    uint64_t callee = call->getEntryAddress().isInvalid() ? ~(uint64_t)0 : call->getEntryAddress().getOffset();
+    // Declared with `...`, or seen to save its argument registers as such a function does.
+    bool declared = call->isInputLocked() && call->isDotdotdot() && session->kept.count(callee) == 0;
+    if (!declared && session->saves_arguments.count(callee) == 0) continue;
+    int4 passed = op->numInput() - 1;
+    for (int4 at = 1; at <= passed; ++at) {
+      uint64_t addr;
+      if (!constant_address(op->getIn(at), addr)) continue;
+      uint1 bytes[256];
+      try {
+        session->image->loadFill(bytes, sizeof(bytes), session->address(addr));
+      } catch (LowlevelError &) {
+        continue;
+      }
+      const uint1 *end = (const uint1 *)memchr(bytes, 0, sizeof(bytes));
+      if (end == nullptr) continue;
+      vector<bool> floats = format_arguments(string((const char *)bytes, end - bytes));
+      if (floats.empty()) continue;
+      // The first argument that is a format settles it, whatever the later ones are. A
+      // floating-point argument travels in a register of its own, and a call of unknown
+      // prototype may list it before the format: with one in play, where the format stands
+      // does not say how many parameters come before it, and the call is left as it is.
+      if (at + floats.size() == (size_t)passed || floats.size() > most || count(floats.begin(), floats.end(), true) > 0) break;
+      size_t fixed = at - 1;
+      PrototypePieces pieces;
+      pieces.model = arch->getModel(call->getModelName());
+      pieces.name = call->getName();
+      pieces.outtype = call->getOutputType();
+      // As a function of exactly these parameters: marked as taking more, the call would
+      // again collect whatever else the registers around it hold.
+      pieces.firstVarArgSlot = -1;
+      pieces.intypes.assign(fixed + 1, arch->types->getBase(word, TYPE_UNKNOWN));
+      for (bool is_float : floats)
+        pieces.intypes.push_back(is_float ? arch->types->getBase(8, TYPE_FLOAT) : arch->types->getBase(word, TYPE_UNKNOWN));
+      pieces.innames.assign(pieces.intypes.size(), "");
+      FuncProto *proto = new FuncProto();
+      proto->setInternal(pieces.model, arch->types->getTypeVoid());
+      proto->setPieces(pieces);
+      proto->setOutputLock(false);
+      fd->getOverride().insertProtoOverride(op->getAddr(), proto);
+      changed = true;
+      break;
+    }
+  }
+  return changed;
 }
 
 // Whether the function reads a register that its recovered prototype does not account for. Such
@@ -880,6 +992,11 @@ int rd_add_comment(RdSession *session, uint64_t function, uint64_t addr, const c
   });
 }
 
+// Says that the function at `addr` takes a variable number of arguments, which its code shows
+// before it is decompiled: a call that passes it a printf format then gets the arguments the
+// format asks for.
+void rd_takes_variable_arguments(RdSession *session, uint64_t addr) { session->saves_arguments.insert(addr); }
+
 // Whether a kept prototype says everything a call passes, or only the least: a call then also
 // passes whatever else the call site shows.
 void rd_keep_prototypes_exact(RdSession *session, int exact) { session->kept_are_lower_bounds = exact == 0; }
@@ -1143,6 +1260,11 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
     }
 
+    if (follow_formats(session, fd)) {
+      arch->clearAnalysis(fd);
+      root->reset(*fd);
+      if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
+    }
     session->locals = name_locals(session, addr, fd);
     ostringstream text;
     if (session->print_c) {
@@ -1216,6 +1338,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     out->flow = session->flow.c_str();
     out->locals = session->locals.c_str();
     spills = spills_a_register_param(fd);
+    if (spills) session->saves_arguments.insert(addr);
     out->flags = (fd->hasBadData() ? RD_BAD_DATA : 0) |
                  (fd->hasUnimplemented() ? RD_UNIMPLEMENTED : 0) |
                  (proto.getOutputType()->getMetatype() != TYPE_VOID ? RD_RETURNS_VALUE : 0);

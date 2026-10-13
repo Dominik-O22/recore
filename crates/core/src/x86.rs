@@ -123,6 +123,24 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         opens_landing_pad(insn)
     }
 
+    fn takes_variable_arguments(insns: &[Instruction]) -> bool {
+        let stored = |insn: &Instruction, registers: &[Register]| insn.mnemonic() == Mnemonic::Mov && insn.op0_kind() == OpKind::Memory && insn.op1_kind() == OpKind::Register && registers.contains(&insn.op1_register());
+        // System V: `al` says how many vector registers carry arguments, and the function
+        // saves them all unless it is zero.
+        let tests_al = insns.iter().any(|insn| insn.mnemonic() == Mnemonic::Test && insn.op0_register() == Register::AL && insn.op1_register() == Register::AL);
+        let saves_vectors = insns.iter().filter(|insn| matches!(insn.mnemonic(), Mnemonic::Movaps | Mnemonic::Movups) && insn.op0_kind() == OpKind::Memory && matches!(insn.op1_register(), Register::XMM4 | Register::XMM5 | Register::XMM6 | Register::XMM7)).count() == 4;
+        if tests_al && saves_vectors {
+            return true;
+        }
+        // Microsoft x64: the last register arguments go to the slots the caller left for them,
+        // and the function takes the address of one, which is where `va_start` begins.
+        let stack = |insn: &Instruction| insn.memory_base() == Register::RSP && insn.memory_index() == Register::None;
+        // The first store of each: the register is free for other use once it is saved.
+        let home = |register: Register| insns.iter().find(|insn| stored(insn, &[register]) && stack(insn)).map(|insn| insn.memory_displacement64());
+        let (Some(third), Some(fourth)) = (home(Register::R8), home(Register::R9)) else { return false };
+        fourth == third + 8 && insns.iter().any(|insn| insn.mnemonic() == Mnemonic::Lea && stack(insn) && insn.memory_displacement64() <= third && third - insn.memory_displacement64() <= 16)
+    }
+
     fn field_use(insn: &Instruction) -> Option<(u64, FieldUse)> {
         let base = insn.memory_base();
         // A frame pointer reaches the function's own variables below it. Code built without

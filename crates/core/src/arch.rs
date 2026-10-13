@@ -180,6 +180,12 @@ pub trait Arch: 'static {
         false
     }
 
+    /// Whether a function beginning with `insns` sets up to read a variable number of
+    /// arguments: it saves the registers arguments arrive in where `va_arg` will look for them.
+    fn takes_variable_arguments(_insns: &[Self::Insn]) -> bool {
+        false
+    }
+
     /// The offset at which `insn` reaches memory from a register that is not the stack's, and
     /// what it does there: how code uses a field of the structure the register points to.
     fn field_use(_insn: &Self::Insn) -> Option<(u64, FieldUse)> {

@@ -223,6 +223,13 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
     }
 
+    for function in analysis.functions.iter().filter(|function| function.fragment_of.is_none()) {
+        if let Some(&(start, end)) = function.ranges.first().filter(|&&(start, end)| recore::cfg::takes_variable_arguments(&image, start, end)) {
+            debug_assert!(start <= function.addr && function.addr < end);
+            session.takes_variable_arguments(function.addr);
+        }
+    }
+
     session.set_style(options.style)?;
     let callees_first = options.callees_first;
     session.keep_prototypes(callees_first);

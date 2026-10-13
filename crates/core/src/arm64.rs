@@ -503,6 +503,18 @@ impl Arch for Arm64 {
         insn.word == BTI_J || insn.register_move() == Some(0)
     }
 
+    fn takes_variable_arguments(insns: &[Insn]) -> bool {
+        // The last vector register that carries an argument is stored to the stack, alone or
+        // as the second of a pair, which nothing but saving the arguments does at an entry.
+        let stores_q7 = |insn: &Insn| {
+            let vector_to_stack = insn.word >> 26 & 1 == 1 && insn.rn() == 31 && insn.word >> 22 & 1 == 0;
+            let single = insn.word & 0x3B00_0000 == 0x3900_0000 && insn.rd() == 7;
+            let pair = insn.word & 0x3A00_0000 == 0x2800_0000 && (insn.word >> 10 & 31) == 7;
+            vector_to_stack && (single || pair)
+        };
+        insns.iter().any(stores_q7)
+    }
+
     fn field_use(insn: &Insn) -> Option<(u64, FieldUse)> {
         // Not from the stack pointer or the frame pointer, which reach the function's own variables.
         let offset = insn.access_offset().filter(|_| !matches!(insn.rn(), 29 | 31))?;
