@@ -470,10 +470,22 @@ impl Session {
         unsafe { ffi::rd_set_flow(self.raw.as_ptr(), keep.into()) }
     }
 
-    /// Says that the function at `addr` takes a variable number of arguments. A call that
-    /// passes it a printf format is then given the arguments the format asks for.
+    /// Says that the function at `addr` takes a format and a variable number of arguments for
+    /// it. A call that passes it a printf format is then given the arguments the format asks for.
     pub fn takes_variable_arguments(&mut self, addr: u64) {
         unsafe { ffi::rd_takes_variable_arguments(self.raw.as_ptr(), addr) }
+    }
+
+    /// Settles what the call at `call` in `function` passes, from the format at `format` that
+    /// it passes as argument `position`, counted from zero. Nothing happens unless the callee
+    /// takes a variable number of arguments and the text is a printf or scanf format. To be
+    /// said before `function` is decompiled.
+    pub fn format_call(&mut self, function: u64, call: u64, callee: recore::report::CallTarget, position: usize, format: u64) -> Result<()> {
+        let (callee, import) = match callee {
+            recore::report::CallTarget::Function(entry) => (entry, false),
+            recore::report::CallTarget::Import(slot) => (slot, true),
+        };
+        check(|err, len| unsafe { ffi::rd_format_call(self.raw.as_ptr(), function, call, callee, import.into(), position, format, err, len) != 0 })
     }
 
     /// Puts a note on the instruction at `addr` of `function`, which the function's C shows

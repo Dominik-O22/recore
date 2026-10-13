@@ -223,9 +223,27 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
     }
 
+    // The functions of the program that take a format and the arguments it asks for: those that
+    // set up to read a variable number of arguments, and hand them to the C library's routine
+    // for formats in an argument list, themselves or through a function or two. Taking a
+    // variable number alone does not make a string with a `%` in it a format: a list of words
+    // ended by a null is passed the same way.
+    let hands_on_formats = {
+        /// Functions between one that takes a format and the library routine it ends in.
+        const DEPTH: usize = 3;
+        let library = |slot: &u64| analysis.imports.iter().find(|import| import.slot == *slot).is_some_and(|import| takes_argument_list(&import.name));
+        let calls = callees_of(&analysis, false);
+        fn reaches(calls: &HashMap<u64, Vec<CallTarget>>, library: &dyn Fn(&u64) -> bool, entry: u64, depth: usize) -> bool {
+            calls.get(&entry).into_iter().flatten().any(|target| match target {
+                CallTarget::Import(slot) => library(slot),
+                CallTarget::Function(callee) => depth > 0 && reaches(calls, library, *callee, depth - 1),
+            })
+        }
+        move |entry: u64| reaches(&calls, &library, entry, DEPTH)
+    };
     for function in analysis.functions.iter().filter(|function| function.fragment_of.is_none()) {
-        if let Some(&(start, end)) = function.ranges.first().filter(|&&(start, end)| recore::cfg::takes_variable_arguments(&image, start, end)) {
-            debug_assert!(start <= function.addr && function.addr < end);
+        let variadic = function.ranges.first().is_some_and(|&(start, end)| recore::cfg::takes_variable_arguments(&image, start, end));
+        if variadic && hands_on_formats(function.addr) {
             session.takes_variable_arguments(function.addr);
         }
     }
@@ -250,6 +268,24 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     for function in &analysis.functions {
         *sizes.entry(function.fragment_of.unwrap_or(function.addr)).or_default() += function.ranges.iter().map(|range| range.1 - range.0).sum::<u64>();
     }
+    // Before a function is decompiled, each call in it that passes a format is given the
+    // arguments the format asks for. Told beforehand it costs nothing; the engine left to find
+    // out for itself gets a good many wrong, and correcting one means decompiling again.
+    let formats: HashSet<u64> = analysis.strings.iter().filter(|string| !string.wide && string.text.contains('%')).map(|string| string.addr).collect();
+    let mut formatted: HashSet<u64> = HashSet::new();
+    let mut settle_formats = |session: &mut Session, entry: u64| {
+        if !formatted.insert(entry) {
+            return;
+        }
+        let body: Vec<(u64, u64)> = analysis.functions.iter().filter(|function| function.fragment_of.unwrap_or(function.addr) == entry).flat_map(|function| function.ranges.iter().copied()).collect();
+        let calls: Vec<&recore::report::CallSite> = analysis.calls.iter().filter(|call| body.iter().any(|&(start, end)| (start..end).contains(&call.at))).collect();
+        let sites: Vec<u64> = calls.iter().map(|call| call.at).collect();
+        for (at, position, format) in recore::cfg::text_arguments(&image, &body, &sites, &|addr| formats.contains(&addr)) {
+            let target = calls[sites.binary_search(&at).expect("one of the sites asked about")].target;
+            // One the engine does not take leaves the call to be worked out as before.
+            let _ = session.format_call(entry, at, target, position, format);
+        }
+    };
     // Results of functions decompiled ahead of a caller that are as good as asked for.
     let mut ready: HashMap<u64, Event> = HashMap::new();
 
@@ -289,6 +325,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 if let Some(importer) = &mut importer {
                     importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
                 }
+                settle_formats(&mut session, addr);
                 session.keep_flow(true);
                 let flow = session.decompile(addr).map(|function| function.flow.unwrap_or_default());
                 session.keep_flow(false);
@@ -299,6 +336,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 if let Some(importer) = &mut importer {
                     importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
                 }
+                settle_formats(&mut session, addr);
                 session.keep_addresses(true);
                 let c_text = session.decompile(addr).map(|function| function.c_text);
                 session.keep_addresses(false);
@@ -309,6 +347,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 if let Some(importer) = &mut importer {
                     importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
                 }
+                settle_formats(&mut session, addr);
                 send(&Event::Locals(session.decompile(addr).map(|function| function.locals).map_err(|error| error.to_string())))?;
                 continue;
             }
@@ -348,6 +387,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 importer.functions(&mut session, std::iter::once(target));
             }
             // A failure here only leaves the caller as well off as it was.
+            settle_formats(&mut session, target);
             let _ = session.decompile(target);
             known.insert(target);
         }
@@ -361,6 +401,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
         }
         let start = Instant::now();
+        settle_formats(&mut session, addr);
         let result = session.decompile(addr);
         known.insert(addr);
         let ms = start.elapsed().as_secs_f64() * 1e3;
@@ -389,6 +430,16 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether an imported function formats or scans with arguments it is handed as a list, as
+/// `vsnprintf` and `vfscanf` do, under any of the names the C libraries give such routines.
+fn takes_argument_list(import: &str) -> bool {
+    let name = import.trim_start_matches('_');
+    // `vprintf`, `vsnprintf`, `vasprintf`, `vfwprintf`, `vsscanf`; glibc's checked `vsnprintf_chk`;
+    // the Microsoft runtime's `stdio_common_vfprintf`; and `vsyslog`, `verr`, `vwarn` and kin.
+    let formatted = ["printf", "scanf"].iter().any(|family| name.split(family).next().is_some_and(|before| before.len() < name.len() && before.rsplit('_').next().is_some_and(|prefix| prefix.starts_with('v'))));
+    formatted || matches!(name, "vsyslog" | "vsyslog_chk" | "verr" | "verrx" | "vwarn" | "vwarnx")
 }
 
 /// How many jumps from function to function are followed to learn what the first returns.

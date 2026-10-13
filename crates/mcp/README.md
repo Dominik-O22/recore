@@ -54,7 +54,7 @@ When a binary has debug information, the decompiler uses it: functions take thei
 
 `xrefs` with `offset` answers who sets or uses a field: it lists the functions that reach memory at that offset from a register, whatever structure the register points to, so a large offset is telling and a small one is not. `function` and `decompile` say which function names a function's assertions carry, which is its own name unless the assertion came in with an inlined function.
 
-A call that passes a printf format to a function taking a variable number of arguments is shown with the arguments the format asks for. The decompiler by itself judges from the registers around the call, and leaves out a value the caller also looked at. A format with a floating-point conversion is not followed, since those arguments travel in registers of their own.
+A call that passes a printf or scanf format is shown with the arguments the format asks for. The decompiler by itself judges from the registers around the call, and leaves out a value the caller also looked at. This holds for the C library's functions and for a program's own that hand their arguments on to one, such as a logging function built on `vsnprintf`; a function that merely takes a variable number of arguments is left alone, since a string with a `%` in it need not be a format.
 
 An answer that leaves something out says so where it does: how many of how many it shows, and the argument that shows the rest.
 

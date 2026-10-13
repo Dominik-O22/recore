@@ -60,6 +60,49 @@ pub fn field_uses(image: &Image, body: &[(u64, u64)], offset: u64) -> Vec<(u64, 
     }
 }
 
+/// For each of `calls`, sorted addresses of call instructions in `body`: the first argument,
+/// by position, whose register was given a fixed address that `is_text` accepts, by an
+/// instruction that leads straight to the call. That is how a format string reaches a call, and
+/// its position says how many parameters stand before it. Returned as `(call, position,
+/// address)`.
+pub fn text_arguments(image: &Image, body: &[(u64, u64)], calls: &[u64], is_text: &dyn Fn(u64) -> bool) -> Vec<(u64, usize, u64)> {
+    fn with<A: Arch>(image: &Image, body: &[(u64, u64)], calls: &[u64], is_text: &dyn Fn(u64) -> bool) -> Vec<(u64, usize, u64)> {
+        let state = A::State::default();
+        let decoded = |&(start, end): &(u64, u64)| {
+            let bytes = image.bytes_from(start).unwrap_or(&[]);
+            A::decode(&bytes[..bytes.len().min((end - start) as usize)], start).filter_map(|decoded| Some((decoded.addr, decoded.insn?)))
+        };
+        // Where a jump lands, what the registers hold depends on where it came from.
+        let landings: BTreeSet<u64> = body.iter().flat_map(decoded).filter_map(|(_, insn)| match A::flow(&insn, &state)? {
+            Flow::Jump(target) | Flow::Branch(target) => Some(target),
+            _ => None,
+        }).collect();
+        let mut found = Vec::new();
+        for range in body {
+            let mut held = [None; 8];
+            for (addr, insn) in decoded(range) {
+                if landings.contains(&addr) {
+                    held = [None; 8];
+                }
+                if calls.binary_search(&addr).is_ok() {
+                    found.extend(held.iter().enumerate().find_map(|(position, held)| Some((addr, position, held.filter(|&text| is_text(text))?))));
+                }
+                match (A::flow(&insn, &state), A::argument_write(&insn)) {
+                    (Some(_), _) => held = [None; 8],
+                    (None, Some((position, address))) => held[position] = address,
+                    (None, None) => {}
+                }
+            }
+        }
+        found
+    }
+    match (image.machine, image.format == crate::image::Format::Pe) {
+        (Machine::X86_64, true) => with::<X86<64, true>>(image, body, calls, is_text),
+        (Machine::X86_64, false) => with::<X86<64, false>>(image, body, calls, is_text),
+        (Machine::X86 | Machine::Aarch64, _) => Vec::new(),
+    }
+}
+
 /// Whether the function in `[start, end)` begins as one that takes a variable number of
 /// arguments does, by saving the registers they arrive in.
 pub fn takes_variable_arguments(image: &Image, start: u64, end: u64) -> bool {

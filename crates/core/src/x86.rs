@@ -123,6 +123,23 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         opens_landing_pad(insn)
     }
 
+    fn argument_write(insn: &Instruction) -> Option<(usize, Option<u64>)> {
+        const WINDOWS_ORDER: [Register; 4] = [Register::RCX, Register::RDX, Register::R8, Register::R9];
+        const SYSTEM_V_ORDER: [Register; 6] = [Register::RDI, Register::RSI, Register::RDX, Register::RCX, Register::R8, Register::R9];
+        let order: &[Register] = if WINDOWS { &WINDOWS_ORDER } else { &SYSTEM_V_ORDER };
+        // These read their first operand and leave it as it was.
+        if BITS != 64 || insn.op0_kind() != OpKind::Register || matches!(insn.mnemonic(), Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Push) {
+            return None;
+        }
+        let position = order.iter().position(|&register| register == insn.op0_register().full_register())?;
+        let address = match insn.mnemonic() {
+            Mnemonic::Lea if insn.is_ip_rel_memory_operand() => Some(insn.ip_rel_memory_address()),
+            Mnemonic::Mov if matches!(insn.op1_kind(), OpKind::Immediate32 | OpKind::Immediate64 | OpKind::Immediate32to64) => Some(insn.immediate(1)),
+            _ => None,
+        };
+        Some((position, address))
+    }
+
     fn takes_variable_arguments(insns: &[Instruction]) -> bool {
         let stored = |insn: &Instruction, registers: &[Register]| insn.mnemonic() == Mnemonic::Mov && insn.op0_kind() == OpKind::Memory && insn.op1_kind() == OpKind::Register && registers.contains(&insn.op1_register());
         // System V: `al` says how many vector registers carry arguments, and the function

@@ -180,6 +180,13 @@ pub trait Arch: 'static {
         false
     }
 
+    /// The register argument `insn` writes, by its position among the arguments, and the address
+    /// it puts there when it puts a fixed one: how a call's string arguments are told before
+    /// the function is decompiled.
+    fn argument_write(_insn: &Self::Insn) -> Option<(usize, Option<u64>)> {
+        None
+    }
+
     /// Whether a function beginning with `insns` sets up to read a variable number of
     /// arguments: it saves the registers arguments arrive in where `va_arg` will look for them.
     fn takes_variable_arguments(_insns: &[Self::Insn]) -> bool {

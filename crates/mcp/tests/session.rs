@@ -227,7 +227,7 @@ fn a_format_says_what_a_call_passes() {
     // `report` of the fixture loads a value and looks at it before passing it on with a format,
     // which the decompiler by itself takes for a value the call does not pass.
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/format.elf");
-    let c_text = Client::start().tool("decompile", json!({ "path": path, "functions": ["0x4010e0"] })).unwrap();
-    assert!(c_text.contains("func_0x00401050(param_1,\"built from commit: %s\\n\",(char *)*param_2);"), "{c_text}");
-    assert!(c_text.contains("func_0x00401050(param_1,\"no commit\\n\");"), "{c_text}");
+    let c_text = Client::start().tool("decompile", json!({ "path": path, "functions": ["0x1220"] })).unwrap();
+    assert!(c_text.contains("func_0x00001180(param_1,\"built from commit: %s\\n\",(char *)*param_2);"), "{c_text}");
+    assert!(c_text.contains("func_0x00001180(param_1,\"no commit\\n\");"), "{c_text}");
 }

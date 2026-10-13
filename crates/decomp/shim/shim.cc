@@ -209,9 +209,11 @@ struct RdSession {
   bool want_flow = false;
   bool want_addresses = false;
   set<uint64_t> kept;  // functions whose prototype this session locked
-  // Functions that save their argument registers as one taking a variable number of arguments
-  // does: those rd_takes_variable_arguments named, and those spills_a_register_param found.
+  // Functions rd_takes_variable_arguments named: those of the program that take a format and
+  // the arguments it asks for.
   set<uint64_t> saves_arguments;
+  // Calls whose arguments rd_format_call settled before their function was decompiled.
+  set<pair<uint64_t, uint64_t>> format_calls;
   // Names given to variables, per function: the variable's place and its name.
   map<uint64_t, vector<pair<string, string>>> local_names;
   // Where and as what each function decompiled so far returns its value, if it returns one.
@@ -386,6 +388,7 @@ static bool follow_formats(RdSession *session, Funcdata *fd) {
     PcodeOp *op = call->getOp();
     uint64_t callee = call->getEntryAddress().isInvalid() ? ~(uint64_t)0 : call->getEntryAddress().getOffset();
     // Declared with `...`, or seen to save its argument registers as such a function does.
+    if (session->format_calls.count({fd->getAddress().getOffset(), op->getAddr().getOffset()}) != 0) continue;
     bool declared = call->isInputLocked() && call->isDotdotdot() && session->kept.count(callee) == 0;
     if (!declared && session->saves_arguments.count(callee) == 0) continue;
     int4 passed = op->numInput() - 1;
@@ -423,6 +426,7 @@ static bool follow_formats(RdSession *session, Funcdata *fd) {
       proto->setInternal(pieces.model, arch->types->getTypeVoid());
       proto->setPieces(pieces);
       proto->setOutputLock(false);
+      proto->setNoReturn(call->isNoReturn());
       fd->getOverride().insertProtoOverride(op->getAddr(), proto);
       changed = true;
       break;
@@ -1006,10 +1010,64 @@ int rd_add_comment(RdSession *session, uint64_t function, uint64_t addr, const c
   });
 }
 
-// Says that the function at `addr` takes a variable number of arguments, which its code shows
-// before it is decompiled: a call that passes it a printf format then gets the arguments the
-// format asks for.
+// Says that the function at `addr` takes a format and a variable number of arguments for it:
+// a call that passes it a printf format then gets the arguments the format asks for.
 void rd_takes_variable_arguments(RdSession *session, uint64_t addr) { session->saves_arguments.insert(addr); }
+
+// Settles what the call at `call` in `function` passes, from the printf or scanf format at
+// `format` that it passes as argument `position`, counted from zero: the parameters before the
+// format, the format, and an argument for each conversion in it. Done before the function is
+// decompiled, this costs nothing, where finding out afterwards costs decompiling it again.
+// Nothing happens unless `callee`, a function's entry or with `import` an import's slot, takes a
+// variable number of arguments, and unless the text is a format.
+int rd_format_call(RdSession *session, uint64_t function, uint64_t call, uint64_t callee, int import,
+                   size_t position, uint64_t format, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    int4 word = arch->getDefaultCodeSpace()->getAddrSize();
+    Funcdata *target = nullptr;
+    if (import != 0) {
+      auto slot = session->slots.find(callee);
+      if (slot == session->slots.end()) return;
+      target = arch->symboltab->getGlobalScope()->queryFunction(session->address(slot->second));
+      // An import is known to take a variable number of arguments only by its declaration,
+      // which also says where its format stands.
+      if (target == nullptr || !target->getFuncProto().isInputLocked() || !target->getFuncProto().isDotdotdot() ||
+          (size_t)target->getFuncProto().numParams() != position + 1)
+        return;
+    } else {
+      if (session->saves_arguments.count(callee) == 0) return;
+      target = session->function(callee);
+    }
+    uint1 bytes[256];
+    session->image->loadFill(bytes, sizeof(bytes), session->address(format));
+    const uint1 *end = (const uint1 *)memchr(bytes, 0, sizeof(bytes));
+    if (end == nullptr) return;
+    vector<bool> floats = format_arguments(string((const char *)bytes, end - bytes), target->getName().find("scanf") != string::npos);
+    if (floats.empty() || floats.size() > 12) return;
+
+    const FuncProto &declared = target->getFuncProto();
+    PrototypePieces pieces;
+    pieces.model = arch->getModel(declared.getModelName());
+    pieces.name = target->getName();
+    pieces.outtype = declared.isOutputLocked() ? declared.getOutputType() : arch->types->getBase(word, TYPE_UNKNOWN);
+    pieces.firstVarArgSlot = -1;
+    for (size_t i = 0; i <= position; ++i)
+      pieces.intypes.push_back(import != 0 ? declared.getParam(i)->getType() : arch->types->getBase(word, TYPE_UNKNOWN));
+    for (bool is_float : floats)
+      pieces.intypes.push_back(is_float ? arch->types->getBase(8, TYPE_FLOAT) : arch->types->getBase(word, TYPE_UNKNOWN));
+    pieces.innames.assign(pieces.intypes.size(), "");
+    FuncProto *proto = new FuncProto();
+    proto->setInternal(pieces.model, arch->types->getTypeVoid());
+    proto->setPieces(pieces);
+    proto->setOutputLock(declared.isOutputLocked());
+    // What stands in for the function's prototype at this call says, as that does, whether
+    // the call comes back.
+    proto->setNoReturn(declared.isNoReturn());
+    session->function(function)->getOverride().insertProtoOverride(session->address(call), proto);
+    session->format_calls.insert({function, call});
+  });
+}
 
 // Whether a kept prototype says everything a call passes, or only the least: a call then also
 // passes whatever else the call site shows.
@@ -1352,7 +1410,6 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     out->flow = session->flow.c_str();
     out->locals = session->locals.c_str();
     spills = spills_a_register_param(fd);
-    if (spills) session->saves_arguments.insert(addr);
     out->flags = (fd->hasBadData() ? RD_BAD_DATA : 0) |
                  (fd->hasUnimplemented() ? RD_UNIMPLEMENTED : 0) |
                  (proto.getOutputType()->getMetatype() != TYPE_VOID ? RD_RETURNS_VALUE : 0);
