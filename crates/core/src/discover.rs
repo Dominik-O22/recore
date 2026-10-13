@@ -887,6 +887,11 @@ impl<A: Arch> Explorer<'_, A> {
                     // Always make progress, even past bytes that do not decode.
                     offset = ((scanned_to - section.addr) as usize).max(offset + 1);
                     let Some((addr, insn)) = candidate else { continue };
+                    // A trampoline entry is not a function: what it reaches is, and every jump
+                    // or call to the entry already goes there.
+                    if self.image.banking.trampolines.contains_key(&addr) {
+                        continue;
+                    }
                     let at = (addr - section.addr) as usize;
                     if skipped_padding && !self.regions[index].follows_break(at) {
                         self.regions[index].flags[at] |= FOLLOWS_BREAK;

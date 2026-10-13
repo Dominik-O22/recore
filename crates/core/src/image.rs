@@ -66,6 +66,38 @@ pub enum Format {
     Raw,
 }
 
+/// How code that outgrew a 16-bit address space is laid out: several banks share the same
+/// addresses and the hardware shows one of them at a time. A banked code address is written
+/// `bank << 16 | address` here, so every bank has a range of its own. An image that is not banked
+/// has no common ranges and no trampolines, and all its code is bank 0.
+#[derive(Default)]
+pub struct Banking {
+    /// `[start, end)` of the 16-bit addresses that hold the same code whichever bank shows.
+    /// That code is loaded once, as bank 0. Sorted.
+    pub common: Vec<(u64, u64)>,
+    /// The address of each trampoline entry, which is common code that switches banks on the
+    /// way to a function, to the address of that function.
+    pub trampolines: FxHashMap<u64, u64>,
+}
+
+impl Banking {
+    /// Where the 16-bit address `target` lies when `bank` shows.
+    pub fn address(&self, bank: u64, target: u16) -> u64 {
+        let target = u64::from(target);
+        let common = self.common.iter().any(|&(start, end)| target >= start && target < end);
+        if common { target } else { bank << 16 | target }
+    }
+
+    /// The address a jump or call at `from` to the 16-bit address `target` reaches: the function
+    /// behind a trampoline entry, and otherwise the target in the bank of `from`. Nothing says
+    /// which bank shows while common code runs, so a target it names outside the common ranges
+    /// counts as bank 0, where the common code is loaded.
+    pub fn reach(&self, from: u64, target: u16) -> u64 {
+        let address = self.address(from >> 16, target);
+        self.trampolines.get(&address).copied().unwrap_or(address)
+    }
+}
+
 pub struct Image {
     pub name: String,
     pub format: Format,
@@ -86,7 +118,7 @@ pub struct Image {
     pub import_slots: FxHashMap<u64, String>,
     /// Exported function addresses from the dynamic symbol table. In a Mach-O image, also the
     /// methods its Objective-C metadata lists, which the runtime calls by name. In a raw image,
-    /// the entry points its layout lists after the first.
+    /// the entry points its layout lists after the first, and the functions its trampolines reach.
     pub exports: Vec<u64>,
     /// Names the image itself carries for addresses in it: exports, as written in the file.
     pub symbol_names: FxHashMap<u64, String>,
@@ -99,6 +131,7 @@ pub struct Image {
     /// Compilers for this format place jump tables and other data among the code, so bytes
     /// that control flow never reaches cannot be assumed to be instructions.
     pub data_in_code: bool,
+    pub banking: Banking,
 }
 
 impl Image {
@@ -192,6 +225,7 @@ impl Image {
             frames,
             relative_targets,
             data_in_code: is_pe,
+            banking: Banking::default(),
         })
     }
 

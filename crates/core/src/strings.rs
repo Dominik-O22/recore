@@ -89,6 +89,7 @@ mod tests {
             frames: Vec::new(),
             relative_targets: Vec::new(),
             data_in_code: false,
+            banking: Default::default(),
         };
         let known = [StringLiteral { addr: 0x2000, text: "known one".into(), wide: false }];
         let found: Vec<(u64, String)> = unreferenced(&image, &known).into_iter().map(|string| (string.addr, string.text)).collect();

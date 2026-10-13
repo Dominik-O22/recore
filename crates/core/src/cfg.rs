@@ -220,6 +220,7 @@ mod tests {
             frames: Vec::new(),
             relative_targets: Vec::new(),
             data_in_code: false,
+            banking: Default::default(),
         }
     }
 
