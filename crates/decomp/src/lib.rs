@@ -266,6 +266,9 @@ impl Decompiled {
 pub struct Session {
     raw: NonNull<ffi::RdSession>,
     target: Target,
+    /// Jump tables of recore's, by function, that the engine is first left to read itself:
+    /// see [`Facts::engine_tables`].
+    engine_tables: std::collections::HashMap<u64, Vec<JumpTable>>,
 }
 
 // A session owns all of its C++ state. The engine's globals are written only while a session
@@ -333,7 +336,7 @@ impl Session {
         unsafe { ffi::rd_keep_prototypes_exact(raw.as_ptr(), target.callers_pass_what_is_read().into()) };
         unsafe { ffi::rd_functions_run_on(raw.as_ptr(), target.functions_run_on().into()) };
         // The session frees the engine's side if a space is not there.
-        let session = Session { raw, target };
+        let session = Session { raw, target, engine_tables: Default::default() };
         for &(base, name) in target.spaces() {
             check(|err, len| unsafe { ffi::rd_map_space(raw.as_ptr(), base, name.as_ptr(), err, len) != 0 })?;
         }
@@ -482,6 +485,9 @@ impl Session {
         }
         for &(function, count) in &facts.param_counts {
             check(|err, len| unsafe { ffi::rd_set_param_count(self.raw.as_ptr(), function, count, err, len) != 0 })?;
+        }
+        for &(caller, function) in &facts.inlined {
+            check(|err, len| unsafe { ffi::rd_inline(self.raw.as_ptr(), caller, function, err, len) != 0 })?;
         }
         for &(function, jump) in &facts.tail_calls {
             self.override_tail_call(function, jump)?;
@@ -668,6 +674,15 @@ impl Session {
             if facts.switch_calls.iter().any(|switch| switch.call == table.jump && switch.cases.is_some()) {
                 continue;
             }
+            // A call that comes back past its data is no jump to the engine, and a table for
+            // a jump it never meets is one it trips over.
+            if facts.data_after_calls.iter().any(|&(call, _)| call == table.jump) {
+                continue;
+            }
+            if facts.engine_tables.contains(&(function, index)) {
+                self.engine_tables.entry(function).or_default().push(JumpTable { jump: table.jump, targets: table.targets.clone() });
+                continue;
+            }
             self.override_jump_table(function, table.jump, &table.targets)?;
         }
         Ok(())
@@ -698,7 +713,23 @@ impl Session {
     /// pass it whole. For C51 [`Facts::storage`] says where each function takes its
     /// arguments before any is decompiled.
     pub fn decompile(&mut self, addr: u64) -> Result<Decompiled> {
-        let decompiled = self.decompile_as_declared(addr)?;
+        let mut decompiled = self.decompile_as_declared(addr);
+        // A table the engine was left to read is taken from recore after all if the engine
+        // found other places than recore did, or none.
+        if let Some(tables) = self.engine_tables.get(&addr) {
+            let same = |table: &JumpTable| {
+                let found = decompiled.as_ref().ok().and_then(|decompiled| decompiled.jump_tables.iter().find(|found| found.jump == table.jump));
+                // The engine lists the place the jump is kept from, the default, with the others.
+                found.is_some_and(|found| table.targets.iter().all(|target| found.targets.contains(target)) && found.targets.iter().filter(|target| !table.targets.contains(target)).count() <= 1)
+            };
+            if !tables.iter().all(same) {
+                for table in self.engine_tables.remove(&addr).unwrap_or_default() {
+                    self.override_jump_table(addr, table.jump, &table.targets)?;
+                }
+                decompiled = self.decompile_as_declared(addr);
+            }
+        }
+        let decompiled = decompiled?;
         let reads = |register: &str| decompiled.c_text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|word| word.strip_prefix("in_") == Some(register));
         // The parameter the engine found, the register it left out, and the two as one.
         let whole = match self.target {

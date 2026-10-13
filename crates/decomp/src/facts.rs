@@ -46,6 +46,14 @@ pub struct Facts {
     pub own_entries: Vec<(u64, u64)>,
     /// `(function, index into Analysis::jump_tables)`: an indirect jump inside the function.
     pub jump_tables: Vec<(u64, usize)>,
+    /// `(function, index into Analysis::jump_tables)`: those of `jump_tables` that the engine is
+    /// left to read itself, because it then knows the value of each case, and is given only
+    /// if it reads them otherwise than recore did: an 8051 `JMP @A+DPTR` into a row of jumps.
+    pub engine_tables: Vec<(u64, usize)>,
+    /// `(caller, function)`: a function to read as part of each function that calls it: a few
+    /// instructions without a branch that an 8051 `switch` calls to scale its index, and
+    /// that the engine must see through to know the value of each case.
+    pub inlined: Vec<(u64, u64)>,
     /// `(call, register)`: a call that is the indirect jump of a jump table. The routine it
     /// calls takes its return address as the address of a table that follows the call, and
     /// jumps to the entry the value in the register picks.
@@ -231,6 +239,31 @@ impl Facts {
         }));
         facts.jump_tables.sort_unstable();
         facts.jump_tables.dedup();
+        if image.machine == Machine::I8051 {
+            let jumps_through_dptr = |index: usize| image.bytes_from(analysis.jump_tables[index].jump).is_some_and(|bytes| bytes.first() == Some(&0x73));
+            facts.engine_tables = facts.jump_tables.iter().copied().filter(|&(_, index)| jumps_through_dptr(index)).collect();
+            /// The most bytes of code that is read as part of its callers.
+            const SCALER: u64 = 16;
+            let call_at = |at: u64| analysis.calls.binary_search_by_key(&at, |call| call.at).ok().map(|index| &analysis.calls[index]);
+            // The call straight before the jump, which is two or three bytes long.
+            let scalers = facts.engine_tables.iter().filter_map(|&(_, index)| {
+                let jump = analysis.jump_tables[index].jump;
+                let call = [3, 2].into_iter().find_map(|length| call_at(jump.checked_sub(length)?).filter(|call| !call.tail))?;
+                let CallTarget::Function(scaler) = call.target else { return None };
+                let function = analysis.functions.iter().find(|function| function.addr == scaler && function.fragment_of.is_none())?;
+                let &[(start, end)] = &function.ranges[..] else { return None };
+                let straight = end - start <= SCALER && image.bytes_from(end - 1)?.first() == Some(&0x22) && !analysis.calls.iter().any(|call| (start..end).contains(&call.at));
+                straight.then_some(scaler)
+            });
+            let scalers: std::collections::BTreeSet<u64> = scalers.collect();
+            let owner_at = |at: u64| analysis.functions.iter().find(|function| function.ranges.iter().any(|&(start, end)| (start..end).contains(&at))).map(|function| function.fragment_of.unwrap_or(function.addr));
+            facts.inlined = analysis.calls.iter().filter_map(|call| match call.target {
+                CallTarget::Function(scaler) if scalers.contains(&scaler) => Some((owner_at(call.at)?, scaler)),
+                _ => None,
+            }).collect();
+            facts.inlined.sort_unstable();
+            facts.inlined.dedup();
+        }
         facts.import_aliases.sort_unstable();
         facts.import_aliases.dedup_by_key(|alias| alias.0);
         stub_names.sort_unstable();

@@ -27,10 +27,9 @@ fn a_switch_through_a_list_of_cases_after_a_call_has_each_case_by_its_value() {
     assert_eq!(after("default:"), "return 0x33;");
 }
 
-/// A session for `code` as C51 compiled it, loaded at address 0 with the function at 0 as
-/// the entry, told everything the analysis of it says.
-fn analysed(code: &[u8]) -> Session {
-    let image = recore::Image {
+/// `code` as C51 compiled it, loaded at address 0 with the function at 0 as the entry.
+fn image(code: &[u8]) -> recore::Image {
+    recore::Image {
         name: String::new(),
         format: recore::image::Format::Raw,
         machine: recore::image::Machine::I8051,
@@ -47,7 +46,12 @@ fn analysed(code: &[u8]) -> Session {
         data_in_code: true,
         banking: Default::default(),
         compiler: None,
-    };
+    }
+}
+
+/// A session for `code`, told everything the analysis of it says.
+fn analysed(code: &[u8]) -> Session {
+    let image = image(code);
     let analysis = recore::analyze(&image);
     let mut session = Session::from_image(&image, &analysis).unwrap();
     session.add_functions(&Facts::derive(&image, &analysis)).unwrap();
@@ -135,4 +139,35 @@ fn a_call_to_a_function_that_returns_what_it_jumps_to_keeps_its_argument() {
     assert!(session.decompile(0x10).unwrap().returns_value);
     let c = session.decompile(0).unwrap().c_text;
     assert!(c.contains("func_0x000010(5)"), "{c}");
+}
+
+#[test]
+fn a_switch_through_a_row_of_jumps_has_each_case_by_its_value() {
+    #[rustfmt::skip]
+    let code = [
+        0xef,                   // 00  MOV A,R7
+        0xb4, 0x03, 0x00,       // 01  CJNE A,#3: carry if below
+        0x50, 0x19,             // 04  JNC the default
+        0x90, 0x00, 0x0d,       // 06  MOV DPTR,#the row
+        0xf8, 0x28, 0x28,       // 09  MOV R0,A; ADD A,R0; ADD A,R0: three bytes a jump
+        0x73,                   // 0c  JMP @A+DPTR
+        0x02, 0x00, 0x16,       // 0d  LJMP case 0
+        0x02, 0x00, 0x19,       // 10  LJMP case 1
+        0x02, 0x00, 0x1c,       // 13  LJMP case 2
+        0x7f, 0x11, 0x22,       // 16  MOV R7,#0x11; RET
+        0x7f, 0x22, 0x22,       // 19  MOV R7,#0x22; RET
+        0x7f, 0x33, 0x22,       // 1c  MOV R7,#0x33; RET
+        0x7f, 0x44, 0x22,       // 1f  MOV R7,#0x44; RET
+    ];
+    let image = image(&code);
+    let analysis = recore::analyze(&image);
+    let facts = Facts::derive(&image, &analysis);
+    let mut session = Session::from_image(&image, &analysis).unwrap();
+    session.add_functions(&facts).unwrap();
+    session.override_jump_tables(&analysis, &facts).unwrap();
+    let c = session.decompile(0).unwrap().c_text;
+    let after = |label: &str| c.split_once(label).unwrap_or_else(|| panic!("no `{label}` in {c}")).1.trim_start().lines().next().unwrap().to_string();
+    assert!(c.contains("switch(param_1)"), "{c}");
+    assert_eq!(after("case 1:"), "return 0x22;");
+    assert_eq!(after("case 2:"), "return 0x33;");
 }

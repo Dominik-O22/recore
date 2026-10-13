@@ -1254,6 +1254,15 @@ static void set_kept_registers(RdSession *session, uint64_t addr, bool as_conven
   }
 }
 
+// Says that the function at `function` is read as part of `caller` wherever that one calls it:
+// its instructions stand in place of the call. To be said for every function that calls it.
+int rd_inline(RdSession *session, uint64_t caller, uint64_t function, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    session->function(function)->getFuncProto().setInline(true);
+    session->image->allowed.insert({caller, function});
+  });
+}
+
 // Replaces every call to the function at `addr` with the p-code of the compiler spec's call
 // fixup `fixup`. Compiler helpers such as the stack-cookie check and `_alloca_probe` break the
 // calling convention, and their fixup says what they really do to the caller.
@@ -1642,6 +1651,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
   // A prototype that was declared, not recovered, is the whole truth and stays as it is.
   bool declared = false;
   bool spills = false;
+  bool inlined = false;
   bool ok = guarded(err, errlen, [&] {
     fd = session->function(addr);
     declared = fd->getFuncProto().isInputLocked() && session->kept.count(addr) == 0;
@@ -1652,6 +1662,13 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       arch->clearAnalysis(fd);
     }
     set_kept_registers(session, addr, true);
+    // A function read as part of its callers is decompiled as any other when asked for.
+    inlined = fd->getFuncProto().isInline() && fd->getFuncProto().getInjectId() < 0;
+    if (inlined) {
+      // As part of a caller it was left holding its instructions.
+      arch->clearAnalysis(fd);
+      fd->getFuncProto().setInline(false);
+    }
     Action *root = arch->allacts.getCurrent();
     root->reset(*fd);
     session->image->current = addr;
@@ -1770,6 +1787,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     fd->getFuncProto().setOutputLock(false);
   }
   guarded(nullptr, 0, [&] { set_kept_registers(session, addr, false); });
+  if (inlined) fd->getFuncProto().setInline(true);
   session->image->current = ~(uint64_t)0;
   // Drop the p-code, varnodes and inferred (unlocked) prototype: they are large, and a failed
   // run leaves them half built. Overrides and the function symbol itself are kept.
