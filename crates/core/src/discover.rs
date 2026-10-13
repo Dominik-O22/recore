@@ -312,13 +312,15 @@ impl<'a, A: Arch> Explorer<'a, A> {
             }
         }
         // Whether an address becomes an entry point depends neither on who asks nor on when,
-        // and most addresses are asked about many times: once per call to them.
+        // and most addresses are asked about many times: once per call to them. So each is
+        // decided once, and is no entry point yet when it is.
         if *flags & ASKED_AS_START != 0 {
             return;
         }
         *flags |= ASKED_AS_START;
-        if !self.inside_frame(addr) && !self.starts.contains_key(&addr) {
-            self.starts.insert(addr, origin);
+        if !self.inside_frame(addr) {
+            let before = self.starts.insert(addr, origin);
+            debug_assert!(before.is_none());
             self.pending.push(Pending::entry(addr));
         }
     }
