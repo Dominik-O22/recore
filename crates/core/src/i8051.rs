@@ -7,6 +7,8 @@
 //!
 //! [`Banking`]: crate::image::Banking
 
+pub mod registers;
+
 use rustc_hash::FxHashMap;
 
 use crate::arch::{Arch, Decoded, Flow, Table, TextPointer};
@@ -649,7 +651,7 @@ mod tests {
     use crate::image::{Banking, Format, Section};
 
     /// An image that is not banked, with `code` at `addr`.
-    fn image(code: &[u8], addr: u64) -> Image {
+    pub(super) fn image(code: &[u8], addr: u64) -> Image {
         Image {
             name: String::new(),
             format: Format::Raw,
