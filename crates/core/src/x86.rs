@@ -43,6 +43,8 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
     const FUNCTION_ALIGN: u64 = 16;
     const ALIGNMENT_IS_EVIDENCE: bool = true;
     const ADDRESSES_ARE_RELOCATED: bool = BITS == 32;
+    /// An operand names the slot outright or not at all.
+    const FLOW_READS_STATE: bool = false;
 
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Instruction>> {
         let mut decoder = Decoder::with_ip(BITS, bytes, addr, DecoderOptions::NONE);

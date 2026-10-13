@@ -55,9 +55,12 @@ fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool) -> Function 
                 function.controls.push(Control { addr: decoded.addr, next: decoded.next_addr(), flow });
                 // The state only matters for resolving slots, so a fresh one after any control
                 // transfer is enough for a linear pass.
-                state = A::State::default();
+                if A::FLOW_READS_STATE {
+                    state = A::State::default();
+                }
             }
-            None => A::step(&mut state, &insn),
+            None if A::FLOW_READS_STATE => A::step(&mut state, &insn),
+            None => {}
         }
     }
     if trim {
