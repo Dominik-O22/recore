@@ -20,12 +20,12 @@
 //!
 //! ```toml
 //! [banking]
-//! common = [[0x0000, 0x4900], [0xff00, 0x10000]]
+//! common = [[0x0000, 0x6000], [0xfe00, 0x10000]]
 //!
 //! [[banking.trampoline]]
 //! # Bytes in hex. `hh ll` is the target, `ss ss` the address of a stub, `..` any byte.
 //! entry = "90 hh ll 02 ss ss"
-//! stub = "e5 49 54 1f 23 23 c0 e0 74 46 c0 e0 c0 82 c0 83 02 46 .."
+//! stub = "e5 30 54 07 23 23 c0 e0 74 5f c0 e0 c0 82 c0 83 02 5f .."
 //! ```
 //!
 //! That is a table of entries in the common code, one per function, each of which goes on to
@@ -386,13 +386,13 @@ mod tests {
             common = [[0x0000, 0x0040]]
             [[trampoline]]
             entry = "90 hh ll 02 ss ss"
-            stub = "e5 49 02 46 .."
+            stub = "e5 30 02 5f .."
             "#,
         )
         .unwrap();
         let mut code = Vec::new();
         // Stubs at 0x00 and 0x05, for bank 0 and bank 1.
-        code.extend([0xE5, 0x49, 0x02, 0x46, 0x00, 0xE5, 0x49, 0x02, 0x46, 0x04]);
+        code.extend([0xE5, 0x30, 0x02, 0x5F, 0x00, 0xE5, 0x30, 0x02, 0x5F, 0x04]);
         // Entries at 0x0A, 0x10 and 0x16: to 0x8010 in bank 1, to 0x8010 in bank 0, and to the
         // common address 0x0020 by way of bank 1.
         code.extend([0x90, 0x80, 0x10, 0x02, 0x00, 0x05, 0x90, 0x80, 0x10, 0x02, 0x00, 0x00, 0x90, 0x00, 0x20, 0x02, 0x00, 0x05]);

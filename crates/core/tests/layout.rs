@@ -61,7 +61,7 @@ fn banked_code_calls_through_a_trampoline_into_the_bank_it_names() {
     let mut place = |at: usize, code: &[u8]| bytes[at..at + code.len()].copy_from_slice(code);
     // Common code. Reset: LJMP 0x0010. The stubs of bank 0 and bank 1.
     place(0x00, &[0x02, 0x00, 0x10]);
-    place(0x03, &[0xE5, 0x49, 0x22, 0x00, 0x00, 0xE5, 0x49, 0x22, 0x00, 0x04]);
+    place(0x03, &[0xE5, 0x30, 0x22, 0x00, 0x00, 0xE5, 0x30, 0x22, 0x00, 0x04]);
     // LCALL 0x0020, the entry; LCALL 0x0050, which no bank is named for; RET.
     place(0x10, &[0x12, 0x00, 0x20, 0x12, 0x00, 0x50, 0x22]);
     // The entry: 0x0040 by way of the stub of bank 1.
@@ -94,7 +94,7 @@ fn banked_code_calls_through_a_trampoline_into_the_bank_it_names() {
 
         [[banking.trampoline]]
         entry = "90 hh ll 02 ss ss"
-        stub = "e5 49 22 00 .."
+        stub = "e5 30 22 00 .."
     "#;
     let image = Image::load(&write("banked", layout, &bytes)).unwrap();
     let analysis = recore::analyze(&image);

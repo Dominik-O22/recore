@@ -9,13 +9,13 @@
 //! P4 = 0xc0
 //!
 //! [xdata]
-//! PANEL_CONTROL = 0x2f00
+//! LCD_CONTROL = 0x8100
 //!
 //! [bit]
 //! EA = 0xaf
 //!
 //! [code]
-//! main = 0x00fafc
+//! main = 0x001a40
 //! ```
 //!
 //! `sfr`, `xdata`, `idata` and `bit` are the spaces of an 8051, whose standard registers and
@@ -250,18 +250,18 @@ mod tests {
         assert_eq!((standard[&(SFR + 0x81)].as_str(), standard[&(SFR + 0xE0)].as_str(), standard[&(BIT + 0xAF)].as_str(), standard.len()), ("SP", "ACC", "EA", 64));
         assert!(read(Machine::X86_64, "").unwrap().is_empty());
 
-        let file = "[sfr]\nPORT0 = 0x80\nP4 = 0xc0\n[xdata]\nPANEL = 0x2f00\n[bit]\nIRQ_ON = 0xaf\nLED = 0x93\n[code]\nmain = 0xfafc\n";
+        let file = "[sfr]\nPORT0 = 0x80\nP4 = 0xc0\n[xdata]\nLCD = 0x8100\n[bit]\nIRQ_ON = 0xaf\nLED = 0x93\n[code]\nmain = 0x1a40\n";
         let named = read(Machine::I8051, file).unwrap();
         let name = |addr: u64| named[&addr].as_str();
-        assert_eq!([name(SFR + 0x80), name(SFR + 0xC0), name(XDATA + 0x2F00), name(BIT + 0xAF), name(BIT + 0x93), name(0xFAFC), name(SFR + 0x90)], ["PORT0", "P4", "PANEL", "IRQ_ON", "LED", "main", "P1"]);
+        assert_eq!([name(SFR + 0x80), name(SFR + 0xC0), name(XDATA + 0x8100), name(BIT + 0xAF), name(BIT + 0x93), name(0x1A40), name(SFR + 0x90)], ["PORT0", "P4", "LCD", "IRQ_ON", "LED", "main", "P1"]);
         assert!(read(Machine::X86_64, file).is_err(), "only an 8051 has these spaces");
         assert!(read(Machine::I8051, "[sfr]\nSTACK = 0x7f\n").is_err(), "0x7f is internal data, not a register");
     }
 
     #[test]
     fn the_addresses_without_a_name_come_most_accessed_first() {
-        // MOV DPTR, #0x2F00; MOVX A, @DPTR; MOVX @DPTR, A; MOV 0xC0, A; INC 0x30; MOV SP, #0x60; RET.
-        let code = [0x90, 0x2F, 0x00, 0xE0, 0xF0, 0xF5, 0xC0, 0x05, 0x30, 0x75, 0x81, 0x60, 0x22];
+        // MOV DPTR, #0x8100; MOVX A, @DPTR; MOVX @DPTR, A; MOV 0xC0, A; INC 0x30; MOV SP, #0x60; RET.
+        let code = [0x90, 0x81, 0x00, 0xE0, 0xF0, 0xF5, 0xC0, 0x05, 0x30, 0x75, 0x81, 0x60, 0x22];
         let layout: crate::layout::Layout = toml::from_str("machine = \"8051\"\nentry = [0]\nregion = []").unwrap();
         let section = crate::image::Section { name: String::new(), addr: 0, data: code.to_vec(), file_offset: None, executable: true, writable: false };
         let mut image = layout.image(String::new(), vec![section], None).unwrap();
@@ -271,7 +271,7 @@ mod tests {
         let found = unnamed(&program, |addr| program.image.symbol_names.contains_key(&addr));
         let rows: Vec<(String, usize, usize)> = found.iter().map(|accessed| (place(&program.image, accessed.addr), accessed.reads, accessed.writes)).collect();
         // SP has its name. The others are ordered by how many instructions touch each.
-        assert_eq!(rows, [("xdata 0x2f00".to_string(), 1, 1), ("idata 0x30".to_string(), 1, 1), ("sfr 0xc0".to_string(), 0, 1)]);
+        assert_eq!(rows, [("xdata 0x8100".to_string(), 1, 1), ("idata 0x30".to_string(), 1, 1), ("sfr 0xc0".to_string(), 0, 1)]);
         assert_eq!(found[0].functions, BTreeSet::from([0]));
     }
 
