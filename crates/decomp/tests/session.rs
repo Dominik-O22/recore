@@ -3,7 +3,7 @@
 use recore_decomp::{Facts, Section, Session, Target, vendored_spec_dir};
 
 fn session(code: &[u8]) -> Session {
-    Session::new(&vendored_spec_dir(), Target::X86_64Gcc, &[Section { addr: 0x1000, data: code, readonly: true, code: true }]).unwrap()
+    Session::new(&vendored_spec_dir().unwrap(), Target::X86_64Gcc, &[Section { addr: 0x1000, data: code, readonly: true, code: true }]).unwrap()
 }
 
 #[test]
@@ -62,7 +62,7 @@ fn every_builtin_prototype_parses() {
     use recore::image::Format;
     use recore_decomp::prototypes;
     for (target, format) in [(Target::X86Windows, Format::Pe), (Target::X86_64Windows, Format::Pe), (Target::X86_64Gcc, Format::Elf), (Target::X86Gcc, Format::Elf)] {
-        let mut session = Session::new(&vendored_spec_dir(), target, &[Section { addr: 0x1000, data: &[0xc3], readonly: true, code: true }]).unwrap();
+        let mut session = Session::new(&vendored_spec_dir().unwrap(), target, &[Section { addr: 0x1000, data: &[0xc3], readonly: true, code: true }]).unwrap();
         for (index, name) in prototypes::known().enumerate() {
             session.add_import(0x2000 + 8 * index as u64, name, false).unwrap();
         }
@@ -75,7 +75,7 @@ fn every_builtin_prototype_parses() {
 fn stdcall_callee_cleanup_gives_stack_parameters() {
     // 32-bit: mov eax, [esp+4]; add eax, [esp+8]; ret 8
     let code = [0x8b, 0x44, 0x24, 0x04, 0x03, 0x44, 0x24, 0x08, 0xc2, 0x08, 0x00];
-    let mut session = Session::new(&vendored_spec_dir(), Target::X86Windows, &[Section { addr: 0x1000, data: &code, readonly: true, code: true }]).unwrap();
+    let mut session = Session::new(&vendored_spec_dir().unwrap(), Target::X86Windows, &[Section { addr: 0x1000, data: &code, readonly: true, code: true }]).unwrap();
     let function = session.decompile(0x1000).unwrap();
     let storage: Vec<&str> = function.params.iter().map(|p| p.storage.as_str()).collect();
     assert_eq!(storage, ["stack:0x4", "stack:0x8"]);
@@ -87,7 +87,7 @@ fn stdcall_callee_cleanup_gives_stack_parameters() {
 fn archive_prototypes_parse() {
     use recore::image::Format;
     for (target, format) in [(Target::X86Windows, Format::Pe), (Target::X86_64Gcc, Format::Elf), (Target::Aarch64, Format::MachO)] {
-        let mut session = Session::new(&vendored_spec_dir(), target, &[Section { addr: 0x1000, data: &[0xc3], readonly: true, code: true }]).unwrap();
+        let mut session = Session::new(&vendored_spec_dir().unwrap(), target, &[Section { addr: 0x1000, data: &[0xc3], readonly: true, code: true }]).unwrap();
         recore_decomp::prototypes::declare(&mut session, target, format, std::iter::empty()).unwrap();
         let declarations: Vec<(&str, String)> = recore_decomp::prototypes::archive_declarations(target, format).collect();
         let mut rejected = Vec::new();

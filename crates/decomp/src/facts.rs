@@ -7,7 +7,7 @@ use recore::Image;
 use recore::image::Machine;
 use recore::report::{Analysis, CallTarget};
 
-use crate::{Target, vendored_spec_dir};
+use crate::Target;
 
 /// Control-flow facts for one binary. Each is attributed to the function whose decompilation
 /// it affects: every function that has the instruction in one of its ranges, or the owner
@@ -53,7 +53,7 @@ impl Facts {
             names: analysis.functions.iter().filter(|f| f.fragment_of.is_none()).filter_map(|f| Some((f.addr, f.name.clone()?))).collect(),
             ..Facts::default()
         };
-        let fixups: HashMap<String, String> = Target::of(image).call_fixups(&vendored_spec_dir()).into_iter().collect();
+        let fixups: HashMap<String, String> = Target::of(image).call_fixups().into_iter().collect();
         // 32-bit C names carry one more leading underscore in some symbol sources than others.
         let fixup_of = |name: &str| fixups.get(name).or_else(|| fixups.get(&format!("_{name}"))).cloned();
         facts.call_fixups = facts.names.iter().filter_map(|(function, name)| Some((*function, fixup_of(name)?))).collect();

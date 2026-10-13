@@ -102,11 +102,12 @@ impl Target {
 
     /// The call fixups of the compiler spec, as (function name, fixup name). The engine reads
     /// the fixups themselves from the spec but leaves it to its host to apply them by name.
-    fn call_fixups(self, spec_dir: &Path) -> Vec<(String, String)> {
+    fn call_fixups(self) -> Vec<(String, String)> {
         let attribute = |line: &str, tag: &str| Some(line.trim().strip_prefix(tag)?.split('"').nth(1)?.to_string());
         let mut fixups = Vec::new();
         let mut current = None;
-        for line in std::fs::read_to_string(spec_dir.join(self.compiler_spec())).unwrap_or_default().lines() {
+        let spec = languages::FILES.iter().find(|(name, _)| *name == self.compiler_spec()).map_or(&[][..], |(_, bytes)| bytes);
+        for line in String::from_utf8_lossy(spec).lines() {
             if let Some(name) = attribute(line, "<callfixup name=") {
                 current = Some(name);
             } else if let (Some(target), Some(fixup)) = (attribute(line, "<target name="), &current) {
@@ -208,9 +209,37 @@ pub struct Session {
 // is created and while C is printed, and the shim takes a lock around both.
 unsafe impl Send for Session {}
 
-/// The x86-64 language files vendored with the decompiler sources.
-pub fn vendored_spec_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../third_party/ghidra-decompiler/languages")
+/// The engine's language files, which are part of the program: see `build.rs`.
+mod languages {
+    include!(concat!(env!("OUT_DIR"), "/languages.rs"));
+}
+
+/// A directory holding the language files, which the engine reads by path. They are written
+/// out the first time, under the user's cache directory, and again only when they change.
+pub fn vendored_spec_dir() -> Result<PathBuf> {
+    let cache = match (std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")) {
+        (Some(cache), _) => PathBuf::from(cache),
+        (None, Some(home)) => PathBuf::from(home).join(".cache"),
+        (None, None) => std::env::temp_dir(),
+    };
+    let dir = cache.join(format!("recore/languages-{:016x}", languages::ID));
+    // One thread of this process writes; the process number keeps other processes apart.
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _writing = WRITING.lock();
+    if dir.is_dir() {
+        return Ok(dir);
+    }
+    // Written beside it and renamed, so that no process finds half of the files.
+    let partial = dir.with_extension(format!("{}.partial", std::process::id()));
+    std::fs::create_dir_all(&partial).with_context(|| format!("writing the language files to {partial:?}"))?;
+    for (name, bytes) in languages::FILES {
+        std::fs::write(partial.join(name), bytes)?;
+    }
+    if std::fs::rename(&partial, &dir).is_err() {
+        // Another process got there first.
+        std::fs::remove_dir_all(&partial)?;
+    }
+    Ok(dir)
 }
 
 /// Runs a shim call that reports failure through an error buffer.
@@ -253,7 +282,7 @@ impl Session {
     pub fn load(image: &Image) -> Result<Session> {
         let loaded = facts::loaded(image);
         let sections: Vec<Section> = loaded.iter().map(|l| Section { addr: l.addr, data: &l.data, readonly: l.constant, code: l.code }).collect();
-        Session::new(&vendored_spec_dir(), Target::of(image), &sections)
+        Session::new(&vendored_spec_dir()?, Target::of(image), &sections)
     }
 
     /// Declares the imports the code calls, with prototypes for the well-known ones.
