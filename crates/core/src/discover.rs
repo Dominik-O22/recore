@@ -267,6 +267,11 @@ impl<A: Arch> Explorer<'_, A> {
         }
     }
 
+    /// Whether the instruction at `addr` is filler.
+    fn is_padding_at(&self, addr: u64) -> bool {
+        self.image.bytes_from(addr).and_then(|bytes| A::decode(bytes, addr).next()?.insn).is_some_and(|insn| A::is_padding(&insn))
+    }
+
     fn is_data(&self, addr: u64) -> bool {
         let index = self.data_sections.partition_point(|&(start, _)| start <= addr);
         index > 0 && addr < self.data_sections[index - 1].1
@@ -461,7 +466,9 @@ impl<A: Arch> Explorer<'_, A> {
                     }
                     Flow::CallIndirect(_) => self.import_never_returns(flow),
                     // A function that is nothing but a jump forwards to another function.
-                    Flow::Jump(target) if decoded.addr == start && self.starts.contains_key(&start) => {
+                    // Not to padding: a jump the linker puts in to step over an area it keeps
+                    // for patches lands on the filler after it.
+                    Flow::Jump(target) if decoded.addr == start && self.starts.contains_key(&start) && !self.is_padding_at(target) => {
                         self.add_start(target, Origin::Thunk);
                         true
                     }
