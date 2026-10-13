@@ -82,6 +82,9 @@ pub struct Banking {
     /// The address of each trampoline entry, which is common code that switches banks on the
     /// way to a function, to the address of that function.
     pub trampolines: FxHashMap<u64, u64>,
+    /// The address of each call that names a function and its bank and goes through a stub,
+    /// which switches banks on the way, to the address of that function.
+    pub calls: FxHashMap<u64, u64>,
 }
 
 impl Banking {

@@ -291,6 +291,10 @@ impl Arch for I8051 {
         if let Some(&target) = image.banking.trampolines.get(&insn.addr) {
             return Some(Flow::Jump(target));
         }
+        // A call through a stub that switches banks calls the function its caller names.
+        if let Some(&target) = image.banking.calls.get(&insn.addr) {
+            return Some(Flow::Call(target));
+        }
         if let Some((transfer, target)) = insn.transfer() {
             let target = image.banking.reach(insn.addr, target);
             return Some(match transfer {
@@ -442,7 +446,7 @@ pub fn banking_summary(image: &Image, analysis: &Analysis) -> Option<String> {
     let banked = image.machine == Machine::I8051 && !image.banking.common.is_empty();
     banked.then(|| {
         let unbanked = unbanked_transfers(image, analysis).len();
-        format!("{} trampolines, {unbanked} jumps and calls from common code to a bank it does not name (taken as bank 0)", image.banking.trampolines.len())
+        format!("{} trampolines, {unbanked} jumps and calls from common code to a bank it does not name (taken as bank 0)", image.banking.trampolines.len() + image.banking.calls.len())
     })
 }
 

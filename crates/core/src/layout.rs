@@ -28,6 +28,16 @@
 //! stub = "e5 49 54 1f 23 23 c0 e0 74 46 c0 e0 c0 82 c0 83 02 46 .."
 //! ```
 //!
+//! That is a table of entries in the common code, one per function, each of which goes on to
+//! the stub of the function's bank. Where the caller itself names the bank and calls the one
+//! stub there is, the pattern is that of the call, with `bb` for the bank:
+//!
+//! ```toml
+//! [[banking.trampoline]]
+//! call = "78 ll 79 hh 7a bb 12 ss ss"
+//! stub = "c0 b1 c8 c0 e0 e9 c0 e0 ea 54 0f 53 b1 f0 42 b1 c8 22"
+//! ```
+//!
 //! [`Image::load`] takes a layout wherever it takes an executable.
 
 use std::path::{Path, PathBuf};
@@ -74,13 +84,17 @@ struct BankingLayout {
     trampoline: Vec<Trampoline>,
 }
 
-/// How code reaches a function in another bank: it jumps to or calls an entry, which names the
-/// function and goes on to a stub, which switches to the function's bank. There is one stub per
-/// bank, and in address order they select bank 0, bank 1 and so on.
+/// How code reaches a function in another bank: through bytes that name the function and go on
+/// to a stub, which switches to the function's bank. They say which bank with `bb`. Without
+/// it there is one stub per bank, and in address order they select bank 0, bank 1 and so on.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Trampoline {
-    entry: Pattern,
+    /// An entry in the common code, which other code jumps to or calls in place of the function.
+    entry: Option<Pattern>,
+    /// A call in any code: the instructions that name the function, then the one whose
+    /// operand is the stub's address, which is where the function is called.
+    call: Option<Pattern>,
     stub: Pattern,
 }
 
@@ -94,10 +108,12 @@ enum Unit {
     TargetLow,
     /// A byte of the address of the stub, high byte first.
     Stub,
+    /// The number of the function's bank.
+    Bank,
 }
 
 /// A run of bytes with places in it that vary, written as hex bytes and the placeholders `..`,
-/// `hh`, `ll` and `ss`.
+/// `hh`, `ll`, `ss` and `bb`.
 #[derive(Deserialize)]
 #[serde(try_from = "String")]
 struct Pattern(Vec<Unit>);
@@ -111,6 +127,7 @@ impl TryFrom<String> for Pattern {
             "hh" => Ok(Unit::TargetHigh),
             "ll" => Ok(Unit::TargetLow),
             "ss" => Ok(Unit::Stub),
+            "bb" => Ok(Unit::Bank),
             byte if byte.len() == 2 => u8::from_str_radix(byte, 16).map(Unit::Byte).with_context(|| format!("`{byte}` in the pattern `{text}` is not a byte")),
             other => anyhow::bail!("`{other}` in the pattern `{text}` is not a byte"),
         };
@@ -123,6 +140,7 @@ impl TryFrom<String> for Pattern {
 struct Match {
     target: u16,
     stub: u16,
+    bank: Option<u8>,
 }
 
 impl Pattern {
@@ -140,6 +158,7 @@ impl Pattern {
                 Unit::TargetHigh => found.target |= u16::from(byte) << 8,
                 Unit::TargetLow => found.target |= u16::from(byte),
                 Unit::Stub => found.stub = found.stub << 8 | u16::from(byte),
+                Unit::Bank => found.bank = Some(byte),
             }
         }
         Some(found)
@@ -156,22 +175,33 @@ impl BankingLayout {
             let common = sections.iter().flat_map(|section| banking.common.iter().map(move |&(start, end)| (section, start.max(section.addr), end.min(section.end()))));
             common.flat_map(|(section, start, end)| (start..end).map(move |addr| (addr, &section.data[(addr - section.addr) as usize..(end - section.addr) as usize])))
         };
-        let mut trampolines = FxHashMap::default();
+        let (mut trampolines, mut calls) = (FxHashMap::default(), FxHashMap::default());
         for trampoline in &self.trampoline {
-            let Trampoline { entry, stub } = trampoline;
-            let placeholders = |pattern: &Pattern| [Unit::TargetHigh, Unit::TargetLow, Unit::Stub].map(|unit| pattern.count(unit));
-            ensure!(placeholders(entry) == [1, 1, 2], "a trampoline entry names its target with `hh ll` and its stub with `ss ss`");
-            ensure!(placeholders(stub) == [0, 0, 0] && !stub.0.is_empty(), "a trampoline stub is bytes and `..` only");
+            let Trampoline { entry, call, stub } = trampoline;
+            let pattern = match (entry, call) {
+                (Some(pattern), None) | (None, Some(pattern)) => pattern,
+                _ => anyhow::bail!("a trampoline is either an `entry` or a `call`"),
+            };
+            let placeholders = |pattern: &Pattern| [Unit::TargetHigh, Unit::TargetLow, Unit::Stub, Unit::Bank].map(|unit| pattern.count(unit));
+            ensure!(matches!(placeholders(pattern), [1, 1, 2, 0 | 1]), "a trampoline names its target with `hh ll`, its stub with `ss ss`, and its bank with `bb` if at all");
+            ensure!(placeholders(stub) == [0; 4] && !stub.0.is_empty(), "a trampoline stub is bytes and `..` only");
             let bank_of: FxHashMap<u64, u64> = places().filter(|(_, bytes)| stub.matches(bytes).is_some()).map(|(addr, _)| addr).zip(0..).collect();
-            for (addr, bytes) in places() {
-                if let Some(found) = entry.matches(bytes)
-                    && let Some(&bank) = bank_of.get(&u64::from(found.stub))
-                {
-                    trampolines.insert(addr, banking.address(bank, found.target));
-                }
+            let reached = |bytes: &[u8]| {
+                let found = pattern.matches(bytes)?;
+                let bank = *bank_of.get(&u64::from(found.stub))?;
+                Some(banking.address(found.bank.map_or(bank, u64::from), found.target))
+            };
+            if entry.is_some() {
+                trampolines.extend(places().filter_map(|(addr, bytes)| Some((addr, reached(bytes)?))));
+            } else {
+                // The instruction that calls is the one before the stub's address.
+                let call = pattern.0.iter().position(|&unit| unit == Unit::Stub).and_then(|stub| stub.checked_sub(1)).context("a call names its stub after an instruction")?;
+                let anywhere = sections.iter().filter(|section| section.executable).flat_map(|section| (0..section.data.len()).map(move |offset| (section.addr + offset as u64, &section.data[offset..])));
+                calls.extend(anywhere.filter_map(|(addr, bytes)| Some((addr + call as u64, reached(bytes)?))));
             }
         }
         banking.trampolines = trampolines;
+        banking.calls = calls;
         Ok(banking)
     }
 }
@@ -216,7 +246,7 @@ pub fn load(path: &Path) -> Result<Image> {
     let banking = layout.banking.map(|banking| banking.resolve(&sections)).transpose()?.unwrap_or_default();
     // A trampoline exists for each function that another bank calls.
     let mut exports = vectors.to_vec();
-    exports.extend(banking.trampolines.values());
+    exports.extend(banking.trampolines.values().chain(banking.calls.values()));
     exports.sort_unstable();
     exports.dedup();
 
@@ -274,5 +304,34 @@ mod tests {
         assert_eq!(trampolines, [(0x0A, 0x1_8010), (0x10, 0x8010), (0x16, 0x0020)]);
         // From bank 2: a call to an entry, to common code, and to code of its own.
         assert_eq!([banking.reach(0x2_9000, 0x000A), banking.reach(0x2_9000, 0x0030), banking.reach(0x2_9000, 0x9100)], [0x1_8010, 0x0030, 0x2_9100]);
+    }
+
+    #[test]
+    fn a_call_reaches_its_target_in_the_bank_it_names() {
+        let layout: BankingLayout = toml::from_str(
+            r#"
+            common = [[0x0000, 0x8000]]
+            [[trampoline]]
+            call = "78 ll 79 hh 7a bb 12 ss ss"
+            stub = "c0 b1 22"
+            "#,
+        )
+        .unwrap();
+        // The stub at 0x10. At 0x20, a call of 0x9000 in bank 2; at 0x30, the same bytes with a
+        // call of something else.
+        let mut common = vec![0; 0x40];
+        common[0x10..0x13].copy_from_slice(&[0xC0, 0xB1, 0x22]);
+        common[0x20..0x29].copy_from_slice(&[0x78, 0x00, 0x79, 0x90, 0x7A, 0x02, 0x12, 0x00, 0x10]);
+        common[0x30..0x39].copy_from_slice(&[0x78, 0x00, 0x79, 0x90, 0x7A, 0x02, 0x12, 0x00, 0x11]);
+        // In bank 2 at 0x8000, a call of 0x8123 in bank 1, and of the common address 0x0123.
+        let mut bank = vec![0x78, 0x23, 0x79, 0x81, 0x7A, 0x01, 0x12, 0x00, 0x10];
+        bank.extend([0x78, 0x23, 0x79, 0x01, 0x7A, 0x01, 0x12, 0x00, 0x10]);
+        let section = |addr, data| Section { name: String::new(), addr, data, file_offset: None, executable: true, writable: false };
+
+        let banking = layout.resolve(&[section(0, common), section(0x2_8000, bank)]).unwrap();
+        let mut calls: Vec<(u64, u64)> = banking.calls.iter().map(|(&call, &target)| (call, target)).collect();
+        calls.sort_unstable();
+        assert_eq!(calls, [(0x26, 0x2_9000), (0x2_8006, 0x1_8123), (0x2_800F, 0x0123)]);
+        assert!(banking.trampolines.is_empty());
     }
 }
