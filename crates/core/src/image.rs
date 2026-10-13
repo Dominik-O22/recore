@@ -131,8 +131,8 @@ pub struct Image {
     pub import_slots: FxHashMap<u64, String>,
     /// Exported function addresses from the dynamic symbol table. In a Mach-O image, also the
     /// methods its Objective-C metadata lists, which the runtime calls by name. In a raw image,
-    /// the entry points its layout lists after the first, the functions its trampolines reach,
-    /// and the stubs they go through.
+    /// the entry points its layout lists after the first, the interrupt vectors of an 8051,
+    /// the functions its trampolines reach, and the stubs they go through.
     pub exports: Vec<u64>,
     /// Names the image itself carries for addresses in it: exports, as written in the file. In
     /// a raw image, what its layout says the trampoline tables and stubs are.

@@ -66,6 +66,8 @@ class Program:
     # root or to a glue directory. The rest is common to all banks, as is SDCC's library, whose
     # helpers the compiler calls without switching banks.
     banks: dict[int, list[str]] = field(default_factory=dict)
+    # Addresses the hardware enters besides the reset and the interrupt vectors.
+    entries: list[int] = field(default_factory=list)
 
 
 def github(repository, commit, sha256):
@@ -105,10 +107,12 @@ CH554 = {"flags": ["--model-small", "--xram-size", "0x0300", "--xram-loc", "0x01
          "include": ["include"]}
 
 # The Cypress FX2's library, with the descriptors and the interrupt jump table where the chip
-# looks for them.
+# looks for them. The chip enters the table itself: it overwrites the low byte of the address
+# in two interrupt vectors with four times the number of what interrupted.
 FX2 = {"library": ["lib/*.c", "lib/interrupts/*.c", "lib/usbav.a51"], "include": ["include"],
        "flags": ["--model-small", "--code-size", "0x3c00", "--xram-size", "0x0200", "--xram-loc", "0x3c00",
-                 "-Wl-bDSCR_AREA=0x3e00", "-Wl-bINT2JT=0x3f00"]}
+                 "-Wl-bDSCR_AREA=0x3e00", "-Wl-bINT2JT=0x3f00"],
+       "entries": list(range(0x3F00, 0x3FB8, 4))}
 
 PROGRAMS = {
     "aes": Program("tiny-AES-c", ["aes.c", "test.c"], flags=["--model-large"], glue=["console"]),
@@ -235,13 +239,7 @@ def library_modules(map_file):
     return set(re.findall(r"\[ (\S+)\.rel \]", linked[1])) if len(linked) == 2 else set()
 
 
-def interrupts(cdb):
-    """The numbers of the interrupts the program has a handler for."""
-    functions = re.findall(r"^F:.*\),\w,\d+,\d+,(\d),(\d+),\d+$", cdb, re.M)
-    return sorted({int(number) for is_handler, number in functions if is_handler == "1"})
-
-
-def write_layout(name, memory, cdb, banked):
+def write_layout(name, memory, entries, banked):
     """Writes the image and the layout that loads it."""
     # The linker lets a segment run on past the end of its bank, into addresses that the next
     # bank's number and the common code's addresses name.
@@ -255,10 +253,8 @@ def write_layout(name, memory, cdb, banked):
         regions.append((len(image), end - start, start))
         image += bytes(memory.get(address, 0xFF) for address in range(start, end))
     (CORPUS / "image" / f"{name}.bin").write_bytes(image)
-    # Reset, then the vector of each interrupt that is handled: SDCC writes a jump there only
-    # for a handler that the unit with `main` declares.
-    entries = [0] + [vector for vector in (3 + 8 * number for number in interrupts(cdb)) if memory.get(vector) == 0x02]
-    layout = f'machine = "8051"\nentry = [{", ".join(f"{entry:#06x}" for entry in entries)}]\n'
+    # Reset. recore reads the interrupt vectors from their slots.
+    layout = f'machine = "8051"\nentry = [{", ".join(f"{entry:#06x}" for entry in [0, *entries])}]\n'
     for offset, length, address in regions:
         layout += (f'\n[[region]]\nfile = "../image/{name}.bin"\noffset = {offset:#x}\nlength = {length:#x}\n'
                    f"address = {address:#08x}\nexecutable = true\n")
@@ -326,11 +322,10 @@ def build(name, program):
         with ThreadPoolExecutor(JOBS) as pool:
             objects += own + list(pool.map(lambda source: compile_unit(source, work / "lib"), wanted))
 
-    cdb = (work / f"{name}.cdb").read_text()
     for suffix in ("cdb", "map"):
         shutil.copy(work / f"{name}.{suffix}", CORPUS / "debug" / f"{name}.{suffix}")
     (CORPUS / "debug" / f"{name}.rst").write_text("".join(obj.with_suffix(".rst").read_text() for obj in objects))
-    return write_layout(name, read_hex(work / f"{name}.ihx"), cdb, bool(banks))
+    return write_layout(name, read_hex(work / f"{name}.ihx"), program.entries, bool(banks))
 
 
 def main():

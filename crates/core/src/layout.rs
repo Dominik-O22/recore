@@ -53,8 +53,9 @@ use crate::image::{Banking, Format, Image, Machine, Section};
 #[serde(deny_unknown_fields)]
 struct Layout {
     machine: Machine,
-    /// Where execution starts: the reset address first, then any other the hardware enters,
-    /// such as interrupt vectors.
+    /// Where execution starts: the reset address first, then any other the hardware enters.
+    /// The interrupt vectors of an 8051 need no listing where they follow one another from
+    /// the first: see [`crate::i8051::interrupt_vectors`].
     entry: Vec<u64>,
     region: Vec<Region>,
     banking: Option<BankingLayout>,
@@ -264,6 +265,10 @@ pub fn load(path: &Path) -> Result<Image> {
     let mut exports = vectors.to_vec();
     exports.extend(banking.trampolines.values().chain(banking.calls.values()));
     exports.extend(machinery.iter().map(|&(addr, _)| addr).filter(|addr| banking.tables.binary_search_by_key(addr, |&(start, _)| start).is_err()));
+    // An 8051 is entered at its interrupt vectors, which the image itself shows.
+    if let Some(low) = sections.first().filter(|section| layout.machine == Machine::I8051 && section.addr == 0 && section.executable) {
+        exports.extend(crate::i8051::interrupt_vectors(&low.data));
+    }
     exports.sort_unstable();
     exports.dedup();
 

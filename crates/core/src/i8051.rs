@@ -281,6 +281,15 @@ fn jump_slots(bytes: &[u8], count: usize) -> Option<usize> {
     slots.chunks_exact(size).enumerate().all(fits).then_some(size)
 }
 
+/// The interrupt vectors in `code`, which lies at address 0, that hold a jump to a handler.
+/// The hardware enters interrupt N at `3 + 8 * N`. A program that handles interrupts fills the
+/// slots up to its last handler, each with an `LJMP` to one or with a `RETI`, so the first slot
+/// that holds neither is where its other code begins.
+pub fn interrupt_vectors(code: &[u8]) -> impl Iterator<Item = u64> + '_ {
+    let slots = (3..code.len()).step_by(8).take_while(|&slot| matches!(code[slot], 0x02 | 0x32));
+    slots.filter(|&slot| code[slot] == 0x02).map(|slot| slot as u64)
+}
+
 /// The 8051 and its descendants with the original instruction set.
 pub struct I8051;
 
@@ -708,6 +717,16 @@ mod tests {
         for &(bytes, addr, expected) in cases {
             assert_eq!(decoded(bytes, addr), expected, "{bytes:02x?} at {addr:#x}");
         }
+    }
+
+    #[test]
+    fn a_vector_is_a_slot_with_a_jump_before_the_first_that_is_no_vector() {
+        // Reset, then RETI at 0x03, LJMP at 0x0B and 0x13, and code from 0x1B that has the
+        // byte of an LJMP at 0x23.
+        let mut code = [0xFF; 0x28];
+        code[..4].copy_from_slice(&[0x02, 0x00, 0x1B, 0x32]);
+        (code[0x0B], code[0x13], code[0x1B], code[0x23]) = (0x02, 0x02, 0xE4, 0x02);
+        assert_eq!(interrupt_vectors(&code).collect::<Vec<_>>(), [0x0B, 0x13]);
     }
 
     #[test]

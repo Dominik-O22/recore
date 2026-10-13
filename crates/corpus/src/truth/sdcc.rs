@@ -97,8 +97,9 @@ pub fn extract(layout: &Path, cdb_path: &Path) -> Result<Truth> {
     // way to one.
     let is_thunk = |addr: u64| first(addr).and_then(|decoded| decoded.insn).is_some_and(|insn| matches!(I8051::flow(&insn, &Default::default(), &image), Some(Flow::Jump(_))));
     for (addr, label, area) in code_labels(&map) {
-        // Debug symbols, the linker's own, and constants: only code areas hold routines.
-        if label.contains('$') || !(area == "HOME" || area == "CSEG" || area.starts_with("GSINIT") || area.starts_with("BANK")) || !image.is_code(addr) {
+        // Debug symbols, the linker's own, and constants: only code areas hold routines. `INT2JT`
+        // is the FX2 library's table of jumps to interrupt handlers, which the chip enters.
+        if label.contains('$') || !(area == "HOME" || area == "CSEG" || area == "INT2JT" || area.starts_with("GSINIT") || area.starts_with("BANK")) || !image.is_code(addr) {
             continue;
         }
         let thunk = is_thunk(addr);
