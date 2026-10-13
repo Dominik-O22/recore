@@ -99,7 +99,7 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
 fn tool_usage(tool: &str) -> Option<String> {
     let tools = tools::list();
     let described = tools.as_array()?.iter().find(|described| described["name"] == tool)?;
-    let mut text = format!("recore-mcp {tool} <binary> [arguments]\n\n{}\n\n", described["description"].as_str()?);
+    let mut text = format!("recore-mcp {tool} <binary> [arguments]\n\n{}\n\n<binary>\n    The file to analyze, called `path` above.\n", described["description"].as_str()?);
     for (name, property) in described["inputSchema"]["properties"].as_object()?.iter().filter(|(name, _)| *name != "path") {
         text += &format!("--{name}\n    {}\n", property["description"].as_str().unwrap_or_default());
     }

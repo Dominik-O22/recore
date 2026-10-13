@@ -811,6 +811,7 @@ dependencies = [
  "anyhow",
  "recore",
  "recore-decomp",
+ "regex",
  "serde",
  "serde_json",
 ]

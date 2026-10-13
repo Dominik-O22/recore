@@ -136,10 +136,11 @@ impl Cache {
     }
 
     /// Two binaries at once, for a tool that compares them.
-    pub fn pair(&mut self, first: &Path, second: &Path) -> Result<(&Binary, &Binary)> {
+    pub fn pair(&mut self, first: &Path, second: &Path) -> Result<(&mut Binary, &mut Binary)> {
         anyhow::ensure!(first != second, "{} is given twice", first.display());
         self.get(first)?;
         self.get(second)?;
-        Ok((&self.binaries[1], &self.binaries[0]))
+        let (second, first) = self.binaries.split_at_mut(1);
+        Ok((&mut first[0], &mut second[0]))
     }
 }

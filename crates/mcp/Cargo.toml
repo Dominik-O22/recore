@@ -5,6 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
+regex = "1.13.1"
 anyhow = "1.0.104"
 recore = { version = "0.1.0", path = "../core" }
 recore-decomp = { version = "0.1.0", path = "../decomp" }

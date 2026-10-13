@@ -192,15 +192,23 @@ fn a_patch_shows_as_the_functions_it_touched() {
     // Two builds of the decompiler's fixture: the later one has a check in `total`, which
     // calls a new function, and neither has a name to go by.
     let data = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data");
-    let diff = Client::start().tool("diff", json!({ "path": format!("{data}/types.elf"), "to": format!("{data}/types-patched.elf") })).unwrap();
+    let mut client = Client::start();
+    let diff = client.tool("diff", json!({ "path": format!("{data}/types.elf"), "to": format!("{data}/types-patched.elf") })).unwrap();
     assert_eq!(
         diff,
         "3 functions before, 4 after: 2 the same, 1 changed, 0 removed, 1 added\n\n\
-         changed, as before -> after with bytes of code\n\
+         changed, as before -> after with bytes of code; `function` with one of them shows how its C differs\n\
          0x401000 39 -> 0x40100b 47  (called from the same place)\n\
          \x20   now calls 0x401000\n\n\
          removed: none\n\n\
          added\n\
          0x401000 11\n"
     );
+    // The one function, line by line: the check is new, and the loop it guards is not. The
+    // earlier build has debug information and the later has none, so the loop's body reads
+    // differently in each.
+    let lines = client.tool("diff", json!({ "path": format!("{data}/types.elf"), "to": format!("{data}/types-patched.elf"), "function": "0x401000" })).unwrap();
+    assert!(lines.starts_with("0x401000 -> 0x40100b\n"), "{lines}");
+    assert!(lines.contains("\n+   if (100 < param_2) {\n"), "{lines}");
+    assert!(lines.contains("\n    do {\n"), "{lines}");
 }
