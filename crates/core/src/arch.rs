@@ -82,6 +82,11 @@ pub trait Arch: 'static {
     /// that runs off the end of its function is code that never returns.
     const RUNS_ON: bool = false;
 
+    /// Whether unreached code counts as functions on the strength of dividing into them with
+    /// nothing left over, for a machine whose code shows no other sign of where one starts:
+    /// no alignment, no padding between functions, no common opening.
+    const TILES_GAPS: bool = false;
+
     /// Decodes consecutive instructions from `bytes`, which are loaded at `addr`.
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Self::Insn>>;
 

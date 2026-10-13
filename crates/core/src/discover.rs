@@ -813,6 +813,59 @@ impl<A: Arch> Explorer<'_, A> {
         false
     }
 
+    /// Whether the unreached bytes from `addr` to the next known code divide into functions with
+    /// nothing left over: decoded one after the other they are all instructions, each stretch
+    /// ends in a return or a jump, the last of them where the known code begins, every jump
+    /// lands on one of the instructions or on known code, and every call on a function. Bytes
+    /// that are data seldom do all of that.
+    fn tiles_gap(&self, index: usize, addr: u64) -> bool {
+        let region = &self.regions[index];
+        let section = region.section;
+        let known = |at: u64| self.region_index(at).is_some_and(|index| self.regions[index].insn_len[(at - self.regions[index].section.addr) as usize] != 0);
+        let state = A::State::default();
+        // Where each instruction and each stretch begins, in order, and where the code goes.
+        let (mut instructions, mut stretches, mut jumps, mut calls) = (Vec::new(), vec![addr], Vec::new(), Vec::new());
+        let mut ended = false;
+        for decoded in A::decode(&section.data[(addr - section.addr) as usize..], addr) {
+            if known(decoded.addr) {
+                break;
+            }
+            let Some(insn) = decoded.insn else { return false };
+            let covers = (decoded.addr - section.addr) as usize..(decoded.next_addr() - section.addr) as usize;
+            if (decoded.addr + 1..decoded.next_addr()).any(known) || region.flags[covers].iter().any(|flags| flags & IN_TABLE != 0) {
+                return false;
+            }
+            instructions.push(decoded.addr);
+            ended = match A::flow(&insn, &state, self.image) {
+                Some(Flow::Halt) => return false,
+                Some(Flow::Call(target)) => {
+                    calls.push(target);
+                    false
+                }
+                Some(Flow::Branch(target)) => {
+                    jumps.push(target);
+                    false
+                }
+                Some(Flow::Jump(target)) => {
+                    jumps.push(target);
+                    true
+                }
+                Some(Flow::Return | Flow::JumpIndirect(_)) => true,
+                Some(Flow::CallIndirect(_)) | None => false,
+            };
+            if ended {
+                // A lone `ret` is more often the tail of the function before it.
+                if decoded.next_addr() - stretches[stretches.len() - 1] < 3 {
+                    return false;
+                }
+                stretches.push(decoded.next_addr());
+            }
+        }
+        ended
+            && jumps.iter().all(|target| instructions.binary_search(target).is_ok() || known(*target))
+            && calls.iter().all(|target| self.starts.contains_key(target) || stretches.binary_search(target).is_ok())
+    }
+
     fn in_table(&self, addr: u64) -> bool {
         self.tables.iter().any(|(_, table)| addr >= table.address && addr < table.address + table.entry_size * table.entries.len() as u64)
     }
@@ -948,7 +1001,8 @@ impl<A: Arch> Explorer<'_, A> {
                         let unwound_elsewhere = !self.frames.is_empty() && self.frame_of(addr).is_none();
                         let whole = after_break
                             && (unwound_elsewhere && self.is_whole_function(index, addr, false)
-                                || aligned && self.is_whole_function(index, addr, true));
+                                || aligned && self.is_whole_function(index, addr, true)
+                                || A::TILES_GAPS && self.tiles_gap(index, addr));
                         is_start = (aligned_after_break || opens || whole) && !self.inside_frame(addr);
                         if !is_start {
                             // Inside an unwind entry the bytes belong to a function, so they are

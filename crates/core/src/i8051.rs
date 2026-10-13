@@ -278,6 +278,7 @@ impl Arch for I8051 {
     const FUNCTION_ALIGN: u64 = 1;
     const ALIGNMENT_IS_EVIDENCE: bool = false;
     const RUNS_ON: bool = true;
+    const TILES_GAPS: bool = true;
 
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> {
         let mut offset = 0;
@@ -613,7 +614,8 @@ mod tests {
         code.extend([0x12, 0x00, 0x20, 0x22, 0x22]);
         code.resize(0x20, 0x00);
         code.push(0x22);
-        code.resize(0x100, 0x00);
+        // The opcode that is no instruction keeps the routine apart from the code.
+        code.resize(0x100, 0xA5);
         code.extend(CCASE);
         let image = image(&code, 0);
         let analysis = crate::analyze(&image);
@@ -629,7 +631,7 @@ mod tests {
     fn a_call_that_stores_a_constant_returns_past_it() {
         // 0x0000: LCALL 0x0100; the constant, whose bytes would be ACALL 0x0122 and more; RET.
         let mut code = vec![0x12, 0x01, 0x00, 0x11, 0x22, 0x33, 0x44, 0x22];
-        code.resize(0x100, 0x00);
+        code.resize(0x100, 0xA5);
         code.extend(STORE.iter().enumerate().map(|(at, byte)| byte.unwrap_or_else(|| [0x01, 0x17][(at - 1) % 3])));
         code.extend(STORE_BYTE);
         let analysis = crate::analyze(&image(&code, 0));
@@ -648,6 +650,20 @@ mod tests {
         let analysis = crate::analyze(&image);
         let functions: Vec<(u64, &[(u64, u64)])> = analysis.functions.iter().map(|function| (function.addr, function.ranges.as_slice())).collect();
         assert_eq!(functions, [(0x0000, &[(0x0000, 0x000B)][..]), (0x000B, &[(0x000B, 0x000F)][..]), (0x000F, &[(0x000F, 0x0010)][..])]);
+    }
+
+    #[test]
+    fn unreached_code_that_divides_into_functions_is_functions() {
+        let starts = |code: &[u8]| crate::analyze(&image(code, 0)).functions.iter().map(|function| function.addr).collect::<Vec<_>>();
+        // LCALL 0x0010; RET. Then what nothing refers to: CLR A; MOV R7, A; RET, then
+        // MOV A, #1; LCALL 0x0010; RET, then CLR A; MOV R7, A; RET. At 0x0010, RET.
+        let code = [0x12, 0x00, 0x10, 0x22, 0xE4, 0xFF, 0x22, 0x74, 0x01, 0x12, 0x00, 0x10, 0x22, 0xE4, 0xFF, 0x22, 0x22];
+        assert_eq!(starts(&code), [0x0000, 0x0004, 0x0007, 0x000D, 0x0010]);
+        // The same with a call of no function in the middle, and with bytes left over at the end.
+        let code = [0x12, 0x00, 0x10, 0x22, 0xE4, 0xFF, 0x22, 0x74, 0x01, 0x12, 0x00, 0x0E, 0x22, 0xE4, 0xFF, 0x22, 0x22];
+        assert_eq!(starts(&code), [0x0000, 0x0010]);
+        let code = [0x12, 0x00, 0x10, 0x22, 0xE4, 0xFF, 0x22, 0x74, 0x01, 0x12, 0x00, 0x10, 0x22, 0xE4, 0xFF, 0xFF, 0x22];
+        assert_eq!(starts(&code), [0x0000, 0x0010]);
     }
 
     #[test]

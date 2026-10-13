@@ -153,9 +153,13 @@ PROGRAMS = {
                                    "-DWITH_NUMBERS", "-DWITH_FLOAT"],
                             glue=["console", "libtest"]),
     # Banked. With `--model-huge` every function is called through the bank switch.
-    "fatfs_banked": Program("fatfs", ["source/ff.c", "source/ffunicode.c"], include=["source"],
-                            flags=["--model-huge", "--stack-auto"], glue=["console", "fatfs", "banked"],
-                            banks={1: ["source/ff.c"], 2: ["source/ffunicode.c", "diskio.c"]}),
+    "coremark_banked": Program("coremark", ["core_list_join.c", "core_main.c", "core_matrix.c", "core_state.c",
+                                            "core_util.c"],
+                               flags=["--model-huge", "--stack-auto", "-DITERATIONS=1", "-DTOTAL_DATA_SIZE=600",
+                                      "-DFLAGS_STR=\"--model-huge\""],
+                               glue=["console", "coremark", "banked"],
+                               banks={1: ["core_list_join.c"], 2: ["core_matrix.c"],
+                                      3: ["core_state.c", "core_util.c"]}),
     "uip_banked": Program("uip", ["uip/psock.c", "uip/timer.c", "uip/uip.c", "uip/uip_arp.c", "uip/uiplib.c",
                                   "lib/memb.c", "apps/webserver/http-strings.c", "apps/webserver/httpd*.c",
                                   "unix/main.c"],
@@ -239,6 +243,10 @@ def interrupts(cdb):
 
 def write_layout(name, memory, cdb, banked):
     """Writes the image and the layout that loads it."""
+    # The linker lets a segment run on past the end of its bank, into addresses that the next
+    # bank's number and the common code's addresses name.
+    if any(address >> 16 and address & 0xFFFF < BANK_START for address in memory):
+        raise RuntimeError("a bank's code does not fit it")
     # Unprogrammed memory reads as 0xFF.
     regions, image = [], bytearray()
     for bank in sorted({address >> 16 for address in memory}):
