@@ -54,6 +54,9 @@ pub struct Table {
     /// Whether the entry count is known. Otherwise `entries` runs to the first value that is not
     /// a plausible target and may overshoot into the next table.
     pub bounded: bool,
+    /// For a table that lies in the code straight after its jump: the address after its last
+    /// byte, where the code goes on. Nothing from `address` to there is an instruction.
+    pub inline_end: Option<u64>,
 }
 
 pub trait Arch: 'static {

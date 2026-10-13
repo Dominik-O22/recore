@@ -18,8 +18,8 @@ struct Region<'a> {
     section: &'a Section,
     /// Per byte, the length of the decoded instruction that begins there, or zero.
     insn_len: Vec<u8>,
-    /// Per byte, what is known about the address: [`FOLLOWS_BREAK`], [`ASKED_AS_START`] and
-    /// [`REFERENCED`]. One array, so that looking up a call's target touches one place in memory.
+    /// Per byte, what is known about the address: [`FOLLOWS_BREAK`], [`ASKED_AS_START`],
+    /// [`REFERENCED`] and [`IN_TABLE`]. One array, so that looking up a call's target touches one place in memory.
     flags: Vec<u8>,
     /// Per page, the time `insn_len` or a [`FOLLOWS_BREAK`] flag last changed in it, on the
     /// explorer's clock.
@@ -39,6 +39,8 @@ const FOLLOWS_BREAK: u8 = 1;
 const ASKED_AS_START: u8 = 2;
 /// Something calls the address, takes it, exports it, or points to it from data.
 const REFERENCED: u8 = 4;
+/// The byte is part of a jump table that lies in the code after its jump.
+const IN_TABLE: u8 = 8;
 
 /// The gap scan works through a section in pages of this many bytes.
 const PAGE: usize = 4096;
@@ -138,6 +140,9 @@ pub struct Discovery {
     pub uncertain_refs: Vec<(u64, u64, bool)>,
     /// Every stretch of decoded instructions, as sorted `[start, end)` ranges.
     pub code: Vec<(u64, u64)>,
+    /// `[start, end)` of every jump table that lies in the code straight after its jump,
+    /// sorted. A function's code goes on after it.
+    pub inline_tables: Vec<(u64, u64)>,
 }
 
 /// A set of addresses, for asking of very many ranges whether any member lies inside. Most
@@ -562,6 +567,16 @@ impl<A: Arch> Explorer<'_, A> {
             table.entries.iter().filter(|&&target| Some(target) != function_end).map(|&addr| Pending { addr, state: at_case, trusted, speculative }),
         );
         self.unresolved.remove(&jump);
+        // Nothing in a table among the code is an instruction, whatever its bytes look like.
+        if let Some(end) = table.inline_end
+            && let Some(index) = self.region_index(table.address)
+        {
+            let clock = self.clock;
+            let region = &mut self.regions[index];
+            let (start, end) = ((table.address - region.section.addr) as usize, ((end - region.section.addr) as usize).min(region.flags.len()));
+            region.flags[start..end].iter_mut().for_each(|flags| *flags |= IN_TABLE);
+            (start..end).step_by(PAGE).chain([end.saturating_sub(1)]).for_each(|offset| region.touch(offset, clock));
+        }
         // Tables sit back to back, so each table's address ends the one before it.
         self.data_refs.push(table.address);
         if !speculative {
@@ -858,6 +873,10 @@ impl<A: Arch> Explorer<'_, A> {
                         offset = self.regions[index].end_of_run(offset);
                         continue;
                     }
+                    if self.regions[index].flags[offset] & IN_TABLE != 0 {
+                        offset += 1;
+                        continue;
+                    }
                     // Relocated pointers in a code section are a jump table. Step over the whole
                     // table; what follows it cannot be fallen into.
                     if self.image.data_in_code && self.pointer_slots.contains_key(&addr) {
@@ -994,7 +1013,10 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
     let _phase = phase::scope("discover/code ranges");
     let code = explorer.code_ranges();
     let uncertain_refs = std::mem::take(&mut explorer.uncertain_ref_sites);
-    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code }
+    let mut inline_tables: Vec<(u64, u64)> = explorer.tables.iter().filter_map(|(_, table)| Some((table.address, table.inline_end?))).collect();
+    inline_tables.sort_unstable();
+    inline_tables.dedup();
+    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code, inline_tables }
 }
 
 /// What the image's relative relocations say, in the forms exploring looks them up.

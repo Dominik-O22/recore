@@ -568,7 +568,7 @@ impl Arch for Arm64 {
                     .map_while(|i| pointer_slots.get(&(table + 8 * i)).copied())
                     .take_while(|&target| is_target(target))
                     .collect();
-                return (!entries.is_empty()).then_some(Table { address: table, entry_size: 8, entries, bounded: true });
+                return (!entries.is_empty()).then_some(Table { address: table, entry_size: 8, entries, bounded: true, inline_end: None });
             }
             _ => return None,
         };
@@ -586,7 +586,7 @@ impl Arch for Arm64 {
             }
             entries.push(target);
         }
-        (!entries.is_empty()).then_some(Table { address: table, entry_size: size, entries, bounded: max_index.is_some() })
+        (!entries.is_empty()).then_some(Table { address: table, entry_size: size, entries, bounded: max_index.is_some(), inline_end: None })
     }
 
     fn marked_jump_target(image: &Image, target: u64) -> Option<bool> {

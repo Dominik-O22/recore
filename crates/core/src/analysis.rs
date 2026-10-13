@@ -34,30 +34,46 @@ struct Function {
     instructions: u64,
 }
 
-/// Decodes `[start, end)` linearly and keeps its control-flow instructions. With `trim`, `end` is
-/// only an upper bound and the function ends before any trailing padding.
-fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool) -> Function {
+/// The parts of `[start, end)` that are code: all of it but the jump tables in `tables` that
+/// lie among it. `tables` is sorted `[start, end)` ranges.
+fn code_pieces(start: u64, end: u64, tables: &[(u64, u64)]) -> impl Iterator<Item = (u64, u64)> {
+    let mut tables = tables[tables.partition_point(|&(table, _)| table < start)..].iter().take_while(move |&&(table, _)| table < end);
+    let mut next = Some(start);
+    std::iter::from_fn(move || {
+        let from = next.filter(|&from| from < end || from == start)?;
+        let (to, after) = tables.next().map_or((end, None), |&(table, after)| (table, Some(after)));
+        next = after;
+        Some((from, to))
+    })
+}
+
+/// Decodes `[start, end)` linearly, stepping over `tables`, and keeps its control-flow
+/// instructions. With `trim`, `end` is only an upper bound and the function ends before any
+/// trailing padding.
+fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool, tables: &[(u64, u64)]) -> Function {
     let mut function = Function { start, end, controls: Vec::new(), instructions: 0 };
-    let Some(bytes) = image.bytes_from(start) else {
-        return function;
-    };
-    let bytes = &bytes[..bytes.len().min((end - start) as usize)];
-    let mut state = A::State::default();
     let mut body_end = start;
-    for decoded in A::decode(bytes, start) {
-        let Some(insn) = decoded.insn else { continue };
-        function.instructions += 1;
-        if !A::is_padding(&insn) {
-            body_end = decoded.next_addr();
-        }
-        match A::flow(&insn, &state, image) {
-            Some(flow) => {
-                function.controls.push(Control { addr: decoded.addr, next: decoded.next_addr(), flow });
-                // The state only matters for resolving slots, so a fresh one after any control
-                // transfer is enough for a linear pass.
-                state = A::State::default();
+    for (from, to) in code_pieces(start, end, tables) {
+        let Some(bytes) = image.bytes_from(from) else {
+            return function;
+        };
+        let bytes = &bytes[..bytes.len().min((to - from) as usize)];
+        let mut state = A::State::default();
+        for decoded in A::decode(bytes, from) {
+            let Some(insn) = decoded.insn else { continue };
+            function.instructions += 1;
+            if !A::is_padding(&insn) {
+                body_end = decoded.next_addr();
             }
-            None => A::step(&mut state, &insn),
+            match A::flow(&insn, &state, image) {
+                Some(flow) => {
+                    function.controls.push(Control { addr: decoded.addr, next: decoded.next_addr(), flow });
+                    // The state only matters for resolving slots, so a fresh one after any control
+                    // transfer is enough for a linear pass.
+                    state = A::State::default();
+                }
+                None => A::step(&mut state, &insn),
+            }
         }
     }
     if trim {
@@ -254,32 +270,34 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program) -> Wa
 /// Where the code of a function without a frame ends, for images that keep data among the
 /// code: the first unconditional terminator that no earlier forward branch jumps past. Decoding
 /// up to the next function instead would read a trailing jump table as instructions.
-fn code_end<A: Arch>(image: &Image, start: u64, bound: u64, tables: &FxHashMap<u64, &[u64]>) -> u64 {
-    let Some(bytes) = image.bytes_from(start) else { return start };
-    let bytes = &bytes[..bytes.len().min((bound - start) as usize)];
+fn code_end<A: Arch>(image: &Image, start: u64, bound: u64, tables: &FxHashMap<u64, &[u64]>, inline_tables: &[(u64, u64)]) -> u64 {
     let state = A::State::default();
     let mut furthest_target = start;
-    for decoded in A::decode(bytes, start) {
-        let Some(insn) = decoded.insn else { return decoded.addr };
-        match A::flow(&insn, &state, image) {
-            Some(Flow::Branch(target)) if target > decoded.addr && target < bound => {
-                furthest_target = furthest_target.max(target);
-            }
-            Some(Flow::Jump(target)) if target > decoded.addr && target < bound && decoded.next_addr() <= furthest_target => {
-                furthest_target = furthest_target.max(target);
-            }
-            // The cases of a resolved switch come after the jump that dispatches to them.
-            Some(Flow::JumpIndirect(None)) if tables.contains_key(&decoded.addr) => {
-                let cases = tables[&decoded.addr].iter().copied().filter(|&target| target > decoded.addr && target < bound);
-                furthest_target = furthest_target.max(cases.max().unwrap_or(furthest_target));
-                if decoded.next_addr() > furthest_target {
+    for (from, to) in code_pieces(start, bound, inline_tables) {
+        let Some(bytes) = image.bytes_from(from) else { return from };
+        let bytes = &bytes[..bytes.len().min((to - from) as usize)];
+        for decoded in A::decode(bytes, from) {
+            let Some(insn) = decoded.insn else { return decoded.addr };
+            match A::flow(&insn, &state, image) {
+                Some(Flow::Branch(target)) if target > decoded.addr && target < bound => {
+                    furthest_target = furthest_target.max(target);
+                }
+                Some(Flow::Jump(target)) if target > decoded.addr && target < bound && decoded.next_addr() <= furthest_target => {
+                    furthest_target = furthest_target.max(target);
+                }
+                // The cases of a resolved switch come after the jump that dispatches to them.
+                Some(Flow::JumpIndirect(None)) if tables.contains_key(&decoded.addr) => {
+                    let cases = tables[&decoded.addr].iter().copied().filter(|&target| target > decoded.addr && target < bound);
+                    furthest_target = furthest_target.max(cases.max().unwrap_or(furthest_target));
+                    if decoded.next_addr() > furthest_target {
+                        return decoded.next_addr();
+                    }
+                }
+                Some(Flow::Jump(_) | Flow::JumpIndirect(_) | Flow::Return | Flow::Halt) if decoded.next_addr() > furthest_target => {
                     return decoded.next_addr();
                 }
+                _ => {}
             }
-            Some(Flow::Jump(_) | Flow::JumpIndirect(_) | Flow::Return | Flow::Halt) if decoded.next_addr() > furthest_target => {
-                return decoded.next_addr();
-            }
-            _ => {}
         }
     }
     bound
@@ -404,6 +422,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         }
     }
 
+    let inline_tables = std::mem::take(&mut discovery.inline_tables);
+    let inline_tables = inline_tables.as_slice();
     let (starts, functions, chunks, noreturn, controls, extents) = loop {
         _phase = phase::scope("decode functions");
         let starts: Vec<u64> = discovery.starts.keys().copied().collect();
@@ -411,14 +431,14 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .par_iter()
             .enumerate()
             .map(|(index, &start)| match frame_end.get(&start) {
-                Some(&end) => decode::<A>(image, start, end, false),
+                Some(&end) => decode::<A>(image, start, end, false, inline_tables),
                 None => {
                     let section_end = image.section_at(start).map_or(start, |s| s.end());
                     let mut bound = starts.get(index + 1).copied().unwrap_or(section_end).min(section_end);
                     if image.data_in_code {
-                        bound = code_end::<A>(image, start, bound, &tables);
+                        bound = code_end::<A>(image, start, bound, &tables, inline_tables);
                     }
-                    decode::<A>(image, start, bound, true)
+                    decode::<A>(image, start, bound, true, inline_tables)
                 }
             })
             .collect();
@@ -429,7 +449,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         _phase = phase::scope("decode chunks");
         let chunks: Vec<Function> = if image.data_in_code {
             let covered: Vec<(u64, u64)> = functions.iter().map(|f| (f.start, f.end)).collect();
-            uncovered(&discovery.code, &covered).into_iter().map(|(start, end)| decode::<A>(image, start, end, false)).collect()
+            uncovered(&discovery.code, &covered).into_iter().map(|(start, end)| decode::<A>(image, start, end, false, inline_tables)).collect()
         } else {
             Vec::new()
         };
@@ -790,7 +810,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .iter()
             .map(|f| AnalyzedFunction {
                 addr: f.start,
-                ranges: std::iter::once((f.start, f.end)).chain(extra_ranges.get(&f.start).into_iter().flatten().copied()).collect(),
+                ranges: code_pieces(f.start, f.end, inline_tables).chain(extra_ranges.get(&f.start).into_iter().flatten().copied()).collect(),
                 noreturn: noreturn.contains(&f.start),
                 thunk: thunk_target(f).is_some(),
                 origin: discovery.starts[&f.start],
