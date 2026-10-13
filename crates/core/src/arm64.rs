@@ -504,7 +504,8 @@ impl Arch for Arm64 {
     }
 
     fn field_use(insn: &Insn) -> Option<(u64, FieldUse)> {
-        let offset = insn.access_offset().filter(|_| insn.rn() != 31)?;
+        // Not from the stack pointer or the frame pointer, which reach the function's own variables.
+        let offset = insn.access_offset().filter(|_| !matches!(insn.rn(), 29 | 31))?;
         // Bit 22 tells a load from a store, in the single and in the paired forms alike.
         Some((offset, if insn.word >> 22 & 1 == 1 { FieldUse::Read } else { FieldUse::Write }))
     }

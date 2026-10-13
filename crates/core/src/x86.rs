@@ -125,7 +125,10 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
 
     fn field_use(insn: &Instruction) -> Option<(u64, FieldUse)> {
         let base = insn.memory_base();
-        let stack = matches!(base.full_register(), Register::RSP | Register::RBP | Register::RIP | Register::None);
+        // A frame pointer reaches the function's own variables below it. Code built without
+        // one uses the register as any other, and then with offsets that are not negative.
+        let below_frame = base.full_register() == Register::RBP && (insn.memory_displacement64() as i64) < 0;
+        let stack = below_frame || matches!(base.full_register(), Register::RSP | Register::RIP | Register::None);
         if stack || insn.memory_index() != Register::None || !insn.op_kinds().any(|kind| kind == OpKind::Memory) {
             return None;
         }
