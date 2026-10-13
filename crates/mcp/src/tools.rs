@@ -620,6 +620,7 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
         Machine::X86 => "x86 (32-bit)",
         Machine::X86_64 => "x86-64",
         Machine::Aarch64 => "AArch64",
+        Machine::I8051 => "8051",
     };
     let mut out = String::new();
     writeln!(out, "{}: {format}, {machine}, image base {:#x}, entry {:#x}", image.name, image.base, image.entry)?;
@@ -634,6 +635,9 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
         analysis.strings.len(),
         analysis.jump_tables.len(),
     )?;
+    if let Some(banking) = recore::i8051::banking_summary(image, analysis) {
+        writeln!(out, "{banking}")?;
+    }
     writeln!(out, "analyzed in {:.0} ms, kept until the file changes", binary.analysis_ms)?;
     let edits = &binary.edits;
     writeln!(out, "edits: {} names, {} named variables, {} comments, {} declarations, {} typed data, saved in {}", edits.names.len(), edits.locals.values().map(|names| names.len()).sum::<usize>(), edits.comments.len(), edits.declarations.len(), edits.types.len(), binary.edits_file()?.display())?;

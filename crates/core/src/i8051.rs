@@ -1,0 +1,616 @@
+//! 8051 support, decoded directly from the one to three bytes of each instruction.
+//!
+//! Code addresses are 16 bits wide. Larger programs are banked, and [`Banking`] says where a
+//! 16-bit target lies: a code address here is `bank << 16 | address`. The 8051 has address
+//! spaces besides code, which get ranges of their own far above any bank: [`XDATA`], [`IDATA`]
+//! and [`SFR`].
+//!
+//! [`Banking`]: crate::image::Banking
+
+use rustc_hash::FxHashMap;
+
+use crate::arch::{Arch, Decoded, Flow, Table};
+use crate::image::{Image, Machine};
+use crate::report::Analysis;
+
+/// External data memory, reached through `DPTR`: 64 KB from here.
+pub const XDATA: u64 = 1 << 32;
+/// Internal data memory: 256 bytes from here, of which the first 128 are also reached by
+/// direct addressing.
+pub const IDATA: u64 = 2 << 32;
+/// The special function registers, at their direct addresses 0x80 to 0xFF from here.
+pub const SFR: u64 = 3 << 32;
+
+/// `[start, end)` of the memory an 8051 program has besides its code, none of it in the image.
+pub fn memory() -> Vec<(u64, u64)> {
+    vec![(XDATA, XDATA + 0x1_0000), (IDATA, IDATA + 0x100), (SFR + 0x80, SFR + 0x100)]
+}
+
+/// The direct addresses of the two halves of `DPTR`.
+const DPL: u8 = 0x82;
+const DPH: u8 = 0x83;
+
+/// Bytes in the instruction each opcode begins, or zero for 0xA5, the one opcode that is not
+/// an instruction.
+#[rustfmt::skip]
+const LENGTH: [u8; 256] = [
+ // x0 x1 x2 x3 x4 x5 x6 x7 x8 x9 xA xB xC xD xE xF
+    1, 2, 3, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 0x: NOP AJMP LJMP RR INC
+    3, 2, 3, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 1x: JBC ACALL LCALL RRC DEC
+    3, 2, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 2x: JB AJMP RET RL ADD
+    3, 2, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 3x: JNB ACALL RETI RLC ADDC
+    2, 2, 2, 3, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 4x: JC AJMP ORL
+    2, 2, 2, 3, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 5x: JNC ACALL ANL
+    2, 2, 2, 3, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 6x: JZ AJMP XRL
+    2, 2, 2, 1, 2, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, // 7x: JNZ ACALL ORL JMP MOV
+    2, 2, 2, 1, 1, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, // 8x: SJMP AJMP ANL MOVC DIV MOV
+    3, 2, 2, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 9x: MOV ACALL MOV MOVC SUBB
+    2, 2, 2, 1, 1, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, // Ax: ORL AJMP MOV INC MUL - MOV
+    2, 2, 2, 1, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, // Bx: ANL ACALL CPL CPL CJNE
+    2, 2, 2, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // Cx: PUSH AJMP CLR CLR SWAP XCH
+    2, 2, 2, 1, 1, 3, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, // Dx: POP ACALL SETB SETB DA DJNZ XCHD DJNZ
+    1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // Ex: MOVX AJMP MOVX CLR MOV
+    1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // Fx: MOVX ACALL MOVX CPL MOV
+];
+
+/// One instruction and where it sits, which every jump but `LJMP` needs for its target.
+#[derive(Clone, Copy)]
+pub struct Insn {
+    addr: u64,
+    /// The opcode and its operand bytes. Those the instruction lacks are zero.
+    bytes: [u8; 3],
+}
+
+/// How an instruction names a place in the 16-bit code space.
+enum Transfer {
+    Call,
+    Jump,
+    Branch,
+}
+
+impl Insn {
+    fn opcode(self) -> u8 {
+        self.bytes[0]
+    }
+
+    /// The 16-bit address after the instruction, which relative and in-page targets count from.
+    fn next(self) -> u16 {
+        (self.addr as u16).wrapping_add(u16::from(LENGTH[usize::from(self.opcode())]))
+    }
+
+    /// A direct jump, call or conditional branch, and the 16-bit address it names.
+    fn transfer(self) -> Option<(Transfer, u16)> {
+        let [opcode, first, second] = self.bytes;
+        let absolute = u16::from_be_bytes([first, second]);
+        // `AJMP` and `ACALL` keep the top five bits of the address and carry the other eleven.
+        let in_page = self.next() & 0xF800 | u16::from(opcode >> 5) << 8 | u16::from(first);
+        let relative = |offset: u8| self.next().wrapping_add_signed(i16::from(offset as i8));
+        Some(match opcode {
+            0x02 => (Transfer::Jump, absolute),
+            0x12 => (Transfer::Call, absolute),
+            _ if opcode & 0x1F == 0x01 => (Transfer::Jump, in_page),
+            _ if opcode & 0x1F == 0x11 => (Transfer::Call, in_page),
+            0x80 => (Transfer::Jump, relative(first)),
+            // JC, JNC, JZ, JNZ, and DJNZ on a register.
+            0x40 | 0x50 | 0x60 | 0x70 | 0xD8..=0xDF => (Transfer::Branch, relative(first)),
+            // JBC, JB, JNB, CJNE, and DJNZ on a direct address: the offset is the third byte.
+            0x10 | 0x20 | 0x30 | 0xB4..=0xBF | 0xD5 => (Transfer::Branch, relative(second)),
+            _ => return None,
+        })
+    }
+
+    /// The direct address or the bit the instruction names in its second byte, as the address of
+    /// the byte it is in: internal data below 0x80, a special function register from there.
+    fn direct(self) -> Option<u64> {
+        let [opcode, first, _] = self.bytes;
+        let byte = |direct: u8| if direct < 0x80 { IDATA + u64::from(direct) } else { SFR + u64::from(direct) };
+        match opcode {
+            // The bits below 0x80 are those of the bytes from 0x20; the others are the bits of
+            // every eighth register.
+            0x10 | 0x20 | 0x30 | 0x72 | 0x82 | 0x92 | 0xA0 | 0xA2 | 0xB0 | 0xB2 | 0xC2 | 0xD2 => Some(byte(if first < 0x80 { 0x20 + first / 8 } else { first & 0xF8 })),
+            0x42 | 0x43 | 0x52 | 0x53 | 0x62 | 0x63 | 0x86..=0x8F | 0xA6..=0xAF | 0xC0 | 0xD0 => Some(byte(first)),
+            _ if opcode & 0x0F == 0x05 => Some(byte(first)),
+            _ => None,
+        }
+    }
+
+    /// Whether the instruction may change `DPTR` other than by loading or incrementing it: it
+    /// names one of the two registers that are its halves.
+    fn touches_dptr(self) -> bool {
+        let halves = [SFR + u64::from(DPL), SFR + u64::from(DPH)];
+        // `MOV direct, direct` names its destination in the third byte.
+        self.direct().is_some_and(|direct| halves.contains(&direct)) || self.opcode() == 0x85 && [DPL, DPH].contains(&self.bytes[2])
+    }
+}
+
+/// What is known of the registers on a path.
+#[derive(Clone, Copy, Default)]
+pub struct State {
+    dptr: Option<u16>,
+    /// The number `A` was just compared with by `CJNE A, #n`, which leaves carry set when `A`
+    /// is the smaller.
+    compared: Option<u8>,
+    /// A number the index in `A` was found to be below, and has only been scaled since.
+    below: Option<u8>,
+    /// The routine called last, if the index was below a number when it was. It may be the one
+    /// that scales an index, which the jump checks; nothing else holds after the call.
+    scaler: Option<u16>,
+}
+
+impl State {
+    /// Forgets everything once more than a jump follows a call that might have scaled an index.
+    fn settle(&mut self) {
+        if self.scaler.is_some() {
+            *self = State::default();
+        }
+    }
+}
+
+/// The whole routine that scales an index too large to triple in `A`: `MOV B, #3; MUL AB`,
+/// then the high byte of the product added to `DPH`.
+const TRIPLE: [u8; 11] = [0x75, 0xF0, 0x03, 0xA4, 0xC5, 0x83, 0x25, 0xF0, 0xC5, 0x83, 0x22];
+
+/// What follows a call to one of the routines of Keil's C51 library that take their return
+/// address as the address of data: the data lies after the call in place of code.
+#[derive(Clone, Copy)]
+enum Inline {
+    /// `?C?CCASE` and `?C?ICASE`, which a `switch` calls: a table of each case's address and
+    /// its value, of this many bytes, then a zero address and the address of the default
+    /// case. The routine jumps to the case and never returns.
+    Cases { value: usize },
+    /// Four bytes that the routine stores through `DPTR` before it returns past them.
+    Constant,
+}
+
+/// The whole of `?C?CCASE`: `POP DPH; POP DPL; MOV R0,A`, the search, and `JMP @A+DPTR`.
+const CCASE: [u8; 38] = [
+    0xD0, 0x83, 0xD0, 0x82, 0xF8, 0xE4, 0x93, 0x70, 0x12, 0x74, 0x01, 0x93, 0x70, 0x0D, 0xA3, 0xA3, 0x93, 0xF8, 0x74, 0x01, 0x93, 0xF5, 0x82,
+    0x88, 0x83, 0xE4, 0x73, 0x74, 0x02, 0x93, 0x68, 0x60, 0xEF, 0xA3, 0xA3, 0xA3, 0x80, 0xDF,
+];
+
+/// The whole of `?C?ICASE`, which differs in comparing `B` with the value's high byte as well.
+const ICASE: [u8; 45] = [
+    0xD0, 0x83, 0xD0, 0x82, 0xF8, 0xE4, 0x93, 0x70, 0x12, 0x74, 0x01, 0x93, 0x70, 0x0D, 0xA3, 0xA3, 0x93, 0xF8, 0x74, 0x01, 0x93, 0xF5, 0x82,
+    0x88, 0x83, 0xE4, 0x73, 0x74, 0x02, 0x93, 0xB5, 0xF0, 0x06, 0x74, 0x03, 0x93, 0x68, 0x60, 0xE9, 0xA3, 0xA3, 0xA3, 0xA3, 0x80, 0xD8,
+];
+
+/// The routine that stores a four-byte constant: it keeps `DPTR` in `B` and `R0`, pops the
+/// return address into `DPTR`, calls the helper after it four times, and jumps to where
+/// `DPTR` then points. Each `.. ..` is the address of the helper.
+const STORE: [Option<u8>; 23] = {
+    let (call, any) = (Some(0x12), None);
+    [
+        Some(0xA8), Some(0x82), Some(0x85), Some(0x83), Some(0xF0), Some(0xD0), Some(0x83), Some(0xD0), Some(0x82),
+        call, any, any, call, any, any, call, any, any, call, any, any, Some(0xE4), Some(0x73),
+    ]
+};
+
+/// The helper: it reads the byte at `DPTR` from the code, swaps `DPTR` with `B` and `R0`, stores
+/// the byte there, and swaps back, stepping both addresses on.
+const STORE_BYTE: [u8; 26] = [
+    0xE4, 0x93, 0xA3, 0xC5, 0x83, 0xC5, 0xF0, 0xC5, 0x83, 0xC8, 0xC5, 0x82, 0xC8, 0xF0, 0xA3, 0xC5, 0x83, 0xC5, 0xF0, 0xC5, 0x83, 0xC8, 0xC5,
+    0x82, 0xC8, 0x22,
+];
+
+impl Inline {
+    /// What follows a call to `target`, if the code there is one of the routines. Only a
+    /// routine's exact bytes count, since they are what says how its data is laid out.
+    fn after_call_to(image: &Image, target: u64) -> Option<Inline> {
+        let code = image.bytes_from(target).filter(|_| image.is_code(target))?;
+        if code.starts_with(&CCASE) {
+            return Some(Inline::Cases { value: 1 });
+        } else if code.starts_with(&ICASE) {
+            return Some(Inline::Cases { value: 2 });
+        }
+        let helper = ((target + STORE.len() as u64) as u16).to_be_bytes();
+        let (routine, rest) = code.split_at_checked(STORE.len())?;
+        let calls_helper = routine.iter().zip(STORE).enumerate().all(|(at, (&byte, expected))| byte == expected.unwrap_or_else(|| helper[(at - 1) % 3]));
+        (calls_helper && rest.starts_with(&STORE_BYTE)).then_some(Inline::Constant)
+    }
+
+    /// Bytes in one entry of the data.
+    fn entry_size(self) -> usize {
+        match self {
+            Inline::Cases { value } => 2 + value,
+            Inline::Constant => 4,
+        }
+    }
+
+    /// The 16-bit addresses of the cases the data in `bytes` names, the default last, and the
+    /// length of the data. A constant names none.
+    fn cases(self, bytes: &[u8]) -> Option<(Vec<u16>, usize)> {
+        let size = self.entry_size();
+        if let Inline::Constant = self {
+            return (bytes.len() >= size).then_some((Vec::new(), size));
+        }
+        let mut cases = Vec::new();
+        for (index, entry) in bytes.chunks(size).enumerate() {
+            let case = u16::from_be_bytes([*entry.first()?, *entry.get(1)?]);
+            if case == 0 {
+                let default = bytes.get(index * size + 2..)?.get(..2)?;
+                cases.push(u16::from_be_bytes([default[0], default[1]]));
+                return Some((cases, index * size + 4));
+            }
+            cases.push(case);
+        }
+        None
+    }
+}
+
+/// The jump instructions a `switch` over a dense range jumps into with `JMP @A+DPTR`: `count`
+/// of one kind, back to back, at the start of `bytes`. Returns the length of each.
+fn jump_slots(bytes: &[u8], count: usize) -> Option<usize> {
+    let is_long = |opcode: u8| opcode == 0x02;
+    let is_short = |opcode: u8| opcode & 0x1F == 0x01;
+    let size = if is_long(*bytes.first()?) { 3 } else { 2 };
+    let slots = bytes.get(..size * count)?;
+    slots.chunks_exact(size).all(|slot| if size == 3 { is_long(slot[0]) } else { is_short(slot[0]) }).then_some(size)
+}
+
+/// The 8051 and its descendants with the original instruction set.
+pub struct I8051;
+
+impl Arch for I8051 {
+    type Insn = Insn;
+    type State = State;
+
+    // Nothing aligns functions, so an address says nothing about what starts there.
+    const FUNCTION_ALIGN: u64 = 1;
+    const ALIGNMENT_IS_EVIDENCE: bool = false;
+    const RUNS_ON: bool = true;
+
+    fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> {
+        let mut offset = 0;
+        std::iter::from_fn(move || {
+            let opcode = *bytes.get(offset)?;
+            let at = addr + offset as u64;
+            // No instruction: the opcode is not one, or its operands run past the end.
+            let insn = bytes.get(offset..offset + usize::from(LENGTH[usize::from(opcode)])).filter(|insn| !insn.is_empty()).map(|insn| {
+                let mut bytes = [0; 3];
+                bytes[..insn.len()].copy_from_slice(insn);
+                Insn { addr: at, bytes }
+            });
+            let len = if insn.is_some() { LENGTH[usize::from(opcode)] } else { 1 };
+            offset += usize::from(len);
+            Some(Decoded { addr: at, len, insn })
+        })
+    }
+
+    type Decoder<'a> = (&'a [u8], u64);
+
+    fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_> {
+        (bytes, addr)
+    }
+
+    fn decode_from<'d>(&mut (bytes, base): &'d mut Self::Decoder<'_>, offset: usize) -> impl Iterator<Item = Decoded<Insn>> + 'd {
+        Self::decode(&bytes[offset..], base + offset as u64)
+    }
+
+    fn flow(insn: &Insn, _: &State, image: &Image) -> Option<Flow> {
+        // Code that runs into a trampoline entry goes where a jump to the entry goes.
+        if let Some(&target) = image.banking.trampolines.get(&insn.addr) {
+            return Some(Flow::Jump(target));
+        }
+        if let Some((transfer, target)) = insn.transfer() {
+            let target = image.banking.reach(insn.addr, target);
+            return Some(match transfer {
+                // A call that hands its return address to a library routine comes back
+                // elsewhere or not at all: it is an indirect jump, and its data follows it.
+                Transfer::Call if Inline::after_call_to(image, target).is_some() => Flow::JumpIndirect(None),
+                Transfer::Call => Flow::Call(target),
+                Transfer::Jump => Flow::Jump(target),
+                Transfer::Branch => Flow::Branch(target),
+            });
+        }
+        match insn.opcode() {
+            0x22 | 0x32 => Some(Flow::Return),
+            0x73 => Some(Flow::JumpIndirect(None)),
+            _ => None,
+        }
+    }
+
+    /// Nothing: `MOV DPTR, #address` loads the address of data far more often than of code.
+    fn address_taken(_: &Insn, _: &State) -> Option<u64> {
+        None
+    }
+
+    fn memory_reference(insn: &Insn, state: &State) -> Option<u64> {
+        match (insn.opcode(), state.dptr.filter(|_| state.scaler.is_none())) {
+            // MOVX through DPTR, in either direction.
+            (0xE0 | 0xF0, Some(dptr)) => Some(XDATA + u64::from(dptr)),
+            _ => insn.direct(),
+        }
+    }
+
+    fn is_padding(_: &Insn) -> bool {
+        false
+    }
+
+    fn is_entry_marker(_: &Insn) -> bool {
+        false
+    }
+
+    fn opens_landing_pad(_: &Insn) -> bool {
+        false
+    }
+
+    fn step(state: &mut State, insn: &Insn) {
+        let [opcode, first, second] = insn.bytes;
+        state.settle();
+        state.compared = None;
+        let called = insn.transfer().and_then(|(transfer, routine)| matches!(transfer, Transfer::Call).then_some(routine));
+        if let (Some(routine), Some(_)) = (called, state.below) {
+            state.scaler = Some(routine);
+            return;
+        }
+        // What scales an index and what loads the table's address leave the index below what
+        // it was below: MOV DPTR, #; MOV Rn, A; ADD A, Rn; RL A; ADD A, ACC; and for an index
+        // too large to triple in A, MOV B, #3; MUL AB; XCH A, DPH; ADD A, B.
+        let scales = matches!(opcode, 0x90 | 0xF8..=0xFF | 0x28..=0x2F | 0x23 | 0xA4) || matches!((opcode, first), (0x25, 0xE0 | 0xF0) | (0x75, 0xF0) | (0xC5, DPH));
+        state.below = state.below.filter(|_| scales);
+        state.dptr = match opcode {
+            0x90 => Some(u16::from_be_bytes([first, second])),
+            0xA3 => state.dptr.map(|dptr| dptr.wrapping_add(1)),
+            // Scaling adds to DPH, and the table is still where DPTR was loaded to point.
+            0xC5 if state.below.is_some() => state.dptr,
+            // A called function leaves anything in it.
+            _ if called.is_some() || insn.touches_dptr() => None,
+            _ => state.dptr,
+        };
+    }
+
+    fn branch(state: &mut State, insn: &Insn) -> State {
+        state.settle();
+        let compared = state.compared.take();
+        state.below = None;
+        let mut taken = *state;
+        match insn.opcode() {
+            // CJNE A, #n: carry says whether A is below n, on both ways out.
+            0xB4 => (state.compared, taken.compared) = (Some(insn.bytes[1]), Some(insn.bytes[1])),
+            // JC is taken, and JNC is not, when carry is set.
+            0x40 => taken.below = compared,
+            0x50 => state.below = compared,
+            _ => {}
+        }
+        taken
+    }
+
+    /// The routines jump through `DPTR`, and a `switch` has scaled its index in `A`.
+    fn after_jump(_: State, _: &Insn) -> State {
+        State::default()
+    }
+
+    fn resolve_table(
+        state: &State,
+        image: &Image,
+        _: &FxHashMap<u64, u64>,
+        jump: &Insn,
+        _: &dyn Fn(u64) -> bool,
+        is_code: &dyn Fn(u64) -> bool,
+    ) -> Option<Table> {
+        // Cases are in the function that switches, so in its bank, and never behind a trampoline.
+        let here = |target: u16| image.banking.address(jump.addr >> 16, target);
+        let table = if jump.opcode() == 0x73 {
+            // `JMP @A+DPTR` into a table of jumps, one per value below the bound.
+            let (address, count) = (here(state.dptr?), u64::from(state.below.filter(|&count| count > 0)?));
+            if let Some(routine) = state.scaler {
+                image.bytes_from(image.banking.reach(jump.addr, routine)).filter(|code| code.starts_with(&TRIPLE))?;
+            }
+            let size = jump_slots(image.bytes_from(address)?, count as usize)? as u64;
+            Table { address, entry_size: size, entries: (0..count).map(|index| address + index * size).collect(), bounded: true, inline_end: None }
+        } else {
+            let (Transfer::Call, routine) = jump.transfer()? else { return None };
+            let kind = Inline::after_call_to(image, image.banking.reach(jump.addr, routine))?;
+            let address = jump.addr + u64::from(LENGTH[usize::from(jump.opcode())]);
+            let (cases, length) = kind.cases(image.bytes_from(address)?)?;
+            let end = address + length as u64;
+            // The routine that takes a constant returns to the code after it.
+            let entries = if cases.is_empty() { vec![end] } else { cases.into_iter().map(here).collect() };
+            Table { address, entry_size: kind.entry_size() as u64, entries, bounded: true, inline_end: Some(end) }
+        };
+        table.entries.iter().all(|&target| is_code(target)).then_some(table)
+    }
+
+    fn plt_stubs(_: &Image) -> FxHashMap<u64, u64> {
+        FxHashMap::default()
+    }
+}
+
+/// The direct jumps and calls in the functions of `analysis` that go from common code to an
+/// address outside it, as `(instruction, target)`. Nothing says which bank shows when one runs,
+/// and each is taken to reach bank 0, so these are the places where that guess is made.
+pub fn unbanked_transfers(image: &Image, analysis: &Analysis) -> Vec<(u64, u64)> {
+    let banking = &image.banking;
+    let is_common = |addr: u64| addr >> 16 == 0 && banking.is_common(addr as u16);
+    let mut found = Vec::new();
+    for &(start, end) in analysis.functions.iter().flat_map(|function| &function.ranges) {
+        let Some(bytes) = image.bytes_from(start).filter(|_| is_common(start)) else { continue };
+        for insn in I8051::decode(&bytes[..bytes.len().min((end - start) as usize)], start).filter_map(|decoded| decoded.insn) {
+            if let Some((_, target)) = insn.transfer().filter(|&(_, target)| is_common(insn.addr) && !banking.is_common(target)) {
+                found.push((insn.addr, u64::from(target)));
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// One line for a summary on how the banks of an image are tied together, or `None` for an
+/// image that is not banked 8051 code.
+pub fn banking_summary(image: &Image, analysis: &Analysis) -> Option<String> {
+    let banked = image.machine == Machine::I8051 && !image.banking.common.is_empty();
+    banked.then(|| {
+        let unbanked = unbanked_transfers(image, analysis).len();
+        format!("{} trampolines, {unbanked} jumps and calls from common code to a bank it does not name (taken as bank 0)", image.banking.trampolines.len())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image::{Banking, Format, Section};
+
+    /// An image that is not banked, with `code` at `addr`.
+    fn image(code: &[u8], addr: u64) -> Image {
+        Image {
+            name: String::new(),
+            format: Format::Raw,
+            machine: Machine::I8051,
+            base: 0,
+            branch_targets_marked: false,
+            entry: addr,
+            sections: vec![Section { name: String::new(), addr, data: code.to_vec(), file_offset: None, executable: true, writable: false }],
+            zero_filled: memory(),
+            import_slots: FxHashMap::default(),
+            exports: Vec::new(),
+            symbol_names: FxHashMap::default(),
+            frames: Vec::new(),
+            relative_targets: Vec::new(),
+            data_in_code: true,
+            banking: Banking::default(),
+        }
+    }
+
+    /// The length and the control flow of the instruction `bytes` holds at `addr`.
+    fn decoded(bytes: &[u8], addr: u64) -> (u8, Option<Flow>) {
+        let first = I8051::decode(bytes, addr).next().unwrap();
+        (first.len, I8051::flow(&first.insn.unwrap(), &State::default(), &image(bytes, addr)))
+    }
+
+    #[test]
+    fn every_kind_of_jump_goes_where_its_bytes_say() {
+        use Flow::*;
+        let cases: &[(&[u8], u64, (u8, Option<Flow>))] = &[
+            // LJMP 0x1234; LCALL 0x1234
+            (&[0x02, 0x12, 0x34], 0x0100, (3, Some(Jump(0x1234)))),
+            (&[0x12, 0x12, 0x34], 0x0100, (3, Some(Call(0x1234)))),
+            // AJMP and ACALL: eleven bits within the 2 KB page of the next instruction, which
+            // for the jump at 0x17FE is the page after its own.
+            (&[0xE1, 0x34], 0x17FE, (2, Some(Jump(0x1F34)))),
+            (&[0x01, 0xFF], 0x2000, (2, Some(Jump(0x20FF)))),
+            (&[0x11, 0x34], 0x0100, (2, Some(Call(0x0034)))),
+            (&[0xF1, 0x00], 0x2000, (2, Some(Call(0x2700)))),
+            // SJMP to itself, and forward by the most it can.
+            (&[0x80, 0xFE], 0x0100, (2, Some(Jump(0x0100)))),
+            (&[0x80, 0x7F], 0x0100, (2, Some(Jump(0x0181)))),
+            // JC +0x10; JNC -0x80; JZ -0x11; JNZ +0
+            (&[0x40, 0x10], 0x0100, (2, Some(Branch(0x0112)))),
+            (&[0x50, 0x80], 0x0100, (2, Some(Branch(0x0082)))),
+            (&[0x60, 0xEF], 0x0200, (2, Some(Branch(0x01F1)))),
+            (&[0x70, 0x00], 0x0200, (2, Some(Branch(0x0202)))),
+            // JBC 0x2E, +5; JB 0x2E, +5; JNB ACC.0, -3
+            (&[0x10, 0x2E, 0x05], 0x0100, (3, Some(Branch(0x0108)))),
+            (&[0x20, 0x2E, 0x05], 0x0100, (3, Some(Branch(0x0108)))),
+            (&[0x30, 0xE0, 0xFD], 0x0100, (3, Some(Branch(0x0100)))),
+            // CJNE A, #5, +3; CJNE A, 0x30, +3; CJNE @R0, #5, -3; CJNE R7, #5, +0x10
+            (&[0xB4, 0x05, 0x03], 0x0100, (3, Some(Branch(0x0106)))),
+            (&[0xB5, 0x30, 0x03], 0x0100, (3, Some(Branch(0x0106)))),
+            (&[0xB6, 0x05, 0xFD], 0x0100, (3, Some(Branch(0x0100)))),
+            (&[0xBF, 0x05, 0x10], 0x0100, (3, Some(Branch(0x0113)))),
+            // DJNZ 0x30, -3; DJNZ R0, -2; DJNZ R7, -2
+            (&[0xD5, 0x30, 0xFD], 0x0100, (3, Some(Branch(0x0100)))),
+            (&[0xD8, 0xFE], 0x0100, (2, Some(Branch(0x0100)))),
+            (&[0xDF, 0xFE], 0x0100, (2, Some(Branch(0x0100)))),
+            // RET; RETI; JMP @A+DPTR
+            (&[0x22], 0x0100, (1, Some(Return))),
+            (&[0x32], 0x0100, (1, Some(Return))),
+            (&[0x73], 0x0100, (1, Some(JumpIndirect(None)))),
+            // What only falls through, of each length: NOP; MOVC A, @A+DPTR; MOV A, #0x73;
+            // MOV DPTR, #0x0222; MOV 0x81, #0x50; MOV 0x22, 0x02
+            (&[0x00], 0x0100, (1, None)),
+            (&[0x93], 0x0100, (1, None)),
+            (&[0x74, 0x73], 0x0100, (2, None)),
+            (&[0x90, 0x02, 0x22], 0x0100, (3, None)),
+            (&[0x75, 0x81, 0x50], 0x0100, (3, None)),
+            (&[0x85, 0x02, 0x22], 0x0100, (3, None)),
+        ];
+        for &(bytes, addr, expected) in cases {
+            assert_eq!(decoded(bytes, addr), expected, "{bytes:02x?} at {addr:#x}");
+        }
+    }
+
+    #[test]
+    fn what_is_not_an_instruction_is_one_byte_of_nothing() {
+        // The opcode that is none; LJMP cut short by the end of the code.
+        let lengths = |bytes: &[u8]| I8051::decode(bytes, 0).map(|decoded| (decoded.len, decoded.insn.is_some())).collect::<Vec<_>>();
+        assert_eq!(lengths(&[0xA5, 0x22]), [(1, false), (1, true)]);
+        assert_eq!(lengths(&[0x22, 0x02, 0x12]), [(1, true), (1, false), (1, false)]);
+    }
+
+    #[test]
+    fn data_is_referred_to_in_its_own_address_space() {
+        // MOV DPTR, #0x1234; INC DPTR; MOVX A, @DPTR; MOV 0x30, A; MOV 0x90, A; SETB 0x0A;
+        // CLR 0x93; MOV DPL, A; MOVX @DPTR, A
+        let code = [0x90, 0x12, 0x34, 0xA3, 0xE0, 0xF5, 0x30, 0xF5, 0x90, 0xD2, 0x0A, 0xC2, 0x93, 0xF5, 0x82, 0xF0];
+        let mut state = State::default();
+        let mut referred = Vec::new();
+        for insn in I8051::decode(&code, 0).filter_map(|decoded| decoded.insn) {
+            referred.push(I8051::memory_reference(&insn, &state));
+            I8051::step(&mut state, &insn);
+        }
+        let expected = [None, None, Some(XDATA + 0x1235), Some(IDATA + 0x30), Some(SFR + 0x90), Some(IDATA + 0x21), Some(SFR + 0x90), Some(SFR + 0x82), None];
+        assert_eq!(referred, expected);
+    }
+
+    #[test]
+    fn a_call_to_a_switch_routine_is_a_jump_through_the_table_after_it() {
+        // 0x0000: LCALL 0x0100, then the table: 0x000D for 1, 0x0010 for 2, default 0x0011.
+        // 0x000D: LCALL 0x0020; RET; RET. 0x0020: RET.
+        let mut code = vec![0x12, 0x01, 0x00, 0x00, 0x0D, 0x01, 0x00, 0x10, 0x02, 0x00, 0x00, 0x00, 0x11];
+        code.extend([0x12, 0x00, 0x20, 0x22, 0x22]);
+        code.resize(0x20, 0x00);
+        code.push(0x22);
+        code.resize(0x100, 0x00);
+        code.extend(CCASE);
+        let image = image(&code, 0);
+        let analysis = crate::analyze(&image);
+        let tables: Vec<(u64, &[u64])> = analysis.jump_tables.iter().map(|table| (table.jump, table.targets.as_slice())).collect();
+        assert_eq!(tables, [(0x0000, &[0x000D, 0x0010, 0x0011][..])]);
+        // The switch calls no routine, and the table is no part of the function's code.
+        let functions: Vec<(u64, &[(u64, u64)])> = analysis.functions.iter().map(|function| (function.addr, function.ranges.as_slice())).collect();
+        assert_eq!(functions, [(0x0000, &[(0x0000, 0x0003), (0x000D, 0x0012)][..]), (0x0020, &[(0x0020, 0x0021)][..])]);
+        assert_eq!(analysis.calls.iter().map(|call| call.at).collect::<Vec<_>>(), [0x000D]);
+    }
+
+    #[test]
+    fn a_call_that_stores_a_constant_returns_past_it() {
+        // 0x0000: LCALL 0x0100; the constant, whose bytes would be ACALL 0x0122 and more; RET.
+        let mut code = vec![0x12, 0x01, 0x00, 0x11, 0x22, 0x33, 0x44, 0x22];
+        code.resize(0x100, 0x00);
+        code.extend(STORE.iter().enumerate().map(|(at, byte)| byte.unwrap_or_else(|| [0x01, 0x17][(at - 1) % 3])));
+        code.extend(STORE_BYTE);
+        let analysis = crate::analyze(&image(&code, 0));
+        let functions: Vec<(u64, &[(u64, u64)])> = analysis.functions.iter().map(|function| (function.addr, function.ranges.as_slice())).collect();
+        assert_eq!(functions, [(0x0000, &[(0x0000, 0x0003), (0x0007, 0x0008)][..])]);
+        assert!(analysis.calls.is_empty());
+    }
+
+    #[test]
+    fn a_dense_switch_jumps_into_as_many_jumps_as_its_bound_allows() {
+        // MOV A, R7; CJNE A, #2, next; JNC 0x0013; MOV DPTR, #0x000D; MOV R0, A; ADD A, R0;
+        // ADD A, R0; JMP @A+DPTR. At 0x000D: LJMP 0x0016; LJMP 0x0017. At 0x0013, the default
+        // case, which is one more jump: LJMP 0x0018. Then three RETs.
+        let code = [
+            0xEF, 0xB4, 0x02, 0x00, 0x50, 0x0D, 0x90, 0x00, 0x0D, 0xF8, 0x28, 0x28, 0x73, 0x02, 0x00, 0x16, 0x02, 0x00, 0x17, 0x02, 0x00, 0x18,
+            0x22, 0x22, 0x22,
+        ];
+        let analysis = crate::analyze(&image(&code, 0));
+        let tables: Vec<(u64, &[u64])> = analysis.jump_tables.iter().map(|table| (table.jump, table.targets.as_slice())).collect();
+        assert_eq!(tables, [(0x000C, &[0x000D, 0x0010][..])]);
+
+        // The same with the index scaled by a call: to the routine that triples it, at 0x0040,
+        // and to one that does something else, at 0x0030.
+        let scaled_by = |routine: u8| {
+            let mut code = vec![0xEF, 0xB4, 0x02, 0x00, 0x50, 0x0D, 0x90, 0x00, 0x0D, 0x12, 0x00, routine, 0x73, 0x02, 0x00, 0x16, 0x02, 0x00, 0x17, 0x02, 0x00, 0x18];
+            code.extend([0x22, 0x22, 0x22]);
+            code.resize(0x30, 0x00);
+            code.extend([0x23, 0x22]);
+            code.resize(0x40, 0x00);
+            code.extend(TRIPLE);
+            crate::analyze(&image(&code, 0)).jump_tables.iter().map(|table| (table.jump, table.targets.clone())).collect::<Vec<_>>()
+        };
+        assert_eq!(scaled_by(0x40), [(0x000C, vec![0x000D, 0x0010])]);
+        assert_eq!(scaled_by(0x30), []);
+    }
+}

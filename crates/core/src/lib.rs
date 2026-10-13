@@ -10,6 +10,7 @@ pub mod cfg;
 pub mod diff;
 pub mod discover;
 pub mod edits;
+pub mod i8051;
 pub mod image;
 pub mod itanium;
 pub mod jumptable;

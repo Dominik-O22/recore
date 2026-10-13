@@ -138,6 +138,8 @@ struct Program<'a> {
     /// Slot address to target for pointers the loader relocates. A call through such a slot
     /// goes to a function in this image, not to an import.
     pointer_slots: &'a FxHashMap<u64, u64>,
+    /// [`Arch::RUNS_ON`].
+    runs_on: bool,
 }
 
 impl Program<'_> {
@@ -199,6 +201,11 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program) -> Wa
                 // `run_start == addr` means nothing was decoded on the way: the jump itself
                 // landed outside known code.
                 if run_start == addr && !program.is_covered(addr) {
+                    result.may_return = true;
+                }
+                // Running on into the next function is a tail call of it, when code leads
+                // right up to its entry.
+                if program.runs_on && program.is_start(boundary) && program.is_covered(boundary - 1) && target_returns(boundary) {
                     result.may_return = true;
                 }
                 break;
@@ -387,6 +394,7 @@ pub fn analyze(image: &Image) -> Analysis {
         Machine::X86 if image.data_in_code => analyze_with::<X86<32, true>>(image),
         Machine::X86 => analyze_with::<X86<32, false>>(image),
         Machine::Aarch64 => analyze_with::<crate::arm64::Arm64>(image),
+        Machine::I8051 => analyze_with::<crate::i8051::I8051>(image),
     }
 }
 
@@ -494,7 +502,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         controls.par_sort_unstable_by_key(|c| c.addr);
         let mut extents: Vec<(u64, u64)> = functions.iter().chain(&chunks).map(|f| (f.start, f.end)).collect();
         extents.sort_unstable();
-        let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots };
+        let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots, runs_on: A::RUNS_ON };
 
         // A compiler emits nothing after a call it knows will not return: the call is followed
         // by a trap, or ends the function. Padding after a call proves nothing, since an
@@ -565,7 +573,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     let extra_ranges: FxHashMap<u64, Vec<(u64, u64)>> = if chunks.is_empty() {
         FxHashMap::default()
     } else {
-        let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots };
+        let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots, runs_on: A::RUNS_ON };
         functions
             .par_iter()
             .filter_map(|f| {

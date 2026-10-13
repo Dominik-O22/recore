@@ -52,6 +52,9 @@ fn main() -> Result<()> {
                 analysis.jump_tables.len(),
                 analysis.strings.len(),
             );
+            if let Some(banking) = recore::i8051::banking_summary(&image, &analysis) {
+                println!("{banking}");
+            }
             println!("analyzed in {:.0} ms", start.elapsed().as_secs_f64() * 1000.0);
         }
         Command::Analyze { binary } => {

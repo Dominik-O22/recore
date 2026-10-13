@@ -44,6 +44,9 @@ pub enum Machine {
     X86_64,
     #[serde(rename = "aarch64")]
     Aarch64,
+    /// The 8051 and the many microcontrollers that keep its instruction set.
+    #[serde(rename = "8051")]
+    I8051,
 }
 
 impl Machine {
@@ -52,6 +55,7 @@ impl Machine {
         match self {
             Machine::X86 => 4,
             Machine::X86_64 | Machine::Aarch64 => 8,
+            Machine::I8051 => 2,
         }
     }
 }
@@ -81,11 +85,14 @@ pub struct Banking {
 }
 
 impl Banking {
+    /// Whether every bank holds the same code at the 16-bit address `target`.
+    pub fn is_common(&self, target: u16) -> bool {
+        self.common.iter().any(|&(start, end)| u64::from(target) >= start && u64::from(target) < end)
+    }
+
     /// Where the 16-bit address `target` lies when `bank` shows.
     pub fn address(&self, bank: u64, target: u16) -> u64 {
-        let target = u64::from(target);
-        let common = self.common.iter().any(|&(start, end)| target >= start && target < end);
-        if common { target } else { bank << 16 | target }
+        if self.is_common(target) { u64::from(target) } else { bank << 16 | u64::from(target) }
     }
 
     /// The address a jump or call at `from` to the 16-bit address `target` reaches: the function

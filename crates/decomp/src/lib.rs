@@ -66,16 +66,17 @@ pub enum Target {
 }
 
 impl Target {
-    /// The target an image was built for.
-    pub fn of(image: &Image) -> Target {
-        match (image.machine, image.format) {
+    /// The target an image was built for, when the decompiler has language files for it.
+    pub fn of(image: &Image) -> Result<Target> {
+        Ok(match (image.machine, image.format) {
             (Machine::X86, Format::Pe) => Target::X86Windows,
             (Machine::X86, Format::Elf | Format::MachO | Format::Raw) => Target::X86Gcc,
             (Machine::X86_64, Format::Pe) => Target::X86_64Windows,
             // macOS follows the System V convention on x86-64.
             (Machine::X86_64, Format::Elf | Format::MachO | Format::Raw) => Target::X86_64Gcc,
             (Machine::Aarch64, _) => Target::Aarch64,
-        }
+            (Machine::I8051, _) => bail!("decompiling 8051 code is not supported yet"),
+        })
     }
 
     /// Ghidra's `processor:endian:size:variant:compiler` id.
@@ -295,7 +296,7 @@ impl Session {
     pub fn load(image: &Image) -> Result<Session> {
         let loaded = facts::loaded(image);
         let sections: Vec<Section> = loaded.iter().map(|l| Section { addr: l.addr, data: &l.data, readonly: l.constant, code: l.code }).collect();
-        Session::new(&vendored_spec_dir()?, Target::of(image), &sections)
+        Session::new(&vendored_spec_dir()?, Target::of(image)?, &sections)
     }
 
     /// Declares the imports the code calls, with prototypes for the well-known ones.
@@ -303,7 +304,7 @@ impl Session {
         for import in &analysis.imports {
             self.add_import(import.slot, &import.name, import.noreturn)?;
         }
-        prototypes::declare(self, Target::of(image), image.format, analysis.imports.iter().map(|i| i.name.as_str()))
+        prototypes::declare(self, Target::of(image)?, image.format, analysis.imports.iter().map(|i| i.name.as_str()))
     }
 
     /// Declares that the GOT entry at `slot` points to the imported function `name`. Indirect

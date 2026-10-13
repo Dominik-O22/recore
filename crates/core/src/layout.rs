@@ -228,13 +228,14 @@ pub fn load(path: &Path) -> Result<Image> {
         branch_targets_marked: false,
         entry,
         sections,
-        zero_filled: Vec::new(),
+        zero_filled: if layout.machine == Machine::I8051 { crate::i8051::memory() } else { Vec::new() },
         import_slots: FxHashMap::default(),
         exports,
         symbol_names: FxHashMap::default(),
         frames: Vec::new(),
         relative_targets: Vec::new(),
-        data_in_code: false,
+        // An 8051 reads its constants and its switch tables from the code space.
+        data_in_code: layout.machine == Machine::I8051,
         banking,
     })
 }

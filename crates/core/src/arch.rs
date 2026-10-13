@@ -77,6 +77,11 @@ pub trait Arch: 'static {
     /// merely look like one.
     const ADDRESSES_ARE_RELOCATED: bool = false;
 
+    /// Whether a function may run on into the one after it, which then returns for both: how
+    /// hand-written code and code a linker has factored share their endings. Elsewhere code
+    /// that runs off the end of its function is code that never returns.
+    const RUNS_ON: bool = false;
+
     /// Decodes consecutive instructions from `bytes`, which are loaded at `addr`.
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Self::Insn>>;
 

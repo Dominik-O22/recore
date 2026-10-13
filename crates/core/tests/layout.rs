@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use recore::image::{Format, Image, Machine};
+use recore::report::CallTarget;
 
 /// Writes a layout and the bytes it places into a directory of their own, and returns the
 /// layout's path.
@@ -52,4 +53,55 @@ fn a_region_the_file_does_not_hold_is_refused() {
     "#;
     let error = Image::load(&write("refused", layout, &[0xC3; 8])).err().unwrap();
     assert_eq!(error.to_string(), r#""code.bin" has no 0x7 bytes at 0x2"#);
+}
+
+#[test]
+fn banked_code_calls_through_a_trampoline_into_the_bank_it_names() {
+    let mut bytes = vec![0; 0x80];
+    let mut place = |at: usize, code: &[u8]| bytes[at..at + code.len()].copy_from_slice(code);
+    // Common code. Reset: LJMP 0x0010. The stubs of bank 0 and bank 1.
+    place(0x00, &[0x02, 0x00, 0x10]);
+    place(0x03, &[0xE5, 0x49, 0x02, 0x46, 0x00, 0xE5, 0x49, 0x02, 0x46, 0x04]);
+    // LCALL 0x0020, the entry; LCALL 0x0050, which no bank is named for; RET.
+    place(0x10, &[0x12, 0x00, 0x20, 0x12, 0x00, 0x50, 0x22]);
+    // The entry: 0x0040 by way of the stub of bank 1.
+    place(0x20, &[0x90, 0x00, 0x40, 0x02, 0x00, 0x08]);
+    place(0x30, &[0x22]);
+    // Bank 0 past the common code.
+    place(0x50, &[0x22]);
+    // Bank 1, which the file holds after bank 0: at 0x0040, LCALL 0x0030 in the common code; RET.
+    place(0x60, &[0x12, 0x00, 0x30, 0x22]);
+    let layout = r#"
+        machine = "8051"
+        entry = [0x0000]
+
+        [[region]]
+        file = "code.bin"
+        offset = 0
+        length = 0x60
+        address = 0x000000
+        executable = true
+
+        [[region]]
+        file = "code.bin"
+        offset = 0x60
+        length = 0x20
+        address = 0x010040
+        executable = true
+
+        [banking]
+        common = [[0x0000, 0x0040]]
+
+        [[banking.trampoline]]
+        entry = "90 hh ll 02 ss ss"
+        stub = "e5 49 02 46 .."
+    "#;
+    let image = Image::load(&write("banked", layout, &bytes)).unwrap();
+    let analysis = recore::analyze(&image);
+    let functions: Vec<u64> = analysis.functions.iter().map(|function| function.addr).collect();
+    assert_eq!(functions, [0x0000, 0x0010, 0x0030, 0x0050, 0x1_0040]);
+    let calls: Vec<(u64, CallTarget)> = analysis.calls.iter().map(|call| (call.at, call.target)).collect();
+    let function = CallTarget::Function;
+    assert_eq!(calls, [(0x0000, function(0x0010)), (0x0010, function(0x1_0040)), (0x0013, function(0x0050)), (0x1_0040, function(0x0030))]);
+    assert_eq!(recore::i8051::unbanked_transfers(&image, &analysis), [(0x0013, 0x0050)]);
 }

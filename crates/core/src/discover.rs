@@ -934,7 +934,8 @@ impl<A: Arch> Explorer<'_, A> {
                         let opens = after_break && A::opens_function(&insn, next.as_ref());
                         // After a table, alignment alone proves little: a byte table or more of the
                         // same function may follow. The start of the section is different.
-                        let aligned_after_break = aligned && (skipped_padding || at == 0);
+                        // Where nothing aligns functions, no address is likelier to start one.
+                        let aligned_after_break = A::FUNCTION_ALIGN > 1 && aligned && (skipped_padding || at == 0);
                         if self.pointer_slots.contains_key(&addr) {
                             // The padding scan stopped on a table entry; resume after that entry.
                             let pointer_size = self.image.machine.pointer_size() as usize;
