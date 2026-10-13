@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use recore::image::{Format, Machine};
 use recore::program::{Pattern, Program, matches, parse_addr};
 use recore::FxHashMap;
-use recore::diff::{Change, Evidence};
+use recore::diff::{Change, Evidence, Pair};
 use recore::report::CallTarget;
 use recore_decomp::isolate::Status;
 use serde::Deserialize;
@@ -45,7 +45,7 @@ pub fn list() -> Value {
         tool(
             "strings",
             "Strings the code or relocated pointers refer to, each with its address and the functions that use it. `used by: none` means only a pointer in data refers to it; `xrefs` finds that pointer. C++ class names appear here mangled; `classes` lists them with their vtables.",
-            json!({ "pattern": pattern("text"), "limit": limit }),
+            json!({ "pattern": pattern("text"), "limit": limit, "full": { "type": "boolean", "description": "Print long strings whole. They are cut to 200 characters otherwise." } }),
             &[],
         ),
         tool("imports", "Imported functions the code calls, each with the functions that call it.", json!({ "pattern": pattern("import name") }), &[]),
@@ -78,7 +78,7 @@ pub fn list() -> Value {
             "decompile",
             "Decompiles functions to C with Ghidra's decompiler. A function that crashes the decompiler or runs out of time is reported and the others still come back.",
             json!({
-                "functions": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Hex addresses (anywhere inside a function) or function names." },
+                "functions": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Hex addresses (anywhere inside a function) or function names. From a shell, several separated by spaces or commas." },
                 "timeout": { "type": "number", "description": "Seconds each function may take (default 30)." },
             }),
             &["functions"],
@@ -281,6 +281,36 @@ fn common_lines(before: &[String], after: &[String]) -> (Vec<bool>, Vec<bool>) {
     (kept_before, kept_after)
 }
 
+/// The C of the two builds of a paired function as one sequence of lines: `' '` for a line
+/// both have, `'-'` for one only the earlier build has, `'+'` for one only the later has.
+fn changed_lines(old: &mut Binary, new: &mut Binary, pair: &Pair, paired: &FxHashMap<u64, u64>, timeout: Duration) -> Result<Vec<(char, String)>> {
+    let c_text = |binary: &mut Binary, entry: u64| match binary.decompile(entry, timeout) {
+        (_, Some(text)) => Ok(text),
+        (record, None) => bail!("{} was not decompiled: {}", binary.program.label(entry), record.message.unwrap_or_default()),
+    };
+    let (before, after) = (c_text(old, pair.old)?, c_text(new, pair.new)?);
+    let before_keys = comparable(&before, &old.program, &|entry| paired.get(&entry).copied());
+    let after_keys = comparable(&after, &new.program, &|entry| Some(entry));
+    ensure!(before_keys.len() * after_keys.len() <= 16_000_000, "the function is too long to compare line by line; `decompile` shows each build's");
+    let (kept_before, kept_after) = common_lines(&before_keys, &after_keys);
+    let (before_lines, after_lines): (Vec<&str>, Vec<&str>) = (before.lines().skip(1).collect(), after.lines().skip(1).collect());
+    let mut merged = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < before_lines.len() || j < after_lines.len() {
+        if i < before_lines.len() && !kept_before[i] {
+            merged.push(('-', before_lines[i].to_string()));
+            i += 1;
+        } else if j < after_lines.len() && !kept_after[j] {
+            merged.push(('+', after_lines[j].to_string()));
+            j += 1;
+        } else {
+            merged.push((' ', after_lines[j].to_string()));
+            (i, j) = (i + 1, j + 1);
+        }
+    }
+    Ok(merged)
+}
+
 /// The C of one function before and after, as the lines that went and the lines that came.
 fn diff_function(old: &mut Binary, new: &mut Binary, function: &str, timeout: Duration) -> Result<String> {
     /// Unchanged lines shown around a change.
@@ -294,40 +324,15 @@ fn diff_function(old: &mut Binary, new: &mut Binary, function: &str, timeout: Du
             found.pairs.iter().find(|pair| pair.new == entry).with_context(|| format!("{} has no counterpart in the earlier build", new.program.label(entry)))?
         }
     };
-    let c_text = |binary: &mut Binary, entry: u64| match binary.decompile(entry, timeout) {
-        (_, Some(text)) => Ok(text),
-        (record, None) => bail!("{} was not decompiled: {}", binary.program.label(entry), record.message.unwrap_or_default()),
-    };
-    let (before, after) = (c_text(old, pair.old)?, c_text(new, pair.new)?);
     let paired: FxHashMap<u64, u64> = found.pairs.iter().map(|pair| (pair.old, pair.new)).collect();
-    let before_keys = comparable(&before, &old.program, &|entry| paired.get(&entry).copied());
-    let after_keys = comparable(&after, &new.program, &|entry| Some(entry));
-    ensure!(before_keys.len() * after_keys.len() <= 16_000_000, "the function is too long to compare line by line; `decompile` shows each build's");
-    let (kept_before, kept_after) = common_lines(&before_keys, &after_keys);
-
-    // Both texts in one sequence: a line both have, a line only before has, a line only after has.
-    let (before_lines, after_lines): (Vec<&str>, Vec<&str>) = (before.lines().skip(1).collect(), after.lines().skip(1).collect());
-    let mut merged: Vec<(char, &str)> = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < before_lines.len() || j < after_lines.len() {
-        if i < before_lines.len() && !kept_before[i] {
-            merged.push(('-', before_lines[i]));
-            i += 1;
-        } else if j < after_lines.len() && !kept_after[j] {
-            merged.push(('+', after_lines[j]));
-            j += 1;
-        } else {
-            merged.push((' ', after_lines[j]));
-            (i, j) = (i + 1, j + 1);
-        }
-    }
+    let merged = changed_lines(old, new, pair, &paired, timeout)?;
     let mut out = String::new();
     writeln!(out, "{} -> {}", old.program.label(pair.old), new.program.label(pair.new))?;
     let changed: Vec<usize> = merged.iter().enumerate().filter(|(_, line)| line.0 != ' ').map(|(index, _)| index).collect();
     if changed.is_empty() {
         let how = match pair.change {
             None => "and so is its code",
-            Some(Change::Numbers) => "though numbers in its code differ that the C does not show, such as the line number an assertion reports",
+            Some(Change::Numbers) => "though numbers in its code differ that the C does not show",
             Some(Change::Code) => "though its instructions differ: the compiler arranged them otherwise",
         };
         writeln!(out, "the C is the same line for line, {how}")?;
@@ -357,18 +362,31 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
         let timeout = Duration::try_from_secs_f64(args.timeout.unwrap_or(30.0)).map_err(|_| anyhow!("`timeout` must be a positive number of seconds"))?;
         return diff_function(old, new, function, timeout);
     }
+    let found = recore::diff::diff(&old.program, &new.program);
+    let paired: FxHashMap<u64, u64> = found.pairs.iter().map(|pair| (pair.old, pair.new)).collect();
+    let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
+    // What the C of each changed function lost and gained, for the first of them: the lines
+    // of its body, without its header, whose types the decompiler guesses anew in each build.
+    /// Changed functions whose C is compared, and lines shown of each.
+    const COMPARED: usize = 12;
+    const LINES: usize = 8;
+    let timeout = Duration::try_from_secs_f64(args.timeout.unwrap_or(30.0)).map_err(|_| anyhow!("`timeout` must be a positive number of seconds"))?;
+    let mut in_c: FxHashMap<u64, Vec<String>> = FxHashMap::default();
+    for pair in found.pairs.iter().filter(|pair| pair.change == Some(Change::Code)).take(limit.min(COMPARED)) {
+        let Ok(merged) = changed_lines(old, new, pair, &paired, timeout) else { continue };
+        let body = merged.iter().position(|(_, line)| line.trim().is_empty() && merged.first().is_some()).map_or(0, |blank| merged[blank + 1..].iter().position(|(_, line)| line.trim().is_empty()).map_or(blank, |next| blank + 1 + next));
+        let changed: Vec<String> = merged[body..].iter().filter(|(sign, line)| *sign != ' ' && !line.trim().is_empty()).map(|(sign, line)| format!("{sign} {}", line.trim())).collect();
+        in_c.insert(pair.old, changed);
+    }
     let (old, new) = (&old.program, &new.program);
-    let found = recore::diff::diff(old, new);
     let (old_sizes, new_sizes) = (old.sizes(), new.sizes());
     let size = |sizes: &FxHashMap<u64, u64>, entry: &u64| sizes.get(entry).copied().unwrap_or_default();
-    let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
     let changed: Vec<_> = found.pairs.iter().filter(|pair| pair.change == Some(Change::Code)).collect();
     let renumbered: Vec<_> = found.pairs.iter().filter(|pair| pair.change == Some(Change::Numbers)).collect();
     let mut out = String::new();
     writeln!(out, "{} functions before, {} after: {} the same, {} changed, {} removed, {} added", old.functions().count(), new.functions().count(), found.pairs.len() - changed.len() - renumbered.len(), changed.len() + renumbered.len(), found.removed.len(), found.added.len())?;
     // What a function refers to, in terms the two builds share: the functions it calls, as
     // the after build knows them, and the strings it uses.
-    let paired: FxHashMap<u64, u64> = found.pairs.iter().map(|pair| (pair.old, pair.new)).collect();
     let refers = |program: &Program, entry: u64, in_new: &dyn Fn(u64) -> Option<u64>| -> (BTreeMap<String, String>, BTreeMap<String, String>) {
         let body = program.body(entry);
         // A function both builds have is told by its address in each: before, then after.
@@ -381,7 +399,7 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
         let strings = body.iter().flat_map(|&(start, end)| program.refs_in(start, end)).filter_map(|reference| Some(quoted(&program.string_at(reference.to)?.text))).map(|text| (text.clone(), text));
         (calls.collect(), strings.collect())
     };
-    writeln!(out, "\nchanged, as before -> after with bytes of code{}; `function` with one of them shows how its C differs", shown(changed.len(), limit))?;
+    writeln!(out, "\nchanged, as before -> after with bytes of code{}; under each, lines of C only the earlier (-) or the later (+) build has, which `function` shows in full", shown(changed.len(), limit))?;
     for pair in changed.iter().take(limit) {
         let how = match pair.evidence {
             Evidence::Name => "same name",
@@ -400,6 +418,16 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
                 if !listed.is_empty() {
                     writeln!(out, "    {sign} {what} {}", listed.join(", "))?;
                 }
+            }
+        }
+        if let Some(lines) = in_c.get(&pair.old) {
+            for line in lines.iter().take(LINES) {
+                writeln!(out, "    {line}")?;
+            }
+            match lines.len() {
+                0 => writeln!(out, "    the C reads the same")?,
+                more if more > LINES => writeln!(out, "    ... {} more lines differ", more - LINES)?,
+                _ => {}
             }
         }
     }
@@ -578,6 +606,8 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
 struct Strings {
     pattern: Option<String>,
     limit: Option<usize>,
+    #[serde(default)]
+    full: bool,
 }
 
 fn strings(binary: &mut Binary, args: Strings) -> Result<String> {
@@ -589,7 +619,8 @@ fn strings(binary: &mut Binary, args: Strings) -> Result<String> {
     for string in found.iter().take(limit) {
         let users = binary.program.users(binary.program.refs_to(string.addr).map(|r| r.from));
         // A string no instruction refers to is reached through a pointer in data, which `xrefs` shows.
-        writeln!(out, "{:#x} {}{} used by: {}", string.addr, quoted(&string.text), if string.wide { " (UTF-16)" } else { "" }, labels(binary, &users))?;
+        let text = if args.full { format!("{:?}", string.text) } else { quoted(&string.text) };
+        writeln!(out, "{:#x} {text}{} used by: {}", string.addr, if string.wide { " (UTF-16)" } else { "" }, labels(binary, &users))?;
     }
     Ok(out)
 }
@@ -710,8 +741,10 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
         targets.entry(reference.to).or_default()[usize::from(reference.access)].push(reference.from);
     }
     let sites = |sites: &[u64]| sites.iter().map(|site| format!("{site:#x}")).collect::<Vec<_>>().join(" ");
-    let (strings, globals): (Vec<_>, Vec<_>) = targets.iter().partition(|(addr, _)| binary.program.string_at(**addr).is_some());
-    writeln!(out, "strings:")?;
+    let (mut strings, globals): (Vec<_>, Vec<_>) = targets.iter().partition(|(addr, _)| binary.program.string_at(**addr).is_some());
+    // In the order the code comes to them, which for the messages of a function is their order.
+    strings.sort_by_key(|(_, [taken, accessed])| taken.iter().chain(accessed).min().copied());
+    writeln!(out, "strings, in the order the code uses them:")?;
     for (addr, [taken, _]) in strings {
         writeln!(out, "  {addr:#x} {} at {}", quoted(&binary.program.string_at(*addr).expect("partitioned on it").text), sites(taken))?;
     }

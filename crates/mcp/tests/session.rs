@@ -194,16 +194,11 @@ fn a_patch_shows_as_the_functions_it_touched() {
     let data = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data");
     let mut client = Client::start();
     let diff = client.tool("diff", json!({ "path": format!("{data}/types.elf"), "to": format!("{data}/types-patched.elf") })).unwrap();
-    assert_eq!(
-        diff,
-        "3 functions before, 4 after: 2 the same, 1 changed, 0 removed, 1 added\n\n\
-         changed, as before -> after with bytes of code; `function` with one of them shows how its C differs\n\
-         0x401000 39 -> 0x40100b 47  (called from the same place)\n\
-         \x20   now calls 0x401000\n\n\
-         removed: none\n\n\
-         added\n\
-         0x401000 11\n"
-    );
+    assert!(diff.starts_with("3 functions before, 4 after: 2 the same, 1 changed, 0 removed, 1 added\n"), "{diff}");
+    // The changed function with what it now calls and the lines its C gained, then the new one.
+    assert!(diff.contains("\n0x401000 39 -> 0x40100b 47  (called from the same place)\n    now calls 0x401000\n"), "{diff}");
+    assert!(diff.contains("\n    + if (100 < param_2) {\n"), "{diff}");
+    assert!(diff.ends_with("\nremoved: none\n\nadded\n0x401000 11\n"), "{diff}");
     // The one function, line by line: the check is new, and the loop it guards is not. The
     // earlier build has debug information and the later has none, so the loop's body reads
     // differently in each.

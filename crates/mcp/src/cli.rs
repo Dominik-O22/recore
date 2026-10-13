@@ -10,7 +10,7 @@ use crate::tools;
 /// Options whose value is a number. Everything else, addresses included, stays text.
 const NUMERIC: [&str; 7] = ["limit", "len", "timeout", "count", "param", "arg", "depth"];
 /// Options that are on or off.
-const FLAGS: [&str; 2] = ["pcode", "returns"];
+const FLAGS: [&str; 3] = ["pcode", "returns", "full"];
 
 pub fn usage() -> String {
     let mut text = String::from(
@@ -53,7 +53,8 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
     }
     match (tool, plain.as_slice()) {
         (_, []) => {}
-        ("decompile", functions) => drop(named.insert("functions".into(), json!(functions))),
+        // Separated by spaces or by commas.
+        ("decompile", functions) => drop(named.insert("functions".into(), json!(functions.iter().flat_map(|listed| listed.split(',')).filter(|function| !function.is_empty()).collect::<Vec<_>>()))),
         ("strings" | "imports" | "functions" | "classes" | "symbols", [pattern]) => drop(named.insert("pattern".into(), json!(pattern))),
         ("disassemble" | "pcode" | "trace", [function]) => drop(named.insert("function".into(), json!(function))),
         ("rename", [addr, name]) => {
