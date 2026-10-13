@@ -26,3 +26,19 @@ fn a_switch_through_a_list_of_cases_after_a_call_has_each_case_by_its_value() {
     assert_eq!(after("case 9:"), "return 0x22;");
     assert_eq!(after("default:"), "return 0x33;");
 }
+
+#[test]
+fn a_pointer_argument_read_byte_by_byte_is_one_parameter() {
+    #[rustfmt::skip]
+    let code = [
+        0x90, 0x12, 0x34,                   // mov dptr, #0x1234
+        0xeb, 0xf0, 0xa3,                   // mov a, r3; movx @dptr, a; inc dptr
+        0xea, 0xf0, 0xa3,                   // mov a, r2; movx @dptr, a; inc dptr
+        0xe9, 0xf0, 0x22,                   // mov a, r1; movx @dptr, a; ret
+    ];
+    let mut session = Session::new(&vendored_spec_dir().unwrap(), Target::I8051, &[Section { addr: 0, data: &code, readonly: true, code: true }]).unwrap();
+    let decompiled = session.decompile(0).unwrap();
+    let parameters: Vec<u32> = decompiled.params.iter().map(|param| param.size).collect();
+    assert_eq!(parameters, [3], "{}", decompiled.c_text);
+    assert!(!decompiled.c_text.contains("in_R1"), "{}", decompiled.c_text);
+}

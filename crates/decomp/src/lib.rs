@@ -686,20 +686,33 @@ impl Session {
         check(|err, len| unsafe { ffi::rd_set_storage(self.raw.as_ptr(), addr, storage.as_ptr(), err, len) != 0 })
     }
 
-    /// Decompiles the function at `addr`. SDCC passes a first argument of three or four bytes
-    /// in B and ACC beside DPTR, and code reads the bytes one by one, so the engine takes the
-    /// argument for one in DPTR and B for a register nothing passed. Such a function is given
-    /// its first parameter whole and decompiled again; calls to it then pass it whole.
+    /// Decompiles the function at `addr`. An 8051 compiler passes an argument of three or four
+    /// bytes in registers that are no pair, and code reads the bytes one by one, so the engine
+    /// takes the argument for one of two bytes and the other registers for ones nothing
+    /// passed. Such a function is given the parameter whole and decompiled again; calls to it
+    /// then pass it whole.
     pub fn decompile(&mut self, addr: u64) -> Result<Decompiled> {
         let decompiled = self.decompile_as_declared(addr)?;
         let reads = |register: &str| decompiled.c_text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|word| word.strip_prefix("in_") == Some(register));
-        let in_dptr = decompiled.params.first().is_some_and(|first| first.storage == "DPTR");
-        if self.target != Target::I8051Sdcc || !in_dptr || !reads("B") {
+        // The parameter the engine found, the register it left out, and the two as one.
+        let whole = match self.target {
+            // SDCC's first argument: a pointer that says what memory it points into, or a long.
+            Target::I8051Sdcc if reads("B") && reads("ACC") => Some(("DPTR", "ACC:B:DPTR")),
+            Target::I8051Sdcc if reads("B") => Some(("DPTR", "B:DPTR")),
+            // C51's pointer that says what memory it points into.
+            Target::I8051 if reads("R1") => Some(("R2R3", "R3:R2:R1")),
+            _ => None,
+        };
+        let Some((at, whole)) = whole.and_then(|(part, whole)| Some((decompiled.params.iter().position(|param| param.storage == part)?, whole))) else {
             return Ok(decompiled);
-        }
-        let first = if reads("ACC") { "ACC:B:DPTR" } else { "B:DPTR" };
-        let rest: String = decompiled.params[1..].iter().map(|param| format!(",{}/{}", param.storage, param.size)).collect();
-        self.set_storage(addr, &format!("?({first}{rest})"))?;
+        };
+        let place = |(index, param): (usize, &Param)| match (index == at, param.storage.contains(':')) {
+            (true, _) => whole.to_string(),
+            (false, true) => format!("{}/{}", param.storage, param.size),
+            (false, false) => param.storage.clone(),
+        };
+        let places: Vec<String> = decompiled.params.iter().enumerate().map(place).collect();
+        self.set_storage(addr, &format!("?({})", places.join(",")))?;
         self.decompile_as_declared(addr)
     }
 
