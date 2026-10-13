@@ -98,24 +98,29 @@ fn banked_code_calls_through_a_trampoline_into_the_bank_it_names() {
     "#;
     let image = Image::load(&write("banked", layout, &bytes)).unwrap();
     let analysis = recore::analyze(&image);
-    // The stubs are code too, named for what they are.
+    // The stubs and the table of entries are code too, named for what they are.
     let functions: Vec<(u64, Option<&str>)> = analysis.functions.iter().map(|function| (function.addr, function.name.as_deref())).collect();
     let expected = [
         (0x0000, None),
         (0x0003, Some("bank_switch_0")),
         (0x0008, Some("bank_switch_1")),
         (0x0010, None),
+        (0x0020, Some("bank_trampolines")),
         (0x0030, None),
         (0x0050, None),
         (0x1_0040, None),
     ];
     assert_eq!(functions, expected);
+    assert_eq!(analysis.functions[4].ranges, [(0x0020, 0x0026)]);
+    // A call of the entry is a call of the function, which the entry reaches by its stub.
     let calls: Vec<(u64, CallTarget)> = analysis.calls.iter().map(|call| (call.at, call.target)).collect();
     let function = CallTarget::Function;
     let expected = [
         (0x0000, function(0x0010)),
         (0x0010, function(0x1_0040)),
         (0x0013, function(0x0050)),
+        (0x0020, function(0x1_0040)),
+        (0x0023, function(0x0008)),
         (0x1_0040, function(0x0030)),
     ];
     assert_eq!(calls, expected);

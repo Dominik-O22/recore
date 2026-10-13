@@ -408,7 +408,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         .copied()
         .filter(|&(start, _)| image.section_at(start).is_some_and(is_function_section))
         .collect();
-    let frame_end: FxHashMap<u64, u64> = frames.iter().copied().collect();
+    // A table of trampoline entries is code with a known extent, like a function with a frame.
+    let frame_end: FxHashMap<u64, u64> = frames.iter().chain(&image.banking.tables).copied().collect();
 
     drop(_phase);
     let mut discovery = discover::<A>(image, &frames);
@@ -428,6 +429,12 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             discovery.starts.entry(method).or_insert(Origin::DataPointer);
             discovery.referenced.insert(method);
         }
+    }
+
+    // Nothing calls a table of trampoline entries: what calls an entry calls the function the
+    // entry reaches. The table is listed as one function, so that its code is listed at all.
+    for &(table, _) in &image.banking.tables {
+        discovery.starts.entry(table).or_insert(Origin::Export);
     }
 
     let inline_tables = std::mem::take(&mut discovery.inline_tables);
