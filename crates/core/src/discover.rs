@@ -253,6 +253,12 @@ struct Explorer<'a, A: Arch> {
     clock: u32,
     /// `[start, end)` of every section that holds no code, sorted.
     data_sections: Vec<(u64, u64)>,
+    /// Whether what this pass finds will be reported. A first pass that has learned a table's
+    /// length is followed by a second, and only its lengths are read: from then on it stops
+    /// recording references and what is referenced, which decide nothing while exploring.
+    recording: bool,
+    /// How many tables without a bounds check a first pass has resolved.
+    unbounded: u32,
 }
 
 /// One decoder per section, made when first needed. Decoding starts in a new place for every
@@ -264,7 +270,6 @@ impl<'a, A: Arch> Explorer<'a, A> {
         self.regions.iter().position(|r| r.section.contains(addr))
     }
 
-    /// Whether `addr` is in a section that holds no code.
     /// Records that the instruction at `at` reads or writes the data at `target`. Reading a slot
     /// the loader fills with an address in this image also takes that address: a global or a
     /// function reached through the global offset table.
@@ -302,7 +307,9 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let flags = &mut region.flags[(addr - region.section.addr) as usize];
         if referenced && *flags & REFERENCED == 0 {
             *flags |= REFERENCED;
-            self.referenced.insert(addr);
+            if self.recording {
+                self.referenced.insert(addr);
+            }
         }
         // Whether an address becomes an entry point depends neither on who asks nor on when,
         // and most addresses are asked about many times: once per call to them.
@@ -404,52 +411,34 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 self.regions[index].cover(offset, usize::from(decoded.len.max(1)));
                 let Some(flow) = A::flow(&insn, &state) else {
                     if let Some((base, data)) = A::based_data_address(&insn, &state) {
-                        if self.image.base != 0 && base == self.image.base {
+                        let from_image_base = self.image.base != 0 && base == self.image.base;
+                        if from_image_base {
                             self.data_refs.push(data);
-                            if !speculative && self.is_data(data) {
-                                self.data_ref_sites.push((decoded.addr, data, true));
-                            }
-                        } else if !speculative && self.is_data(base) && self.is_data(data) {
-                            // A field or an element of the global whose address the register holds.
+                        }
+                        // Off the image base, or a field or an element of the global whose
+                        // address the register holds.
+                        if self.recording && !speculative && (from_image_base || self.is_data(base)) && self.is_data(data) {
                             self.data_ref_sites.push((decoded.addr, data, true));
                         }
                     }
-                    let accessed = A::memory_reference(&insn, &state)
-                        .filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target))
-                        .filter(|&target| self.is_data(target));
-                    match accessed {
-                        Some(target) if speculative => self.uncertain_ref_sites.push((decoded.addr, target, true)),
-                        Some(target) => self.note_access(decoded.addr, target),
-                        None => {}
-                    }
-                    if let Some(target) = A::offset_address(&insn, &state).filter(|&target| !speculative && self.is_data(target)) {
-                        self.data_ref_sites.push((decoded.addr, target, false));
-                    }
-                    /// Offsets from a pointer further than this are not fields of what it points to.
-                    const FARTHEST_FIELD: u64 = 1 << 20;
-                    let through = A::through_pointer(&insn, &state).filter(|&(_, offset, _)| !speculative && offset < FARTHEST_FIELD);
-                    if let Some((pointee, offset, access)) = through.and_then(|(slot, offset, access)| Some((*self.pointer_slots.get(&slot)?, offset, access))) {
-                        if self.is_data(pointee) && self.is_data(pointee + offset) {
-                            if access {
-                                self.note_access(decoded.addr, pointee + offset);
-                            } else {
-                                self.data_ref_sites.push((decoded.addr, pointee + offset, false));
-                            }
-                        }
+                    if self.recording {
+                        self.note_references(&insn, &state, decoded.addr, speculative);
                     }
                     let taken = A::address_taken(&insn, &state).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
-                    if let Some(target) = taken.filter(|_| speculative) {
-                        self.uncertain_ref_sites.push((decoded.addr, target, false));
-                    } else if let Some(target) = taken {
+                    if let Some(target) = taken.filter(|_| !speculative) {
                         if self.region_index(target).is_some() {
                             self.add_start(target, Origin::AddressTaken);
-                            // Code whose address is taken is a callback or a method table entry,
-                            // and who takes it is worth as much as who calls it.
-                            self.data_ref_sites.push((decoded.addr, target, false));
                         } else {
                             self.data_refs.push(target);
-                            self.data_ref_sites.push((decoded.addr, target, false));
                         }
+                    }
+                    // Who takes an address is reported for code as for data: code whose address
+                    // is taken is a callback or a method table entry, and who takes it is worth
+                    // as much as who calls it.
+                    match taken.filter(|_| self.recording) {
+                        Some(target) if speculative => self.uncertain_ref_sites.push((decoded.addr, target, false)),
+                        Some(target) => self.data_ref_sites.push((decoded.addr, target, false)),
+                        None => {}
                     }
                     A::step(&mut state, &insn);
                     continue;
@@ -457,6 +446,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 // A call or jump through a variable reads it, as an instruction that loads it
                 // does. An import's slot is reported with the call instead.
                 if let Flow::CallIndirect(Some(slot)) | Flow::JumpIndirect(Some(slot)) = flow
+                    && self.recording
                     && !speculative
                     && self.is_data(slot)
                     && !self.image.import_slots.contains_key(&slot)
@@ -525,6 +515,34 @@ impl<'a, A: Arch> Explorer<'a, A> {
         }
     }
 
+    /// Records the data that `insn`, at `at`, reads, writes or forms the address of, where
+    /// that decides nothing while exploring.
+    fn note_references(&mut self, insn: &A::Insn, state: &A::State, at: u64, speculative: bool) {
+        let accessed = A::memory_reference(insn, state)
+            .filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target))
+            .filter(|&target| self.is_data(target));
+        match accessed {
+            Some(target) if speculative => self.uncertain_ref_sites.push((at, target, true)),
+            Some(target) => self.note_access(at, target),
+            None => {}
+        }
+        if let Some(target) = A::offset_address(insn, state).filter(|&target| !speculative && self.is_data(target)) {
+            self.data_ref_sites.push((at, target, false));
+        }
+        /// Offsets from a pointer further than this are not fields of what it points to.
+        const FARTHEST_FIELD: u64 = 1 << 20;
+        let through = A::through_pointer(insn, state).filter(|&(_, offset, _)| !speculative && offset < FARTHEST_FIELD);
+        if let Some((pointee, offset, access)) = through.and_then(|(slot, offset, access)| Some((*self.pointer_slots.get(&slot)?, offset, access))) {
+            if self.is_data(pointee) && self.is_data(pointee + offset) {
+                if access {
+                    self.note_access(at, pointee + offset);
+                } else {
+                    self.data_ref_sites.push((at, pointee + offset, false));
+                }
+            }
+        }
+    }
+
     /// Cuts a table without a bounds check to the length an earlier pass worked out for it.
     fn apply_known_length(&self, mut table: Table) -> Table {
         if let (false, Some(&length)) = (table.bounded, self.known_lengths.get(&table.address)) {
@@ -570,12 +588,22 @@ impl<'a, A: Arch> Explorer<'a, A> {
         self.unresolved.remove(&jump);
         // Tables sit back to back, so each table's address ends the one before it.
         self.data_refs.push(table.address);
-        if !speculative {
+        if self.recording && !speculative {
             // The jump reads its table, wherever the compiler put it: MSVC keeps tables among
             // the code.
             self.data_ref_sites.push((jump, table.address, true));
         }
+        let first_pass = self.known_lengths.is_empty();
+        let unbounded = !table.bounded;
         self.tables.push((jump, table));
+        // A length learned now is still learned when the pass ends: data addresses only get
+        // closer to a table. Asking sorts all of them, so it is asked ever more rarely.
+        if self.recording && first_pass && unbounded {
+            self.unbounded += 1;
+            if self.unbounded.is_power_of_two() && !self.learned_lengths().is_empty() {
+                self.recording = false;
+            }
+        }
     }
 
     /// Called when a path runs into code that was already decoded. If an unresolved indirect
@@ -979,8 +1007,10 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
         let _phase = phase::scope("discover/pointers");
         Pointers::new(image)
     };
+    // A first pass that learns a length stops recording what only a last pass has to report.
     let first = explore::<A>(image, frames, &pointers, FxHashMap::default());
     let lengths = first.learned_lengths();
+    debug_assert!(first.recording || !lengths.is_empty());
     let mut explorer = if lengths.is_empty() { first } else { explore::<A>(image, frames, &pointers, lengths) };
 
     // An entry point is only real if its first bytes decoded.
@@ -1061,6 +1091,8 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         known_lengths,
         frames,
         clock: 0,
+        recording: true,
+        unbounded: 0,
         data_sections: {
             // Zero-filled memory is data as much as what the file stores.
             let mut ranges: Vec<(u64, u64)> = image.sections.iter().filter(|s| !s.executable).map(|s| (s.addr, s.end())).chain(image.zero_filled.iter().copied()).collect();
@@ -1104,6 +1136,10 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         }
     }
 
+    // The entry points of a pass that only learns lengths are not read.
+    if !explorer.recording {
+        return explorer;
+    }
     let _phase = phase::scope("discover/demote");
     explorer.demote_table_addresses();
     explorer.demote_case_targets();
