@@ -318,9 +318,25 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             send(&event)?;
             continue;
         }
+        // A function that ends by jumping to another passes on what that one takes, and with
+        // that one unknown it seems to pass on every register. So before a function is
+        // decompiled for a caller's sake, the functions it jumps to are, last in the chain first.
+        let mut jumped_first = Vec::new();
+        if matches!(request, Request::Parameters(_)) && callees_first {
+            tail_chain(&tail_callees, addr, &small, TAIL_DEPTH, &mut jumped_first);
+        }
         // Decompiled for a caller's sake with every callee of its own known, a function comes
         // out as it would when asked for, so the result is kept for then.
-        let keep = matches!(request, Request::Parameters(_)) && unknown(addr).is_empty();
+        let keep = matches!(request, Request::Parameters(_)) && unknown(addr).iter().all(|callee| jumped_first.contains(callee));
+        for target in jumped_first {
+            session.keep_prototypes(true);
+            if let Some(importer) = &mut importer {
+                importer.functions(&mut session, std::iter::once(target));
+            }
+            // A failure here only leaves the caller as well off as it was.
+            let _ = session.decompile(target);
+            known.insert(target);
+        }
         for &callee in tail_callees.get(&addr).into_iter().flatten() {
             if session.returns_like(addr, callee) {
                 break;
