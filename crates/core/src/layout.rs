@@ -38,6 +38,9 @@
 //! stub = "c0 b1 c8 c0 e0 e9 c0 e0 ea 54 0f 53 b1 f0 42 b1 c8 22"
 //! ```
 //!
+//! `names = "chip.toml"` beside `machine` names a file that says what the hardware's addresses
+//! are called, see [`crate::hardware`].
+//!
 //! A layout can leave open what is not yet known of a banked image, for [`crate::sweep`] to
 //! find: which bank a region is, written `bank = "?"` with the 16-bit address its bytes start
 //! at as its `address`, the `common` ranges, and the trampolines.
@@ -62,6 +65,9 @@ pub(crate) struct Layout {
     pub(crate) entry: Vec<u64>,
     pub(crate) region: Vec<Region>,
     pub(crate) banking: Option<BankingLayout>,
+    /// A file of names for the hardware's addresses, relative to the layout file: see
+    /// [`crate::hardware`].
+    pub(crate) names: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -335,7 +341,9 @@ pub fn load(path: &Path) -> Result<Image> {
     let open = layout.region.iter().any(|region| region.bank.is_some()) || layout.banking.as_ref().is_some_and(|banking| banking.common.is_empty());
     ensure!(!open, "the layout {path:?} leaves banks or the common ranges open: `recore sweep` finds them and writes a layout that says");
     let sections = layout.region.iter().zip(layout.bytes(path)?).map(|(region, data)| region.section(0, region.address, &data)).collect();
-    layout.image(path.file_stem().unwrap_or_default().to_string_lossy().into_owned(), sections, layout.banking.as_ref())
+    let mut image = layout.image(path.file_stem().unwrap_or_default().to_string_lossy().into_owned(), sections, layout.banking.as_ref())?;
+    image.symbol_names = crate::hardware::names(layout.machine, layout.names.as_ref().map(|names| path.with_file_name(names)).as_deref())?;
+    Ok(image)
 }
 
 #[cfg(test)]

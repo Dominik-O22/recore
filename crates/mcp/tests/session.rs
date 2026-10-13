@@ -94,7 +94,7 @@ fn speaks_the_protocol() {
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        ["summary", "strings", "imports", "functions", "function", "xrefs", "decompile", "bytes", "classes", "addr", "disassemble", "pcode", "trace", "symbols", "diff", "rename", "comment", "declare", "type"]
+        ["summary", "strings", "imports", "functions", "function", "xrefs", "decompile", "unnamed", "bytes", "classes", "addr", "disassemble", "pcode", "trace", "symbols", "diff", "rename", "comment", "declare", "type"]
     );
 
     assert_eq!(client.request("resources/list", json!({}))["error"]["code"], -32601);

@@ -37,7 +37,8 @@ enum Named {
 /// Checks that `addr` can carry a name: a function entry, or data.
 fn nameable(binary: &Binary, addr: u64) -> Result<()> {
     let program = &binary.program;
-    ensure!(program.image.section_at(addr).is_some(), "{addr:#x} is not in any section of the file");
+    // Memory the file holds no bytes for is data all the same: variables, and a chip's registers.
+    ensure!(program.image.section_at(addr).is_some() || program.image.is_zero_filled(addr), "{addr:#x} is not in any section of the file");
     if program.image.is_code(addr) && program.function(addr).is_none() {
         match program.function_at(addr) {
             Ok(entry) => bail!("{addr:#x} is inside function {}; name the function at its entry, a variable of it with `var`, or use `comment` for a place inside it", program.label(entry)),

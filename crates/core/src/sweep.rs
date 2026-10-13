@@ -387,17 +387,21 @@ impl Sweep {
         let Some(best) = self.candidates.first() else { return Ok(None) };
         let directory = |path: &Path| path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new(".")).canonicalize();
         let beside = directory(out).ok().zip(directory(&self.path).ok()).is_some_and(|(out, layout)| out == layout);
+        // A file is named from the layout's place, which this layout may not share.
+        let file = |file: &Path| -> Result<String> { Ok(serde_json::to_string(&if beside { file.to_path_buf() } else { self.path.with_file_name(file).canonicalize()? })?) };
         let mut text = String::new();
         writeln!(text, "machine = {}", serde_json::to_string(&self.layout.machine)?)?;
-        writeln!(text, "entry = [{}]\n", self.layout.entry.iter().map(|entry| format!("{entry:#06x}")).collect::<Vec<_>>().join(", "))?;
+        writeln!(text, "entry = [{}]", self.layout.entry.iter().map(|entry| format!("{entry:#06x}")).collect::<Vec<_>>().join(", "))?;
+        if let Some(names) = &self.layout.names {
+            writeln!(text, "names = {}", file(names)?)?;
+        }
+        writeln!(text)?;
         for placement in best.placements.iter().filter(|placement| placement.bank.is_none()) {
             writeln!(text, "# The region at offset {:#x} is left out: {}.", placement.offset, placement.verdict())?;
         }
         for piece in &best.pieces {
             let region = &self.layout.region[piece.region];
-            // A file is named from the layout's place, which this layout may not share.
-            let file = if beside { region.file.clone() } else { self.path.with_file_name(&region.file).canonicalize()? };
-            writeln!(text, "[[region]]\nfile = {}", serde_json::to_string(&file)?)?;
+            writeln!(text, "[[region]]\nfile = {}", file(&region.file)?)?;
             writeln!(text, "offset = {:#x}\nlength = {:#x}\naddress = {:#08x}", region.offset + piece.skip, piece.length, piece.address)?;
             for (key, value) in [("executable", region.executable), ("writable", region.writable)] {
                 if value {
