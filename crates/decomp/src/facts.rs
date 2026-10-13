@@ -166,7 +166,7 @@ pub fn loaded(image: &Image) -> Vec<Loaded<'_>> {
     let mut relocations = image.relative_targets.clone();
     relocations.sort_unstable();
 
-    let pointer = if image.machine == Machine::X86 { 4 } else { 8 };
+    let pointer = image.machine.pointer_size() as usize;
     let mut pieces = Vec::new();
     for section in &image.sections {
         let inside = |addr: u64| addr >= section.addr && addr + pointer as u64 <= section.end();

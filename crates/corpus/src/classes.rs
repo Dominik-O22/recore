@@ -18,7 +18,6 @@ use anyhow::{Context, Result};
 use object::{Object, ObjectSection, ObjectSymbol};
 use rayon::prelude::*;
 use recore::Image;
-use recore::image::Machine;
 use recore::report::Class;
 
 /// One class of the unstripped copy.
@@ -83,7 +82,7 @@ fn normal(name: &str) -> String {
 
 /// The classes the symbol table of `debug` names, with their vtables as `image` holds them.
 fn true_classes(image: &Image, debug: &object::File) -> Vec<TrueClass> {
-    let size = if image.machine == Machine::X86 { 4 } else { 8 };
+    let size = image.machine.pointer_size();
     // Mach-O puts an underscore before every symbol.
     let symbols: Vec<(String, u64, u64)> = debug
         .symbols()

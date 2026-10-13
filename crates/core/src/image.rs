@@ -43,6 +43,16 @@ pub enum Machine {
     Aarch64,
 }
 
+impl Machine {
+    /// Bytes in a pointer, which is how wide a code or data address stored in the image is.
+    pub fn pointer_size(self) -> u64 {
+        match self {
+            Machine::X86 => 4,
+            Machine::X86_64 | Machine::Aarch64 => 8,
+        }
+    }
+}
+
 /// The container an image came in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {

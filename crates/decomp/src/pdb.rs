@@ -28,7 +28,7 @@ struct Reader<'t> {
 
 /// The types, function prototypes and globals in the PDB at `path`, which belongs to `image`.
 pub fn types(path: &Path, image: &Image) -> Result<Types> {
-    let pointer = if image.machine == recore::image::Machine::X86 { 4 } else { 8 };
+    let pointer = image.machine.pointer_size();
     let mut pdb = pdb2::PDB::open(std::fs::File::open(path)?)?;
     let address_map = pdb.address_map()?;
     let information = pdb.type_information()?;

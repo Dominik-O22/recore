@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::arch::{Arch, Flow, Table};
-use crate::image::{Image, Machine, Section};
+use crate::image::{Image, Section};
 use crate::noreturn::is_noreturn_import;
 use crate::phase;
 use crate::report::{JumpTable, Origin};
@@ -632,7 +632,7 @@ impl<A: Arch> Explorer<'_, A> {
         let offset = (addr - region.section.addr) as usize;
         // Padding between functions is shorter than one alignment unit.
         let earliest = offset.saturating_sub(A::FUNCTION_ALIGN as usize - 1);
-        let pointer_size = if self.image.machine == Machine::X86 { 4 } else { 8 };
+        let pointer_size = self.image.machine.pointer_size() as usize;
         let after_table = |o: usize| {
             self.image.data_in_code && o >= pointer_size && self.pointer_slots.contains_key(&(region.section.addr + (o - pointer_size) as u64))
         };
@@ -861,7 +861,7 @@ impl<A: Arch> Explorer<'_, A> {
                     // Relocated pointers in a code section are a jump table. Step over the whole
                     // table; what follows it cannot be fallen into.
                     if self.image.data_in_code && self.pointer_slots.contains_key(&addr) {
-                        let pointer_size = if self.image.machine == Machine::X86 { 4 } else { 8 };
+                        let pointer_size = self.image.machine.pointer_size() as usize;
                         offset += pointer_size;
                         after_data = offset;
                         continue;
@@ -913,7 +913,7 @@ impl<A: Arch> Explorer<'_, A> {
                         let aligned_after_break = aligned && (skipped_padding || at == 0);
                         if self.pointer_slots.contains_key(&addr) {
                             // The padding scan stopped on a table entry; resume after that entry.
-                            let pointer_size = if self.image.machine == Machine::X86 { 4 } else { 8 };
+                            let pointer_size = self.image.machine.pointer_size() as usize;
                             offset = (addr - section.addr) as usize + pointer_size;
                             after_data = offset;
                             continue;

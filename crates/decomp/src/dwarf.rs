@@ -128,7 +128,7 @@ struct Reader<'a> {
 /// The types, function prototypes and globals in the DWARF of the file at `path`, which is a
 /// binary or a separate debug file, for code of `machine`.
 pub fn types(path: &Path, machine: Machine) -> Result<Types> {
-    let pointer = if machine == Machine::X86 { 4 } else { 8 };
+    let pointer = machine.pointer_size();
     let data = std::fs::read(path).with_context(|| format!("reading {path:?}"))?;
     let file = object::File::parse(&*data)?;
     // Debian compresses these sections, and unpacking them is then most of the work: only the

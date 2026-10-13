@@ -475,7 +475,7 @@ pub(crate) fn resolve_function(binary: &Binary, text: &str) -> Result<u64> {
 /// pair up from there, name first in one table and second in another.
 pub(crate) fn table_names(program: &Program, entry: u64) -> Vec<(u64, String)> {
     let image = &program.image;
-    let pointer = if image.machine == Machine::X86 { 4 } else { 8 };
+    let pointer = image.machine.pointer_size();
     let target_of = |slot: u64| image.relative_targets.iter().find(|&&(at, _)| at == slot).map(|&(_, target)| target);
     let name_at = |slot: u64| short_text(image, target_of(slot)?);
     let partner = |slot: u64| {
@@ -585,7 +585,7 @@ fn pointer_table(binary: &Binary, addr: u64, longest: usize) -> Vec<(u64, Result
     if image.section_at(addr).is_none_or(|section| section.executable) {
         return Vec::new();
     }
-    let size = if image.machine == Machine::X86 { 4 } else { 8 };
+    let size = image.machine.pointer_size();
     let relocated: FxHashMap<u64, u64> = image.relative_targets.iter().copied().collect();
     let begins_another = |slot: u64| slot != addr && (program.refs_to(slot).next().is_some() || program.string_at(slot).is_some());
     let mut slots = Vec::new();
@@ -884,7 +884,7 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
             }
         }
         if table.len() == limit.min(64) {
-            let next = table.last().expect("not empty").0 + if program.image.machine == Machine::X86 { 4 } else { 8 };
+            let next = table.last().expect("not empty").0 + program.image.machine.pointer_size();
             writeln!(out, "  ... the table may go on; `xrefs` of {next:#x} reads on")?;
         }
     }
