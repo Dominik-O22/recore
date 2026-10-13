@@ -826,6 +826,17 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     data_refs.extend(text_refs.iter().map(|pointer| (pointer.from, pointer.to, false)));
     data_refs.sort_unstable();
     data_refs.dedup();
+    // A body that ends where another function begins runs on into it, unless its last
+    // instruction sends control elsewhere.
+    let runs_on = |f: &Function| {
+        let stops = f.controls.last().filter(|control| control.next == f.end).is_some_and(|control| match control.flow {
+            Flow::Jump(_) | Flow::JumpIndirect(_) | Flow::Return | Flow::Halt => true,
+            Flow::Call(target) => noreturn.contains(&target),
+            Flow::Branch(_) | Flow::CallIndirect(_) => false,
+        });
+        let code_to_end = code_pieces(f.start, f.end, inline_tables).last().is_some_and(|(from, to)| from < to && to == f.end);
+        (A::RUNS_ON && is_start(f.end) && code_to_end && !stops).then_some(f.end)
+    };
     Analysis {
         sends,
         types: swift.types,
@@ -843,6 +854,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                 thunk: thunk_target(f).is_some(),
                 origin: discovery.starts[&f.start],
                 fragment_of: fragment_of.get(&f.start).copied(),
+                runs_on: runs_on(f),
                 name: names.get(&f.start).cloned(),
             })
             .collect(),

@@ -806,6 +806,16 @@ mod tests {
     }
 
     #[test]
+    fn a_function_that_ends_where_the_next_begins_runs_on_into_it() {
+        // LCALL 0x0007; LCALL 0x0008; RET. At 0x0007, CLR A, which nothing ends, and at
+        // 0x0008 the function it shares the ending of: MOV R7, A; RET.
+        let code = [0x12, 0x00, 0x07, 0x12, 0x00, 0x08, 0x22, 0xE4, 0xFF, 0x22];
+        let analysis = crate::analyze(&image(&code, 0));
+        let runs_on: Vec<(u64, Option<u64>)> = analysis.functions.iter().map(|function| (function.addr, function.runs_on)).collect();
+        assert_eq!(runs_on, [(0x0000, None), (0x0007, Some(0x0008)), (0x0008, None)]);
+    }
+
+    #[test]
     fn unreached_code_that_divides_into_functions_is_functions() {
         let starts = |code: &[u8]| crate::analyze(&image(code, 0)).functions.iter().map(|function| function.addr).collect::<Vec<_>>();
         // LCALL 0x0010; RET. Then what nothing refers to: CLR A; MOV R7, A; RET, then

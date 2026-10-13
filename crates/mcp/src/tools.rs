@@ -789,6 +789,9 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
         };
         writeln!(out, "  {:#x} {} {target}", call.at, if call.tail { "tail-calls" } else { "calls" })?;
     }
+    if let Some(next) = binary.program.function(entry).and_then(|function| function.runs_on) {
+        writeln!(out, "  runs on into {}, which returns for both", binary.program.label(next))?;
+    }
 
     // Per address referred to: the instructions that read or write it, and those that take it.
     let mut targets: BTreeMap<u64, [Vec<u64>; 2]> = BTreeMap::new();
@@ -864,6 +867,7 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
         }
     }
     lines.extend(program.calls_to(addr).map(|call| format!("{:#x} in {} {} it", call.at, program.site_label(call.at), if call.tail { "tail-calls" } else { "calls" })));
+    lines.extend(program.functions().filter(|function| function.runs_on == Some(addr)).map(|function| format!("{} runs on into it", program.label(function.addr))));
     lines.extend(program.sends_to(addr).map(|send| format!("{:#x} in {} sends {}, which only it implements", send.at, program.site_label(send.at), send.label())));
     lines.extend(program.refs_to(addr).map(|reference| format!("{:#x} in {} {}", reference.from, program.site_label(reference.from), if reference.access { "reads or writes it" } else { "takes its address" })));
     let count = lines.len();
