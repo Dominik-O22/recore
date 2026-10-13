@@ -63,6 +63,8 @@ pub enum Target {
     /// x86-64 with the System V convention.
     X86_64Gcc,
     Aarch64,
+    /// The 8051 as Keil's C51 compiles for it, banked or not: code at `bank << 16 | address`.
+    I8051,
 }
 
 impl Target {
@@ -75,7 +77,7 @@ impl Target {
             // macOS follows the System V convention on x86-64.
             (Machine::X86_64, Format::Elf | Format::MachO | Format::Raw) => Target::X86_64Gcc,
             (Machine::Aarch64, _) => Target::Aarch64,
-            (Machine::I8051, _) => bail!("decompiling 8051 code is not supported yet"),
+            (Machine::I8051, _) => Target::I8051,
         })
     }
 
@@ -87,6 +89,7 @@ impl Target {
             Target::X86_64Windows => c"x86:LE:64:default:windows",
             Target::X86_64Gcc => c"x86:LE:64:default:gcc",
             Target::Aarch64 => c"AARCH64:LE:64:v8A:default",
+            Target::I8051 => c"8051:BE:24:cip-51:default",
         }
     }
 
@@ -98,6 +101,7 @@ impl Target {
             Target::X86_64Windows => "x86-64-win.cspec",
             Target::X86_64Gcc => "x86-64-gcc.cspec",
             Target::Aarch64 => "AARCH64.cspec",
+            Target::I8051 => "keil-cx51.cspec",
         }
     }
 
@@ -130,7 +134,11 @@ impl Target {
     }
 
     pub fn pointer_bytes(self) -> usize {
-        if matches!(self, Target::X86Windows | Target::X86Gcc) { 4 } else { 8 }
+        match self {
+            Target::X86Windows | Target::X86Gcc => 4,
+            Target::X86_64Windows | Target::X86_64Gcc | Target::Aarch64 => 8,
+            Target::I8051 => 2,
+        }
     }
 }
 

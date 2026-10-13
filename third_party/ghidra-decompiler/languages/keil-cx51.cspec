@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<compiler_spec>
+  <global>
+    <range space="IFLASH"/>
+    <range space="CODE"/>
+    <range space="INTMEM"/>
+    <range space="SFR"/>
+    <range space="XRAM"/>
+    <range space="RAM"/>
+    <range space="BITS"/>
+  </global>
+  <!-- recore: the stack is in internal memory, where PUSH, POP and calls keep it in this
+       language. Upstream names RAM, which nothing here writes to. A call pushes its return
+       address itself and the callee takes it off again, so a call leaves SP two lower. -->
+  <stackpointer register="SP" space="INTMEM" growth="positive"/>
+  <default_proto>
+    <prototype name="__stdcall" extrapop="-2" stackshift="-2" strategy="register">
+      <input>
+        <pentry minsize="1" maxsize="1" metatype="float">
+          <register name="R4"/>
+        </pentry>
+        <pentry minsize="1" maxsize="1" metatype="float">
+          <register name="R5"/>
+        </pentry>
+        <pentry minsize="1" maxsize="1">
+          <register name="R7"/>
+        </pentry>
+        <pentry minsize="1" maxsize="1">
+          <register name="R6"/>
+        </pentry>
+        <pentry minsize="1" maxsize="1">
+          <register name="R5"/>
+        </pentry>
+        <pentry minsize="1" maxsize="1">
+          <register name="R4"/>
+        </pentry>
+        <pentry minsize="1" maxsize="1">
+          <register name="R3"/>
+        </pentry>
+        <pentry minsize="1" maxsize="4">
+          <addr space="RAM" offset="0"/>
+        </pentry>
+      </input>
+      <output>
+        <pentry minsize="1" maxsize="1">
+          <register name="R7"/>
+        </pentry>
+        <pentry minsize="1" maxsize="1">
+          <register name="R6"/>
+        </pentry>
+        <pentry minsize="1" maxsize="1">
+          <register name="R7"/>
+        </pentry>
+        <pentry minsize="1" maxsize="1">
+          <register name="R4"/>
+        </pentry>
+        <pentry minsize="1" maxsize="1">
+          <register name="R5"/>
+        </pentry>
+        <pentry minsize="1" maxsize="1">
+          <register name="R6"/>
+        </pentry>
+        <pentry minsize="1" maxsize="1">
+          <register name="R7"/>
+        </pentry>
+      </output>
+      <unaffected>
+        <register name="SP"/>
+        <register name="PSW"/>
+      </unaffected>
+      <!-- recore: without a range the engine takes half the 8-bit stack space for locals, and
+           then keeps every return address a call pushes as a store to one. -->
+      <localrange>
+        <range space="stack" first="0x0" last="0x3f"/>
+      </localrange>
+    </prototype>
+  </default_proto>
+
+  <funcptr align="2" />
+  <aggressivetrim signext="true"/>
+  <returnaddress>
+    <varnode space="stack" offset="0" size="2"/>
+  </returnaddress>
+
+</compiler_spec>

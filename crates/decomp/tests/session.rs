@@ -167,3 +167,28 @@ fn a_function_that_jumps_to_another_returns_what_that_one_returns() {
     assert!(function.returns_value);
     assert!(function.c_text.contains("= func_0x00001010();"), "{}", function.c_text);
 }
+
+/// 8051 code at `addr`, which is `bank << 16 | address`.
+fn session_8051(code: &[u8], addr: u64) -> Session {
+    Session::new(&vendored_spec_dir().unwrap(), Target::I8051, &[Section { addr, data: code, readonly: true, code: true }]).unwrap()
+}
+
+#[test]
+fn an_8051_jump_stays_in_the_bank_of_its_instruction() {
+    // In bank 2: LCALL 0x9000; AJMP 0x8123; SJMP -2
+    let listing = session_8051(&[0x12, 0x90, 0x00, 0x01, 0x23, 0x80, 0xfe], 0x02_8000).listing(0x02_8000, 0x02_8007, false).unwrap();
+    let text: Vec<&str> = listing.iter().map(|instruction| instruction.text.as_str()).collect();
+    assert_eq!(text, ["LCALL 0x29000", "AJMP 0x28023", "SJMP 0x28005"]);
+}
+
+#[test]
+fn every_8051_opcode_is_as_long_as_recore_decodes_it() {
+    use recore::arch::Arch;
+    for opcode in 0..=255u8 {
+        let code = [opcode, 0x00, 0x00];
+        let listed = &session_8051(&code, 0).listing(0, 1, false).unwrap()[0];
+        let decoded = recore::i8051::I8051::decode(&code, 0).next().unwrap();
+        let expected = if decoded.insn.is_some() { u64::from(decoded.len) } else { 1 };
+        assert_eq!((listed.len, listed.text == "(bad)"), (expected, decoded.insn.is_none()), "opcode {opcode:#04x}: {}", listed.text);
+    }
+}
