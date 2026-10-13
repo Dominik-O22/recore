@@ -13,6 +13,7 @@ pub mod edits;
 pub mod image;
 pub mod itanium;
 pub mod jumptable;
+pub mod layout;
 pub mod macho;
 pub mod names;
 pub mod noreturn;

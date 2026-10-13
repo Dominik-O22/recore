@@ -614,6 +614,7 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
         Format::Elf => "ELF",
         Format::Pe => "PE",
         Format::MachO => "Mach-O",
+        Format::Raw => "raw",
     };
     let machine = match image.machine {
         Machine::X86 => "x86 (32-bit)",

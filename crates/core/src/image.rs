@@ -34,12 +34,15 @@ impl Section {
     }
 }
 
-/// The instruction set an image is built for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The instruction set an image is built for. A layout file names it as renamed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 pub enum Machine {
     /// 32-bit x86.
+    #[serde(rename = "x86")]
     X86,
+    #[serde(rename = "x86-64")]
     X86_64,
+    #[serde(rename = "aarch64")]
     Aarch64,
 }
 
@@ -59,6 +62,8 @@ pub enum Format {
     Elf,
     Pe,
     MachO,
+    /// No container: bytes placed by a layout file, see [`crate::layout`].
+    Raw,
 }
 
 pub struct Image {
@@ -80,7 +85,8 @@ pub struct Image {
     /// Slot address (GOT entry) to the imported symbol its relocation binds.
     pub import_slots: FxHashMap<u64, String>,
     /// Exported function addresses from the dynamic symbol table. In a Mach-O image, also the
-    /// methods its Objective-C metadata lists, which the runtime calls by name.
+    /// methods its Objective-C metadata lists, which the runtime calls by name. In a raw image,
+    /// the entry points its layout lists after the first.
     pub exports: Vec<u64>,
     /// Names the image itself carries for addresses in it: exports, as written in the file.
     pub symbol_names: FxHashMap<u64, String>,
@@ -96,7 +102,11 @@ pub struct Image {
 }
 
 impl Image {
+    /// Loads the executable at `path`, or the raw image the layout file at `path` describes.
     pub fn load(path: &Path) -> Result<Image> {
+        if crate::layout::is_layout(path) {
+            return crate::layout::load(path);
+        }
         let data = std::fs::read(path).with_context(|| format!("reading {path:?}"))?;
         if crate::macho::is_macho(&data) {
             return crate::macho::load(path.file_name().unwrap().to_string_lossy().into_owned(), &data);
