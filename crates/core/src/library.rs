@@ -19,6 +19,8 @@ pub struct Routine {
     /// Where it takes its arguments and leaves its result, as `ACC(R3:R2:R1,DPTR)`, if the
     /// list says.
     pub storage: Option<&'static str>,
+    /// Registers it brings back before it returns, though its code writes them.
+    pub restores: Vec<&'static str>,
     /// Bytes of code, and their hash with the bytes of `left_out` taken as zero.
     length: usize,
     hash: u64,
@@ -39,7 +41,9 @@ impl Routine {
                 Some((offset.parse().ok()?, count.parse().ok()?, routine))
             })
             .collect::<Option<_>>()?;
-        Some(Routine { name, storage: Some(storage).filter(|&storage| storage != "-"), length, hash, left_out })
+        let mut restores = storage.split(';');
+        let storage = restores.next().filter(|&storage| storage != "-");
+        Some(Routine { name, storage, restores: restores.collect(), length, hash, left_out })
     }
 
     /// Whether `bytes` start with the routine's code.
@@ -68,7 +72,7 @@ fn parse(list: &'static str) -> Vec<Routine> {
 static KEIL: LazyLock<Vec<Routine>> = LazyLock::new(|| {
     let routines = parse(include_str!("../data/keil-c51.lib")).into_iter();
     #[cfg(test)]
-    let routines = routines.chain(STAND_INS.iter().map(|&(name, code)| Routine { name, storage: None, length: code.len(), hash: hash(code, &[]), left_out: Vec::new() }));
+    let routines = routines.chain(STAND_INS.iter().map(|&(name, code)| Routine { name, storage: None, restores: Vec::new(), length: code.len(), hash: hash(code, &[]), left_out: Vec::new() }));
     routines.collect()
 });
 static SDCC: LazyLock<Vec<Routine>> = LazyLock::new(|| parse(include_str!("../data/sdcc-mcs51.lib")));

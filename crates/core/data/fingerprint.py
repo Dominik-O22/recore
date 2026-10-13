@@ -28,9 +28,9 @@ LEAST = 6
 # Where SDCC's routines written in assembly take arguments and leave a result, when that is
 # not where a C function does. A generic pointer is in B, DPH and DPL.
 SDCC_STORAGE = {
-    "__gptrget": "ACC(B:DPTR)",
-    "__gptrgetc": "ACC(B:DPTR)",
-    "__gptrput": "void(B:DPTR,ACC)",
+    "__gptrget": "ACC(B:DPTR);DPTR;R0",
+    "__gptrgetc": "ACC(B:DPTR);DPTR;R0",
+    "__gptrput": "void(B:DPTR,ACC);DPTR;R0",
 }
 
 

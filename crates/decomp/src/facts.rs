@@ -65,6 +65,10 @@ pub struct Facts {
     /// and what it calls leave as they were, though the calling convention lets a call change
     /// them.
     pub kept_registers: Vec<(u64, String)>,
+    /// Functions of SDCC code that return nothing: SDCC returns a value in `DPL` and the
+    /// registers after it, and these have not set `DPL` when they return. What a function
+    /// last passed to a call would else pass for what it returns.
+    pub returns_nothing: Vec<u64>,
     /// `(function, storage)`: where a function takes its arguments and leaves its result, as
     /// [`crate::Session::set_storage`] takes it: a library routine as [`recore::library::Routine::storage`] has it, and a
     /// function of C51 code as its use of the registers says.
@@ -126,13 +130,18 @@ impl Facts {
                 }
             }
         }
+        // `(routine, register)`: what a library routine brings back though its code writes it.
+        let mut restored: Vec<(u64, &str)> = Vec::new();
         // The analysis names a routine of the compiler's library that the image has no name
         // for. Where such a routine takes its arguments is in the library's list.
         if !library.is_empty() {
             let named: HashMap<u64, &str> = facts.names.iter().map(|(function, name)| (*function, name.as_str())).collect();
             let functions: Vec<u64> = named.keys().copied().collect();
             let routines = recore::library::recognise(image, &functions, library).into_iter().filter(|(function, routine)| named[function] == routine.name);
-            facts.storage = routines.filter_map(|(function, routine)| Some((function, routine.storage?.to_string()))).collect();
+            for (function, routine) in routines {
+                facts.storage.extend(routine.storage.map(|storage| (function, storage.to_string())));
+                restored.extend(routine.restores.iter().map(|&register| (function, register)));
+            }
         }
         let fixups: HashMap<String, String> = Target::of(image).map(Target::call_fixups).unwrap_or_default().into_iter().collect();
         // 32-bit C names carry one more leading underscore in some symbol sources than others.
@@ -148,12 +157,19 @@ impl Facts {
             uses.sort_unstable_by_key(|&(function, _)| function);
             for (function, registers) in uses {
                 // The engine takes `DPTR` whole or not at all.
-                let kept: Vec<&str> = registers.changed.others().names().filter(|name| !matches!(*name, "DPL" | "DPH")).collect();
+                let mut kept: Vec<&str> = registers.changed.others().names().filter(|name| !matches!(*name, "DPL" | "DPH")).collect();
+                for &(_, register) in restored.iter().filter(|restored| restored.0 == function) {
+                    if !kept.contains(&register) {
+                        kept.push(register);
+                    }
+                }
                 if !kept.is_empty() {
                     facts.kept_registers.push((function, kept.join(",")));
                 }
                 if c51 && !described.contains(&function) {
                     facts.storage.push((function, c51_storage(registers)));
+                } else if !c51 && !registers.set.has("DPL") && !registers.set.has("DPTR") && !described.contains(&function) {
+                    facts.returns_nothing.push(function);
                 }
             }
         }

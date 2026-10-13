@@ -1178,7 +1178,8 @@ int rd_set_storage(RdSession *session, uint64_t addr, const char *storage, char 
     int4 count = 0;
     for (string place; getline(arguments, place, ',');) proto.setParam(count++, "", stored_in(arch, place));
     proto.setInputLock(true);
-    proto.setOutputLock(result != "?");
+    // With `?` what is known of the result stays as it is.
+    if (result != "?") proto.setOutputLock(true);
     proto.setModelLock(true);
   });
 }
@@ -1260,6 +1261,17 @@ int rd_inline(RdSession *session, uint64_t caller, uint64_t function, char *err,
   return guarded(err, errlen, [&] {
     session->function(function)->getFuncProto().setInline(true);
     session->image->allowed.insert({caller, function});
+  });
+}
+
+// Says that the function at `addr` returns nothing, whatever its registers hold when it does.
+int rd_returns_nothing(RdSession *session, uint64_t addr, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    FuncProto &proto = session->function(addr)->getFuncProto();
+    // Locking the output locks the calling convention with it, which is still to be recovered.
+    bool model_locked = proto.isModelLocked();
+    proto.setOutputLock(true);
+    proto.setModelLock(model_locked);
   });
 }
 

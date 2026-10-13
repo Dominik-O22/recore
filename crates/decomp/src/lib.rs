@@ -479,6 +479,9 @@ impl Session {
         for &(function, noreturn) in &facts.functions {
             self.add_function(function, noreturn)?;
         }
+        for &function in &facts.returns_nothing {
+            check(|err, len| unsafe { ffi::rd_returns_nothing(self.raw.as_ptr(), function, err, len) != 0 })?;
+        }
         for (function, storage) in &facts.storage {
             self.set_storage(*function, storage)?;
         }
