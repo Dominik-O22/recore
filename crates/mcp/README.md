@@ -70,11 +70,12 @@ recore-mcp trace firmware.dll 0x10001260 --param 1
 recore-mcp diff firmware-1.0.dll firmware-1.1.dll
 recore-mcp rename firmware.dll 0x10001260 parse_header
 recore-mcp rename firmware.dll parse_header param_1 header
+recore-mcp rename firmware.dll 0x10001260 parse_header 0x10001300 read_block
 recore-mcp declare firmware.dll 'struct Header { uint4 magic; uint2 version; };'
 recore-mcp declare firmware.dll 0x1002abd0 Header
 ```
 
-Plain arguments are what the tool looks up; the other arguments in the table are options, `--limit 20`. `recore-mcp --help` lists the tools. Each run analyzes the binary again, so a long session is faster through the server.
+`recore-mcp <tool> --help` describes one tool and each of its options. Plain arguments are what the tool looks up; the other arguments in the table are options, `--limit 20`. `recore-mcp --help` lists the tools. Each run analyzes the binary again, so a long session is faster through the server.
 
 ## Decompiler isolation
 

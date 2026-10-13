@@ -49,6 +49,21 @@ recore-mcp rename program.exe check_license param_1 serial
 
 [crates/mcp/README.md](crates/mcp/README.md) describes each one.
 
+## One session
+
+A stripped program that checks a licence key, which the agent had never seen, and nothing to read it with but `recore-mcp`. Claude found a key the program accepts in 35 seconds. Six calls did it:
+
+```
+recore-mcp summary gate                          9 functions, 3 strings
+recore-mcp strings gate                          "access granted" is used by 0x1060
+recore-mcp imports gate                          strlen is called from 0x1200
+recore-mcp functions gate                        0x1060, 0x11c0 and 0x1200 are the program's own
+recore-mcp decompile gate 0x1060 0x1200 0x11c0   the check: 16 bytes against a table, then a hash
+recore-mcp bytes gate 0x2000 --len 96            the two tables
+```
+
+Each call answered in under a second. Given two stripped builds of Lua 5.4.8 next, `diff` named the four functions a patch had touched and the one it had added, of 786, and the agent explained each change from the decompiled C in 30 seconds.
+
 ## How
 
 The analysis is written from scratch in Rust: loading, function discovery, calls that never return, jump tables, strings, references, library function names by fingerprint, and C++, Objective-C and Swift classes with their methods. The C comes from Ghidra's decompiler engine, compiled into recore and fed recore's analysis instead of Ghidra's.

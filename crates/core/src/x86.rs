@@ -255,7 +255,7 @@ fn lea_target(instr: &Instruction) -> Option<u64> {
 }
 
 /// Bytes the compiler or linker inserts between functions: `int3`, and every form of `nop`.
-fn is_padding(instr: &Instruction) -> bool {
+pub(crate) fn is_padding(instr: &Instruction) -> bool {
     match instr.mnemonic() {
         Mnemonic::Nop | Mnemonic::Int3 => true,
         // `xchg ax, ax` is the two-byte nop.

@@ -58,37 +58,49 @@ pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u6
     let bytes = image.bytes_from(start)?;
     let bytes = bytes.get(..(end - start) as usize)?;
     match image.machine {
-        Machine::X86 => x86(32, bytes, pointer_slots, start, end, MIN_INSTRUCTIONS),
-        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, MIN_INSTRUCTIONS),
-        Machine::Aarch64 => aarch64(bytes, start, end, MIN_WORDS),
+        Machine::X86 => x86(32, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS)),
+        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS)),
+        Machine::Aarch64 => aarch64(bytes, start, end, Some(MIN_WORDS)),
     }
 }
 
 /// The fingerprint of the code in `[start, end)` however short it is: equal for two builds of
-/// one function that differ only in where they and what they refer to were linked. Short
-/// functions share theirs, so it identifies nothing by itself.
+/// one function that differ only in where they and what they refer to were linked, and in the
+/// padding that aligns their loops. Short functions share theirs, so it identifies nothing by
+/// itself.
 pub fn body_hash(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64) -> Option<u64> {
     let bytes = image.bytes_from(start)?.get(..end.checked_sub(start)? as usize)?;
     match image.machine {
-        Machine::X86 => x86(32, bytes, pointer_slots, start, end, 0),
-        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, 0),
-        Machine::Aarch64 => aarch64(bytes, start, end, 0),
+        Machine::X86 => x86(32, bytes, pointer_slots, start, end, None),
+        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, None),
+        Machine::Aarch64 => aarch64(bytes, start, end, None),
     }
 }
 
 /// An x86 function: displacements and immediates are blanked where they are relative to the
 /// instruction pointer and leave the function, or where the loader relocates them.
-fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64, min_instructions: usize) -> Option<u64> {
+/// With a least number of instructions the function must have that many and its padding
+/// counts, as the tables of library functions were built; without one, padding is left out.
+fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64, min_instructions: Option<usize>) -> Option<u64> {
     let mut decoder = Decoder::with_ip(bits, bytes, start, DecoderOptions::NONE);
 
     let mut hash = Hash::new();
     let mut instructions = 0;
+    // Without padding, a branch inside the function is told by which instruction it goes to,
+    // counted without the padding, since padding moves everything after it.
+    let unpadded: Vec<u64> = match min_instructions {
+        Some(_) => Vec::new(),
+        None => Decoder::with_ip(bits, bytes, start, DecoderOptions::NONE).into_iter().filter(|instr| !crate::x86::is_padding(instr)).map(|instr| instr.ip()).collect(),
+    };
 
     while decoder.can_decode() {
         let offset = decoder.position();
         let instr = decoder.decode();
         if instr.is_invalid() {
             return None;
+        }
+        if min_instructions.is_none() && crate::x86::is_padding(&instr) {
+            continue;
         }
         instructions += 1;
         let offsets = decoder.get_constant_offsets(&instr);
@@ -116,22 +128,27 @@ fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64,
             // A call or jump to somewhere else in the binary; branches within the function
             // are relative and identical everywhere.
             let external = is_branch && (instr.flow_control() == FlowControl::Call || leaves(instr.near_branch_target()));
-            if relocated || external {
+            let internal = is_branch && !external && min_instructions.is_none();
+            if relocated || external || internal {
                 mark(at, offsets.immediate_size());
+            }
+            if internal {
+                let ordinal = unpadded.partition_point(|&ip| ip < instr.near_branch_target()) as u32;
+                ordinal.to_le_bytes().into_iter().for_each(|byte| hash.feed(byte));
             }
         }
         for (index, &byte) in raw.iter().enumerate() {
             hash.feed(if blank[index] { 0 } else { byte });
         }
     }
-    (instructions >= min_instructions).then_some(hash.0)
+    (instructions >= min_instructions.unwrap_or(0)).then_some(hash.0)
 }
 
 /// An AArch64 function, a word at a time. Blanked are the offsets of calls and of branches and
 /// literal loads that leave the function, the address `adr` or `adrp` forms, and the low twelve
 /// bits an `add`, load or store then adds to a page. Which registers hold a page is followed
 /// along the instructions in address order, which is all the pairing compilers emit needs.
-fn aarch64(bytes: &[u8], start: u64, end: u64, min_words: usize) -> Option<u64> {
+fn aarch64(bytes: &[u8], start: u64, end: u64, min_words: Option<usize>) -> Option<u64> {
     const OFFSET_26: u32 = 0x03FF_FFFF;
     const OFFSET_19: u32 = 0x00FF_FFE0;
     const OFFSET_14: u32 = 0x0007_FFE0;
@@ -140,21 +157,38 @@ fn aarch64(bytes: &[u8], start: u64, end: u64, min_words: usize) -> Option<u64> 
     /// The registers a call may change: `x0` to `x18` and the link register.
     const CALLER_SAVED: u32 = 0x4007_FFFF;
 
-    if bytes.len() / 4 < min_words {
+    if bytes.len() / 4 < min_words.unwrap_or(0) {
         return None;
     }
+    const NOP: u32 = 0xD503_201F;
+    let words = || bytes.chunks_exact(4).map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()));
+    // Without padding, a branch inside the function is told by which instruction it goes to,
+    // counted without the padding, since padding moves everything after it: for each word,
+    // how many before it are not padding.
+    let unpadded: Vec<u32> = match min_words {
+        Some(_) => Vec::new(),
+        None => words().scan(0, |count, word| Some(std::mem::replace(count, *count + u32::from(word != NOP)))).collect(),
+    };
     let mut hash: u64 = 0;
     // Bit `n` is set while register `n` holds a page address.
     let mut pages: u32 = 0;
-    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
-        let word = u32::from_le_bytes(chunk.try_into().unwrap());
+    for (index, word) in words().enumerate() {
+        if min_words.is_none() && word == NOP {
+            continue;
+        }
+        // Where a branch inside the function goes, once its offset is blanked.
+        let mut inside = None;
         let (rd, rn) = (word & 31, word >> 5 & 31);
         // Whether the branch offset in the bits of `field`, counted in words, leaves the function.
-        let leaves = |field: u32| {
+        let mut leaves = |field: u32| {
             let unused = 64 - field.count_ones();
             let offset = (i64::from((word & field) >> field.trailing_zeros()) << unused >> unused) * 4;
             let target = (start + index as u64 * 4).wrapping_add_signed(offset);
-            target < start || target >= end
+            let leaves = target < start || target >= end;
+            if let (false, Some(&ordinal)) = (leaves, unpadded.get(((target.wrapping_sub(start)) / 4) as usize)) {
+                inside = Some((field, ordinal));
+            }
+            leaves
         };
         let blank_if = |condition: bool, field: u32| if condition { field } else { 0 };
         let mut blank = 0;
@@ -210,7 +244,11 @@ fn aarch64(bytes: &[u8], start: u64, end: u64, min_words: usize) -> Option<u64> 
             pages &= !(1 << rd);
         }
         // One multiplication a word; the rotation carries high bits back into the low ones.
-        hash = (hash.rotate_left(5) ^ u64::from(word & !blank)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        let word = match inside {
+            Some((field, ordinal)) => u64::from(word & !field) ^ u64::from(ordinal) << 32,
+            None => u64::from(word & !blank),
+        };
+        hash = (hash.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
     }
     Some(hash)
 }
@@ -333,7 +371,7 @@ mod tests {
     fn fingerprint_of(words: &[u32], start: u64) -> Option<u64> {
         let padding = (0..MIN_WORDS as u32).map(|n| 0xD280_0000 | n << 5);
         let bytes: Vec<u8> = words.iter().copied().chain(padding).flat_map(u32::to_le_bytes).collect();
-        aarch64(&bytes, start, start + bytes.len() as u64, MIN_WORDS)
+        aarch64(&bytes, start, start + bytes.len() as u64, Some(MIN_WORDS))
     }
 
     #[test]

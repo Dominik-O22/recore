@@ -79,6 +79,10 @@ pub fn rename(binary: &mut Binary, args: Rename) -> Result<String> {
             None => {
                 let addr = addr_arg(&naming.addr)?;
                 nameable(binary, addr)?;
+                // Two functions under one name could not be told apart where a name is asked for.
+                if let Some(other) = binary.program.functions().find(|function| function.addr != addr && function.name.as_deref() == Some(name)) {
+                    bail!("{:#x} is already called `{name}`", other.addr);
+                }
                 Named::Address(addr)
             }
         };

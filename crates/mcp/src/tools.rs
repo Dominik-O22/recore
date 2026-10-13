@@ -385,7 +385,7 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
     )?;
     writeln!(out, "analyzed in {:.0} ms, kept until the file changes", binary.analysis_ms)?;
     let edits = &binary.edits;
-    writeln!(out, "edits: {} names, {} comments, {} declarations, {} typed data, saved in {}", edits.names.len(), edits.comments.len(), edits.declarations.len(), edits.types.len(), binary.edits_file()?.display())?;
+    writeln!(out, "edits: {} names, {} named variables, {} comments, {} declarations, {} typed data, saved in {}", edits.names.len(), edits.locals.values().map(|names| names.len()).sum::<usize>(), edits.comments.len(), edits.declarations.len(), edits.types.len(), binary.edits_file()?.display())?;
     writeln!(out, "sections:")?;
     for section in &image.sections {
         let kind = if section.executable { "code" } else if section.writable { "data" } else { "read-only data" };

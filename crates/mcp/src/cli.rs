@@ -17,7 +17,8 @@ pub fn usage() -> String {
         "recore-mcp                               serve the Model Context Protocol on stdin and stdout\n\
          recore-mcp <tool> <binary> [arguments]   run one tool and print its answer\n\n\
          Plain arguments are what the tool looks up: a pattern, an address, a function name, or\n\
-         several functions for `decompile`. Other arguments are options, such as --limit 20.\n\n",
+         several functions for `decompile`. Other arguments are options, such as --limit 20.\n\
+         `recore-mcp <tool> --help` describes one tool and each of its options.\n\n",
     );
     for tool in tools::list().as_array().into_iter().flatten() {
         let options: Vec<String> = tool["inputSchema"]["properties"].as_object().into_iter().flatten().filter(|(name, _)| *name != "path").map(|(name, _)| format!("--{name}")).collect();
@@ -55,6 +56,11 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
             named.insert("addr".into(), json!(addr));
             named.insert("name".into(), json!(name));
         }
+        // Several at once: address and name, again and again.
+        ("rename", pairs) if pairs.len() >= 4 && pairs.len() % 2 == 0 => {
+            let names: Vec<Value> = pairs.chunks(2).map(|pair| json!({ "addr": pair[0], "name": pair[1] })).collect();
+            named.insert("names".into(), json!(names));
+        }
         ("rename", [function, var, name]) => {
             named.insert("addr".into(), json!(function));
             named.insert("var".into(), json!(var));
@@ -85,8 +91,22 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
     Ok(Value::Object(named))
 }
 
+/// What one tool takes, for `recore-mcp <tool> --help`.
+fn tool_usage(tool: &str) -> Option<String> {
+    let tools = tools::list();
+    let described = tools.as_array()?.iter().find(|described| described["name"] == tool)?;
+    let mut text = format!("recore-mcp {tool} <binary> [arguments]\n\n{}\n\n", described["description"].as_str()?);
+    for (name, property) in described["inputSchema"]["properties"].as_object()?.iter().filter(|(name, _)| *name != "path") {
+        text += &format!("--{name}\n    {}\n", property["description"].as_str().unwrap_or_default());
+    }
+    Some(text)
+}
+
 /// Runs one tool and returns what it answers.
 pub fn run(tool: &str, binary: &str, rest: &[String]) -> Result<String> {
+    if binary == "--help" || rest.iter().any(|argument| argument == "--help") {
+        return tool_usage(tool).ok_or_else(|| anyhow::anyhow!("there is no tool `{tool}`\n\n{}", usage()));
+    }
     let arguments = arguments(tool, binary, rest)?;
     match tools::call(&mut Cache::default(), tool, arguments) {
         Some(answer) => answer,
