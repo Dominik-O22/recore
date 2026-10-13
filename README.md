@@ -86,7 +86,7 @@ The key took six calls that mattered: `summary`, `strings`, `imports`, `function
 
 The analysis is written from scratch in Rust: loading, function discovery, calls that never return, jump tables, strings, references, library function names by fingerprint, and C++, Objective-C and Swift classes with their methods. The C comes from Ghidra's decompiler engine, compiled into recore and fed recore's analysis instead of Ghidra's.
 
-It reads ELF, Windows PE and Mach-O for x86, x86-64 and AArch64.
+It reads ELF, Windows PE and Mach-O for x86, x86-64 and AArch64, and raw 8051 firmware that a layout file describes.
 
 ## Fast is not sloppy
 
@@ -130,9 +130,52 @@ References from code to data have no ground truth, so they are scored against Gh
 
 With unwind tables hidden, recore finds 99.8% of functions on Linux x86-64 and 99.2% on Linux AArch64. It finds every C++ class that has type information in the Linux and macOS corpora, 13,952 of them, at the right vtable address.
 
+## Firmware
+
+A firmware image has no header that says where its bytes load or where execution starts. A layout file beside the image says so, and recore takes the layout wherever it takes an executable:
+
+```toml
+machine = "8051"
+compiler = "keil"
+entry = [0x0000]
+
+[[region]]
+file = "image.bin"
+offset = 0x10000
+length = 0x10000
+address = 0x010000
+executable = true
+
+[banking]
+common = [[0x0000, 0x4000]]
+
+[[banking.trampoline]]
+entry = "90 hh ll 02 ss ss"
+stub = "e5 49 c0 e0 02 46 .."
+```
+
+An 8051 addresses 64 KB of code, and larger programs switch banks. recore gives each bank its own range of addresses, loads the code the banks share once, and reads a call through a bank-switching trampoline as a call of the function it reaches. The trampolines are byte patterns in the layout, so a compiler's scheme is data and not code.
+
+What is not yet known can be left open. `recore sweep` then finds which bank each region is, which ranges the banks share and which trampoline scheme the image uses, and writes the completed layout. It ranks candidates by a score that needs no ground truth, which counts where jumps and calls between regions land. On three banked programs of the corpus below and on a 1.1 MB monitor firmware built with Keil C51, with the answers withheld, it places every bank correctly: 3 banks in under 45 ms and 17 banks in 250 ms. Against 124 deliberately wrong layouts of the corpus programs, the right one scores higher in all 113 that change the analysis. The sweep knows two trampoline schemes, Keil's and SDCC's, and does not search for a region's load address.
+
+Scored against the debug records of 24 open source programs built with SDCC, 21 of which Ghidra can load as one flat image. Both tools start from the same entry points.
+
+| 21 programs, 8051 | Functions found | Precision | Jump tables exact |
+|---|---|---|---|
+| recore | 99.6% | 99.4% | 16 of 16 |
+| Ghidra | 84.8% | 65.9% | 8 of 16 |
+
+Most of Ghidra's wrong starts are inside SDCC's `printf`, which it cuts into about 50 functions. Over all 24 programs, the three banked ones included, recore finds 99.7% at 99.3% precision and reads 19 of 19 jump tables. Two of the truth rules were written after seeing misses and both concern the two Cypress FX2 programs: their interrupt jump table counts as code, and the layout lists its 46 entries, because the chip indexes that table itself and no code refers to it.
+
+The monitor firmware, 17 banks of Keil C51 code, analyzes in 40 ms: 10,537 functions, 529 jump tables and 1,561 trampolines. An emulator that ran 40% of its instructions executed no byte that recore had not listed as code and called no address that recore had not found as a function. Every function decompiles, in 1.4 ms on average.
+
+The decompiler names the compiler's library routines by a hash of their code, so a call of Keil's 32-bit divide reads as a division. It takes its calling convention from the layout's `compiler`. Against SDCC's debug records it gets the parameters of 54.3% of functions right and whether they return a value for 86.6%. That is well short of the Windows figures above. Two-byte values that the code builds from single bytes still print as `CONCAT11(high,low)` in half of SDCC's functions and a fifth of Keil's.
+
+A `names` file gives the hardware's registers their names, the standard 8051 ones are built in, and `recore-mcp unnamed` lists the addresses the code uses most that have none. Text is found where it is stored as ASCII. A firmware that stores its menu as indices into its own font, as the monitor's does, shows none of that text.
+
 ## What Ghidra does that recore does not
 
-- **Processors.** Ghidra covers dozens. recore covers three.
+- **Processors.** Ghidra covers dozens. recore covers four.
 - **Types.** Ghidra ships struct layouts for the common libraries and lets a user edit types in a GUI. recore knows the types a caller declares, the prototypes of Windows, C library and macOS functions, classes from MSVC and Itanium type information and Objective-C metadata, and, when a binary has DWARF or a PDB, the structs, prototypes and globals in it.
 - **A GUI**, a debugger, scripting, and a database of everything it found.
 
@@ -160,7 +203,7 @@ For Claude Code, in `.mcp.json`:
 
 ## Reproducing the numbers
 
-The corpora are not in the repository. `corpus/fetch*.py` download them, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. `recore-bench run analysis --save <name>` and `--compare <name>` hold a change against an earlier build. Next to the times they report the processor instructions executed, which stay the same to a few hundredths of a percent whatever else the machine is doing.
+The corpora are not in the repository. `corpus/fetch*.py` download them, `corpus/build_8051.py` builds the 8051 programs with SDCC, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. `recore-bench run analysis --save <name>` and `--compare <name>` hold a change against an earlier build. Next to the times they report the processor instructions executed, which stay the same to a few hundredths of a percent whatever else the machine is doing.
 
 The speed table compares Ghidra's `Total Time` per binary with the wall time of `recore-mcp summary`, fastest of three runs. Both ran on the same Ryzen 7 9850X3D. Ghidra analyzed several binaries at a time with 4 cores each, and recore one at a time.
 
