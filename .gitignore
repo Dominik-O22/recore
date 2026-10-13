@@ -50,3 +50,11 @@ untrusted/
 dist/
 corpus-arm64/ghidra/
 corpus-macho*/ghidra*/
+corpus-8051/pkgs/
+corpus-8051/obj/
+corpus-8051/bin/
+corpus-8051/image/
+corpus-8051/debug/
+corpus-8051/truth/
+corpus-8051/jumptables/
+corpus-8051/recore*/
