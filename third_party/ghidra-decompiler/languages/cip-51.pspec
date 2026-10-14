@@ -1,0 +1,215 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<processor_spec>
+
+  <programcounter register="PC"/>
+  
+  <volatile outputop="write_volatile" inputop="read_volatile">
+    <range space="SFR" first="0x0" last="0xFF"/>
+    <range space="BITS" first="0x80" last="0xFF"/>
+  </volatile>
+  
+  <default_symbols>
+
+    <symbol name="BANK0_R0" address="INTMEM:00"/>
+    <symbol name="BANK0_R1" address="INTMEM:01"/>
+    <symbol name="BANK0_R2" address="INTMEM:02"/>
+    <symbol name="BANK0_R3" address="INTMEM:03"/>
+    <symbol name="BANK0_R4" address="INTMEM:04"/>
+    <symbol name="BANK0_R5" address="INTMEM:05"/>
+    <symbol name="BANK0_R6" address="INTMEM:06"/>
+    <symbol name="BANK0_R7" address="INTMEM:07"/>
+
+    <!-- recore: upstream names the 24 bytes after these as the registers of banks 1 to 3. A
+         program that selects no other bank, as most do, keeps variables there, and SDCC its
+         frame pointer. -->
+    <!-- recore: only the registers every 8051 has, under their usual names. Upstream names
+         the registers of the Silicon Labs parts here. -->
+    <symbol name="P0" address="SFR:80"/>
+    <symbol name="DPL" address="SFR:82"/>
+    <symbol name="DPH" address="SFR:83"/>
+    <symbol name="PCON" address="SFR:87"/>
+    <symbol name="TCON" address="SFR:88"/>
+    <symbol name="TMOD" address="SFR:89"/>
+    <symbol name="TL0" address="SFR:8a"/>
+    <symbol name="TL1" address="SFR:8b"/>
+    <symbol name="TH0" address="SFR:8c"/>
+    <symbol name="TH1" address="SFR:8d"/>
+    <symbol name="P1" address="SFR:90"/>
+    <symbol name="SCON" address="SFR:98"/>
+    <symbol name="SBUF" address="SFR:99"/>
+    <symbol name="P2" address="SFR:a0"/>
+    <symbol name="IE" address="SFR:a8"/>
+    <symbol name="P3" address="SFR:b0"/>
+    <symbol name="IP" address="SFR:b8"/>
+    <symbol name="PSW" address="SFR:d0"/>
+    <symbol name="ACC" address="SFR:e0"/>
+    <symbol name="B" address="SFR:f0"/>
+    
+    <!-- recore: the bits of internal memory are left without names. Upstream names them
+         by byte and bit, as in 20.0, which reads as a number in C. -->
+    
+    <symbol name="P0.0" address="BITS:80"/>
+    <symbol name="P0.1" address="BITS:81"/>
+    <symbol name="P0.2" address="BITS:82"/>
+    <symbol name="P0.3" address="BITS:83"/>
+    <symbol name="P0.4" address="BITS:84"/>
+    <symbol name="P0.5" address="BITS:85"/>
+    <symbol name="P0.6" address="BITS:86"/>
+    <symbol name="P0.7" address="BITS:87"/>
+    <symbol name="IT0" address="BITS:88"/>
+    <symbol name="IE0" address="BITS:89"/>
+    <symbol name="IT1" address="BITS:8a"/>
+    <symbol name="IE1" address="BITS:8b"/>
+    <symbol name="TR0" address="BITS:8c"/>
+    <symbol name="TF0" address="BITS:8d"/>
+    <symbol name="TR1" address="BITS:8e"/>
+    <symbol name="TF1" address="BITS:8f"/>
+    <symbol name="P1.0" address="BITS:90"/>
+    <symbol name="P1.1" address="BITS:91"/>
+    <symbol name="P1.2" address="BITS:92"/>
+    <symbol name="P1.3" address="BITS:93"/>
+    <symbol name="P1.4" address="BITS:94"/>
+    <symbol name="P1.5" address="BITS:95"/>
+    <symbol name="P1.6" address="BITS:96"/>
+    <symbol name="P1.7" address="BITS:97"/>
+    <symbol name="RI" address="BITS:98"/>
+    <symbol name="TI" address="BITS:99"/>
+    <symbol name="RB8" address="BITS:9a"/>
+    <symbol name="TB8" address="BITS:9b"/>
+    <symbol name="REN" address="BITS:9c"/>
+    <symbol name="SM2" address="BITS:9d"/>
+    <symbol name="SM1" address="BITS:9e"/>
+    <symbol name="SM0" address="BITS:9f"/>
+    <symbol name="P2.0" address="BITS:a0"/>
+    <symbol name="P2.1" address="BITS:a1"/>
+    <symbol name="P2.2" address="BITS:a2"/>
+    <symbol name="P2.3" address="BITS:a3"/>
+    <symbol name="P2.4" address="BITS:a4"/>
+    <symbol name="P2.5" address="BITS:a5"/>
+    <symbol name="P2.6" address="BITS:a6"/>
+    <symbol name="P2.7" address="BITS:a7"/>
+    <symbol name="EX0" address="BITS:a8"/>
+    <symbol name="ET0" address="BITS:a9"/>
+    <symbol name="EX1" address="BITS:aa"/>
+    <symbol name="ET1" address="BITS:ab"/>
+    <symbol name="ES" address="BITS:ac"/>
+    <symbol name="EA" address="BITS:af"/>
+    <symbol name="RXD" address="BITS:b0"/>
+    <symbol name="TXD" address="BITS:b1"/>
+    <symbol name="INT0" address="BITS:b2"/>
+    <symbol name="INT1" address="BITS:b3"/>
+    <symbol name="T0" address="BITS:b4"/>
+    <symbol name="T1" address="BITS:b5"/>
+    <symbol name="WR" address="BITS:b6"/>
+    <symbol name="RD" address="BITS:b7"/>
+    <symbol name="PX0" address="BITS:b8"/>
+    <symbol name="PT0" address="BITS:b9"/>
+    <symbol name="PX1" address="BITS:ba"/>
+    <symbol name="PT1" address="BITS:bb"/>
+    <symbol name="PS" address="BITS:bc"/>
+    <symbol name="P" address="BITS:d0"/>
+    <symbol name="UD" address="BITS:d1"/>
+    <symbol name="OV" address="BITS:d2"/>
+    <symbol name="RS0" address="BITS:d3"/>
+    <symbol name="RS1" address="BITS:d4"/>
+    <symbol name="F0" address="BITS:d5"/>
+    <symbol name="AC" address="BITS:d6"/>
+    <symbol name="C" address="BITS:d7"/>
+    <symbol name="ACC.0" address="BITS:e0"/>
+    <symbol name="ACC.1" address="BITS:e1"/>
+    <symbol name="ACC.2" address="BITS:e2"/>
+    <symbol name="ACC.3" address="BITS:e3"/>
+    <symbol name="ACC.4" address="BITS:e4"/>
+    <symbol name="ACC.5" address="BITS:e5"/>
+    <symbol name="ACC.6" address="BITS:e6"/>
+    <symbol name="ACC.7" address="BITS:e7"/>
+    <symbol name="B.0" address="BITS:f0"/>
+    <symbol name="B.1" address="BITS:f1"/>
+    <symbol name="B.2" address="BITS:f2"/>
+    <symbol name="B.3" address="BITS:f3"/>
+    <symbol name="B.4" address="BITS:f4"/>
+    <symbol name="B.5" address="BITS:f5"/>
+    <symbol name="B.6" address="BITS:f6"/>
+    <symbol name="B.7" address="BITS:f7"/>
+
+  </default_symbols>
+  
+  <default_memory_blocks>
+    <memory_block name="REG_BANK_1" start_address="INTMEM:0" length="0x8" initialized="false"/>
+    <memory_block name="REG_BANK_2" start_address="INTMEM:8" length="0x8" initialized="false"/>
+    <memory_block name="REG_BANK_3" start_address="INTMEM:10" length="0x8" initialized="false"/>
+    <memory_block name="REG_BANK_4" start_address="INTMEM:18" length="0x8" initialized="false"/>
+    <memory_block name="INTMEM" start_address="INTMEM:20" length="0xe0" initialized="false"/>
+    <memory_block name="BITS" start_address="BITS:00" bit_mapped_address="INTMEM:20" length="0x80"/>
+    <memory_block name="SFR" start_address="SFR:80" length="0x80" initialized="false"/>
+    
+    <!--  BUG: SFR-BITS do not map properly since only every 8th SFR register is mapped (e.g., 0x80, 0x88, 0x90 ... 0xF0, 0xF8) -->
+    <memory_block name="SFR-BITS" start_address="BITS:80" bit_mapped_address="SFR:80" length="0x80"/>
+    
+  </default_memory_blocks>
+  <!-- recore: a switch calls ?C?CCASE or ?C?ICASE with a list after the call: for each case
+       the address of its code and its value, of one byte or two, then a zero address and the
+       address of the default case. The routine jumps to the case and does not return.
+       crates/decomp reads such a call as a jump to what byteCases or wordCases gives for the
+       value switched on, the number of cases and the address of the list. The engine reads
+       a jump assist from the processor spec only. -->
+  <jumpassist name="byteCases">
+    <case_pcode>
+      <input name="index" size="3"/>
+      <input name="count" size="3"/>
+      <input name="list" size="3"/>
+      <output name="value" size="3"/>
+      <body><![CDATA[
+      value = zext(*[CODE]:1 (list + index * 3 + 2));
+      ]]></body>
+    </case_pcode>
+    <addr_pcode>
+      <input name="index" size="3"/>
+      <input name="count" size="3"/>
+      <input name="list" size="3"/>
+      <output name="case" size="3"/>
+      <body><![CDATA[
+      case = (list & 0xff0000) + zext(*[CODE]:2 (list + index * 3));
+      ]]></body>
+    </addr_pcode>
+    <default_pcode>
+      <input name="index" size="3"/>
+      <input name="count" size="3"/>
+      <input name="list" size="3"/>
+      <output name="case" size="3"/>
+      <body><![CDATA[
+      case = (list & 0xff0000) + zext(*[CODE]:2 (list + count * 3 + 2));
+      ]]></body>
+    </default_pcode>
+  </jumpassist>
+  <jumpassist name="wordCases">
+    <case_pcode>
+      <input name="index" size="3"/>
+      <input name="count" size="3"/>
+      <input name="list" size="3"/>
+      <output name="value" size="3"/>
+      <body><![CDATA[
+      value = zext(*[CODE]:2 (list + index * 4 + 2));
+      ]]></body>
+    </case_pcode>
+    <addr_pcode>
+      <input name="index" size="3"/>
+      <input name="count" size="3"/>
+      <input name="list" size="3"/>
+      <output name="case" size="3"/>
+      <body><![CDATA[
+      case = (list & 0xff0000) + zext(*[CODE]:2 (list + index * 4));
+      ]]></body>
+    </addr_pcode>
+    <default_pcode>
+      <input name="index" size="3"/>
+      <input name="count" size="3"/>
+      <input name="list" size="3"/>
+      <output name="case" size="3"/>
+      <body><![CDATA[
+      case = (list & 0xff0000) + zext(*[CODE]:2 (list + count * 4 + 2));
+      ]]></body>
+    </default_pcode>
+  </jumpassist>
+</processor_spec>

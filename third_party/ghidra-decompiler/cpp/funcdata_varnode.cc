@@ -921,7 +921,9 @@ void Funcdata::calcNZMask(void)
 	}
 	else {
 	  vn->nzm = calc_mask(vn->getSize());
-	  if (vn->isSpacebase())
+	  // recore: only a base register wider than a byte. Upstream clears the low byte of
+	  // any, which says that the 8051's one-byte stack pointer is zero.
+	  if (vn->isSpacebase() && vn->getSize() > 1)
 	    vn->nzm &= ~((uintb)0xff); // Treat spacebase input as aligned
 	}
       }

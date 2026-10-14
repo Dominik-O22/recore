@@ -399,7 +399,7 @@ pub fn decode_floor(binary: &Path, runs: usize) -> Result<()> {
                 let Some(insn) = std::hint::black_box(decoded).insn else { continue };
                 instructions += 1;
                 if level >= 1 {
-                    found += u64::from(A::flow(&insn, &state).is_some());
+                    found += u64::from(A::flow(&insn, &state, image).is_some());
                 }
                 if level >= 2 {
                     A::step(&mut state, &insn);
@@ -423,6 +423,7 @@ pub fn decode_floor(binary: &Path, runs: usize) -> Result<()> {
                 Machine::X86_64 => walk::<recore::x86::X86<64, false>>(image, &ranges, level),
                 Machine::X86 => walk::<recore::x86::X86<32, false>>(image, &ranges, level),
                 Machine::Aarch64 => walk::<recore::arm64::Arm64>(image, &ranges, level),
+                Machine::I8051 => walk::<recore::i8051::I8051>(image, &ranges, level),
             };
             times.push(ms(start));
         }

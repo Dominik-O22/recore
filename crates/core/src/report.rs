@@ -21,6 +21,11 @@ pub struct AnalyzedFunction {
     /// a `.cold` section holding its unlikely paths. The value is the owning function's entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fragment_of: Option<u64>,
+    /// The entry of the function that begins where this one's body ends, when the last
+    /// instruction of the body passes control on to it: that function returns for both, and no
+    /// jump or call says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_on: Option<u64>,
 }
 
 /// The evidence that first identified a function entry point.

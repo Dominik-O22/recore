@@ -76,7 +76,7 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         })
     }
 
-    fn flow(insn: &Instruction, _: &State) -> Option<Flow> {
+    fn flow(insn: &Instruction, _: &State, _: &Image) -> Option<Flow> {
         classify(insn)
     }
 

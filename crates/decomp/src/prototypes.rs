@@ -43,6 +43,8 @@ fn archives(format: Format) -> &'static [&'static str] {
         // The C library archive covers libraries the macOS one lacks, such as OpenSSL's newer
         // functions, and both describe the same C interface.
         Format::MachO => &[MACOS, CLIB],
+        // A raw image imports nothing.
+        Format::Raw => &[],
     }
 }
 

@@ -1,0 +1,530 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<compiler_spec>
+  <global>
+    <range space="IFLASH"/>
+    <range space="CODE"/>
+    <range space="INTMEM"/>
+    <range space="SFR"/>
+    <range space="XRAM"/>
+    <!-- recore: external memory is EXTMEM in this language. Left out, as upstream has it, every
+         store to it is dropped as one to a variable nothing reads. -->
+    <range space="EXTMEM"/>
+    <range space="RAM"/>
+    <range space="BITS"/>
+  </global>
+  <!-- recore: the stack is in internal memory, where PUSH, POP and calls keep it in this
+       language. Upstream names RAM, which nothing here writes to. A call pushes its return
+       address itself and the callee takes it off again, so a call leaves SP two lower. -->
+  <stackpointer register="SP" space="INTMEM" growth="positive"/>
+  <default_proto>
+    <prototype name="__stdcall" extrapop="-2" stackshift="-2" strategy="register">
+      <!-- recore: C51 passes the first three arguments in R7, R5 and R3, each with the register
+           below it for a second byte, and returns in R7, in R6 and R7, or in R4 to R7.
+           Upstream lists single registers with R4 and R5 first, which shows a call's
+           arguments out of order and a 16-bit one as two. -->
+      <input>
+        <pentry minsize="1" maxsize="2">
+          <register name="R6R7"/>
+        </pentry>
+        <pentry minsize="1" maxsize="2">
+          <register name="R4R5"/>
+        </pentry>
+        <pentry minsize="1" maxsize="2">
+          <register name="R2R3"/>
+        </pentry>
+      </input>
+      <output>
+        <pentry minsize="1" maxsize="2">
+          <register name="R6R7"/>
+        </pentry>
+        <pentry minsize="3" maxsize="4">
+          <register name="R4R5R6R7"/>
+        </pentry>
+      </output>
+      <!-- recore: upstream has PSW as unaffected and nothing as killed. C51 keeps no register
+           across a call, a function returns a bit in the carry flag, and the library's
+           routines return in A, B, DPTR and R0 to R3 as well. Code that reads one of these
+           after a call reads what the call left, not what was there before it. Of the flags,
+           which are registers of their own in this language, a call leaves the ones
+           arithmetic sets changed, and the register bank and the user's flags as they were. -->
+      <unaffected>
+        <register name="SP"/>
+        <register name="RS0"/>
+        <register name="RS1"/>
+        <register name="F0"/>
+        <register name="F1"/>
+      </unaffected>
+      <killedbycall>
+        <register name="CY"/>
+        <register name="AC"/>
+        <register name="OV"/>
+        <register name="ACC"/>
+        <register name="B"/>
+        <register name="DPTR"/>
+        <register name="R0R1R2R3"/>
+        <register name="R4R5R6R7"/>
+      </killedbycall>
+      <!-- recore: without a range the engine takes half the 8-bit stack space for locals, and
+           then keeps every return address a call pushes as a store to one. -->
+      <localrange>
+        <range space="stack" first="0x0" last="0x3f"/>
+      </localrange>
+    </prototype>
+  </default_proto>
+  <!-- recore: the convention again, but saying nothing of what a call does to R0 to R7. A
+       function that is known to leave some of them alone is declared with this one and its
+       own list for them, which the engine would refuse beside the default's. The default
+       lists them four at a time, so that a call is known to change two or four read as one
+       value as well. -->
+    <prototype name="__registers" extrapop="-2" stackshift="-2" strategy="register">
+      <input>
+        <pentry minsize="1" maxsize="2">
+          <register name="R6R7"/>
+        </pentry>
+        <pentry minsize="1" maxsize="2">
+          <register name="R4R5"/>
+        </pentry>
+        <pentry minsize="1" maxsize="2">
+          <register name="R2R3"/>
+        </pentry>
+      </input>
+      <output>
+        <pentry minsize="1" maxsize="2">
+          <register name="R6R7"/>
+        </pentry>
+        <pentry minsize="3" maxsize="4">
+          <register name="R4R5R6R7"/>
+        </pentry>
+      </output>
+      <unaffected>
+        <register name="SP"/>
+        <register name="RS0"/>
+        <register name="RS1"/>
+        <register name="F0"/>
+        <register name="F1"/>
+      </unaffected>
+      <killedbycall>
+        <register name="CY"/>
+        <register name="AC"/>
+        <register name="OV"/>
+        <register name="ACC"/>
+        <register name="B"/>
+        <register name="DPTR"/>
+      </killedbycall>
+      <localrange>
+        <range space="stack" first="0x0" last="0x3f"/>
+      </localrange>
+    </prototype>
+
+  <!-- recore: no funcptr element. Upstream has an alignment of 2, by which the engine clears
+       the lowest bit of an address that code jumps or calls through. 8051 code starts at
+       any address. -->
+  <aggressivetrim signext="true"/>
+  <returnaddress>
+    <varnode space="stack" offset="0" size="2"/>
+  </returnaddress>
+
+  <!-- recore: the routines of the C51 library that do what C has an operator for: arithmetic
+       on 16 and 32 bits, which are in R6R7 and R4R5R6R7 with a second operand in R4R5 and
+       R0R1R2R3, and loads and stores of 32 bits and of a pointer, which is in R3, R2 and R1.
+       A call to one reads as the operator. crates/core/data/keil-c51.lib has the code each
+       is known by. Each fixup ends by taking off the stack the return address the call
+       pushed. A comparison takes the carry flag as a borrow, as SUBB does. A fixup reads and
+       writes the registers one by one and never R4R5R6R7 or R6R7 whole: the engine looks for
+       one argument of a call in each stretch of registers the function uses as one, so a
+       fixup that used four as one would cost every other call of the function the arguments
+       it passes in two of them. -->
+  <callfixup name="?C?IMUL">
+    <target name="?C?IMUL"/>
+    <pcode>
+      <body><![CDATA[
+      local a:2 = (zext(R6) << 8) | zext(R7);
+      local b:2 = (zext(R4) << 8) | zext(R5);
+      local p:2 = a * b;
+      R6 = p(1);
+      R7 = p(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?UIDIV">
+    <target name="?C?UIDIV"/>
+    <pcode>
+      <body><![CDATA[
+      local a:2 = (zext(R6) << 8) | zext(R7);
+      local b:2 = (zext(R4) << 8) | zext(R5);
+      local q:2 = a / b;
+      local r:2 = a % b;
+      R6 = q(1);
+      R7 = q(0);
+      R4 = r(1);
+      R5 = r(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?SIDIV">
+    <target name="?C?SIDIV"/>
+    <pcode>
+      <body><![CDATA[
+      local a:2 = (zext(R6) << 8) | zext(R7);
+      local b:2 = (zext(R4) << 8) | zext(R5);
+      local q:2 = a s/ b;
+      local r:2 = a s% b;
+      R6 = q(1);
+      R7 = q(0);
+      R4 = r(1);
+      R5 = r(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?SCDIV">
+    <target name="?C?SCDIV"/>
+    <pcode>
+      <body><![CDATA[
+      local q:1 = ACC s/ B;
+      B = ACC s% B;
+      ACC = q;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LMUL">
+    <target name="?C?LMUL"/>
+    <pcode>
+      <body><![CDATA[
+      local a2:2 = (zext(R6) << 8) | zext(R7);
+      local a3:3 = (zext(R5) << 16) | zext(a2);
+      local a:4 = (zext(R4) << 24) | zext(a3);
+      local b2:2 = (zext(R2) << 8) | zext(R3);
+      local b3:3 = (zext(R1) << 16) | zext(b2);
+      local b:4 = (zext(R0) << 24) | zext(b3);
+      local p:4 = a * b;
+      R4 = p(3);
+      R5 = p(2);
+      R6 = p(1);
+      R7 = p(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?ULDIV">
+    <target name="?C?ULDIV"/>
+    <pcode>
+      <body><![CDATA[
+      local a2:2 = (zext(R6) << 8) | zext(R7);
+      local a3:3 = (zext(R5) << 16) | zext(a2);
+      local a:4 = (zext(R4) << 24) | zext(a3);
+      local b2:2 = (zext(R2) << 8) | zext(R3);
+      local b3:3 = (zext(R1) << 16) | zext(b2);
+      local b:4 = (zext(R0) << 24) | zext(b3);
+      local q:4 = a / b;
+      local r:4 = a % b;
+      R4 = q(3);
+      R5 = q(2);
+      R6 = q(1);
+      R7 = q(0);
+      R0 = r(3);
+      R1 = r(2);
+      R2 = r(1);
+      R3 = r(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?ULCMP">
+    <target name="?C?ULCMP"/>
+    <pcode>
+      <body><![CDATA[
+      local l2:2 = (zext(R2) << 8) | zext(R3);
+      local l3:3 = (zext(R1) << 16) | zext(l2);
+      local l:4 = (zext(R0) << 24) | zext(l3);
+      local r2:2 = (zext(R6) << 8) | zext(R7);
+      local r3:3 = (zext(R5) << 16) | zext(r2);
+      local r:4 = (zext(R4) << 24) | zext(r3);
+      local cy:4 = zext(CY);
+      CY = (l < r) | ((l - r) < cy);
+      ACC = (l - r) != cy;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?SLCMP">
+    <target name="?C?SLCMP"/>
+    <pcode>
+      <body><![CDATA[
+      local l2:2 = (zext(R2) << 8) | zext(R3);
+      local l3:3 = (zext(R1) << 16) | zext(l2);
+      local l:4 = (zext(R0) << 24) | zext(l3);
+      local r2:2 = (zext(R6) << 8) | zext(R7);
+      local r3:3 = (zext(R5) << 16) | zext(r2);
+      local r:4 = (zext(R4) << 24) | zext(r3);
+      l = l ^ 0x80000000;
+      r = r ^ 0x80000000;
+      local cy:4 = zext(CY);
+      CY = (l < r) | ((l - r) < cy);
+      ACC = (l - r) != cy;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?ULSHR">
+    <target name="?C?ULSHR"/>
+    <pcode>
+      <body><![CDATA[
+      local a2:2 = (zext(R6) << 8) | zext(R7);
+      local a3:3 = (zext(R5) << 16) | zext(a2);
+      local a:4 = (zext(R4) << 24) | zext(a3);
+      local v:4 = a >> R0;
+      R4 = v(3);
+      R5 = v(2);
+      R6 = v(1);
+      R7 = v(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?SLSHR">
+    <target name="?C?SLSHR"/>
+    <pcode>
+      <body><![CDATA[
+      local a2:2 = (zext(R6) << 8) | zext(R7);
+      local a3:3 = (zext(R5) << 16) | zext(a2);
+      local a:4 = (zext(R4) << 24) | zext(a3);
+      local v:4 = a s>> R0;
+      R4 = v(3);
+      R5 = v(2);
+      R6 = v(1);
+      R7 = v(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LSHL">
+    <target name="?C?LSHL"/>
+    <pcode>
+      <body><![CDATA[
+      local a2:2 = (zext(R6) << 8) | zext(R7);
+      local a3:3 = (zext(R5) << 16) | zext(a2);
+      local a:4 = (zext(R4) << 24) | zext(a3);
+      local v:4 = a << R0;
+      R4 = v(3);
+      R5 = v(2);
+      R6 = v(1);
+      R7 = v(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?OFFXADD">
+    <target name="?C?OFFXADD"/>
+    <pcode>
+      <body><![CDATA[
+      DPTR = DPTR + zext(ACC) * zext(B);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?IILDX">
+    <target name="?C?IILDX"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      local v:2 = *[EXTMEM]:2 p;
+      v = v + ((zext(ACC) << 8) | zext(B));
+      *[EXTMEM]:2 p = v;
+      ACC = v(1);
+      B = v(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?ILDIX">
+    <target name="?C?ILDIX"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      local v:2 = *[EXTMEM]:2 p;
+      *[EXTMEM]:2 p = v + ((zext(ACC) << 8) | zext(B));
+      ACC = v(1);
+      B = v(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LLDXDATA">
+    <target name="?C?LLDXDATA"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      local v:4 = *[EXTMEM]:4 p;
+      R4 = v(3);
+      R5 = v(2);
+      R6 = v(1);
+      R7 = v(0);
+      DPTR = DPTR + 3;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LLDXDATA0">
+    <target name="?C?LLDXDATA0"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      local v:4 = *[EXTMEM]:4 p;
+      R0 = v(3);
+      R1 = v(2);
+      R2 = v(1);
+      R3 = v(0);
+      DPTR = DPTR + 3;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LSTXDATA">
+    <target name="?C?LSTXDATA"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      local v2:2 = (zext(R6) << 8) | zext(R7);
+      local v3:3 = (zext(R5) << 16) | zext(v2);
+      local v:4 = (zext(R4) << 24) | zext(v3);
+      *[EXTMEM]:4 p = v;
+      DPTR = DPTR + 3;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LLDIDATA">
+    <target name="?C?LLDIDATA"/>
+    <pcode>
+      <body><![CDATA[
+      local v:4 = *[INTMEM]:4 R0;
+      R4 = v(3);
+      R5 = v(2);
+      R6 = v(1);
+      R7 = v(0);
+      R0 = R0 + 3;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LLDIDATA0">
+    <target name="?C?LLDIDATA0"/>
+    <pcode>
+      <body><![CDATA[
+      local v:4 = *[INTMEM]:4 R0;
+      R0 = v(3);
+      R1 = v(2);
+      R2 = v(1);
+      R3 = v(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LSTIDATA">
+    <target name="?C?LSTIDATA"/>
+    <pcode>
+      <body><![CDATA[
+      local v2:2 = (zext(R6) << 8) | zext(R7);
+      local v3:3 = (zext(R5) << 16) | zext(v2);
+      local v:4 = (zext(R4) << 24) | zext(v3);
+      *[INTMEM]:4 R0 = v;
+      R0 = R0 + 3;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LLDCODE">
+    <target name="?C?LLDCODE"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = (inst_start & 0xff0000) + zext(DPTR);
+      local v:4 = *[CODE]:4 p;
+      R4 = v(3);
+      R5 = v(2);
+      R6 = v(1);
+      R7 = v(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?LLDCODE0">
+    <target name="?C?LLDCODE0"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = (inst_start & 0xff0000) + zext(DPTR);
+      local v:4 = *[CODE]:4 p;
+      R0 = v(3);
+      R1 = v(2);
+      R2 = v(1);
+      R3 = v(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?PLDXDATA">
+    <target name="?C?PLDXDATA"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      local v:3 = *[EXTMEM]:3 p;
+      R3 = v(2);
+      R2 = v(1);
+      R1 = v(0);
+      DPTR = DPTR + 2;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?PSTXDATA">
+    <target name="?C?PSTXDATA"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = zext(DPTR);
+      *[EXTMEM]:3 p = (zext(R3) << 16) | (zext(R2) << 8) | zext(R1);
+      DPTR = DPTR + 2;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?PLDIDATA">
+    <target name="?C?PLDIDATA"/>
+    <pcode>
+      <body><![CDATA[
+      local v:3 = *[INTMEM]:3 R0;
+      R3 = v(2);
+      R2 = v(1);
+      R1 = v(0);
+      R0 = R0 + 2;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?PSTIDATA">
+    <target name="?C?PSTIDATA"/>
+    <pcode>
+      <body><![CDATA[
+      *[INTMEM]:3 R0 = (zext(R3) << 16) | (zext(R2) << 8) | zext(R1);
+      R0 = R0 + 2;
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+  <callfixup name="?C?PLDCODE">
+    <target name="?C?PLDCODE"/>
+    <pcode>
+      <body><![CDATA[
+      local p:3 = (inst_start & 0xff0000) + zext(DPTR);
+      local v:3 = *[CODE]:3 p;
+      R3 = v(2);
+      R2 = v(1);
+      R1 = v(0);
+      SP = SP - 2;
+      ]]></body>
+    </pcode>
+  </callfixup>
+
+</compiler_spec>

@@ -1,5 +1,6 @@
 //! Recognising text strings in an image's data.
 
+use crate::arch::TextPointer;
 use crate::image::Image;
 use crate::report::StringLiteral;
 
@@ -22,25 +23,77 @@ pub fn unreferenced(image: &Image, known: &[StringLiteral]) -> Vec<StringLiteral
     let data = |name: &str| name.starts_with(".rodata") || name == ".rdata" || name == ".data";
     let mut found = Vec::new();
     for section in image.sections.iter().filter(|section| !section.executable && data(&section.name)) {
-        // Bytes of the section that a known string covers are skipped.
-        let mut known = known[known.partition_point(|string| string.addr < section.addr)..].iter().take_while(|string| string.addr < section.end()).peekable();
-        let mut offset = 0;
-        while offset < section.data.len() {
-            let addr = section.addr + offset as u64;
-            if let Some(string) = known.next_if(|string| string.addr <= addr) {
-                let width = if string.wide { 2 } else { 1 };
-                offset = offset.max((string.addr - section.addr) as usize + width * (string.text.len() + 1));
-                continue;
+        unreferenced_in(section.addr, &section.data, known, &mut found);
+    }
+    found
+}
+
+/// The same for an image that keeps its text among the code: in the bytes of its code sections
+/// that are not instructions. `code` is every stretch of instructions, sorted.
+pub fn unreferenced_among_code(image: &Image, code: &[(u64, u64)], known: &[StringLiteral]) -> Vec<StringLiteral> {
+    let mut found = Vec::new();
+    for section in image.sections.iter().filter(|section| section.executable) {
+        let inside = code[code.partition_point(|&(_, end)| end <= section.addr)..].iter().take_while(|&&(start, _)| start < section.end());
+        let mut from = section.addr;
+        for &(start, end) in inside.chain([&(section.end(), section.end())]) {
+            if from < start {
+                unreferenced_in(from, &section.data[(from - section.addr) as usize..(start - section.addr) as usize], known, &mut found);
             }
-            let run = section.data[offset..].iter().take(MAX_CHARS).take_while(|&&byte| is_text(u32::from(byte))).count();
-            let starts_fresh = offset == 0 || section.data[offset - 1] == 0;
-            if starts_fresh && run >= MIN_CHARS_UNREFERENCED && section.data.get(offset + run) == Some(&0) {
-                found.push(StringLiteral { addr, text: String::from_utf8_lossy(&section.data[offset..offset + run]).into_owned(), wide: false });
-            }
-            offset += run + 1;
+            from = end;
         }
     }
     found
+}
+
+/// Adds the strings among `bytes`, which lie at `base`, that [`unreferenced`] is after.
+fn unreferenced_in(base: u64, bytes: &[u8], known: &[StringLiteral], found: &mut Vec<StringLiteral>) {
+    let end = base + bytes.len() as u64;
+    // Bytes that a known string covers are skipped.
+    let mut known = known[known.partition_point(|string| string.addr < base)..].iter().take_while(|string| string.addr < end).peekable();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let addr = base + offset as u64;
+        if let Some(string) = known.next_if(|string| string.addr <= addr) {
+            let width = if string.wide { 2 } else { 1 };
+            offset = offset.max((string.addr - base) as usize + width * (string.text.len() + 1));
+            continue;
+        }
+        let run = bytes[offset..].iter().take(MAX_CHARS).take_while(|&&byte| is_text(u32::from(byte))).count();
+        let starts_fresh = offset == 0 || bytes[offset - 1] == 0;
+        if starts_fresh && run >= MIN_CHARS_UNREFERENCED && bytes.get(offset + run) == Some(&0) {
+            found.push(StringLiteral { addr, text: String::from_utf8_lossy(&bytes[offset..offset + run]).into_owned(), wide: false });
+        }
+        offset += run + 1;
+    }
+}
+
+/// The text among the code that `pointers` point to, sorted by address, and the pointers that
+/// point to some, sorted. `code` is every stretch of instructions, sorted: text is in none.
+///
+/// A pointer the code marks as one into the code space is taken at its word, like a reference
+/// from an instruction elsewhere. One it does not mark may be two numbers that happen to make
+/// the address, so more has to speak for the text: it is longer, and the address is where it
+/// begins.
+pub fn among_code(image: &Image, code: &[(u64, u64)], mut pointers: Vec<TextPointer>) -> (Vec<StringLiteral>, Vec<TextPointer>) {
+    let in_code = |addr: u64| code[..code.partition_point(|&(start, _)| start <= addr)].last().is_some_and(|&(_, end)| addr < end);
+    let text_at = |pointer: &TextPointer| {
+        let addr = pointer.to;
+        let section = image.section_at(addr).filter(|section| section.executable && !in_code(addr))?;
+        let offset = (addr - section.addr) as usize;
+        let run = section.data[offset..].iter().take(MAX_CHARS).take_while(|&&byte| is_text(u32::from(byte))).count();
+        let begins = offset == 0 || !is_text(u32::from(section.data[offset - 1])) || in_code(addr - 1);
+        let enough = if pointer.marked { run >= MIN_CHARS_FROM_CODE } else { run >= MIN_CHARS && begins };
+        let ends = section.data.get(offset + run) == Some(&0) && !in_code(addr + run as u64);
+        (enough && ends).then(|| StringLiteral { addr, text: String::from_utf8_lossy(&section.data[offset..offset + run]).into_owned(), wide: false })
+    };
+    // A marked pointer first among those from one instruction to one address.
+    pointers.sort_unstable_by_key(|pointer| (pointer.from, pointer.to, !pointer.marked));
+    pointers.dedup_by_key(|pointer| (pointer.from, pointer.to));
+    let mut strings = Vec::new();
+    pointers.retain(|pointer| text_at(pointer).map(|string| strings.push(string)).is_some());
+    strings.sort_by_key(|string| string.addr);
+    strings.dedup_by_key(|string| string.addr);
+    (strings, pointers)
 }
 
 fn is_text(c: u32) -> bool {
@@ -89,6 +142,8 @@ mod tests {
             frames: Vec::new(),
             relative_targets: Vec::new(),
             data_in_code: false,
+            banking: Default::default(),
+            compiler: None,
         };
         let known = [StringLiteral { addr: 0x2000, text: "known one".into(), wide: false }];
         let found: Vec<(u64, String)> = unreferenced(&image, &known).into_iter().map(|string| (string.addr, string.text)).collect();

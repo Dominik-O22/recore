@@ -19,6 +19,9 @@ struct Cli {
     /// Corpus directory containing `bin/` and `debug/`.
     #[arg(long, default_value = "corpus")]
     corpus: PathBuf,
+    /// Where function signatures are kept, `<corpus>/signatures` unless given.
+    #[arg(long)]
+    signatures: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -39,9 +42,10 @@ enum Command {
     Signatures { out: PathBuf },
     /// Checks fingerprint naming by leaving each project out of the database in turn.
     SignatureCheck,
-    /// Reads function signatures from the PDBs into `<corpus>/signatures`.
+    /// Reads function signatures from the PDBs, or from SDCC's debug records, into the
+    /// signatures directory.
     SignatureTruth,
-    /// Scores decompiler corpus reports in `dirs` against the PDB signatures.
+    /// Scores decompiler corpus reports in `dirs` against those signatures.
     ScoreSignatures { dirs: Vec<PathBuf> },
     /// Compares recore's data references with Ghidra's in `<corpus>/ghidra-refs`, which
     /// `ghidra/run-refs.sh` writes.
@@ -73,10 +77,17 @@ fn binaries(corpus: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// The debug file of a binary: `<name>.pdb` for a PE image, `<name>.debug` otherwise.
+/// The name of a binary: its file's name, or for a raw image the name of its layout.
+fn name_of(binary: &Path) -> String {
+    let name = if recore::layout::is_layout(binary) { binary.file_stem() } else { binary.file_name() };
+    name.unwrap().to_string_lossy().into_owned()
+}
+
+/// The debug file of a binary: `<name>.pdb` for a PE image, `<name>.cdb` for an 8051 program
+/// built with SDCC, `<name>.debug` otherwise.
 fn debug_file(corpus: &Path, name: &str) -> PathBuf {
-    let pdb = corpus.join("debug").join(format!("{name}.pdb"));
-    if pdb.exists() { pdb } else { corpus.join("debug").join(format!("{name}.debug")) }
+    let with = |extension: &str| corpus.join("debug").join(format!("{name}.{extension}"));
+    [with("pdb"), with("cdb")].into_iter().find(|path| path.exists()).unwrap_or_else(|| with("debug"))
 }
 
 fn run_truth(corpus: &Path) -> Result<()> {
@@ -85,7 +96,7 @@ fn run_truth(corpus: &Path) -> Result<()> {
     let results: Vec<_> = binaries(corpus)?
         .par_iter()
         .map(|binary| {
-            let name = binary.file_name().unwrap().to_string_lossy().into_owned();
+            let name = name_of(binary);
             let truth = truth::extract(binary, &debug_file(corpus, &name));
             (name, truth)
         })
@@ -114,7 +125,7 @@ fn run_pe_facts(corpus: &Path, detail: bool) -> Result<()> {
     let results: Vec<_> = binaries(corpus)?
         .par_iter()
         .map(|binary| {
-            let name = binary.file_name().unwrap().to_string_lossy().into_owned();
+            let name = name_of(binary);
             let facts = truth::pe_facts::facts(binary, &debug_file(corpus, &name));
             (name, facts)
         })
@@ -145,7 +156,7 @@ fn run_jumptables(corpus: &Path) -> Result<()> {
     let results: Vec<_> = binaries(corpus)?
         .par_iter()
         .map(|binary| {
-            let name = binary.file_name().unwrap().to_string_lossy().into_owned();
+            let name = name_of(binary);
             let extracted = jumptables::extract(binary, &debug_file(corpus, &name));
             (name, extracted)
         })
@@ -234,12 +245,13 @@ fn run_score(corpus: &Path, dir: &Path, detail: bool) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let signatures = cli.signatures.clone().unwrap_or_else(|| cli.corpus.join("signatures"));
     match cli.command {
         Command::Truth => run_truth(&cli.corpus),
         Command::Signatures { out } => signatures::build(&cli.corpus, &out),
         Command::SignatureCheck => signatures::evaluate(&cli.corpus),
-        Command::SignatureTruth => signatures_score::write_truth(&cli.corpus),
-        Command::ScoreSignatures { dirs } => signatures_score::score(&cli.corpus, &dirs),
+        Command::SignatureTruth => signatures_score::write_truth(&cli.corpus, &signatures),
+        Command::ScoreSignatures { dirs } => signatures_score::score(&signatures, &dirs),
         Command::Jumptables => run_jumptables(&cli.corpus),
         Command::ScoreReferences { misses } => references::score(&cli.corpus, misses),
         Command::ScoreClasses { detail } => classes::score(&cli.corpus, detail),

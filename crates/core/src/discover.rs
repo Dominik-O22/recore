@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::arch::{Arch, Flow, Table};
-use crate::image::{Image, Machine, Section};
+use crate::image::{Image, Section};
 use crate::noreturn::is_noreturn_import;
 use crate::phase;
 use crate::report::{JumpTable, Origin};
@@ -18,8 +18,8 @@ struct Region<'a> {
     section: &'a Section,
     /// Per byte, the length of the decoded instruction that begins there, or zero.
     insn_len: Vec<u8>,
-    /// Per byte, what is known about the address: [`FOLLOWS_BREAK`], [`ASKED_AS_START`] and
-    /// [`REFERENCED`]. One array, so that looking up a call's target touches one place in memory.
+    /// Per byte, what is known about the address: [`FOLLOWS_BREAK`], [`ASKED_AS_START`],
+    /// [`REFERENCED`] and [`IN_TABLE`]. One array, so that looking up a call's target touches one place in memory.
     flags: Vec<u8>,
     /// Per page, the time `insn_len` or a [`FOLLOWS_BREAK`] flag last changed in it, on the
     /// explorer's clock.
@@ -39,6 +39,8 @@ const FOLLOWS_BREAK: u8 = 1;
 const ASKED_AS_START: u8 = 2;
 /// Something calls the address, takes it, exports it, or points to it from data.
 const REFERENCED: u8 = 4;
+/// The byte is part of a jump table that lies in the code after its jump.
+const IN_TABLE: u8 = 8;
 
 /// The gap scan works through a section in pages of this many bytes.
 const PAGE: usize = 4096;
@@ -138,6 +140,9 @@ pub struct Discovery {
     pub uncertain_refs: Vec<(u64, u64, bool)>,
     /// Every stretch of decoded instructions, as sorted `[start, end)` ranges.
     pub code: Vec<(u64, u64)>,
+    /// `[start, end)` of every jump table that lies in the code straight after its jump,
+    /// sorted. A function's code goes on after it.
+    pub inline_tables: Vec<(u64, u64)>,
 }
 
 /// A set of addresses, for asking of very many ranges whether any member lies inside. Most
@@ -253,6 +258,10 @@ struct Explorer<'a, A: Arch> {
     clock: u32,
     /// `[start, end)` of every section that holds no code, sorted.
     data_sections: Vec<(u64, u64)>,
+    /// Where each stretch begins of the last gap found to divide into functions, in order.
+    /// The gap search comes to them one after the other, and each holds as the gap did, so
+    /// the gap is decoded once and not once for each.
+    tiled: Vec<u64>,
     /// Whether what this pass finds will be reported. A first pass that has learned a table's
     /// length is followed by a second, and only its lengths are read: from then on it stops
     /// recording references and what is referenced, which decide nothing while exploring.
@@ -412,7 +421,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 };
                 after_call = false;
                 self.regions[index].cover(offset, usize::from(decoded.len.max(1)));
-                let Some(flow) = A::flow(insn, &state) else {
+                let Some(flow) = A::flow(insn, &state, self.image) else {
                     if let Some((base, data)) = A::based_data_address(insn, &state) {
                         let from_image_base = self.image.base != 0 && base == self.image.base;
                         if from_image_base {
@@ -589,6 +598,16 @@ impl<'a, A: Arch> Explorer<'a, A> {
             table.entries.iter().filter(|&&target| Some(target) != function_end).map(|&addr| Pending { addr, state: at_case, trusted, speculative }),
         );
         self.unresolved.remove(&jump);
+        // Nothing in a table among the code is an instruction, whatever its bytes look like.
+        if let Some(end) = table.inline_end
+            && let Some(index) = self.region_index(table.address)
+        {
+            let clock = self.clock;
+            let region = &mut self.regions[index];
+            let (start, end) = ((table.address - region.section.addr) as usize, ((end - region.section.addr) as usize).min(region.flags.len()));
+            region.flags[start..end].iter_mut().for_each(|flags| *flags |= IN_TABLE);
+            (start..end).step_by(PAGE).chain([end.saturating_sub(1)]).for_each(|offset| region.touch(offset, clock));
+        }
         // Tables sit back to back, so each table's address ends the one before it.
         self.data_refs.push(table.address);
         if self.recording && !speculative {
@@ -617,7 +636,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let section = self.regions[index].section;
         for decoded in A::decode(&section.data[(addr - section.addr) as usize..], addr) {
             let Some(insn) = decoded.insn else { return };
-            match A::flow(&insn, &state) {
+            match A::flow(&insn, &state, self.image) {
                 None => A::step(&mut state, &insn),
                 Some(Flow::JumpIndirect(None)) if decoded.addr == jump => {
                     let resolved = A::resolve_table(&state, self.image, self.pointer_slots, &insn, &|target| {
@@ -669,7 +688,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let offset = (addr - region.section.addr) as usize;
         // Padding between functions is shorter than one alignment unit.
         let earliest = offset.saturating_sub(A::FUNCTION_ALIGN as usize - 1);
-        let pointer_size = if self.image.machine == Machine::X86 { 4 } else { 8 };
+        let pointer_size = self.image.machine.pointer_size() as usize;
         let after_table = |o: usize| {
             self.image.data_in_code && o >= pointer_size && self.pointer_slots.contains_key(&(region.section.addr + (o - pointer_size) as u64))
         };
@@ -814,7 +833,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
             if inside || A::is_padding(&insn) || self.frame_of(decoded.addr).is_some() {
                 return false;
             }
-            match A::flow(&insn, &state) {
+            match A::flow(&insn, &state, self.image) {
                 Some(Flow::Call(target)) if !may_call || self.region_index(target).is_none() => return false,
                 Some(Flow::CallIndirect(_)) if !may_call => return false,
                 Some(Flow::Halt | Flow::JumpIndirect(None)) => return false,
@@ -833,6 +852,85 @@ impl<'a, A: Arch> Explorer<'a, A> {
             }
         }
         false
+    }
+
+    /// Whether the unreached bytes from `addr` to the next known code divide into functions with
+    /// nothing left over: decoded one after the other they are all instructions, each stretch
+    /// ends in a return or a jump, the last of them where the known code begins, every jump
+    /// lands on one of the instructions or on known code, and every call on a function. A
+    /// stretch of a single return has to be one the code before it jumps to. Bytes that are
+    /// data seldom do all of that. Fill after the last stretch, one byte repeated to the end
+    /// of the region, is left over as no function. Fill that stops short of the end is not
+    /// told from code, as 0x00 and 0xFF are instructions.
+    fn tiles_gap(&mut self, index: usize, addr: u64) -> bool {
+        if self.tiled.binary_search(&addr).is_ok() {
+            return true;
+        }
+        let region = &self.regions[index];
+        let section = region.section;
+        let known = |at: u64| self.region_index(at).is_some_and(|index| self.regions[index].insn_len[(at - self.regions[index].section.addr) as usize] != 0);
+        // Erased flash reads 0xFF, and a linker pads a bank to its size with 0x00.
+        let is_fill = |byte: &u8| matches!(byte, 0x00 | 0xFF);
+        let state = A::State::default();
+        // Where each instruction and each stretch begins, in order, and where the code goes.
+        let (mut instructions, mut stretches, mut jumps, mut calls) = (Vec::new(), vec![addr], Vec::new(), Vec::new());
+        // The stretches too short to be functions.
+        let mut tails = Vec::new();
+        let mut ended = false;
+        for decoded in A::decode(&section.data[(addr - section.addr) as usize..], addr) {
+            if known(decoded.addr) {
+                break;
+            }
+            let Some(insn) = decoded.insn else { return false };
+            let covers = (decoded.addr - section.addr) as usize..(decoded.next_addr() - section.addr) as usize;
+            if (decoded.addr + 1..decoded.next_addr()).any(known) || region.flags[covers].iter().any(|flags| flags & IN_TABLE != 0) {
+                return false;
+            }
+            instructions.push(decoded.addr);
+            ended = match A::flow(&insn, &state, self.image) {
+                Some(Flow::Halt) => return false,
+                Some(Flow::Call(target)) => {
+                    calls.push(target);
+                    false
+                }
+                Some(Flow::Branch(target)) => {
+                    jumps.push(target);
+                    false
+                }
+                Some(Flow::Jump(target)) => {
+                    jumps.push(target);
+                    true
+                }
+                Some(Flow::Return | Flow::JumpIndirect(_)) => true,
+                Some(Flow::CallIndirect(_)) | None => false,
+            };
+            if ended {
+                // A stretch of under three bytes is a lone 8051 `RET` or `SJMP`/`AJMP`, more often
+                // the tail of the function before it.
+                if decoded.next_addr() - stretches[stretches.len() - 1] < 3 {
+                    tails.push(stretches[stretches.len() - 1]);
+                }
+                let next = decoded.next_addr();
+                let rest = &section.data[(next - section.addr) as usize..];
+                // Each fill byte is looked at here once: if the fill stops short, the stretch
+                // that follows is decoded past it.
+                let filled = rest.first().is_some_and(|&fill| is_fill(&fill) && rest.iter().all(|&byte| byte == fill) && (next..section.end()).all(|at| !known(at)));
+                if filled {
+                    break;
+                }
+                stretches.push(next);
+            }
+        }
+        // Here it is that tail only if the code before it jumps to it.
+        jumps.sort_unstable();
+        let tiles = ended
+            && tails.iter().all(|tail| *tail != addr && jumps.binary_search(tail).is_ok())
+            && jumps.iter().all(|target| instructions.binary_search(target).is_ok() || known(*target))
+            && calls.iter().all(|target| self.starts.contains_key(target) || stretches.binary_search(target).is_ok());
+        if tiles {
+            self.tiled = stretches;
+        }
+        tiles
     }
 
     fn in_table(&self, addr: u64) -> bool {
@@ -896,10 +994,14 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         offset = self.regions[index].end_of_run(offset);
                         continue;
                     }
+                    if self.regions[index].flags[offset] & IN_TABLE != 0 {
+                        offset += 1;
+                        continue;
+                    }
                     // Relocated pointers in a code section are a jump table. Step over the whole
                     // table; what follows it cannot be fallen into.
                     if self.image.data_in_code && self.pointer_slots.contains_key(&addr) {
-                        let pointer_size = if self.image.machine == Machine::X86 { 4 } else { 8 };
+                        let pointer_size = self.image.machine.pointer_size() as usize;
                         offset += pointer_size;
                         after_data = offset;
                         continue;
@@ -929,6 +1031,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     // Always make progress, even past bytes that do not decode.
                     offset = ((scanned_to - section.addr) as usize).max(offset + 1);
                     let Some((addr, insn)) = candidate else { continue };
+                    // A trampoline entry is not a function: what it reaches is, and every jump
+                    // or call to the entry already goes there.
+                    if self.image.banking.trampolines.contains_key(&addr) {
+                        continue;
+                    }
                     let at = (addr - section.addr) as usize;
                     if skipped_padding && !self.regions[index].follows_break(at) {
                         self.regions[index].flags[at] |= FOLLOWS_BREAK;
@@ -951,10 +1058,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         let opens = after_break && A::opens_function(&insn, next.as_ref());
                         // After a table, alignment alone proves little: a byte table or more of the
                         // same function may follow. The start of the section is different.
-                        let aligned_after_break = aligned && (skipped_padding || at == 0);
+                        // Where nothing aligns functions, no address is likelier to start one.
+                        let aligned_after_break = A::FUNCTION_ALIGN > 1 && aligned && (skipped_padding || at == 0);
                         if self.pointer_slots.contains_key(&addr) {
                             // The padding scan stopped on a table entry; resume after that entry.
-                            let pointer_size = if self.image.machine == Machine::X86 { 4 } else { 8 };
+                            let pointer_size = self.image.machine.pointer_size() as usize;
                             offset = (addr - section.addr) as usize + pointer_size;
                             after_data = offset;
                             continue;
@@ -964,7 +1072,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         let unwound_elsewhere = !self.frames.is_empty() && self.frame_of(addr).is_none();
                         let whole = after_break
                             && (unwound_elsewhere && self.is_whole_function(index, addr, false)
-                                || aligned && self.is_whole_function(index, addr, true));
+                                || aligned && self.is_whole_function(index, addr, true)
+                                || A::TILES_GAPS && self.tiles_gap(index, addr));
                         is_start = (aligned_after_break || opens || whole) && !self.inside_frame(addr);
                         if !is_start {
                             // Inside an unwind entry the bytes belong to a function, so they are
@@ -1032,7 +1141,10 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
     let _phase = phase::scope("discover/code ranges");
     let code = explorer.code_ranges();
     let uncertain_refs = std::mem::take(&mut explorer.uncertain_ref_sites);
-    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code }
+    let mut inline_tables: Vec<(u64, u64)> = explorer.tables.iter().filter_map(|(_, table)| Some((table.address, table.inline_end?))).collect();
+    inline_tables.sort_unstable();
+    inline_tables.dedup();
+    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code, inline_tables }
 }
 
 /// What the image's relative relocations say, in the forms exploring looks them up.
@@ -1101,6 +1213,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
             ranges.sort_unstable();
             ranges
         },
+        tiled: Vec::new(),
     };
 
     drop(_phase);

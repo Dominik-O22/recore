@@ -6,12 +6,14 @@
 //! shared; only that decode is per architecture (x86-64 and AArch64).
 //!
 //! PE images take their functions from a PDB instead (see [`pe`]), and Mach-O images from an
-//! unstripped copy (see [`macho`]); both share the classification.
+//! unstripped copy (see [`macho`]); both share the classification. 8051 programs take theirs
+//! from SDCC's debug records (see [`sdcc`]).
 
 mod aarch64;
 mod macho;
 pub mod pe;
 pub mod pe_facts;
+pub mod sdcc;
 mod x86;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -293,6 +295,9 @@ fn classify(scans: impl Iterator<Item = Scan>, callees: &Callees) -> Classified 
 }
 
 pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
+    if recore::layout::is_layout(binary_path) {
+        return sdcc::extract(binary_path, debug_path);
+    }
     let binary_data = std::fs::read(binary_path).with_context(|| format!("reading {binary_path:?}"))?;
     let binary = object::File::parse(&*binary_data)?;
     if binary.format() == object::BinaryFormat::Pe {

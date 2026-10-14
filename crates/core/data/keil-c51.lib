@@ -1,0 +1,81 @@
+# Library routines of Keil's C51, which the compiler calls for what the 8051 has no instruction
+# for. Each line is a routine: its name, where it takes its arguments and leaves its result,
+# the length of its code, a hash of that code, and the bytes the hash leaves out because they
+# differ from program to program; `=name` says the two bytes are the address of that routine.
+# The arguments and the result are registers, joined with `:` where one value is in several,
+# most significant first; `-` leaves them to the compiler spec, which has a call fixup for a
+# routine it can say more about. A pointer is in R3, R2 and R1: what memory it points into,
+# then the address. The names are the ones Keil documents, but for `triple_index`, code Keil's
+# tools emit under no documented name, which triples the index of a `switch` with
+# `MOV B, #3; MUL AB` and adds the high byte of the product to DPH.
+#
+# The file holds hashes, not code, but a hash does not hide a short routine: one with few
+# bytes left out can be found by trying the instruction sequences it might be.
+#
+# How the lines were made: `fingerprint.py image <image> <offset> <routines>` over an image a
+# user built with C51, which is not in the repository. `routines` lists `name storage start
+# end` for each routine, found by hand: where a call with the routine's documented use goes,
+# up to its last instruction. To add routines, do the same with any image built with C51: a
+# map file from Keil's linker gives the start of each `?C?` routine, the next symbol its end.
+# Give the offset at which the 64 KB holding the routines start in the file, and append the
+# lines it prints. A line already here that the image's routine does not match is a different
+# version of the routine, and both lines can stay.
+?C?COPY - 38 9e92d7924435396e 35+2
+?C?SCDIV - 34 2c015aa8d1d7e727
+?C?CLDPTR ACC(R3:R2:R1) 25 b2a6f21f472bf755
+?C?CLDIPTR ACC(R3:R2:R1,ACC) 36 e2c6808db76cbcba
+?C?CLDOPTR ACC(R3:R2:R1,DPTR) 45 e58e007d0fc0086f
+?C?CSTPTR void(R3:R2:R1,ACC) 18 0bd67a7c9fa5f565
+?C?CSTOPTR void(R3:R2:R1,DPTR,ACC) 34 3aa5e7a029211eff
+?C?IMUL - 18 7c4089b5ad619493
+?C?UIDIV - 85 68e1198720284cd4
+?C?SIDIV - 54 c82a4d6f0c09fdbb 29+2=?C?UIDIV 41+2=?C?UIDIV
+?C?IILDX - 22 4f5eaa17c385aa8a
+?C?ILDIX - 22 bd13d836f0cef37e
+?C?ILDPTR B:ACC(R3:R2:R1) 43 8763538334e5a054
+?C?ILDOPTR B:ACC(R3:R2:R1,DPTR) 56 87a95bd66bbf6f9f
+?C?IILDPTR ACC:B(R3:R2:R1,ACC:B) 56 5d3f67a78a5422c0 8+2=?C?IILDX
+?C?IILDOPTR ACC:B(R3:R2:R1,DPTR,ACC:B) 77 b3e1366bc713a932 14+2=?C?IILDX
+?C?ISTPTR void(R3:R2:R1,ACC:B) 31 871da1884cd26e6f
+?C?ISTOPTR void(R3:R2:R1,DPTR,ACC:B) 45 e045085970142171
+?C?LMUL - 79 6abeb3b2d2fc095f
+?C?ULDIV - 146 f23ddd8461ffe74c
+?C?SLCMP - 22 ce3e89291dc90dd1
+?C?ULCMP - 17 1a20cacaebc74a71
+?C?ULSHR - 19 1e5d2d4876a4b918
+?C?SLSHR - 20 d26886a27d8df73c
+?C?LSHL - 19 63d0e90d14994066
+?C?LLDPTR R4R5R6R7(R3:R2:R1) 32 165836a8d89367cd 8+2=?C?LLDXDATA 15+2=?C?LLDIDATA 23+2=?C?LLDPDATA 30+2=?C?LLDCODE
+?C?LLDOPTR R4R5R6R7(R3:R2:R1,DPTR) 48 c013248cd1cfa267 14+2=?C?LLDXDATA 23+2=?C?LLDIDATA 33+2=?C?LLDPDATA 46+2=?C?LLDCODE
+?C?LSTPTR void(R3:R2:R1,R4R5R6R7) 26 89e3f3b14dc3a011 8+2=?C?LSTXDATA 15+2=?C?LSTIDATA 23+2=?C?LSTPDATA
+?C?LSTOPTR void(R3:R2:R1,DPTR,R4R5R6R7) 36 650fa1b52a0105c4 14+2=?C?LSTXDATA 23+2=?C?LSTIDATA 33+2=?C?LSTPDATA
+?C?LLDIDATA - 12 b0f1dee199a8e397
+?C?LLDPTR0 R0R1R2R3(R3:R2:R1) 32 165836a8d89367cd 8+2=?C?LLDXDATA0 15+2=?C?LLDIDATA0 23+2=?C?LLDPDATA0 30+2=?C?LLDCODE0
+?C?LLDOPTR0 R0R1R2R3(R3:R2:R1,DPTR) 48 c013248cd1cfa267 14+2=?C?LLDXDATA0 23+2=?C?LLDIDATA0 33+2=?C?LLDPDATA0 46+2=?C?LLDCODE0
+?C?LSTIDATA - 12 2cd40de9bfa583d7
+?C?LSTXDATA - 12 d3c293d917514eae
+?C?LSTKXDATA - 49 d2a8a8ffea487920 10+2 13+2 16+2 19+2
+?C?OFFXADD - 12 98f3992aab449cd0
+?C?PSTPTR - 79 690e7f32a778c612 27+2=?C?PSTXDATA 51+2=?C?PSTIDATA 76+2=?C?PSTPDATA
+?C?PLDOPTR R3:R2:R1(R3:R2:R1,DPTR) 48 c013248cd1cfa267 14+2=?C?PLDXDATA 23+2=?C?PLDIDATA 33+2=?C?PLDPDATA 46+2=?C?PLDCODE
+?C?PSTOPTR - 89 eef0e0621ff9c54b 33+2=?C?PSTXDATA 59+2=?C?PSTIDATA 86+2=?C?PSTPDATA
+?C?CCASE - 38 b15406ec152999ca
+?C?ICASE - 45 0cc09ce122b46a5d
+?C?ICALL - 6 284403cacfdb6274
+?C?MEMSET void(R3:R2:R1,R5,R6R7) 44 bd3e93ff8914f7c3
+?C?LLDXDATA - 12 9755a79d09ca81c2
+?C?LLDPDATA - 12 db27e26093c8028f
+?C?LLDCODE - 16 5cfa85d773dacc0f
+?C?LLDIDATA0 - 13 0ad58272e68c4772
+?C?LLDXDATA0 - 12 a7d42128aedc0cf2
+?C?LLDPDATA0 - 13 1d30fd8c2c7ff552
+?C?LLDCODE0 - 16 494e7d79f46a2837
+?C?LSTPDATA - 12 6d586fabf3d86037
+?C?PLDIDATA - 9 743370a84bc0184b
+?C?PSTIDATA - 9 b4fc190efe22e823
+?C?PLDXDATA - 9 ce1b451d24789a5f
+?C?PSTXDATA - 9 12cf8c957e010ea3
+?C?PLDPDATA - 9 545cdf2017f6453f
+?C?PSTPDATA - 9 e8cadbbf1169f707
+?C?PLDCODE - 12 8a5b66ce5bcdccb9
+triple_index - 11 7f54dadd690cdc38

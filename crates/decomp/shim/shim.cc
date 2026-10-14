@@ -13,6 +13,7 @@
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "funcdata.hh"
@@ -87,16 +88,40 @@ class SectionImage : public LoadImage {
 
  public:
   string language;             // SLEIGH language and compiler id, such as x86:LE:32:default:windows
-  AddrSpace *space = nullptr;  // the RAM space, known once the translator exists
-  // While a function is being decompiled, every other function's entry reads as 0xff bytes,
-  // which decode on neither x86 nor AArch64. Flow that runs or jumps into another function is then cut off with a
-  // "bad instruction" warning instead of being followed. That happens after a call the engine
-  // does not know to be non-returning, and one such miss can chain through thousands of
-  // functions. The engine's own flow bounds (FlowInfo::setRange) cannot do this: a restart
-  // drops them, and a fall-through across the bound fails the function.
+  AddrSpace *space = nullptr;  // the space the code is in, known once the translator exists
+  AddrSpace *constant = nullptr;
+  VarnodeData assist_place;  // a temporary no instruction and no analysis uses, known with it
+  // While a function is being decompiled, no other function's entry decodes: see `hidden`.
   unordered_set<uint64_t> entries;  // every declared function start
   set<pair<uint64_t, uint64_t>> allowed;  // (function, entry) pairs exempt from the above
   uint64_t current = ~(uint64_t)0;  // the function being decompiled, or none
+
+  // A range of addresses that holds the bytes found elsewhere: `[start, end)` is the code from
+  // `target` on, as each bank of banked code shows the code all banks share. Sorted by start.
+  struct Mirror {
+    uintb start, end, target;
+  };
+  vector<Mirror> mirrors;
+  // Addresses a jump or call does not stay at: code there only passes control on to the other
+  // address, as a trampoline into another bank does.
+  unordered_map<uint64_t, uint64_t> redirects;
+  // Calls that never return to the code after them, because the routine they call takes its
+  // return address as the address of a table and jumps to an entry of it: each with the
+  // register the routine picks the entry by.
+  // A call that is a jump to one of several places, picked by `selector`. With `cases`, the
+  // compiler spec's jump assist `assist` says where from `count` cases listed at `list`.
+  struct SwitchCall {
+    VarnodeData selector;
+    bool cases;
+    uintb assist, count, list;
+  };
+  unordered_map<uint64_t, SwitchCall> switch_calls;
+  // Calls followed by data that the routine they call reads and returns past: each with the
+  // number of bytes.
+  unordered_map<uint64_t, int4> data_after;
+  // Code runs from the end of one function into the start of the next on purpose, to share
+  // that one's code: see rd_functions_run_on.
+  bool functions_run_on = false;
 
   SectionImage(const string &lang, const RdSection *secs, size_t count)
       : LoadImage("recore"), language(lang) {
@@ -107,25 +132,58 @@ class SectionImage : public LoadImage {
          [](const Section &a, const Section &b) { return a.addr < b.addr; });
   }
 
+  // Where the bytes at `addr` are kept, and in `room` how many lie there in a row.
+  uintb kept(uintb addr, uintb &room) const {
+    room = ~(uintb)0;
+    auto iter = upper_bound(mirrors.begin(), mirrors.end(), addr,
+                            [](uintb a, const Mirror &m) { return a < m.start; });
+    if (iter != mirrors.end()) room = iter->start - addr;
+    if (iter == mirrors.begin()) return addr;
+    --iter;
+    if (addr >= iter->end) return addr;
+    room = iter->end - addr;
+    return iter->target + (addr - iter->start);
+  }
+
+  // Where a jump or call to `addr` goes.
+  uintb reached(uintb addr) const {
+    uintb room;
+    addr = kept(addr, room);
+    auto found = redirects.find(addr);
+    return found == redirects.end() ? addr : found->second;
+  }
+
+  // Whether the instruction at `addr` is kept from the function being decompiled, because it is
+  // where another function starts. Flow that runs or jumps into another function is then cut
+  // off with a "bad instruction" warning instead of being followed. That happens after a call
+  // the engine does not know to be non-returning, and one such miss can chain through
+  // thousands of functions. The engine's own flow bounds (FlowInfo::setRange) cannot do
+  // this: a restart drops them, and a fall-through across the bound fails the function.
+  bool hidden(uintb addr) const {
+    if (current == ~(uint64_t)0) return false;
+    uintb room;
+    addr = kept(addr, room);
+    if (addr == current || entries.count(addr) == 0 || allowed.count({current, addr}) != 0) return false;
+    const Section *sec = find(addr);
+    return sec != nullptr && sec->code;
+  }
+
   // The instruction decoder reads a fixed window ahead, so a request may run past the end of a
   // section. Like Ghidra's own loaders, pad with zeros and fail only if the first byte is unmapped.
+  // Only the code space has bytes: an address in another space is not one of a section.
   void loadFill(uint1 *ptr, int4 size, const Address &addr) override {
     uintb cur = addr.getOffset();
     int4 done = 0;
-    while (done < size) {
-      const Section *sec = find(cur);
+    while (done < size && addr.getSpace() == space) {
+      uintb room;
+      uintb from = kept(cur, room);
+      const Section *sec = find(from);
       if (sec == nullptr) break;
-      int4 count = (int4)min<uintb>(size - done, sec->end() - cur);
-      memcpy(ptr + done, sec->data.data() + (cur - sec->addr), count);
+      int4 count = (int4)min<uintb>(min<uintb>(size - done, sec->end() - from), room);
+      memcpy(ptr + done, sec->data.data() + (from - sec->addr), count);
       done += count;
       cur += count;
     }
-    // The decoder asks for a window that starts at the instruction, so only a request starting
-    // exactly at an entry is an attempt to decode it; windows that merely overlap one are not.
-    const Section *first = find(addr.getOffset());
-    if (done > 0 && current != ~(uint64_t)0 && addr.getOffset() != current && first->code &&
-        entries.count(addr.getOffset()) != 0 && allowed.count({current, addr.getOffset()}) == 0)
-      memset(ptr, 0xff, done);
     if (done == 0) {
       ostringstream msg;
       msg << "No bytes at 0x" << hex << addr.getOffset();
@@ -144,6 +202,72 @@ class SectionImage : public LoadImage {
   void adjustVma(long) override {}
 };
 
+// Hands on the p-code of one instruction with its jumps and calls going where the image says
+// they go.
+class Retargeted : public PcodeEmit {
+  PcodeEmit &out;
+  const SectionImage &image;
+  const SectionImage::SwitchCall *selector;  // set for a call that is a jump through a table
+
+ public:
+  bool runs_on = true;  // whether control passes on to the next instruction
+
+  Retargeted(PcodeEmit &o, const SectionImage &i, const SectionImage::SwitchCall *s) : out(o), image(i), selector(s) {}
+  void dump(const Address &addr, OpCode opc, VarnodeData *outvar, VarnodeData *vars, int4 isize) override {
+    runs_on = opc != CPUI_BRANCH && opc != CPUI_BRANCHIND && opc != CPUI_RETURN && selector == nullptr;
+    if (selector != nullptr) {
+      // All the instruction does is hand control to the routine, which jumps on. The return
+      // address it pushes for the routine to find its table by is not left on the stack.
+      if (opc != CPUI_CALL) return;
+      VarnodeData input = selector->selector;
+      if (selector->cases) {
+        // Where the jump goes is what the assist makes of the selector. The engine works the
+        // places and the value of each case out from that, and switches on the selector.
+        uint4 wide = image.assist_place.size;
+        VarnodeData place = image.assist_place;
+        VarnodeData inputs[4] = {{image.constant, selector->assist, 4}, input, {image.constant, selector->count, wide}, {image.constant, selector->list, wide}};
+        out.dump(addr, CPUI_CALLOTHER, &place, inputs, 4);
+        input = place;
+      }
+      out.dump(addr, CPUI_BRANCHIND, nullptr, &input, 1);
+      return;
+    }
+    bool direct = opc == CPUI_BRANCH || opc == CPUI_CBRANCH || opc == CPUI_CALL;
+    if (direct && vars[0].space == image.space) vars[0].offset = image.reached(vars[0].offset);
+    out.dump(addr, opc, outvar, vars, isize);
+  }
+};
+
+// The translator, which decodes what the image lets the function being decompiled see.
+class SectionSleigh : public Sleigh {
+  const SectionImage &image;
+
+ public:
+  SectionSleigh(SectionImage *img, ContextDatabase *context) : Sleigh(img, context), image(*img) {}
+
+  int4 oneInstruction(PcodeEmit &emit, const Address &addr) const override {
+    uintb at = addr.getOffset();
+    if (image.hidden(at)) throw BadDataError("The instruction is the entry of another function");
+    if (image.mirrors.empty() && image.redirects.empty() && image.switch_calls.empty() && image.data_after.empty() &&
+        !image.functions_run_on)
+      return Sleigh::oneInstruction(emit, addr);
+    auto jump = image.switch_calls.find(at);
+    Retargeted retargeted(emit, image, jump == image.switch_calls.end() ? nullptr : &jump->second);
+    int4 length = Sleigh::oneInstruction(retargeted, addr);
+    auto data = image.data_after.find(at);
+    if (data != image.data_after.end()) length += data->second;
+    if (image.functions_run_on && retargeted.runs_on && image.hidden(at + length)) {
+      // The function ends by running into the next one: it calls that one and returns, as the
+      // engine has it for a jump that is a tail call.
+      VarnodeData next = {image.space, at + length, 1};
+      emit.dump(addr, CPUI_CALL, nullptr, &next, 1);
+      VarnodeData nowhere = {getConstantSpace(), 0, 1};
+      emit.dump(addr, CPUI_RETURN, nullptr, &nowhere, 1);
+    }
+    return length;
+  }
+};
+
 class SectionArchitecture : public SleighArchitecture {
   SectionImage *image;  // owned by Architecture::loader once buildLoader has run
 
@@ -155,11 +279,13 @@ class SectionArchitecture : public SleighArchitecture {
   // SleighArchitecture keeps one translator per language in a static map and re-points it at
   // whichever Architecture was built last. A translator per session is what makes sessions
   // independent of each other.
-  Translate *buildTranslator(DocumentStorage &) override { return new Sleigh(loader, context); }
+  Translate *buildTranslator(DocumentStorage &) override { return new SectionSleigh(image, context); }
 
   void postSpecFile() override {
     Architecture::postSpecFile();
     image->space = getDefaultCodeSpace();
+    image->constant = translate->getConstantSpace();
+    image->assist_place = {translate->getUniqueSpace(), translate->getUniqueStart(Translate::RUNTIME_RETURN_LOCATION), image->space->getAddrSize()};
   }
 
  public:
@@ -206,6 +332,7 @@ struct RdSession {
   bool print_c = true;
   bool keep_prototypes = false;
   bool kept_are_lower_bounds = true;  // see rd_keep_prototypes_exact
+  bool result_in_first_argument = false;  // see rd_result_in_first_argument
   bool want_flow = false;
   bool want_addresses = false;
   set<uint64_t> kept;  // functions whose prototype this session locked
@@ -218,6 +345,10 @@ struct RdSession {
   map<uint64_t, vector<pair<string, string>>> local_names;
   // Where and as what each function decompiled so far returns its value, if it returns one.
   map<uint64_t, ParameterPieces> outputs;
+  // Functions whose result rd_returns_like settled, until they are next decompiled.
+  set<uint64_t> returns_like;
+  // The registers rd_keep_registers named for each function.
+  map<uint64_t, vector<VarnodeData>> kept_registers;
 
   // Backing storage for the last RdDecompiled, listing and type layout.
   string c_text, return_type, flow, locals, text;
@@ -236,7 +367,24 @@ struct RdSession {
     delete translator;
   }
 
-  Address address(uint64_t offset) const { return Address(arch->getDefaultCodeSpace(), offset); }
+  // Address spaces besides the one the code is in, each with the address recore gives its
+  // first byte. Those addresses lie above every address of code.
+  vector<pair<uint64_t, AddrSpace *>> spaces;
+
+  // The engine's address for one of recore's.
+  Address address(uint64_t offset) const {
+    for (const pair<uint64_t, AddrSpace *> &mapped : spaces)
+      if (offset >= mapped.first && offset - mapped.first <= mapped.second->getHighest())
+        return Address(mapped.second, offset - mapped.first);
+    return Address(arch->getDefaultCodeSpace(), offset);
+  }
+
+  // recore's address for one of the engine's.
+  uint64_t offset(const Address &addr) const {
+    for (const pair<uint64_t, AddrSpace *> &mapped : spaces)
+      if (addr.getSpace() == mapped.second) return mapped.first + addr.getOffset();
+    return addr.getOffset();
+  }
 
   // The function at `offset`, created if it is new: under `name`, or a generated name if empty.
   Funcdata *function(uint64_t offset, string name = "") {
@@ -652,7 +800,7 @@ static const char *flow_opname(OpCode code) {
 //   O <address> <block> <opcode> <output id or -> <input ids, comma-separated> <callee address and name, or ->
 // A value is one SSA varnode, defined by at most one operation. A parameter's text is its
 // position and name; a constant's is its value; a global's is its address.
-static void dump_flow(Funcdata *fd, ostream &out) {
+static void dump_flow(const RdSession *session, Funcdata *fd, ostream &out) {
   const BlockGraph &blocks = fd->getBasicBlocks();
   out << hex;
   for (int4 i = 0; i < blocks.getSize(); ++i) {
@@ -676,7 +824,7 @@ static void dump_flow(Funcdata *fd, ostream &out) {
     else if (symbol != nullptr && symbol->getCategory() == Symbol::function_parameter)
       out << "param\t" << symbol->getCategoryIndex() << " " << symbol->getName();
     else if (vn->isPersist() && vn->getSpace()->getType() == IPTR_PROCESSOR)
-      out << "global\t" << vn->getOffset() << (symbol != nullptr ? " " + symbol->getName() : "");
+      out << "global\t" << session->offset(vn->getAddr()) << (symbol != nullptr ? " " + symbol->getName() : "");
     else if (symbol != nullptr)
       out << "local\t" << symbol->getName();
     else {
@@ -766,8 +914,10 @@ RdSession *rd_session_new(const char *spec_dir, const char *language, const RdSe
     // Every cut at another function's entry counts as a bad instruction, and a function with
     // several conditional tail calls has several. The engine's default gives up at four.
     session->arch->max_baddata = 32;
-    // The top megabyte of the address space, which no image occupies.
-    session->next_external = session->arch->getDefaultCodeSpace()->getHighest() & ~(uintb)0xfffff;
+    // The top megabyte of the address space, which no image occupies, or of a space narrower
+    // than 24 bits its top sixteenth.
+    uintb highest = session->arch->getDefaultCodeSpace()->getHighest();
+    session->next_external = highest & ~min<uintb>(0xfffff, highest >> 4);
   });
   if (session->arch != nullptr) session->translator = session->arch->translator();
   if (ok) return session;
@@ -776,6 +926,72 @@ RdSession *rd_session_new(const char *spec_dir, const char *language, const RdSe
 }
 
 void rd_session_free(RdSession *session) { delete session; }
+
+// Says that recore's addresses from `base` on are those of the engine's address space `name`,
+// from its first. Every address handed over afterwards is read so: without this each one is an
+// address of code.
+int rd_map_space(RdSession *session, uint64_t base, const char *name, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    AddrSpace *space = session->arch->getSpaceByName(name);
+    if (space == nullptr) throw LowlevelError(string("no address space named ") + name);
+    session->spaces.push_back({base, space});
+  });
+}
+
+// Says that the byte of memory at `addr` belongs to the function that runs, as a register does,
+// and is no global variable: what a function keeps there, a called function leaves there.
+int rd_register_at(RdSession *session, uint64_t addr, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Address at = session->address(addr);
+    Database *symbols = session->arch->symboltab;
+    symbols->removeRange(symbols->getGlobalScope(), at.getSpace(), at.getOffset(), at.getOffset());
+    VarnodeData byte = {at.getSpace(), at.getOffset(), 1};
+    session->arch->defaultfp->addEffect(EffectRecord(byte, EffectRecord::unaffected));
+    // And in the convention that carries a function's own list of registers.
+    ProtoModel *carrier = session->arch->getModel("__registers");
+    if (carrier != nullptr) carrier->addEffect(EffectRecord(byte, EffectRecord::unaffected));
+  });
+}
+
+// Says that the `len` bytes of code at `addr` are those at `target`: reading them reads those,
+// and a jump or call into them goes to the code at `target`.
+void rd_mirror(RdSession *session, uint64_t addr, uint64_t len, uint64_t target) {
+  vector<SectionImage::Mirror> &mirrors = session->image->mirrors;
+  mirrors.push_back({addr, addr + len, target});
+  sort(mirrors.begin(), mirrors.end(),
+       [](const SectionImage::Mirror &a, const SectionImage::Mirror &b) { return a.start < b.start; });
+}
+
+// Says that a jump or call to `from` goes to `to`: the code at `from` only passes control on.
+void rd_redirect(RdSession *session, uint64_t from, uint64_t to) { session->image->redirects[from] = to; }
+
+// Says that the call at `call` does not come back: the routine it calls jumps on, to one of the
+// places rd_override_jump_table gives for `call`, which it picks by the register `selector`.
+// With `assist`, the places are not given: the jump assist of that name in the compiler spec
+// finds them and the value of each case, from `count` cases listed at `list`.
+int rd_call_switches(RdSession *session, uint64_t call, const char *selector, const char *assist, uint64_t count, uint64_t list, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    SectionImage::SwitchCall jump = {arch->translate->getRegister(selector), assist != nullptr, 0, count, list};
+    if (assist != nullptr) {
+      UserPcodeOp *op = arch->userops.getOp(assist);
+      if (op == nullptr || op->getType() != UserPcodeOp::jumpassist) throw LowlevelError(string("no jump assist ") + assist);
+      jump.assist = op->getIndex();
+    }
+    session->image->switch_calls[call] = jump;
+  });
+}
+
+// Says that code which runs from the end of one function into the start of the next is meant
+// to: the first function then ends in a call to the second and a return. Without this such
+// flow is cut off, as what follows a call that was not known to never return.
+void rd_functions_run_on(RdSession *session, int on) { session->image->functions_run_on = on != 0; }
+
+// Says that the convention returns a result in the register it passes the first argument in.
+void rd_result_in_first_argument(RdSession *session, int shared) { session->result_in_first_argument = shared != 0; }
+
+// Says that `len` bytes of data follow the call at `call`, and that it returns past them.
+void rd_call_skips(RdSession *session, uint64_t call, uint64_t len) { session->image->data_after[call] = (int4)len; }
 
 // Declares a function start. Calls to it become calls to a known symbol, and with `noreturn`
 // flow stops after every call to it. A non-empty `name` is used if the function is new; the
@@ -923,6 +1139,146 @@ int rd_set_param_count(RdSession *session, uint64_t addr, size_t count, char *er
   });
 }
 
+// Where a value is: a register by name, several joined with `:`, most significant first, or
+// `<space>:<offset>/<size>` as a parameter's storage is reported, with its size.
+static ParameterPieces stored_in(Architecture *arch, const string &place) {
+  ParameterPieces piece;
+  int4 size = 0;
+  size_t sized = place.find('/');
+  if (sized != string::npos) {
+    size_t colon = place.find(':');
+    AddrSpace *space = arch->getSpaceByName(place.substr(0, colon));
+    if (colon == string::npos || space == nullptr) throw LowlevelError("no such storage: " + place);
+    piece.addr = Address(space, stoull(place.substr(colon + 1, sized - colon - 1), nullptr, 16));
+    size = stoi(place.substr(sized + 1));
+  } else {
+    vector<VarnodeData> registers;
+    istringstream names(place);
+    for (string name; getline(names, name, ':');) {
+      registers.push_back(arch->translate->getRegister(name));
+      size += registers.back().size;
+    }
+    piece.addr = registers.size() == 1 ? registers[0].getAddr() : arch->findAddJoin(registers, 0)->getUnified().getAddr();
+  }
+  piece.type = arch->types->getBase(size, TYPE_UNKNOWN);
+  piece.flags = 0;
+  return piece;
+}
+
+// Says where the function at `addr` takes its arguments and leaves its result, for one that
+// keeps to no calling convention: `storage` is `ACC(R3:R2:R1,DPTR)` for a result in ACC and
+// two arguments, `void(...)` for no result, and `?(...)` to leave the result to be found.
+int rd_set_storage(RdSession *session, uint64_t addr, const char *storage, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    string text(storage);
+    size_t open = text.find('('), close = text.rfind(')');
+    if (open == string::npos || close == string::npos) throw LowlevelError("storage is `result(arguments)`: " + text);
+    FuncProto &proto = session->function(addr)->getFuncProto();
+    string result = text.substr(0, open);
+    if (result != "void" && result != "?") proto.setOutput(stored_in(arch, result));
+    istringstream arguments(text.substr(open + 1, close - open - 1));
+    proto.clearInput();
+    int4 count = 0;
+    for (string place; getline(arguments, place, ',');) proto.setParam(count++, "", stored_in(arch, place));
+    proto.setInputLock(true);
+    // With `?` what is known of the result stays as it is.
+    if (result != "?") proto.setOutputLock(true);
+    proto.setModelLock(true);
+  });
+}
+
+// Says that the function at `addr` leaves the registers named in `kept`, separated by commas,
+// as they were, whatever the calling convention says a call does to them: a value one of them
+// holds before a call to the function is the value it holds after. To be said before anything
+// else about the function's prototype, which this sets afresh: the engine takes what a single
+// function does to registers only as part of a stored prototype. R0 to R7 are listed in runs,
+// the ones left alone and the ones a call changes, so that two or four of them read as one
+// value have one answer where they are all alike.
+int rd_keep_registers(RdSession *session, uint64_t addr, const char *kept, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    const VarnodeData first = arch->translate->getRegister("R0");
+    vector<VarnodeData> unaffected;
+    bool bank[8] = {};
+    istringstream names(kept);
+    for (string name; getline(names, name, ',');) {
+      VarnodeData reg = arch->translate->getRegister(name);
+      if (reg.space == first.space && reg.offset - first.offset < 8 && reg.size == 1)
+        bank[reg.offset - first.offset] = true;
+      else
+        unaffected.push_back(reg);
+    }
+    vector<VarnodeData> killed;
+    for (int4 start = 0; start < 8;) {
+      int4 end = start + 1;
+      while (end < 8 && bank[end] == bank[start]) ++end;
+      (bank[start] ? unaffected : killed).push_back({first.space, first.offset + start, (uint4)(end - start)});
+      start = end;
+    }
+    auto list = [](ostream &xml, const char *tag, const vector<VarnodeData> &ranges) {
+      xml << "<" << tag << ">";
+      for (const VarnodeData &range : ranges)
+        xml << "<varnode space=\"" << range.space->getName() << "\" offset=\"0x" << hex << range.offset << "\" size=\"" << dec << range.size << "\"/>";
+      xml << "</" << tag << ">";
+    };
+    ostringstream xml;
+    xml << "<prototype model=\"__registers\"><returnsym><addr/><void/></returnsym>";
+    list(xml, "unaffected", unaffected);
+    list(xml, "killedbycall", killed);
+    xml << "</prototype>";
+    unique_ptr<Document> document;
+    {
+      lock_guard<mutex> guard(xml_lock);
+      istringstream text(xml.str());
+      document.reset(xml_tree(text));
+    }
+    XmlDecode decoder(arch, document->getRoot());
+    session->function(addr)->getFuncProto().decode(decoder, arch);
+    // The convention that carries the list is no part of the function's declaration.
+    arch->getModel("__registers")->setPrintInDecl(false);
+    session->kept_registers[addr] = unaffected;
+  });
+}
+
+// Says what a call to the function at `addr` does to the registers rd_keep_registers named for
+// it: leaves them as they were, or with `as_convention` what the calling convention says. The
+// second is for while the function itself is decompiled: a register it only reads is then one
+// it is passed a value in, and no register its caller keeps a value in across the call.
+static void set_kept_registers(RdSession *session, uint64_t addr, bool as_convention) {
+  auto kept = session->kept_registers.find(addr);
+  if (kept == session->kept_registers.end()) return;
+  const FuncProto &proto = session->function(addr)->getFuncProto();
+  for (auto effect = proto.effectBegin(); effect != proto.effectEnd(); ++effect) {
+    for (const VarnodeData &reg : kept->second) {
+      if (effect->getAddress() != reg.getAddr() || effect->getSize() != (int4)reg.size) continue;
+      uint4 type = as_convention ? (uint4)EffectRecord::killedbycall : (uint4)EffectRecord::unaffected;
+      // The engine has no call that changes one record of a prototype's list.
+      const_cast<EffectRecord &>(*effect) = EffectRecord(reg, type);
+    }
+  }
+}
+
+// Says that the function at `function` is read as part of `caller` wherever that one calls it:
+// its instructions stand in place of the call. To be said for every function that calls it.
+int rd_inline(RdSession *session, uint64_t caller, uint64_t function, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    session->function(function)->getFuncProto().setInline(true);
+    session->image->allowed.insert({caller, function});
+  });
+}
+
+// Says that the function at `addr` returns nothing, whatever its registers hold when it does.
+int rd_returns_nothing(RdSession *session, uint64_t addr, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    FuncProto &proto = session->function(addr)->getFuncProto();
+    // Locking the output locks the calling convention with it, which is still to be recovered.
+    bool model_locked = proto.isModelLocked();
+    proto.setOutputLock(true);
+    proto.setModelLock(model_locked);
+  });
+}
+
 // Replaces every call to the function at `addr` with the p-code of the compiler spec's call
 // fixup `fixup`. Compiler helpers such as the stack-cookie check and `_alloca_probe` break the
 // calling convention, and their fixup says what they really do to the caller.
@@ -981,6 +1337,8 @@ int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int 
     } else {
       auto found = session->outputs.find(callee);
       if (found == session->outputs.end()) return;
+      // A call fixup stands in for the callee, and what the function returns shows in that.
+      if (session->function(callee)->getFuncProto().getInjectId() >= 0) return;
       piece = found->second;
     }
     Funcdata *fd = session->function(function);
@@ -990,6 +1348,7 @@ int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int 
     fd->getFuncProto().setOutputLock(true);
     // Locking the output locks the calling convention with it, which is still to be recovered.
     fd->getFuncProto().setModelLock(model_locked);
+    session->returns_like.insert(function);
     returns = true;
   });
   return ok && returns;
@@ -1308,6 +1667,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
   // A prototype that was declared, not recovered, is the whole truth and stays as it is.
   bool declared = false;
   bool spills = false;
+  bool inlined = false;
   bool ok = guarded(err, errlen, [&] {
     fd = session->function(addr);
     declared = fd->getFuncProto().isInputLocked() && session->kept.count(addr) == 0;
@@ -1316,6 +1676,14 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       fd->getFuncProto().setInputLock(false);
       fd->getFuncProto().setDotdotdot(false);
       arch->clearAnalysis(fd);
+    }
+    set_kept_registers(session, addr, true);
+    // A function read as part of its callers is decompiled as any other when asked for.
+    inlined = fd->getFuncProto().isInline() && fd->getFuncProto().getInjectId() < 0;
+    if (inlined) {
+      // As part of a caller it was left holding its instructions.
+      arch->clearAnalysis(fd);
+      fd->getFuncProto().setInline(false);
     }
     Action *root = arch->allacts.getCurrent();
     root->reset(*fd);
@@ -1355,7 +1723,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     }
     session->c_text = text.str();
     ostringstream flow;
-    if (session->want_flow) dump_flow(fd, flow);
+    if (session->want_flow) dump_flow(session, fd, flow);
     session->flow = flow.str();
 
     const FuncProto &proto = fd->getFuncProto();
@@ -1427,6 +1795,16 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       session->kept.insert(addr);
     }
   }
+  if (fd != nullptr && session->returns_like.erase(addr) != 0 && !session->keep_prototypes &&
+      session->result_in_first_argument) {
+    // A prototype is kept whole or not at all. The engine does not look for an argument of a
+    // call in the place the call is known to return in, so where the convention returns in the
+    // register of its first argument, a result kept without the parameters costs every call
+    // that argument.
+    fd->getFuncProto().setOutputLock(false);
+  }
+  guarded(nullptr, 0, [&] { set_kept_registers(session, addr, false); });
+  if (inlined) fd->getFuncProto().setInline(true);
   session->image->current = ~(uint64_t)0;
   // Drop the p-code, varnodes and inferred (unlocked) prototype: they are large, and a failed
   // run leaves them half built. Overrides and the function symbol itself are kept.

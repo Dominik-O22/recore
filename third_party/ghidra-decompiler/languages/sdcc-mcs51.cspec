@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- recore: the 8051 as SDCC compiles for it. Global memory, the stack and the return address
+     are as in keil-cx51.cspec; the prototype is SDCC's. -->
+<compiler_spec>
+  <global>
+    <range space="IFLASH"/>
+    <range space="CODE"/>
+    <range space="INTMEM"/>
+    <range space="SFR"/>
+    <range space="XRAM"/>
+    <!-- recore: external memory is EXTMEM in this language. Left out, as upstream has it, every
+         store to it is dropped as one to a variable nothing reads. -->
+    <range space="EXTMEM"/>
+    <range space="RAM"/>
+    <range space="BITS"/>
+  </global>
+  <!-- recore: the stack is in internal memory, where PUSH, POP and calls keep it in this
+       language. Upstream names RAM, which nothing here writes to. A call pushes its return
+       address itself and the callee takes it off again, so a call leaves SP two lower. -->
+  <stackpointer register="SP" space="INTMEM" growth="positive"/>
+  <default_proto>
+    <prototype name="__stdcall" extrapop="-2" stackshift="-2" strategy="register">
+      <!-- SDCC passes the first argument in DPL, in DPH and DPL, in B, DPH and DPL, or in ACC,
+           B, DPH and DPL, by its size, and returns a value the same way. With stack-auto the
+           other arguments are pushed, last one first, before the call pushes its return
+           address: the stack grows upwards, so they are the bytes below the two of the
+           return address, of which the upper one is where SP points. Without stack-auto they
+           are stored in memory of the callee's, which are no parameters here. -->
+      <input>
+        <pentry minsize="1" maxsize="2">
+          <register name="DPTR"/>
+        </pentry>
+        <pentry minsize="3" maxsize="3">
+          <addr space="join" piece1="B" piece2="DPTR"/>
+        </pentry>
+        <pentry minsize="4" maxsize="4">
+          <addr space="join" piece1="ACC" piece2="B" piece3="DPTR"/>
+        </pentry>
+        <pentry minsize="1" maxsize="64" align="1">
+          <addr space="stack" offset="0xbf"/>
+        </pentry>
+      </input>
+      <output>
+        <pentry minsize="1" maxsize="2">
+          <register name="DPTR"/>
+        </pentry>
+        <pentry minsize="3" maxsize="3">
+          <addr space="join" piece1="B" piece2="DPTR"/>
+        </pentry>
+        <pentry minsize="4" maxsize="4">
+          <addr space="join" piece1="ACC" piece2="B" piece3="DPTR"/>
+        </pentry>
+      </output>
+      <!-- SDCC keeps no register across a call. A function that sets up a frame restores the
+           frame pointer before it returns. -->
+      <unaffected>
+        <register name="SP"/>
+        <register name="RS0"/>
+        <register name="RS1"/>
+        <register name="F0"/>
+        <register name="F1"/>
+      </unaffected>
+      <killedbycall>
+        <register name="CY"/>
+        <register name="AC"/>
+        <register name="OV"/>
+        <register name="ACC"/>
+        <register name="B"/>
+        <register name="DPTR"/>
+        <register name="R0R1R2R3"/>
+        <register name="R4R5R6R7"/>
+      </killedbycall>
+      <localrange>
+        <range space="stack" first="0x0" last="0x3f"/>
+      </localrange>
+    </prototype>
+  </default_proto>
+  <!-- recore: the convention again, but saying nothing of what a call does to R0 to R7. A
+       function that is known to leave some of them alone is declared with this one and its
+       own list for them, which the engine would refuse beside the default's. The default
+       lists them four at a time, so that a call is known to change two or four read as one
+       value as well. -->
+    <prototype name="__registers" extrapop="-2" stackshift="-2" strategy="register">
+      <input>
+        <pentry minsize="1" maxsize="2">
+          <register name="DPTR"/>
+        </pentry>
+        <pentry minsize="3" maxsize="3">
+          <addr space="join" piece1="B" piece2="DPTR"/>
+        </pentry>
+        <pentry minsize="4" maxsize="4">
+          <addr space="join" piece1="ACC" piece2="B" piece3="DPTR"/>
+        </pentry>
+        <pentry minsize="1" maxsize="64" align="1">
+          <addr space="stack" offset="0xbf"/>
+        </pentry>
+      </input>
+      <output>
+        <pentry minsize="1" maxsize="2">
+          <register name="DPTR"/>
+        </pentry>
+        <pentry minsize="3" maxsize="3">
+          <addr space="join" piece1="B" piece2="DPTR"/>
+        </pentry>
+        <pentry minsize="4" maxsize="4">
+          <addr space="join" piece1="ACC" piece2="B" piece3="DPTR"/>
+        </pentry>
+      </output>
+      <unaffected>
+        <register name="SP"/>
+        <register name="RS0"/>
+        <register name="RS1"/>
+        <register name="F0"/>
+        <register name="F1"/>
+      </unaffected>
+      <killedbycall>
+        <register name="CY"/>
+        <register name="AC"/>
+        <register name="OV"/>
+        <register name="ACC"/>
+        <register name="B"/>
+        <register name="DPTR"/>
+      </killedbycall>
+      <localrange>
+        <range space="stack" first="0x0" last="0x3f"/>
+      </localrange>
+    </prototype>
+
+  <!-- recore: no funcptr element, as in keil-cx51.cspec. -->
+  <aggressivetrim signext="true"/>
+  <returnaddress>
+    <varnode space="stack" offset="0" size="2"/>
+  </returnaddress>
+
+</compiler_spec>

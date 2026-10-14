@@ -6,7 +6,7 @@
 
 use rustc_hash::FxHashSet;
 
-use crate::image::{Format, Image, Machine};
+use crate::image::{Format, Image};
 use crate::report::Class;
 
 /// Most virtual functions read from one vtable, and most base classes from one class.
@@ -57,7 +57,7 @@ pub fn classes(image: &Image) -> Vec<Class> {
     if image.format != Format::Pe {
         return Vec::new();
     }
-    let reader = Reader { image, pointer: if image.machine == Machine::X86 { 4 } else { 8 } };
+    let reader = Reader { image, pointer: image.machine.pointer_size() };
     let relocated: FxHashSet<u64> = image.relative_targets.iter().map(|&(slot, _)| slot).collect();
     let in_data = |addr: u64| image.section_at(addr).is_some_and(|section| !section.executable);
     let mut classes: Vec<Class> = image
@@ -93,7 +93,7 @@ pub fn type_names(image: &Image) -> Vec<(u64, String)> {
     if image.format != Format::Pe {
         return Vec::new();
     }
-    let pointer = if image.machine == Machine::X86 { 4 } else { 8 };
+    let pointer = image.machine.pointer_size();
     let mut names: Vec<(u64, String)> = image
         .sections
         .iter()

@@ -8,7 +8,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use rayon::prelude::*;
 
-use crate::arch::{Arch, Flow};
+use crate::arch::{Arch, Flow, TextPointer};
 use crate::discover::{discover, is_function_section};
 use crate::image::{Format, Image, Machine};
 use crate::noreturn::is_noreturn_import;
@@ -34,33 +34,49 @@ struct Function {
     instructions: u64,
 }
 
-/// Decodes `[start, end)` linearly and keeps its control-flow instructions. With `trim`, `end` is
-/// only an upper bound and the function ends before any trailing padding.
-fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool) -> Function {
+/// The parts of `[start, end)` that are code: all of it but the jump tables in `tables` that
+/// lie among it. `tables` is sorted `[start, end)` ranges.
+fn code_pieces(start: u64, end: u64, tables: &[(u64, u64)]) -> impl Iterator<Item = (u64, u64)> {
+    let mut tables = tables[tables.partition_point(|&(table, _)| table < start)..].iter().take_while(move |&&(table, _)| table < end);
+    let mut next = Some(start);
+    std::iter::from_fn(move || {
+        let from = next.filter(|&from| from < end || from == start)?;
+        let (to, after) = tables.next().map_or((end, None), |&(table, after)| (table, Some(after)));
+        next = after;
+        Some((from, to))
+    })
+}
+
+/// Decodes `[start, end)` linearly, stepping over `tables`, and keeps its control-flow
+/// instructions. With `trim`, `end` is only an upper bound and the function ends before any
+/// trailing padding.
+fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool, tables: &[(u64, u64)]) -> Function {
     let mut function = Function { start, end, controls: Vec::new(), instructions: 0 };
-    let Some(bytes) = image.bytes_from(start) else {
-        return function;
-    };
-    let bytes = &bytes[..bytes.len().min((end - start) as usize)];
-    let mut state = A::State::default();
     let mut body_end = start;
-    for decoded in A::decode(bytes, start) {
-        let Some(insn) = decoded.insn else { continue };
-        function.instructions += 1;
-        if !A::is_padding(&insn) {
-            body_end = decoded.next_addr();
-        }
-        match A::flow(&insn, &state) {
-            Some(flow) => {
-                function.controls.push(Control { addr: decoded.addr, next: decoded.next_addr(), flow });
-                // The state only matters for resolving slots, so a fresh one after any control
-                // transfer is enough for a linear pass.
-                if A::FLOW_READS_STATE {
-                    state = A::State::default();
-                }
+    for (from, to) in code_pieces(start, end, tables) {
+        let Some(bytes) = image.bytes_from(from) else {
+            return function;
+        };
+        let bytes = &bytes[..bytes.len().min((to - from) as usize)];
+        let mut state = A::State::default();
+        for decoded in A::decode(bytes, from) {
+            let Some(insn) = decoded.insn else { continue };
+            function.instructions += 1;
+            if !A::is_padding(&insn) {
+                body_end = decoded.next_addr();
             }
-            None if A::FLOW_READS_STATE => A::step(&mut state, &insn),
-            None => {}
+            match A::flow(&insn, &state, image) {
+                Some(flow) => {
+                    function.controls.push(Control { addr: decoded.addr, next: decoded.next_addr(), flow });
+                    // The state only matters for resolving slots, so a fresh one after any control
+                    // transfer is enough for a linear pass.
+                    if A::FLOW_READS_STATE {
+                        state = A::State::default();
+                    }
+                }
+                None if A::FLOW_READS_STATE => A::step(&mut state, &insn),
+                None => {}
+            }
         }
     }
     if trim {
@@ -134,6 +150,8 @@ struct Program<'a> {
     /// Slot address to target for pointers the loader relocates. A call through such a slot
     /// goes to a function in this image, not to an import.
     pointer_slots: &'a FxHashMap<u64, u64>,
+    /// [`Arch::RUNS_ON`].
+    runs_on: bool,
 }
 
 impl Program<'_> {
@@ -217,6 +235,11 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program, mut r
                 if run_start == addr && !program.is_covered(addr) {
                     result.may_return = true;
                 }
+                // Running on into the next function is a tail call of it, when code leads
+                // right up to its entry.
+                if program.runs_on && program.is_start(boundary) && program.is_covered(boundary - 1) && target_returns(boundary) {
+                    result.may_return = true;
+                }
                 break;
             };
             if !first_visit(index) {
@@ -287,32 +310,34 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program, mut r
 /// Where the code of a function without a frame ends, for images that keep data among the
 /// code: the first unconditional terminator that no earlier forward branch jumps past. Decoding
 /// up to the next function instead would read a trailing jump table as instructions.
-fn code_end<A: Arch>(image: &Image, start: u64, bound: u64, tables: &FxHashMap<u64, &[u64]>) -> u64 {
-    let Some(bytes) = image.bytes_from(start) else { return start };
-    let bytes = &bytes[..bytes.len().min((bound - start) as usize)];
+fn code_end<A: Arch>(image: &Image, start: u64, bound: u64, tables: &FxHashMap<u64, &[u64]>, inline_tables: &[(u64, u64)]) -> u64 {
     let state = A::State::default();
     let mut furthest_target = start;
-    for decoded in A::decode(bytes, start) {
-        let Some(insn) = decoded.insn else { return decoded.addr };
-        match A::flow(&insn, &state) {
-            Some(Flow::Branch(target)) if target > decoded.addr && target < bound => {
-                furthest_target = furthest_target.max(target);
-            }
-            Some(Flow::Jump(target)) if target > decoded.addr && target < bound && decoded.next_addr() <= furthest_target => {
-                furthest_target = furthest_target.max(target);
-            }
-            // The cases of a resolved switch come after the jump that dispatches to them.
-            Some(Flow::JumpIndirect(None)) if tables.contains_key(&decoded.addr) => {
-                let cases = tables[&decoded.addr].iter().copied().filter(|&target| target > decoded.addr && target < bound);
-                furthest_target = furthest_target.max(cases.max().unwrap_or(furthest_target));
-                if decoded.next_addr() > furthest_target {
+    for (from, to) in code_pieces(start, bound, inline_tables) {
+        let Some(bytes) = image.bytes_from(from) else { return from };
+        let bytes = &bytes[..bytes.len().min((to - from) as usize)];
+        for decoded in A::decode(bytes, from) {
+            let Some(insn) = decoded.insn else { return decoded.addr };
+            match A::flow(&insn, &state, image) {
+                Some(Flow::Branch(target)) if target > decoded.addr && target < bound => {
+                    furthest_target = furthest_target.max(target);
+                }
+                Some(Flow::Jump(target)) if target > decoded.addr && target < bound && decoded.next_addr() <= furthest_target => {
+                    furthest_target = furthest_target.max(target);
+                }
+                // The cases of a resolved switch come after the jump that dispatches to them.
+                Some(Flow::JumpIndirect(None)) if tables.contains_key(&decoded.addr) => {
+                    let cases = tables[&decoded.addr].iter().copied().filter(|&target| target > decoded.addr && target < bound);
+                    furthest_target = furthest_target.max(cases.max().unwrap_or(furthest_target));
+                    if decoded.next_addr() > furthest_target {
+                        return decoded.next_addr();
+                    }
+                }
+                Some(Flow::Jump(_) | Flow::JumpIndirect(_) | Flow::Return | Flow::Halt) if decoded.next_addr() > furthest_target => {
                     return decoded.next_addr();
                 }
+                _ => {}
             }
-            Some(Flow::Jump(_) | Flow::JumpIndirect(_) | Flow::Return | Flow::Halt) if decoded.next_addr() > furthest_target => {
-                return decoded.next_addr();
-            }
-            _ => {}
         }
     }
     bound
@@ -402,6 +427,7 @@ pub fn analyze(image: &Image) -> Analysis {
         Machine::X86 if image.data_in_code => analyze_with::<X86<32, true>>(image),
         Machine::X86 => analyze_with::<X86<32, false>>(image),
         Machine::Aarch64 => analyze_with::<crate::arm64::Arm64>(image),
+        Machine::I8051 => analyze_with::<crate::i8051::I8051>(image),
     }
 }
 
@@ -415,7 +441,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         .copied()
         .filter(|&(start, _)| image.section_at(start).is_some_and(is_function_section))
         .collect();
-    let frame_end: FxHashMap<u64, u64> = frames.iter().copied().collect();
+    // A table of trampoline entries is code with a known extent, like a function with a frame.
+    let frame_end: FxHashMap<u64, u64> = frames.iter().chain(&image.banking.tables).copied().collect();
 
     drop(_phase);
     let mut discovery = discover::<A>(image, &frames);
@@ -436,6 +463,15 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             discovery.referenced.insert(method);
         }
     }
+
+    // Nothing calls a table of trampoline entries: what calls an entry calls the function the
+    // entry reaches. The table is listed as one function, so that its code is listed at all.
+    for &(table, _) in &image.banking.tables {
+        discovery.starts.entry(table).or_insert(Origin::Export);
+    }
+
+    let inline_tables = std::mem::take(&mut discovery.inline_tables);
+    let inline_tables = inline_tables.as_slice();
 
     // Functions by the entry and the bound they were decoded from. A round of the loop below
     // that adds entry points starts over, and all but the functions next to the new entry
@@ -462,9 +498,9 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .zip(reused)
             .map(|(&(start, bound), reused)| {
                 reused.unwrap_or_else(|| match frame_end.contains_key(&start) {
-                    true => decode::<A>(image, start, bound, false),
-                    false if image.data_in_code => decode::<A>(image, start, code_end::<A>(image, start, bound, &tables), true),
-                    false => decode::<A>(image, start, bound, true),
+                    true => decode::<A>(image, start, bound, false, inline_tables),
+                    false if image.data_in_code => decode::<A>(image, start, code_end::<A>(image, start, bound, &tables, inline_tables), true, inline_tables),
+                    false => decode::<A>(image, start, bound, true, inline_tables),
                 })
             })
             .collect();
@@ -475,7 +511,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         _phase = phase::scope("decode chunks");
         let chunks: Vec<Function> = if image.data_in_code {
             let covered: Vec<(u64, u64)> = functions.iter().map(|f| (f.start, f.end)).collect();
-            uncovered(&discovery.code, &covered).into_iter().map(|(start, end)| decode::<A>(image, start, end, false)).collect()
+            uncovered(&discovery.code, &covered).into_iter().map(|(start, end)| decode::<A>(image, start, end, false, inline_tables)).collect()
         } else {
             Vec::new()
         };
@@ -508,10 +544,14 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                 sources >= 2 || (sources == 1 && opens_function() == Some(true))
             })
             .collect();
-        if !tail_called.is_empty() {
-            for addr in tail_called {
-                discovery.starts.entry(addr).or_insert(Origin::TailCall);
-            }
+        // Go round again only for a start that is new. A chunk can begin at a start already: a
+        // function whose first instruction runs past the next start decodes to nothing and leaves
+        // its bytes uncovered. Each further round adds a start, and a section holds finitely many.
+        let before = discovery.starts.len();
+        for addr in tail_called {
+            discovery.starts.entry(addr).or_insert(Origin::TailCall);
+        }
+        if discovery.starts.len() > before {
             decoded = spans.into_iter().zip(functions).collect();
             continue;
         }
@@ -521,7 +561,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         controls.par_sort_unstable_by_key(|c| c.addr);
         let mut extents: Vec<(u64, u64)> = functions.iter().chain(&chunks).map(|f| (f.start, f.end)).collect();
         extents.sort_unstable();
-        let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots };
+        let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots, runs_on: A::RUNS_ON };
 
         // A compiler emits nothing after a call it knows will not return: the call is followed
         // by a trap, or ends the function. Padding after a call proves nothing, since an
@@ -541,7 +581,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                     // been trimmed from its extent.
                     let trap_follows = || {
                         let insn = A::decode(image.bytes_from(control.next)?, control.next).next()?.insn?;
-                        Some(A::flow(&insn, &A::State::default()) == Some(Flow::Halt))
+                        Some(A::flow(&insn, &A::State::default(), image) == Some(Flow::Halt))
                     };
                     (ends_function || trap_follows() == Some(true)).then_some(target)
                 })
@@ -621,7 +661,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     let extra_ranges: FxHashMap<u64, Vec<(u64, u64)>> = if chunks.is_empty() {
         FxHashMap::default()
     } else {
-        let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots };
+        let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots, runs_on: A::RUNS_ON };
         functions
             .par_iter()
             .filter_map(|f| {
@@ -763,6 +803,18 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     // by an address it computes.
     strings.extend(crate::strings::unreferenced(image, &strings));
     strings.sort_by_key(|string| string.addr);
+    // Text among the code, and the instructions that form its address.
+    let mut text_refs = Vec::new();
+    if A::TEXT_IN_CODE {
+        let pieces = functions.par_iter().chain(&chunks).flat_map_iter(|piece| code_pieces(piece.start, piece.end, inline_tables));
+        let pointers: Vec<TextPointer> = pieces.flat_map_iter(|(start, end)| A::text_pointers(image, start, end)).collect();
+        let (among_code, pointers) = crate::strings::among_code(image, &discovery.code, pointers);
+        text_refs = pointers;
+        strings.extend(among_code);
+        strings.sort_by_key(|string| string.addr);
+        strings.extend(crate::strings::unreferenced_among_code(image, &discovery.code, &strings));
+        strings.sort_by_key(|string| string.addr);
+    }
 
     // A function that is a single jump forwards to its target; an export name on such a thunk
     // is really the target's name.
@@ -802,6 +854,12 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .filter_map(|f| Some((f.start, signatures.recognise(image, &pointer_slots, f.start, f.end)?)))
             .collect();
         names.extend(recognised.into_iter().map(|(addr, name)| (addr, name.to_string())));
+    }
+    // A compiler's own library is known by its code too. A fragment is no routine.
+    let library = crate::library::routines(image.machine, image.compiler);
+    if !library.is_empty() {
+        let unnamed: Vec<u64> = functions.iter().map(|f| f.start).filter(|start| !names.contains_key(start) && !fragment_of.contains_key(start)).collect();
+        names.extend(crate::library::recognise(image, &unnamed, library).into_iter().map(|(addr, routine)| (addr, routine.name.to_string())));
     }
 
     // A virtual function nothing else names takes the name of its vtable slot, in the class
@@ -856,8 +914,20 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     data_refs.extend(discovery.uncertain_refs.iter().copied().filter(|&(from, target, access)| {
         in_function(from) && (is_data(target) || (!access && extents.binary_search_by_key(&target, |&(start, _)| start).is_ok()))
     }));
+    data_refs.extend(text_refs.iter().map(|pointer| (pointer.from, pointer.to, false)));
     data_refs.sort_unstable();
     data_refs.dedup();
+    // A body that ends where another function begins runs on into it, unless its last
+    // instruction sends control elsewhere.
+    let runs_on = |f: &Function| {
+        let stops = f.controls.last().filter(|control| control.next == f.end).is_some_and(|control| match control.flow {
+            Flow::Jump(_) | Flow::JumpIndirect(_) | Flow::Return | Flow::Halt => true,
+            Flow::Call(target) => noreturn.contains(&target),
+            Flow::Branch(_) | Flow::CallIndirect(_) => false,
+        });
+        let code_to_end = code_pieces(f.start, f.end, inline_tables).last().is_some_and(|(from, to)| from < to && to == f.end);
+        (A::RUNS_ON && is_start(f.end) && code_to_end && !stops).then_some(f.end)
+    };
     Analysis {
         sends,
         types: swift.types,
@@ -870,11 +940,12 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .iter()
             .map(|f| AnalyzedFunction {
                 addr: f.start,
-                ranges: std::iter::once((f.start, f.end)).chain(extra_ranges.get(&f.start).into_iter().flatten().copied()).collect(),
+                ranges: code_pieces(f.start, f.end, inline_tables).chain(extra_ranges.get(&f.start).into_iter().flatten().copied()).collect(),
                 noreturn: noreturn.contains(&f.start),
                 thunk: thunk_target(f).is_some(),
                 origin: discovery.starts[&f.start],
                 fragment_of: fragment_of.get(&f.start).copied(),
+                runs_on: runs_on(f),
                 name: names.get(&f.start).cloned(),
             })
             .collect(),

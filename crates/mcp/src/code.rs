@@ -121,6 +121,7 @@ pub fn disassemble(binary: &mut Binary, args: Disassemble) -> Result<String> {
     } else {
         writeln!(out, "{start:#x} is in no function the analysis found")?;
     }
+    let runs_on = entry.and_then(|entry| binary.program.function(entry)).and_then(|function| function.runs_on);
     let blocks: BTreeMap<u64, &recore::cfg::Block> = graph.iter().flat_map(|graph| &graph.blocks).map(|block| (block.start, block)).collect();
     for instruction in &instructions {
         if let Some(block) = blocks.get(&instruction.addr) {
@@ -134,7 +135,11 @@ pub fn disassemble(binary: &mut Binary, args: Disassemble) -> Result<String> {
                 }
                 .to_string()
             }));
-            writeln!(out, "block {:#x} -> {}", block.start, if leaves.is_empty() { "falls out of the function".into() } else { leaves.join(", ") })?;
+            writeln!(out, "block {:#x} -> {}", block.start, match (leaves.is_empty(), runs_on.filter(|&next| next == block.end)) {
+                (false, _) => leaves.join(", "),
+                (true, Some(next)) => format!("runs on into {}", binary.program.label(next)),
+                (true, None) => "falls out of the function".into(),
+            })?;
         }
         let end = instruction.addr + instruction.len;
         let bytes = binary.program.image.bytes_from(instruction.addr).unwrap_or(&[]);

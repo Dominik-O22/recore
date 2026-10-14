@@ -18,7 +18,7 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::image::{Format, Image, Machine};
+use crate::image::{Format, Image};
 use crate::report::Class;
 
 /// Most virtual functions read from one vtable, base classes from one record, and characters
@@ -269,7 +269,7 @@ pub fn classes(image: &Image, slots: &FxHashMap<u64, u64>) -> Vec<Class> {
     // An image that can load anywhere relocates its pointers to data. One that cannot has at
     // most relocations for functions chosen at load time, which point at code.
     let relocated = image.relative_targets.iter().any(|&(_, target)| !image.is_code(target));
-    let reader = Reader { image, slots, size: if image.machine == Machine::X86 { 4 } else { 8 }, relocated };
+    let reader = Reader { image, slots, size: image.machine.pointer_size(), relocated };
     let found = reader.records();
     if found.is_empty() {
         return Vec::new();

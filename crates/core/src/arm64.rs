@@ -428,7 +428,7 @@ impl Arch for Arm64 {
         Some(Decoded { addr: insn.addr, len: 4, insn: Some(&*insn) })
     }
 
-    fn flow(insn: &Insn, state: &State) -> Option<Flow> {
+    fn flow(insn: &Insn, state: &State, _: &Image) -> Option<Flow> {
         let slot = |register: usize| match state.registers[register] {
             Value::Slot(slot) => Some(slot),
             _ => None,
@@ -607,7 +607,7 @@ impl Arch for Arm64 {
                     .map_while(|i| pointer_slots.get(&(table + 8 * i)).copied())
                     .take_while(|&target| is_target(target))
                     .collect();
-                return (!entries.is_empty()).then_some(Table { address: table, entry_size: 8, entries, bounded: true });
+                return (!entries.is_empty()).then_some(Table { address: table, entry_size: 8, entries, bounded: true, inline_end: None });
             }
             _ => return None,
         };
@@ -624,7 +624,7 @@ impl Arch for Arm64 {
             }
             entries.push(target);
         }
-        (!entries.is_empty()).then_some(Table { address: table, entry_size: size, entries, bounded: limit.is_some() })
+        (!entries.is_empty()).then_some(Table { address: table, entry_size: size, entries, bounded: limit.is_some(), inline_end: None })
     }
 
     fn marked_jump_target(image: &Image, target: u64) -> Option<bool> {
@@ -647,7 +647,7 @@ impl Arch for Arm64 {
             for decoded in Self::decode(&section.data, section.addr) {
                 let Some(insn) = decoded.insn else { continue };
                 // Padding and traps separate stubs.
-                if insn.word == NOP || Self::flow(&insn, &state) == Some(Flow::Halt) {
+                if insn.word == NOP || Self::flow(&insn, &state, image) == Some(Flow::Halt) {
                     continue;
                 }
                 let start = *stub_start.get_or_insert(decoded.addr);

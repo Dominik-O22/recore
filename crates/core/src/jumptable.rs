@@ -356,6 +356,7 @@ impl State {
                     entry_size: pointer_size,
                     entries,
                     bounded: bound.is_some(),
+                    inline_end: None,
                 })
             }
             _ => None,
@@ -379,7 +380,7 @@ fn read_relative(image: &Image, table: u64, anchor: u64, limit: Option<Limit>, i
         }
         entries.push(target);
     }
-    (!entries.is_empty()).then_some(Table { address: table, entry_size: 4, entries, bounded: limit.is_some() })
+    (!entries.is_empty()).then_some(Table { address: table, entry_size: 4, entries, bounded: limit.is_some(), inline_end: None })
 }
 
 /// The offset of a plain `[rsp + disp]` memory operand in position `operand`.

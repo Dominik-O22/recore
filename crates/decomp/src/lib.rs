@@ -27,7 +27,7 @@ use std::ptr::NonNull;
 
 use anyhow::{Context, Result, bail};
 use recore::Image;
-use recore::image::{Format, Machine};
+use recore::image::{Compiler, Format, Machine};
 use recore::report::Analysis;
 
 pub use facts::Facts;
@@ -63,6 +63,28 @@ pub enum Target {
     /// x86-64 with the System V convention.
     X86_64Gcc,
     Aarch64,
+    /// The 8051 as Keil's C51 compiles for it, banked or not: code at `bank << 16 | address`.
+    I8051,
+    /// The 8051 as SDCC compiles for it.
+    I8051Sdcc,
+}
+
+/// Where SDCC keeps the frame pointer of an 8051 program whose functions have their arguments
+/// and variables on the stack: the byte of internal memory that functions save, load from
+/// `SP` and restore. SDCC has no register to spare for it.
+fn frame_pointer(image: &Image) -> Option<u8> {
+    // PUSH direct; MOV direct, SP
+    let saves = |code: &[u8]| match *code {
+        [0xc0, pushed, 0x85, 0x81, loaded] if pushed == loaded && pushed < 0x80 => Some(pushed),
+        _ => None,
+    };
+    let mut counts = [0usize; 0x80];
+    for section in image.sections.iter().filter(|section| section.executable) {
+        section.data.windows(5).filter_map(saves).for_each(|direct| counts[direct as usize] += 1);
+    }
+    // One function may keep some other byte so. The frame pointer is kept by more.
+    let (direct, &most) = counts.iter().enumerate().max_by_key(|&(_, count)| *count)?;
+    (most >= 2).then_some(direct as u8)
 }
 
 impl Target {
@@ -70,11 +92,13 @@ impl Target {
     pub fn of(image: &Image) -> Target {
         match (image.machine, image.format) {
             (Machine::X86, Format::Pe) => Target::X86Windows,
-            (Machine::X86, Format::Elf | Format::MachO) => Target::X86Gcc,
+            (Machine::X86, Format::Elf | Format::MachO | Format::Raw) => Target::X86Gcc,
             (Machine::X86_64, Format::Pe) => Target::X86_64Windows,
             // macOS follows the System V convention on x86-64.
-            (Machine::X86_64, Format::Elf | Format::MachO) => Target::X86_64Gcc,
+            (Machine::X86_64, Format::Elf | Format::MachO | Format::Raw) => Target::X86_64Gcc,
             (Machine::Aarch64, _) => Target::Aarch64,
+            (Machine::I8051, _) if image.compiler == Some(Compiler::Sdcc) => Target::I8051Sdcc,
+            (Machine::I8051, _) => Target::I8051,
         }
     }
 
@@ -86,6 +110,8 @@ impl Target {
             Target::X86_64Windows => c"x86:LE:64:default:windows",
             Target::X86_64Gcc => c"x86:LE:64:default:gcc",
             Target::Aarch64 => c"AARCH64:LE:64:v8A:default",
+            Target::I8051 => c"8051:BE:24:cip-51:default",
+            Target::I8051Sdcc => c"8051:BE:24:cip-51:sdcc",
         }
     }
 
@@ -97,6 +123,8 @@ impl Target {
             Target::X86_64Windows => "x86-64-win.cspec",
             Target::X86_64Gcc => "x86-64-gcc.cspec",
             Target::Aarch64 => "AARCH64.cspec",
+            Target::I8051 => "keil-cx51.cspec",
+            Target::I8051Sdcc => "sdcc-mcs51.cspec",
         }
     }
 
@@ -128,8 +156,37 @@ impl Target {
         matches!(self, Target::X86_64Gcc | Target::Aarch64)
     }
 
+    /// The address spaces the target has besides the one its code is in: the address recore
+    /// gives the first byte of each, and the engine's name for the space.
+    fn spaces(self) -> &'static [(u64, &'static CStr)] {
+        use recore::hardware::BIT;
+        use recore::i8051::{IDATA, SFR, XDATA};
+        match self {
+            Target::I8051 | Target::I8051Sdcc => &[(XDATA, c"EXTMEM"), (IDATA, c"INTMEM"), (SFR, c"SFR"), (BIT, c"BITS")],
+            _ => &[],
+        }
+    }
+
+    /// Whether code that runs from the end of one function into the start of the next is meant
+    /// to, and the first function ends by calling the second. 8051 code shares the end of a
+    /// function this way, and what recore makes of it is two functions. Elsewhere such code
+    /// follows a call that never returns, and is none of the function's.
+    fn functions_run_on(self) -> bool {
+        matches!(self, Target::I8051 | Target::I8051Sdcc)
+    }
+
+    /// Whether a result comes back in the register the first argument goes in: `R7` for C51,
+    /// `DPL` for SDCC.
+    fn result_in_first_argument(self) -> bool {
+        matches!(self, Target::I8051 | Target::I8051Sdcc)
+    }
+
     pub fn pointer_bytes(self) -> usize {
-        if matches!(self, Target::X86Windows | Target::X86Gcc) { 4 } else { 8 }
+        match self {
+            Target::X86Windows | Target::X86Gcc => 4,
+            Target::X86_64Windows | Target::X86_64Gcc | Target::Aarch64 => 8,
+            Target::I8051 | Target::I8051Sdcc => 2,
+        }
     }
 }
 
@@ -214,6 +271,10 @@ impl Decompiled {
 /// A program loaded into the decompiler.
 pub struct Session {
     raw: NonNull<ffi::RdSession>,
+    target: Target,
+    /// Jump tables of recore's, by function, that the engine is first left to read itself:
+    /// see [`Facts::engine_tables`].
+    engine_tables: std::collections::HashMap<u64, Vec<JumpTable>>,
 }
 
 // A session owns all of its C++ state. The engine's globals are written only while a session
@@ -279,7 +340,14 @@ impl Session {
         })?;
         let raw = NonNull::new(raw).expect("checked above");
         unsafe { ffi::rd_keep_prototypes_exact(raw.as_ptr(), target.callers_pass_what_is_read().into()) };
-        Ok(Session { raw })
+        unsafe { ffi::rd_functions_run_on(raw.as_ptr(), target.functions_run_on().into()) };
+        unsafe { ffi::rd_result_in_first_argument(raw.as_ptr(), target.result_in_first_argument().into()) };
+        // The session frees the engine's side if a space is not there.
+        let session = Session { raw, target, engine_tables: Default::default() };
+        for &(base, name) in target.spaces() {
+            check(|err, len| unsafe { ffi::rd_map_space(raw.as_ptr(), base, name.as_ptr(), err, len) != 0 })?;
+        }
+        Ok(session)
     }
 
     /// Loads a recore image as it looks after relocation, with the vendored language files, and
@@ -295,7 +363,48 @@ impl Session {
     pub fn load(image: &Image) -> Result<Session> {
         let loaded = facts::loaded(image);
         let sections: Vec<Section> = loaded.iter().map(|l| Section { addr: l.addr, data: &l.data, readonly: l.constant, code: l.code }).collect();
-        Session::new(&vendored_spec_dir()?, Target::of(image), &sections)
+        let session_target = Target::of(image);
+        let mut session = Session::new(&vendored_spec_dir()?, session_target, &sections)?;
+        // Banked code: every bank shows the code all banks share, which the image holds once,
+        // as bank 0, and a trampoline entry stands for the function it reaches.
+        let banking = &image.banking;
+        let mut banks: Vec<u64> = image.sections.iter().filter(|section| section.executable && !banking.common.is_empty()).map(|section| section.addr >> 16).collect();
+        banks.sort_unstable();
+        banks.dedup();
+        for bank in banks.into_iter().filter(|&bank| bank != 0) {
+            for &(start, end) in &banking.common {
+                session.mirror(bank << 16 | start, end - start, start);
+            }
+        }
+        for (&entry, &target) in &banking.trampolines {
+            session.redirect(entry, target);
+        }
+        // Through the frame pointer a function reaches what it was passed on the stack and
+        // what it keeps there, which the engine follows only if a call leaves the pointer be.
+        if session_target == Target::I8051Sdcc
+            && let Some(direct) = frame_pointer(image)
+        {
+            session.register_at(recore::i8051::IDATA + u64::from(direct))?;
+        }
+        Ok(session)
+    }
+
+    /// Says that the `len` bytes of code at `addr` are those at `target`: reading them reads
+    /// those, and a jump or call into them goes to the code at `target`.
+    pub fn mirror(&mut self, addr: u64, len: u64, target: u64) {
+        unsafe { ffi::rd_mirror(self.raw.as_ptr(), addr, len, target) }
+    }
+
+    /// Says that the byte of memory at `addr` is the running function's own, as a register is,
+    /// and no global variable: what a function keeps there, a function it calls leaves there.
+    pub fn register_at(&mut self, addr: u64) -> Result<()> {
+        check(|err, len| unsafe { ffi::rd_register_at(self.raw.as_ptr(), addr, err, len) != 0 })
+    }
+
+    /// Says that a jump or call to `from` goes to `to`, because the code at `from` only passes
+    /// control on.
+    pub fn redirect(&mut self, from: u64, to: u64) {
+        unsafe { ffi::rd_redirect(self.raw.as_ptr(), from, to) }
     }
 
     /// Declares the imports the code calls, with prototypes for the well-known ones.
@@ -368,6 +477,11 @@ impl Session {
         for (function, name) in &facts.names {
             self.name_function(*function, name)?;
         }
+        // Before anything else is said of a function's prototype, which this sets afresh.
+        for (function, kept) in &facts.kept_registers {
+            let kept = CString::new(kept.as_str())?;
+            check(|err, len| unsafe { ffi::rd_keep_registers(self.raw.as_ptr(), *function, kept.as_ptr(), err, len) != 0 })?;
+        }
         for (function, fixup) in &facts.call_fixups {
             let fixup = CString::new(fixup.as_str())?;
             check(|err, len| unsafe { ffi::rd_set_call_fixup(self.raw.as_ptr(), *function, fixup.as_ptr(), err, len) != 0 })?;
@@ -375,8 +489,17 @@ impl Session {
         for &(function, noreturn) in &facts.functions {
             self.add_function(function, noreturn)?;
         }
+        for &function in &facts.returns_nothing {
+            check(|err, len| unsafe { ffi::rd_returns_nothing(self.raw.as_ptr(), function, err, len) != 0 })?;
+        }
+        for (function, storage) in &facts.storage {
+            self.set_storage(*function, storage)?;
+        }
         for &(function, count) in &facts.param_counts {
             check(|err, len| unsafe { ffi::rd_set_param_count(self.raw.as_ptr(), function, count, err, len) != 0 })?;
+        }
+        for &(caller, function) in &facts.inlined {
+            check(|err, len| unsafe { ffi::rd_inline(self.raw.as_ptr(), caller, function, err, len) != 0 })?;
         }
         for &(function, jump) in &facts.tail_calls {
             self.override_tail_call(function, jump)?;
@@ -389,6 +512,13 @@ impl Session {
         }
         for &(function, call, target) in &facts.local_calls {
             check(|err, len| unsafe { ffi::rd_override_call(self.raw.as_ptr(), function, call, target, err, len) != 0 })?;
+        }
+        for switch in &facts.switch_calls {
+            let (assist, count, list) = switch.cases.map_or((std::ptr::null(), 0, 0), |(assist, count, list)| (assist.as_ptr(), count, list));
+            check(|err, len| unsafe { ffi::rd_call_switches(self.raw.as_ptr(), switch.call, switch.selector.as_ptr(), assist, count, list, err, len) != 0 })?;
+        }
+        for &(call, len) in &facts.data_after_calls {
+            unsafe { ffi::rd_call_skips(self.raw.as_ptr(), call, len) };
         }
         Ok(())
     }
@@ -552,6 +682,19 @@ impl Session {
     pub fn override_jump_tables(&mut self, analysis: &Analysis, facts: &Facts) -> Result<()> {
         for &(function, index) in &facts.jump_tables {
             let table = &analysis.jump_tables[index];
+            // The engine finds the cases of this one itself, each with its value.
+            if facts.switch_calls.iter().any(|switch| switch.call == table.jump && switch.cases.is_some()) {
+                continue;
+            }
+            // A call that comes back past its data is no jump to the engine, and a table for
+            // a jump it never meets is one it trips over.
+            if facts.data_after_calls.iter().any(|&(call, _)| call == table.jump) {
+                continue;
+            }
+            if facts.engine_tables.contains(&(function, index)) {
+                self.engine_tables.entry(function).or_default().push(JumpTable { jump: table.jump, targets: table.targets.clone() });
+                continue;
+            }
             self.override_jump_table(function, table.jump, &table.targets)?;
         }
         Ok(())
@@ -565,9 +708,62 @@ impl Session {
         })
     }
 
+    /// Says where the function at `addr` takes its arguments and leaves its result, when a
+    /// calling convention does not: `ACC(B:DPTR,stack:0xbf/1)` for a result in ACC, an argument
+    /// in B and DPTR and one of a byte on the stack. `?` for the result leaves it to be found.
+    pub fn set_storage(&mut self, addr: u64, storage: &str) -> Result<()> {
+        let storage = CString::new(storage)?;
+        check(|err, len| unsafe { ffi::rd_set_storage(self.raw.as_ptr(), addr, storage.as_ptr(), err, len) != 0 })
+    }
+
+    /// Decompiles the function at `addr`. SDCC passes an argument of three or four bytes in
+    /// registers that are no pair, and code reads the bytes one by one, so the engine takes
+    /// the argument for one of two bytes and the other registers for ones nothing passed.
+    /// Such a function is given the parameter whole and decompiled again; calls to it then
+    /// pass it whole. For C51 [`Facts::storage`] says where each function takes its
+    /// arguments before any is decompiled.
+    pub fn decompile(&mut self, addr: u64) -> Result<Decompiled> {
+        let mut decompiled = self.decompile_as_declared(addr);
+        // A table the engine was left to read is taken from recore after all if the engine
+        // found other places than recore did, or none.
+        if let Some(tables) = self.engine_tables.get(&addr) {
+            let same = |table: &JumpTable| {
+                let found = decompiled.as_ref().ok().and_then(|decompiled| decompiled.jump_tables.iter().find(|found| found.jump == table.jump));
+                // The engine lists the place the jump is kept from, the default, with the others.
+                found.is_some_and(|found| table.targets.iter().all(|target| found.targets.contains(target)) && found.targets.iter().filter(|target| !table.targets.contains(target)).count() <= 1)
+            };
+            if !tables.iter().all(same) {
+                for table in self.engine_tables.remove(&addr).unwrap_or_default() {
+                    self.override_jump_table(addr, table.jump, &table.targets)?;
+                }
+                decompiled = self.decompile_as_declared(addr);
+            }
+        }
+        let decompiled = decompiled?;
+        let reads = |register: &str| decompiled.c_text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|word| word.strip_prefix("in_") == Some(register));
+        // The parameter the engine found, the register it left out, and the two as one.
+        let whole = match self.target {
+            // SDCC's first argument: a pointer that says what memory it points into, or a long.
+            Target::I8051Sdcc if reads("B") && reads("ACC") => Some(("DPTR", "ACC:B:DPTR")),
+            Target::I8051Sdcc if reads("B") => Some(("DPTR", "B:DPTR")),
+            _ => None,
+        };
+        let Some((at, whole)) = whole.and_then(|(part, whole)| Some((decompiled.params.iter().position(|param| param.storage == part)?, whole))) else {
+            return Ok(decompiled);
+        };
+        let place = |(index, param): (usize, &Param)| match (index == at, param.storage.contains(':')) {
+            (true, _) => whole.to_string(),
+            (false, true) => format!("{}/{}", param.storage, param.size),
+            (false, false) => param.storage.clone(),
+        };
+        let places: Vec<String> = decompiled.params.iter().enumerate().map(place).collect();
+        self.set_storage(addr, &format!("?({})", places.join(",")))?;
+        self.decompile_as_declared(addr)
+    }
+
     /// Runs the session's [`Style`] on the function starting at `addr`. The function need not
     /// have been declared.
-    pub fn decompile(&mut self, addr: u64) -> Result<Decompiled> {
+    fn decompile_as_declared(&mut self, addr: u64) -> Result<Decompiled> {
         let mut out = std::mem::MaybeUninit::<ffi::RdDecompiled>::uninit();
         check(|err, len| unsafe { ffi::rd_decompile(self.raw.as_ptr(), addr, out.as_mut_ptr(), err, len) != 0 })?;
         // Everything `out` points to lives in the session until its next call; copy it out now.

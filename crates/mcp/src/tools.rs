@@ -92,6 +92,12 @@ pub fn list() -> Value {
             &[],
         ),
         tool(
+            "unnamed",
+            "The data addresses the code reads or writes that have no name, the most accessed first, with how many instructions read and write each and the functions they are in. In firmware these are the chip's registers and the program's variables: name the first few with `rename`, or in the names file of the layout, and the code that uses them reads by name.",
+            json!({ "space": { "type": "string", "description": "Only the addresses in this memory of an 8051: `sfr`, `xdata` or `idata`." }, "limit": limit }),
+            &[],
+        ),
+        tool(
             "bytes",
             "Hex dump of bytes as mapped in the image, for reading tables, keys and other data out of its sections.",
             json!({
@@ -213,6 +219,7 @@ pub fn call(cache: &mut Cache, name: &str, arguments: Value) -> Option<Result<St
         "xrefs" => run(cache, name, arguments, xrefs),
         "decompile" => run(cache, name, arguments, decompile),
         "bytes" => run(cache, name, arguments, bytes),
+        "unnamed" => run(cache, name, arguments, unnamed),
         "classes" => run(cache, name, arguments, classes),
         "addr" => run(cache, name, arguments, addr),
         "disassemble" => run(cache, name, arguments, code::disassemble),
@@ -475,7 +482,7 @@ pub(crate) fn resolve_function(binary: &Binary, text: &str) -> Result<u64> {
 /// pair up from there, name first in one table and second in another.
 pub(crate) fn table_names(program: &Program, entry: u64) -> Vec<(u64, String)> {
     let image = &program.image;
-    let pointer = if image.machine == Machine::X86 { 4 } else { 8 };
+    let pointer = image.machine.pointer_size();
     let target_of = |slot: u64| image.relative_targets.iter().find(|&&(at, _)| at == slot).map(|&(_, target)| target);
     let name_at = |slot: u64| short_text(image, target_of(slot)?);
     let partner = |slot: u64| {
@@ -556,7 +563,11 @@ pub(crate) fn describe(binary: &Binary, addr: u64) -> String {
         return format!("string {}", quoted(&string.text));
     }
     if let Some(name) = binary.program.image.symbol_names.get(&addr).filter(|_| binary.program.function(addr).is_none()) {
-        return format!("{name}, a name the file carries");
+        let image = &binary.program.image;
+        // A raw image carries no names: its layout gives them, with its machine or in a names file.
+        let source = if image.format == Format::Raw { "a name the layout gives" } else { "a name the file carries" };
+        let bits: Vec<String> = recore::hardware::bits(image, addr).into_iter().map(|(bit, name)| format!("{name} is bit {bit:#x}")).collect();
+        return format!("{name}, {source}{}", if bits.is_empty() { String::new() } else { format!(" ({})", bits.join(", ")) });
     }
     if let Some(name) = binary.program.import_name(addr) {
         return format!("import slot of {name}");
@@ -570,6 +581,8 @@ pub(crate) fn describe(binary: &Binary, addr: u64) -> String {
     match binary.program.image.section_at(addr) {
         Some(section) if section.executable => format!("code in {}", binary.program.site_label(addr)),
         Some(section) => section.name.clone(),
+        // On a machine with several memories, which one says more than that it holds no bytes.
+        None if binary.program.image.is_zero_filled(addr) && binary.program.image.machine == Machine::I8051 => recore::hardware::place(&binary.program.image, addr),
         None if binary.program.image.is_zero_filled(addr) => "uninitialized data".into(),
         None => "not mapped".into(),
     }
@@ -585,7 +598,7 @@ fn pointer_table(binary: &Binary, addr: u64, longest: usize) -> Vec<(u64, Result
     if image.section_at(addr).is_none_or(|section| section.executable) {
         return Vec::new();
     }
-    let size = if image.machine == Machine::X86 { 4 } else { 8 };
+    let size = image.machine.pointer_size();
     let relocated: FxHashMap<u64, u64> = image.relative_targets.iter().copied().collect();
     let begins_another = |slot: u64| slot != addr && (program.refs_to(slot).next().is_some() || program.string_at(slot).is_some());
     let mut slots = Vec::new();
@@ -606,6 +619,38 @@ fn pointer_table(binary: &Binary, addr: u64, longest: usize) -> Vec<(u64, Result
 }
 
 #[derive(Deserialize)]
+struct Unnamed {
+    space: Option<String>,
+    limit: Option<usize>,
+}
+
+fn unnamed(binary: &mut Binary, args: Unnamed) -> Result<String> {
+    let program = &binary.program;
+    let is_named = |addr: u64| program.image.symbol_names.contains_key(&addr) || binary.edits.names.contains_key(&addr);
+    let space = |addr: u64| recore::hardware::space(&program.image, addr).map(|(space, _)| space);
+    let mut found = recore::hardware::unnamed(program, is_named);
+    let mut spaces: BTreeMap<&str, usize> = BTreeMap::new();
+    found.iter().filter_map(|accessed| space(accessed.addr)).for_each(|space| *spaces.entry(space).or_default() += 1);
+    if let Some(wanted) = &args.space {
+        ensure!(spaces.contains_key(wanted.as_str()), "no unnamed address is in a space called `{wanted}`: the code reaches {}", if spaces.is_empty() { "one space only".to_string() } else { spaces.keys().copied().collect::<Vec<_>>().join(", ") });
+        found.retain(|accessed| space(accessed.addr) == Some(wanted));
+    }
+    let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
+    let mut out = String::new();
+    let within = match &args.space {
+        Some(space) => format!(" in {space}"),
+        None if spaces.is_empty() => String::new(),
+        None => format!(": {}", spaces.iter().map(|(space, count)| format!("{count} in {space}")).collect::<Vec<_>>().join(", ")),
+    };
+    writeln!(out, "{} data addresses without a name{within}{}", found.len(), shown(found.len(), limit))?;
+    for accessed in found.iter().take(limit) {
+        let place = recore::hardware::place(&program.image, accessed.addr);
+        writeln!(out, "{:#x} {place}: {} reads, {} writes, in {} functions: {}", accessed.addr, accessed.reads, accessed.writes, accessed.functions.len(), labels(binary, &accessed.functions, &format!("xrefs {:#x}", accessed.addr)))?;
+    }
+    Ok(out)
+}
+
+#[derive(Deserialize)]
 struct Summary {}
 
 fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
@@ -614,11 +659,13 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
         Format::Elf => "ELF",
         Format::Pe => "PE",
         Format::MachO => "Mach-O",
+        Format::Raw => "raw",
     };
     let machine = match image.machine {
         Machine::X86 => "x86 (32-bit)",
         Machine::X86_64 => "x86-64",
         Machine::Aarch64 => "AArch64",
+        Machine::I8051 => "8051",
     };
     let mut out = String::new();
     writeln!(out, "{}: {format}, {machine}, image base {:#x}, entry {:#x}", image.name, image.base, image.entry)?;
@@ -633,6 +680,9 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
         analysis.strings.len(),
         analysis.jump_tables.len(),
     )?;
+    if let Some(banking) = recore::i8051::banking_summary(image, analysis) {
+        writeln!(out, "{banking}")?;
+    }
     writeln!(out, "analyzed in {:.0} ms, kept until the file changes", binary.analysis_ms)?;
     let edits = &binary.edits;
     writeln!(out, "edits: {} names, {} named variables, {} comments, {} declarations, {} typed data, saved in {}", edits.names.len(), edits.locals.values().map(|names| names.len()).sum::<usize>(), edits.comments.len(), edits.declarations.len(), edits.types.len(), binary.edits_file()?.display())?;
@@ -784,6 +834,9 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
         };
         writeln!(out, "  {:#x} {} {target}", call.at, if call.tail { "tail-calls" } else { "calls" })?;
     }
+    if let Some(next) = binary.program.function(entry).and_then(|function| function.runs_on) {
+        writeln!(out, "  runs on into {}, which returns for both", binary.program.label(next))?;
+    }
 
     // Per address referred to: the instructions that read or write it, and those that take it.
     let mut targets: BTreeMap<u64, [Vec<u64>; 2]> = BTreeMap::new();
@@ -859,6 +912,7 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
         }
     }
     lines.extend(program.calls_to(addr).map(|call| format!("{:#x} in {} {} it", call.at, program.site_label(call.at), if call.tail { "tail-calls" } else { "calls" })));
+    lines.extend(program.functions().filter(|function| function.runs_on == Some(addr)).map(|function| format!("{} runs on into it", program.label(function.addr))));
     lines.extend(program.sends_to(addr).map(|send| format!("{:#x} in {} sends {}, which only it implements", send.at, program.site_label(send.at), send.label())));
     lines.extend(program.refs_to(addr).map(|reference| format!("{:#x} in {} {}", reference.from, program.site_label(reference.from), if reference.access { "reads or writes it" } else { "takes its address" })));
     let count = lines.len();
@@ -884,7 +938,7 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
             }
         }
         if table.len() == limit.min(64) {
-            let next = table.last().expect("not empty").0 + if program.image.machine == Machine::X86 { 4 } else { 8 };
+            let next = table.last().expect("not empty").0 + program.image.machine.pointer_size();
             writeln!(out, "  ... the table may go on; `xrefs` of {next:#x} reads on")?;
         }
     }

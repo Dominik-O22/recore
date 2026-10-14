@@ -34,13 +34,40 @@ impl Section {
     }
 }
 
-/// The instruction set an image is built for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The instruction set an image is built for. A layout file names it as renamed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Machine {
     /// 32-bit x86.
+    #[serde(rename = "x86")]
     X86,
+    #[serde(rename = "x86-64")]
     X86_64,
+    #[serde(rename = "aarch64")]
     Aarch64,
+    /// The 8051 and the many microcontrollers that keep its instruction set.
+    #[serde(rename = "8051")]
+    I8051,
+}
+
+/// The compiler that built an image, where a layout file names it. It decides how functions
+/// pass arguments and return values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compiler {
+    /// Keil's C51.
+    Keil,
+    Sdcc,
+}
+
+impl Machine {
+    /// Bytes in a pointer, which is how wide a code or data address stored in the image is.
+    pub fn pointer_size(self) -> u64 {
+        match self {
+            Machine::X86 => 4,
+            Machine::X86_64 | Machine::Aarch64 => 8,
+            Machine::I8051 => 2,
+        }
+    }
 }
 
 /// The container an image came in.
@@ -49,6 +76,49 @@ pub enum Format {
     Elf,
     Pe,
     MachO,
+    /// No container: bytes placed by a layout file, see [`crate::layout`].
+    Raw,
+}
+
+/// How code that outgrew a 16-bit address space is laid out: several banks share the same
+/// addresses and the hardware shows one of them at a time. A banked code address is written
+/// `bank << 16 | address` here, so every bank has a range of its own. An image that is not banked
+/// has no common ranges and no trampolines, and all its code is bank 0.
+#[derive(Default)]
+pub struct Banking {
+    /// `[start, end)` of the 16-bit addresses that hold the same code whichever bank shows.
+    /// That code is loaded once, as bank 0. Sorted.
+    pub common: Vec<(u64, u64)>,
+    /// The address of each trampoline entry, which is common code that switches banks on the
+    /// way to a function, to the address of that function.
+    pub trampolines: FxHashMap<u64, u64>,
+    /// The address of each call that names a function and its bank and goes through a stub,
+    /// which switches banks on the way, to the address of that function.
+    pub calls: FxHashMap<u64, u64>,
+    /// `[start, end)` of each run of trampoline entries that lie back to back, sorted. A run is
+    /// one table: code, but no function for each entry.
+    pub tables: Vec<(u64, u64)>,
+}
+
+impl Banking {
+    /// Whether every bank holds the same code at the 16-bit address `target`.
+    pub fn is_common(&self, target: u16) -> bool {
+        self.common.iter().any(|&(start, end)| u64::from(target) >= start && u64::from(target) < end)
+    }
+
+    /// Where the 16-bit address `target` lies when `bank` shows.
+    pub fn address(&self, bank: u64, target: u16) -> u64 {
+        if self.is_common(target) { u64::from(target) } else { bank << 16 | u64::from(target) }
+    }
+
+    /// The address a jump or call at `from` to the 16-bit address `target` reaches: the function
+    /// behind a trampoline entry, and otherwise the target in the bank of `from`. Nothing says
+    /// which bank shows while common code runs, so a target it names outside the common ranges
+    /// counts as bank 0, where the common code is loaded.
+    pub fn reach(&self, from: u64, target: u16) -> u64 {
+        let address = self.address(from >> 16, target);
+        self.trampolines.get(&address).copied().unwrap_or(address)
+    }
 }
 
 pub struct Image {
@@ -70,9 +140,12 @@ pub struct Image {
     /// Slot address (GOT entry) to the imported symbol its relocation binds.
     pub import_slots: FxHashMap<u64, String>,
     /// Exported function addresses from the dynamic symbol table. In a Mach-O image, also the
-    /// methods its Objective-C metadata lists, which the runtime calls by name.
+    /// methods its Objective-C metadata lists, which the runtime calls by name. In a raw image,
+    /// the entry points its layout lists after the first, the interrupt vectors of an 8051,
+    /// the functions its trampolines reach, and the stubs they go through.
     pub exports: Vec<u64>,
-    /// Names the image itself carries for addresses in it: exports, as written in the file.
+    /// Names the image itself carries for addresses in it: exports, as written in the file. In
+    /// a raw image, what its layout says the trampoline tables and stubs are.
     pub symbol_names: FxHashMap<u64, String>,
     /// `[start, end)` of every function the image describes: a frame description entry in
     /// `.eh_frame`, a PE `RUNTIME_FUNCTION`, or a Mach-O function start up to the next one.
@@ -83,10 +156,17 @@ pub struct Image {
     /// Compilers for this format place jump tables and other data among the code, so bytes
     /// that control flow never reaches cannot be assumed to be instructions.
     pub data_in_code: bool,
+    pub banking: Banking,
+    /// What a layout says built the image. Without it the machine and the format decide.
+    pub compiler: Option<Compiler>,
 }
 
 impl Image {
+    /// Loads the executable at `path`, or the raw image the layout file at `path` describes.
     pub fn load(path: &Path) -> Result<Image> {
+        if crate::layout::is_layout(path) {
+            return crate::layout::load(path);
+        }
         let data = std::fs::read(path).with_context(|| format!("reading {path:?}"))?;
         if crate::macho::is_macho(&data) {
             return crate::macho::load(path.file_name().unwrap().to_string_lossy().into_owned(), &data);
@@ -172,6 +252,8 @@ impl Image {
             frames,
             relative_targets,
             data_in_code: is_pe,
+            banking: Banking::default(),
+            compiler: None,
         })
     }
 

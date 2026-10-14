@@ -46,6 +46,18 @@ impl<I> Decoded<I> {
     }
 }
 
+/// An address the code may be forming of text that lies among the code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TextPointer {
+    /// The instruction that completes the address.
+    pub from: u64,
+    pub to: u64,
+    /// The code also says that the address is one in the code space: it reads from there, or
+    /// passes the address on with the mark its compiler gives a pointer to code. An address
+    /// without that is two numbers that may mean anything.
+    pub marked: bool,
+}
+
 /// Upper bound on the entries read from one table.
 pub const MAX_ENTRIES: usize = 4096;
 
@@ -77,6 +89,9 @@ pub struct Table {
     /// Whether the entry count is known. Otherwise `entries` runs to the first value that is not
     /// a plausible target and may overshoot into the next table.
     pub bounded: bool,
+    /// For a table that lies in the code straight after its jump: the address after its last
+    /// byte, where the code goes on. Nothing from `address` to there is an instruction.
+    pub inline_end: Option<u64>,
 }
 
 pub trait Arch: 'static {
@@ -96,6 +111,20 @@ pub trait Arch: 'static {
     /// counts as an address when some relocation carries it, which rules out constants that
     /// merely look like one.
     const ADDRESSES_ARE_RELOCATED: bool = false;
+
+    /// Whether a function may run on into the one after it, which then returns for both: how
+    /// hand-written code and code a linker has factored share their endings. Elsewhere code
+    /// that runs off the end of its function is code that never returns.
+    const RUNS_ON: bool = false;
+
+    /// Whether unreached code counts as functions on the strength of dividing into them with
+    /// nothing left over, for a machine whose code shows no other sign of where one starts:
+    /// no alignment, no padding between functions, no common opening.
+    const TILES_GAPS: bool = false;
+
+    /// Whether the program keeps its text among the code, as a machine does whose code space
+    /// is the only memory that holds anything when it starts.
+    const TEXT_IN_CODE: bool = false;
 
     /// Whether [`Arch::flow`] reads the state: whether what a call or jump goes through can
     /// depend on earlier instructions. A pass that only classifies control flow need not
@@ -120,8 +149,9 @@ pub trait Arch: 'static {
     /// bytes.
     fn decode_next<'d>(decoder: &'d mut Self::Decoder<'_>) -> Option<Decoded<&'d Self::Insn>>;
 
-    /// The control-flow effect of `insn`, given the state before it.
-    fn flow(insn: &Self::Insn, state: &Self::State) -> Option<Flow>;
+    /// The control-flow effect of `insn`, given the state before it. The image says where a
+    /// target really lies when the instruction alone does not, as in banked code.
+    fn flow(insn: &Self::Insn, state: &Self::State, image: &Image) -> Option<Flow>;
 
     /// The address `insn` materialises in a register, if it computes one: how code takes the
     /// address of a function or of data.
@@ -230,6 +260,13 @@ pub trait Arch: 'static {
     /// what it does there: how code uses a field of the structure the register points to.
     fn field_use(_insn: &Self::Insn) -> Option<(u64, FieldUse)> {
         None
+    }
+
+    /// The addresses the code in `[start, end)` may be forming of text that lies among the code.
+    /// Nothing but the text itself says that such an address is one, so each is only a
+    /// candidate until text is found there.
+    fn text_pointers(_image: &Image, _start: u64, _end: u64) -> Vec<TextPointer> {
+        Vec::new()
     }
 
     /// Whether the first real instruction of a block shows it is an exception landing pad.
