@@ -179,9 +179,11 @@ impl State {
     }
 }
 
-/// The whole routine that scales an index too large to triple in `A`: `MOV B, #3; MUL AB`,
-/// then the high byte of the product added to `DPH`.
-const TRIPLE: [u8; 11] = [0x75, 0xF0, 0x03, 0xA4, 0xC5, 0x83, 0x25, 0xF0, 0xC5, 0x83, 0x22];
+/// Whether the code at `addr` is the routine of the image's compiler's library named `name`.
+fn is_routine(image: &Image, addr: u64, name: &str) -> bool {
+    let Some(code) = image.bytes_from(addr).filter(|_| image.is_code(addr)) else { return false };
+    crate::library::routines(Machine::I8051, image.compiler).iter().any(|routine| routine.name == name && routine.is_at(code))
+}
 
 /// What follows a call to one of the routines of Keil's C51 library that take their return
 /// address as the address of data: the data lies after the call in place of code.
@@ -201,8 +203,7 @@ impl Inline {
     /// routine's exact code counts, since it is what says how its data is laid out, and the
     /// library's list knows each by a hash of that.
     fn after_call_to(image: &Image, target: u64) -> Option<Inline> {
-        let code = image.bytes_from(target).filter(|_| image.is_code(target))?;
-        let is = |name: &str| crate::library::routines(Machine::I8051, None).iter().any(|routine| routine.name == name && routine.is_at(code));
+        let is = |name: &str| is_routine(image, target, name);
         if is("?C?CCASE") {
             Some(Inline::Cases { value: 1 })
         } else if is("?C?ICASE") {
@@ -563,8 +564,10 @@ impl Arch for I8051 {
         } else if jump.opcode() == 0x73 {
             // `JMP @A+DPTR` into a table of jumps, one per value below the bound.
             let (address, count) = (here(state.dptr?), u64::from(state.below.filter(|&count| count > 0)?));
-            if let Some(routine) = state.scaler {
-                image.bytes_from(image.banking.reach(jump.addr, routine)).filter(|code| code.starts_with(&TRIPLE))?;
+            // A call scales the index only where it goes to the routine that triples an index
+            // too large to triple in `A`.
+            if state.scaler.is_some_and(|routine| !is_routine(image, image.banking.reach(jump.addr, routine), "triple_index")) {
+                return None;
             }
             let size = jump_slots(image.bytes_from(address)?, count as usize)? as u64;
             Table { address, entry_size: size, entries: (0..count).map(|index| address + index * size).collect(), bounded: true, inline_end: None }
@@ -922,7 +925,7 @@ mod tests {
             code.resize(0x30, 0x00);
             code.extend([0x23, 0x22]);
             code.resize(0x40, 0x00);
-            code.extend(TRIPLE);
+            code.extend(stand_in("triple_index"));
             crate::analyze(&image(&code, 0)).jump_tables.iter().map(|table| (table.jump, table.targets.clone())).collect::<Vec<_>>()
         };
         assert_eq!(scaled_by(0x40), [(0x000C, vec![0x000D, 0x0010])]);

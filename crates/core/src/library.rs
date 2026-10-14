@@ -78,10 +78,10 @@ static KEIL: LazyLock<Vec<Routine>> = LazyLock::new(|| {
 static SDCC: LazyLock<Vec<Routine>> = LazyLock::new(|| parse(include_str!("../data/sdcc-mcs51.lib")));
 
 /// Code the tests of this crate have in place of routines of Keil's library, under the names
-/// of those: the list holds no code to build the real ones from. None does what its routine
-/// does.
+/// of those, as the list holds no code to build the real ones from. Only `triple_index` does
+/// what its routine does.
 #[cfg(test)]
-pub(crate) const STAND_INS: [(&str, &[u8]); 4] = [
+pub(crate) const STAND_INS: [(&str, &[u8]); 5] = [
     // MOV A, R4; ADD A, R5; ADD A, R6; ADD A, R7; MOV R7, A; RET.
     ("?C?LMUL", &[0xEC, 0x2D, 0x2E, 0x2F, 0xFF, 0x22]),
     // POP DPH; POP DPL; CLR A; JMP @A+DPTR.
@@ -90,6 +90,8 @@ pub(crate) const STAND_INS: [(&str, &[u8]); 4] = [
     ("?C?ICASE", &[0xD0, 0x83, 0xD0, 0x82, 0xA8, 0xF0, 0xE4, 0x73]),
     // POP DPH; POP DPL; four times INC DPTR; CLR A; JMP @A+DPTR.
     ("?C?LSTKXDATA", &[0xD0, 0x83, 0xD0, 0x82, 0xA3, 0xA3, 0xA3, 0xA3, 0xE4, 0x73]),
+    // MOV R0, A; ADD A, R0; ADD A, R0; RET.
+    ("triple_index", &[0xF8, 0x28, 0x28, 0x22]),
 ];
 
 /// The routines of the library that code for `machine` calls when `compiler` built it. An

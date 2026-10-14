@@ -5,8 +5,21 @@
 # The arguments and the result are registers, joined with `:` where one value is in several,
 # most significant first; `-` leaves them to the compiler spec, which has a call fixup for a
 # routine it can say more about. A pointer is in R3, R2 and R1: what memory it points into,
-# then the address. The names are the ones Keil documents. `fingerprint.py image` wrote the
-# lines from routines found by hand in a C51-built image; no code of the library is here.
+# then the address. The names are the ones Keil documents, but for `triple_index`, code Keil's
+# tools emit under no documented name, which triples the index of a `switch` with
+# `MOV B, #3; MUL AB` and adds the high byte of the product to DPH.
+#
+# The file holds hashes, not code, but a hash does not hide a short routine: one with few
+# bytes left out can be found by trying the instruction sequences it might be.
+#
+# How the lines were made: `fingerprint.py image <image> <offset> <routines>` over an image a
+# user built with C51, which is not in the repository. `routines` lists `name storage start
+# end` for each routine, found by hand: where a call with the routine's documented use goes,
+# up to its last instruction. To add routines, do the same with any image built with C51: a
+# map file from Keil's linker gives the start of each `?C?` routine, the next symbol its end.
+# Give the offset at which the 64 KB holding the routines start in the file, and append the
+# lines it prints. A line already here that the image's routine does not match is a different
+# version of the routine, and both lines can stay.
 ?C?COPY - 38 9e92d7924435396e 35+2
 ?C?SCDIV - 34 2c015aa8d1d7e727
 ?C?CLDPTR ACC(R3:R2:R1) 25 b2a6f21f472bf755
@@ -65,3 +78,4 @@
 ?C?PLDPDATA - 9 545cdf2017f6453f
 ?C?PSTPDATA - 9 e8cadbbf1169f707
 ?C?PLDCODE - 12 8a5b66ce5bcdccb9
+triple_index - 11 7f54dadd690cdc38
