@@ -720,18 +720,36 @@ pub fn vector_table(table: &[u8], is_code: impl Fn(u64) -> bool) -> (u64, Vec<u6
 /// The branches through a register in `[start, end)` that return, through the word the code
 /// popped off the stack: where the engine sees an indirect jump it cannot follow.
 pub fn returns_through_register(image: &Image, start: u64, end: u64) -> Vec<u64> {
-    let Some(bytes) = image.bytes_from(start) else { return Vec::new() };
-    let mut state = State::default();
     let mut found = Vec::new();
+    scan(image, start, end, |insn, _, flow| {
+        if let (Some(Flow::Return), Some((2 | 3, _, rm))) = (flow, insn.high())
+            && rm != LR
+        {
+            found.push(insn.addr);
+        }
+    });
+    found
+}
+
+/// Decodes `[start, end)` one instruction after the other and hands `visit` each, with the
+/// state before it and where it sends control. The state goes on past a call, which changes
+/// the registers a call may, and past a branch, as it does where the branch is not taken, as
+/// discovery has it on that path. After any other transfer nothing is known.
+fn scan(image: &Image, start: u64, end: u64, mut visit: impl FnMut(&Insn, &State, Option<Flow>)) {
+    let Some(bytes) = image.bytes_from(start) else { return };
+    let mut state = State::default();
     for insn in Thumb::decode(bytes, start).take_while(|decoded| decoded.addr < end).filter_map(|decoded| decoded.insn) {
-        match (Thumb::flow(&insn, &state, image), insn.high()) {
-            (Some(Flow::Return), Some((2 | 3, _, rm))) if rm != LR => found.push(insn.addr),
-            (Some(Flow::Call(_) | Flow::CallIndirect(_)), _) => state.clobber(CALLER_SAVED),
-            (Some(_), _) => state = State::default(),
-            (None, _) => state.step(insn),
+        let flow = Thumb::flow(&insn, &state, image);
+        visit(&insn, &state, flow);
+        match flow {
+            Some(Flow::Call(_) | Flow::CallIndirect(_)) => state.clobber(CALLER_SAVED),
+            Some(Flow::Branch(_)) => {
+                Thumb::branch(&mut state, &insn);
+            }
+            Some(_) => state = State::default(),
+            None => state.step(insn),
         }
     }
-    found
 }
 
 /// Thumb code of a Cortex-M.
@@ -968,20 +986,13 @@ impl Arch for Thumb {
     /// `MOVT` pair: text, if text is there. Text may begin at an odd address, which is not
     /// one of code then.
     fn text_pointers(image: &Image, start: u64, end: u64) -> Vec<TextPointer> {
-        let Some(bytes) = image.bytes_from(start) else { return Vec::new() };
-        let mut state = State::default();
         let mut found = Vec::new();
         // The literals lie past the end of the code that loads them.
-        for insn in Self::decode(bytes, start).take_while(|decoded| decoded.addr < end).filter_map(|decoded| decoded.insn) {
-            if let Some(address) = Self::completed_address(&insn, &state) {
+        scan(image, start, end, |insn, state, _| {
+            if let Some(address) = Self::completed_address(insn, state) {
                 found.push(TextPointer { from: insn.addr, to: u64::from(address), marked: true });
             }
-            match Self::flow(&insn, &state, image) {
-                Some(Flow::Call(_) | Flow::CallIndirect(_)) => state.clobber(CALLER_SAVED),
-                Some(_) => state = State::default(),
-                None => state.step(insn),
-            }
-        }
+        });
         found
     }
 
@@ -1009,8 +1020,8 @@ impl Arch for Thumb {
     }
 
     /// A load from far up the stack before anything is pushed: a block that reads its
-    /// function's variables. Only the arguments past the eighth would be that far from a
-    /// function's entry.
+    /// function's variables. At a function's entry SP points at its fifth argument, and only
+    /// the thirteenth on would be that far from it.
     fn borrows_frame(insns: &[Insn]) -> bool {
         const ARGUMENTS: u64 = 0x20;
         for insn in insns {
@@ -1218,6 +1229,7 @@ impl Arch for Thumb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::Origin;
 
     /// An image with `code` at `addr`.
     fn image(code: &[u8], addr: u64) -> Image {
@@ -1448,6 +1460,92 @@ mod tests {
         // at 0x0C, which count from there; cases at 0x14, 0x18 and 0x1C. The helper at 0x20.
         let code = [&[0x3000, 0x2801, 0xD80A][..], &bl(0x06, 0x20), &[0x0000, 0x0008, 0x0000, 0x000C, 0x0000, 0x2014, 0x4770, 0x2015, 0x4770, 0x2000, 0x4770], &helper(4)].concat();
         assert_eq!(tables(&code).0, [(0x06, vec![0x14, 0x18])]);
+    }
+
+    #[test]
+    fn a_branch_through_the_popped_word_returns_past_a_branch_not_taken() {
+        // POP {R1}; CMP R0, #0; BEQ 0x08; BX R1; at 0x08 BX LR.
+        let bytes: Vec<u8> = [0xBC02u16, 0x2800, 0xD000, 0x4708, 0x4770].iter().flat_map(|half| half.to_le_bytes()).collect();
+        assert_eq!(returns_through_register(&image(&bytes, 0), 0, 10), [0x06]);
+    }
+
+    #[test]
+    fn a_compare_bounds_the_index_on_the_side_of_the_branch_it_proves() {
+        // What R0 holds where `halfwords` fall through their last instruction, a branch, and
+        // where the branch is taken.
+        let bounds = |halfwords: &[u16]| {
+            let bytes: Vec<u8> = halfwords.iter().flat_map(|half| half.to_le_bytes()).collect();
+            let insns: Vec<Insn> = Thumb::decode(&bytes, 0).filter_map(|decoded| decoded.insn).collect();
+            let (branch, before) = insns.split_last().unwrap();
+            let mut state = State::default();
+            before.iter().for_each(|insn| state.step(*insn));
+            let taken = Thumb::branch(&mut state, branch);
+            (state.registers[0], taken.registers[0])
+        };
+        let bounded = |limit: u64| Value::Bounded(Limit::of(limit));
+        let unknown = Value::Unknown;
+        // CMP R0, #5, then BHI, BLS, BHS and BLO.
+        assert!(bounds(&[0x2805, 0xD800]) == (bounded(5), unknown));
+        assert!(bounds(&[0x2805, 0xD900]) == (unknown, bounded(5)));
+        assert!(bounds(&[0x2805, 0xD200]) == (bounded(4), unknown));
+        assert!(bounds(&[0x2805, 0xD300]) == (unknown, bounded(4)));
+        // CMP R0, #0; BHS: no index is below 0.
+        assert!(bounds(&[0x2800, 0xD200]) == (unknown, unknown));
+        // MOVS R1, #7; CMP R0, R1; BHI. CMP.W R0, #255; BHI.W.
+        assert!(bounds(&[0x2107, 0x4288, 0xD800]) == (bounded(7), unknown));
+        assert!(bounds(&[0xF1B0, 0x0FFF, 0xF200, 0x8000]) == (bounded(255), unknown));
+        // ADDS R1, #1 between sets the flags anew; LDR R1, [R2] does not.
+        assert!(bounds(&[0x2805, 0x3101, 0xD800]) == (unknown, unknown));
+        assert!(bounds(&[0x2805, 0x6811, 0xD800]) == (bounded(5), unknown));
+    }
+
+    #[test]
+    fn a_jump_through_pc_reads_the_table_its_index_picks_from() {
+        let tables = |halfwords: &[u16]| {
+            let bytes: Vec<u8> = halfwords.iter().flat_map(|half| half.to_le_bytes()).collect();
+            crate::analysis::analyze(&image(&bytes, 0)).jump_tables.iter().map(|table| (table.jump, table.targets.clone())).collect::<Vec<_>>()
+        };
+        // CMP R0, #2; BHI 0x1C; ADD R0, PC; LDRB R0, [R0, #4]; LSLS R0, R0, #1; ADD PC, R0; the
+        // bytes 1, 3, 5 counting halfwords from 0x0E; three cases and the default.
+        let cases = [0x200A, 0x4770, 0x200B, 0x4770, 0x200C, 0x4770, 0x2000, 0x4770];
+        let code = [&[0x2802, 0xD80B, 0x4478, 0x7900, 0x0040, 0x4487, 0x0301, 0x0005][..], &cases].concat();
+        assert_eq!(tables(&code), [(0x0A, vec![0x10, 0x14, 0x18])]);
+        // CMP R0, #1; BHI 0x1C; ADR R1, 0x0C; LSLS R0, R0, #2; LDR R0, [R1, R0]; MOV PC, R0; the
+        // addresses 0x14 and 0x18 with the Thumb bit; two cases and the default.
+        let code = [&[0x2801, 0xD80B, 0xA101, 0x0080, 0x5808, 0x4687, 0x0015, 0x0000, 0x0019, 0x0000][..], &cases[2..]].concat();
+        assert_eq!(tables(&code), [(0x0A, vec![0x14, 0x18])]);
+    }
+
+    #[test]
+    fn code_is_a_function_where_it_sets_up_a_frame_or_soon_returns() {
+        let is_function = |bytes: &[u8]| Thumb::code_pointer(&image(bytes, 0), 0);
+        let halfwords = |halfwords: &[u16]| halfwords.iter().flat_map(|half| half.to_le_bytes()).collect::<Vec<u8>>();
+        // PUSH {R4, LR}; SUB SP, #8; MOVS R0, #0; BX LR.
+        assert!(is_function(&halfwords(&[0xB510, 0x2000])));
+        assert!(is_function(&halfwords(&[0xB082, 0x2000])));
+        assert!(is_function(&halfwords(&[0x2000, 0x4770])));
+        // NOP first; zeros before the return; text.
+        assert!(!is_function(&halfwords(&[0xBF00, 0x4770])));
+        assert!(!is_function(&halfwords(&[0x2000, 0x0000, 0x4770])));
+        assert!(!is_function(b"Hello, world\0\0\0\0"));
+    }
+
+    #[test]
+    fn a_word_of_data_among_the_code_with_the_thumb_bit_points_at_a_function() {
+        // BX LR; padding; a word; MOVS R0, #1; BX LR at 0x08.
+        let origins = |word: u16| {
+            let bytes: Vec<u8> = [0x4770, 0x0000, word, 0x0000, 0x2001, 0x4770].iter().flat_map(|half| half.to_le_bytes()).collect();
+            crate::analysis::analyze(&image(&bytes, 0)).functions.iter().map(|function| (function.addr, function.origin)).collect::<Vec<_>>()
+        };
+        assert_eq!(origins(0x0009), [(0x00, Origin::Export), (0x08, Origin::DataPointer)]);
+        assert!(origins(0x0008).iter().all(|&(_, origin)| origin != Origin::DataPointer));
+    }
+
+    #[test]
+    fn the_memory_beyond_the_image_is_what_the_regions_leave() {
+        let section = |addr: u64, len: usize| Section { name: String::new(), addr, data: vec![0; len], file_offset: None, executable: false, writable: true };
+        let free = memory(&[section(0, 0x1000), section(0x2000_0000, 0x1000)]);
+        assert_eq!(free, [(0x2000_1000, 0x4000_0000), (0x4000_0000, 0x6000_0000), (0x6000_0000, 0xA000_0000), (0xA000_0000, 0xE000_0000), (0xE000_0000, 0x1_0000_0000)]);
     }
 
     #[test]
