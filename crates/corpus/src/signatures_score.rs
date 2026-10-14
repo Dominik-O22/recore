@@ -135,44 +135,60 @@ fn declared_parameters(source: &str, line: usize, name: &str) -> Option<(usize, 
 /// Signatures of the C functions of an 8051 program, from SDCC's debug records, the listing of
 /// its modules, and its sources.
 ///
-/// `F:G$name$0_0$0({2}DF,SI:U),..` gives a function's type, `SV` for one that returns nothing,
-/// and `L:G$name$0$0:ADDR` where it starts. The records do not say which of a function's
-/// symbols are parameters, so those are counted in the source. The record of the source line
-/// at the function's start, `L:C$file.c$107$1_0$72:ADDR`, has the line, and the listing, which
-/// repeats that line after the path of its file, has where the file is. A function whose
-/// source is not there, or does not declare it by name, is left out.
+/// `M:module` opens the records of a module, `F:G$name$0_0$0({2}DF,SI:U),..` gives a function's
+/// type, `SV` for one that returns nothing, and `L:G$name$0$0:ADDR` where it starts. The
+/// records do not say which of a function's symbols are parameters, so those are counted in the
+/// source. A record of a source line at the function's start, `L:C$module.c$107$1_0$72:ADDR`,
+/// has the line: the first in the module's own file, or in a file it includes that declares the
+/// function there, as a record of another module's last line can share the address. The
+/// listing has the path of each file. A function whose source is not there, or does not
+/// declare it by name, is left out.
 fn sdcc_signatures(cdb: &str, rst: &str) -> BTreeMap<u64, Signature> {
     let address = |text: &str| u64::from_str_radix(text, 16).ok();
-    // By the symbol a function's records go under: whether it returns a value.
-    let mut functions: HashMap<&str, bool> = HashMap::new();
+    // By the symbol a function's records go under: its module, and whether it returns a value.
+    let mut functions: HashMap<&str, (&str, bool)> = HashMap::new();
     let mut starts: HashMap<&str, u64> = HashMap::new();
-    // The file and line of the first source line at an address.
-    let mut lines: HashMap<u64, (&str, &str)> = HashMap::new();
+    // The file and line of each source line at an address.
+    let mut lines: HashMap<u64, Vec<(&str, &str)>> = HashMap::new();
+    let mut module = "";
     for line in cdb.lines() {
-        if let Some((symbol, kind)) = line.strip_prefix("F:").and_then(|record| record.split_once("$0_0$0(")) {
-            functions.insert(symbol, kind.split_once("DF,").is_some_and(|(_, returned)| !returned.starts_with("SV")));
+        if let Some(name) = line.strip_prefix("M:") {
+            module = name;
+        } else if let Some((symbol, kind)) = line.strip_prefix("F:").and_then(|record| record.split_once("$0_0$0(")) {
+            functions.insert(symbol, (module, kind.split_once("DF,").is_some_and(|(_, returned)| !returned.starts_with("SV"))));
         } else if let Some(record) = line.strip_prefix("L:C$") {
             let mut fields = record.split('$');
             if let (Some(file), Some(number), Some(addr)) = (fields.next(), fields.next(), record.rsplit_once(':').and_then(|(_, addr)| address(addr))) {
-                lines.entry(addr).or_insert((file, number));
+                lines.entry(addr).or_default().push((file, number));
             }
         } else if let Some((symbol, addr)) = line.strip_prefix("L:").and_then(|record| record.split_once("$0$0:")) {
             starts.extend(address(addr).map(|addr| (symbol, addr)));
         }
     }
-    // The listing has `;<tab><path>:<line>: <text>` for each line of source that made code.
-    let path_of = |file: &str, number: &str| {
-        let line = format!("/{file}:{number}: ");
-        rst.lines().find_map(|listed| Some(format!("{}/{file}", listed.split_once(&line)?.0.split_once(";\t")?.1)))
-    };
-    let mut sources: HashMap<String, Option<String>> = HashMap::new();
+    // The listing has `;<tab><path>:<line>: <text>` for each line of source that made code. A
+    // module is named for its file with what C does not allow in a name as `_`.
+    let mut paths: HashMap<String, &str> = HashMap::new();
+    for listed in rst.lines() {
+        let Some((_, path)) = listed.split_once(";\t") else { continue };
+        let Some(path) = path.split_once(": ").and_then(|(place, _)| place.rsplit_once(':')).map(|(path, _)| path) else { continue };
+        let file = path.rsplit_once('/').map_or(path, |(_, file)| file);
+        paths.entry(file.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '_' }).collect()).or_insert(path);
+    }
+    let mut sources: HashMap<&str, Option<String>> = HashMap::new();
     let mut signatures = BTreeMap::new();
-    for (symbol, returns_value) in functions {
-        let Some((&addr, &(file, number))) = starts.get(symbol).and_then(|addr| lines.get_key_value(addr)) else { continue };
-        let Some(path) = path_of(file, number) else { continue };
-        let source = sources.entry(path).or_insert_with_key(|path| std::fs::read(path).ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned()));
+    for (symbol, (module, returns_value)) in functions {
+        let Some((&addr, at)) = starts.get(symbol).and_then(|addr| lines.get_key_value(addr)) else { continue };
         let name = symbol.rsplit_once('$').map_or(symbol, |(_, name)| name);
-        let declared = source.as_deref().and_then(|source| declared_parameters(source, number.parse().ok()?, name));
+        // The line in the module's own file first; a function defined in a file it includes
+        // has its line in that file.
+        let own = format!("{module}.c");
+        let mut candidates: Vec<&(&str, &str)> = at.iter().collect();
+        candidates.sort_by_key(|(file, _)| *file != own);
+        let declared = candidates.into_iter().find_map(|&(file, number)| {
+            let path = *paths.get(file)?;
+            let source = sources.entry(path).or_insert_with(|| std::fs::read(path).ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned()));
+            declared_parameters(source.as_deref()?, number.parse().ok()?, name)
+        });
         if let Some((params, variadic)) = declared {
             signatures.insert(addr, Signature { params, returns_value, variadic });
         }
@@ -293,5 +309,21 @@ mod tests {
         assert_eq!(declared_parameters(source, 9, "log"), Some((1, true)));
         assert_eq!(declared_parameters(source, 12, "tick"), Some((0, false)));
         assert_eq!(declared_parameters(source, 7, "missing"), None);
+    }
+
+    #[test]
+    fn an_sdcc_function_has_the_line_of_its_own_file_at_its_start() {
+        let dir = std::env::temp_dir().join(format!("recore-sdcc-signatures-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a-b.c"), "int twice(int x)\n{\n  return x + x;\n}\n").unwrap();
+        std::fs::write(dir.join("main.c"), "int twice(int x);\nvoid main(void)\n{\n  twice(1);\n}\n").unwrap();
+        // SDCC names the module of a-b.c a_b. The line of the closing brace of `twice` shares
+        // the address of `main`, and comes first.
+        let cdb = "M:a_b\nF:G$twice$0_0$0({2}DF,SI:S),C,0,0,0,0,0\nL:G$twice$0$0:10\nL:C$a_b.c$1$0_0$1:10\nL:C$a_b.c$4$0_0$1:20\n\
+                   M:main\nF:G$main$0_0$0({2}DF,SV:S),C,0,0,0,0,0\nL:G$main$0$0:20\nL:C$main.c$2$0_0$2:20\n";
+        let rst = format!("      1 ;\t{0}/a-b.c:1: int twice(int x)\n      2 ;\t{0}/main.c:2: void main(void)\n", dir.display());
+        let found: Vec<(u64, usize, bool)> = sdcc_signatures(cdb, &rst).into_iter().map(|(addr, signature)| (addr, signature.params, signature.returns_value)).collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, [(0x10, 1, true), (0x20, 0, false)]);
     }
 }
