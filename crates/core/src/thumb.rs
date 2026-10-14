@@ -224,9 +224,7 @@ impl Insn {
         let imm12 = u32::from(self.hw1 >> 10 & 1) << 11 | u32::from(self.hw2 >> 12 & 7) << 8 | u32::from(self.hw2 & 0xFF);
         (self.hw1 & 0xFBF0 == 0xF1B0 && self.hw2 & 0x8F00 == 0x0F00).then(|| (self.rn(), expand_immediate(imm12)))
     }
-}
 
-impl Insn {
     /// Whether the instruction may set the condition flags. Those that cannot are loads and
     /// stores, moves of addresses and between high registers, stack adjustments, and the
     /// 32-bit forms that leave their S bit clear.
@@ -239,7 +237,9 @@ impl Insn {
                 || matches!(hw1 >> 8, 0xB0 | 0xB2 | 0xB4 | 0xB5 | 0xBA | 0xBC | 0xBD | 0xBF | 0x44 | 0x46));
         }
         match hw1 >> 9 {
-            0b1110100 | 0b1111100 | 0b1111101 => hw1 & 0xFF80 == 0xFA00 && hw1 & 0x10 != 0,
+            0b1110100 | 0b1111100 => false,
+            // Of the operations on registers only the shifts have an S bit, and multiplies none.
+            0b1111101 => hw1 & 0xFF80 == 0xFA00 && hw1 & 0x10 != 0,
             0b1110101 => hw1 & 0x10 != 0,
             0b1111000..=0b1111011 if self.hw2 & 0x8000 == 0 => hw1 & 0x0200 == 0 && hw1 & 0x10 != 0,
             0b1110110 | 0b1110111 | 0b1111110 | 0b1111111 => hw1 == 0xEEF1 && self.hw2 & 0xF000 == 0xF000,
