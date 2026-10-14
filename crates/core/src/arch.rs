@@ -2,6 +2,8 @@
 //! register tracking that resolves jump tables. Discovery and analysis are written once against
 //! this trait.
 
+use std::num::NonZeroU16;
+
 use rustc_hash::FxHashMap;
 
 use crate::image::Image;
@@ -56,6 +58,27 @@ pub struct TextPointer {
     pub marked: bool,
 }
 
+/// Upper bound on the entries read from one table.
+pub const MAX_ENTRIES: usize = 4096;
+
+/// How many entries of a table a bounds check on its index allows, at most [`MAX_ENTRIES`].
+/// Two bytes, because every tracked register carries one along every path that is followed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Limit(NonZeroU16);
+
+impl Limit {
+    /// For an index proven to be at most `max_index`.
+    pub fn of(max_index: u64) -> Limit {
+        let entries = (max_index as usize).saturating_add(1).min(MAX_ENTRIES);
+        Limit(NonZeroU16::new(entries as u16).expect("at least one entry"))
+    }
+
+    /// How many entries to read: `limit`'s, or as many as any table may have.
+    pub fn entries(limit: Option<Limit>) -> usize {
+        limit.map_or(MAX_ENTRIES, |limit| usize::from(limit.0.get()))
+    }
+}
+
 /// A jump table as read from the image.
 pub struct Table {
     pub address: u64,
@@ -103,18 +126,28 @@ pub trait Arch: 'static {
     /// is the only memory that holds anything when it starts.
     const TEXT_IN_CODE: bool = false;
 
+    /// Whether [`Arch::flow`] reads the state: whether what a call or jump goes through can
+    /// depend on earlier instructions. A pass that only classifies control flow need not
+    /// track registers where it cannot.
+    const FLOW_READS_STATE: bool = true;
+
     /// Decodes consecutive instructions from `bytes`, which are loaded at `addr`.
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Self::Insn>>;
 
     /// A decoder over a whole section, for decoding from many places in it: moving one is
-    /// cheaper than making one.
+    /// cheaper than making one. It holds the instruction it decoded last and lends it out, so
+    /// that no instruction is copied on its way to whoever reads it.
     type Decoder<'a>;
 
     /// A decoder over `bytes`, which are loaded at `addr`.
     fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_>;
 
-    /// Decodes consecutive instructions from `offset` into the decoder's bytes.
-    fn decode_from<'d>(decoder: &'d mut Self::Decoder<'_>, offset: usize) -> impl Iterator<Item = Decoded<Self::Insn>> + 'd;
+    /// Moves the decoder to `offset` into its bytes.
+    fn seek(decoder: &mut Self::Decoder<'_>, offset: usize);
+
+    /// Decodes the instruction the decoder is at and moves past it. `None` at the end of the
+    /// bytes.
+    fn decode_next<'d>(decoder: &'d mut Self::Decoder<'_>) -> Option<Decoded<&'d Self::Insn>>;
 
     /// The control-flow effect of `insn`, given the state before it. The image says where a
     /// target really lies when the instruction alone does not, as in banked code.

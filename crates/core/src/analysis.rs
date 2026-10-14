@@ -70,9 +70,12 @@ fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool, tables: &[(u
                     function.controls.push(Control { addr: decoded.addr, next: decoded.next_addr(), flow });
                     // The state only matters for resolving slots, so a fresh one after any control
                     // transfer is enough for a linear pass.
-                    state = A::State::default();
+                    if A::FLOW_READS_STATE {
+                        state = A::State::default();
+                    }
                 }
-                None => A::step(&mut state, &insn),
+                None if A::FLOW_READS_STATE => A::step(&mut state, &insn),
+                None => {}
             }
         }
     }
@@ -119,9 +122,18 @@ struct Walk {
     reach_end: u64,
     /// False when an indirect jump could not be followed, so more may be reachable.
     complete: bool,
-    /// The straight-line stretches of code that were reached, as `[start, end)`, sorted. May
-    /// extend outside the function's own extent.
-    reached: Vec<(u64, u64)>,
+    /// Some path ran through code outside the function's own extent.
+    left_extent: bool,
+}
+
+/// A function that may yet turn out never to return, while that is being worked out.
+struct Open<'a> {
+    function: &'a Function,
+    /// Whether what its last walk found may no longer hold.
+    due: bool,
+    /// What its last walk found.
+    may_return: bool,
+    left_extent: bool,
 }
 
 /// The whole program's control-flow instructions and function entries, for following a
@@ -163,10 +175,31 @@ impl Program<'_> {
 /// function's entry. A jump to code that is not an entry is followed even outside the function's
 /// own extent, which is how a function reaches its cold part when that sits elsewhere. An
 /// unresolved indirect jump counts as possibly returning.
-fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program) -> Walk {
+///
+/// `reached` is told each straight-line stretch of code that is reached, as `[start, end)`, in
+/// no order. A stretch may lie outside the function's own extent.
+fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program, mut reached: impl FnMut(u64, u64)) -> Walk {
     let controls = &program.controls;
     let imports = program.imports;
     let in_extent = |addr: u64| addr >= function.start && addr < function.end;
+    // Nearly every path stays inside the extent, so what a path asks at each step is answered
+    // from the function's own few controls where it can be: a search of the whole program's
+    // misses the cache at every probe.
+    let own = controls.partition_point(|c| c.addr < function.start)..controls.partition_point(|c| c.addr < function.end);
+    let first_control_from = |addr: u64| match in_extent(addr) {
+        true => own.start + controls[own.clone()].partition_point(|c| c.addr < addr),
+        false => controls.partition_point(|c| c.addr < addr),
+    };
+    // The entry after the function's own is also the next one after any address in the extent
+    // that it lies beyond.
+    let following = program.next_start(function.start);
+    let next_start = |addr: u64| if in_extent(addr) && following > addr { following } else { program.next_start(addr) };
+    let mut seen = vec![false; own.len()];
+    let mut seen_outside: FxHashSet<usize> = FxHashSet::default();
+    let mut first_visit = |index: usize| match own.contains(&index) {
+        true => !std::mem::replace(&mut seen[index - own.start], true),
+        false => seen_outside.insert(index),
+    };
     let target_returns = |target: u64| match imports.stub(target) {
         Some(name) => !is_noreturn_import(name),
         None => !noreturn.contains(&target),
@@ -180,14 +213,13 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program) -> Wa
         (None, None) => true,
     };
 
-    let mut result = Walk { may_return: false, reach_end: function.start, complete: true, reached: Vec::new() };
-    let mut visited: FxHashSet<usize> = FxHashSet::default();
+    let mut result = Walk { may_return: false, reach_end: function.start, complete: true, left_extent: false };
     let mut pending = vec![function.start];
     while let Some(addr) = pending.pop() {
         // Everything up to the next control instruction falls through, unless another
         // function's entry comes first.
-        let mut index = controls.partition_point(|c| c.addr < addr);
-        let boundary = program.next_start(addr);
+        let mut index = first_control_from(addr);
+        let boundary = next_start(addr);
         let mut run_start = addr;
         loop {
             let Some(control) = controls.get(index).filter(|c| c.addr < boundary) else {
@@ -196,7 +228,7 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program) -> Wa
                 // second kind carries on somewhere this walk cannot see, so it may return.
                 if in_extent(run_start) {
                     result.reach_end = function.end;
-                    result.reached.push((run_start, function.end));
+                    reached(run_start, function.end);
                 }
                 // `run_start == addr` means nothing was decoded on the way: the jump itself
                 // landed outside known code.
@@ -210,14 +242,16 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program) -> Wa
                 }
                 break;
             };
-            if !visited.insert(index) {
-                result.reached.push((run_start, control.addr));
+            if !first_visit(index) {
+                reached(run_start, control.addr);
                 break;
             }
-            result.reached.push((run_start, control.next));
+            reached(run_start, control.next);
             run_start = control.next;
             if in_extent(control.addr) {
                 result.reach_end = result.reach_end.max(control.next);
+            } else {
+                result.left_extent = true;
             }
             let mut leave = |target: u64, pending: &mut Vec<u64>| {
                 // A PLT stub or another function's entry is a tail call. Anything else is more
@@ -270,7 +304,6 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program) -> Wa
             index += 1;
         }
     }
-    result.reached.sort_unstable();
     result
 }
 
@@ -439,22 +472,36 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
     let inline_tables = std::mem::take(&mut discovery.inline_tables);
     let inline_tables = inline_tables.as_slice();
+
+    // Functions by the entry and the bound they were decoded from. A round of the loop below
+    // that adds entry points starts over, and all but the functions next to the new entry
+    // points come out as they did before.
+    let mut decoded: FxHashMap<(u64, u64), Function> = FxHashMap::default();
     let (starts, functions, chunks, noreturn, controls, extents) = loop {
         _phase = phase::scope("decode functions");
         let starts: Vec<u64> = discovery.starts.keys().copied().collect();
-        let functions: Vec<Function> = starts
-            .par_iter()
+        // A frame gives a function's end; otherwise the next entry point bounds it.
+        let spans: Vec<(u64, u64)> = starts
+            .iter()
             .enumerate()
             .map(|(index, &start)| match frame_end.get(&start) {
-                Some(&end) => decode::<A>(image, start, end, false, inline_tables),
+                Some(&end) => (start, end),
                 None => {
                     let section_end = image.section_at(start).map_or(start, |s| s.end());
-                    let mut bound = starts.get(index + 1).copied().unwrap_or(section_end).min(section_end);
-                    if image.data_in_code {
-                        bound = code_end::<A>(image, start, bound, &tables, inline_tables);
-                    }
-                    decode::<A>(image, start, bound, true, inline_tables)
+                    (start, starts.get(index + 1).copied().unwrap_or(section_end).min(section_end))
                 }
+            })
+            .collect();
+        let reused: Vec<Option<Function>> = spans.iter().map(|span| decoded.remove(span)).collect();
+        let functions: Vec<Function> = spans
+            .par_iter()
+            .zip(reused)
+            .map(|(&(start, bound), reused)| {
+                reused.unwrap_or_else(|| match frame_end.contains_key(&start) {
+                    true => decode::<A>(image, start, bound, false, inline_tables),
+                    false if image.data_in_code => decode::<A>(image, start, code_end::<A>(image, start, bound, &tables, inline_tables), true, inline_tables),
+                    false => decode::<A>(image, start, bound, true, inline_tables),
+                })
             })
             .collect();
 
@@ -505,6 +552,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             discovery.starts.entry(addr).or_insert(Origin::TailCall);
         }
         if discovery.starts.len() > before {
+            decoded = spans.into_iter().zip(functions).collect();
             continue;
         }
 
@@ -540,16 +588,44 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             })
             .collect();
 
-        // Least fixpoint: a function joins the set once no path through it can return.
+        // Least fixpoint: a function joins the set once no path through it can return. What a
+        // walk finds changes only when a function it asked about joins the set, and it asks at
+        // the calls and jumps it passes. So after the first round only the functions that can
+        // pass a call or jump to one that has just joined are walked again: those with one in
+        // their extent, and those that leave their extent, which may pass any.
         let mut noreturn: FxHashSet<u64> = terminal_callees.into_iter().filter(|target| starts.binary_search(target).is_ok()).collect();
+        let mut open: Vec<Open> = functions
+            .iter()
+            .filter(|f| !noreturn.contains(&f.start))
+            .map(|function| Open { function, due: true, may_return: true, left_extent: false })
+            .collect();
         loop {
-            let added: Vec<u64> = functions
-                .par_iter()
-                .filter(|f| !noreturn.contains(&f.start) && !walk(f, &noreturn, &program).may_return)
-                .map(|f| f.start)
-                .collect();
+            open.par_iter_mut().filter(|open| open.due).for_each(|open| {
+                let walk = walk(open.function, &noreturn, &program, |_, _| {});
+                (open.may_return, open.left_extent) = (walk.may_return, walk.left_extent);
+            });
+            let added: FxHashSet<u64> = open.iter().filter(|open| !open.may_return).map(|open| open.function.start).collect();
             if added.is_empty() {
                 break;
+            }
+            // In address order, as the controls are.
+            let asking: Vec<u64> = program
+                .controls
+                .iter()
+                .filter(|control| {
+                    let target = match control.flow {
+                        Flow::Call(target) | Flow::Jump(target) | Flow::Branch(target) => Some(target),
+                        Flow::CallIndirect(Some(slot)) | Flow::JumpIndirect(Some(slot)) => pointer_slots.get(&slot).copied(),
+                        _ => None,
+                    };
+                    target.is_some_and(|target| added.contains(&target))
+                })
+                .map(|control| control.addr)
+                .collect();
+            let passes = |f: &Function| asking.get(asking.partition_point(|&addr| addr < f.start)).is_some_and(|&addr| addr < f.end);
+            open.retain(|open| open.may_return);
+            for open in &mut open {
+                open.due = open.left_extent || passes(open.function);
             }
             noreturn.extend(added);
         }
@@ -563,7 +639,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .par_iter()
             .filter(|f| !frame_end.contains_key(&f.start) && !image.data_in_code)
             .filter_map(|f| {
-                let reached = walk(f, &noreturn, &program);
+                let reached = walk(f, &noreturn, &program, |_, _| {});
                 (reached.complete && reached.reach_end < f.end)
                     .then(|| next_function_start::<A>(image, reached.reach_end, f.end))
                     .flatten()
@@ -576,6 +652,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         for addr in splits {
             discovery.starts.entry(addr).or_insert(Origin::Unreachable);
         }
+        decoded = spans.into_iter().zip(functions).collect();
     };
 
     // The chunks each function reaches become further ranges of its body.
@@ -588,8 +665,12 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         functions
             .par_iter()
             .filter_map(|f| {
-                let reached = walk(f, &noreturn, &program);
-                let outside: Vec<(u64, u64)> = reached.reached.iter().copied().filter(|&(start, end)| end > start && (start < f.start || start >= f.end)).collect();
+                let mut outside: Vec<(u64, u64)> = Vec::new();
+                walk(f, &noreturn, &program, |start, end| {
+                    if end > start && (start < f.start || start >= f.end) {
+                        outside.push((start, end));
+                    }
+                });
                 let extra = intersect(&merge(outside), &chunk_ranges);
                 (!extra.is_empty()).then_some((f.start, extra))
             })

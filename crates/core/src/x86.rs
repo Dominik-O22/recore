@@ -43,31 +43,36 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
     const FUNCTION_ALIGN: u64 = 16;
     const ALIGNMENT_IS_EVIDENCE: bool = true;
     const ADDRESSES_ARE_RELOCATED: bool = BITS == 32;
+    /// An operand names the slot outright or not at all.
+    const FLOW_READS_STATE: bool = false;
 
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Instruction>> {
         let mut decoder = Decoder::with_ip(BITS, bytes, addr, DecoderOptions::NONE);
+        let mut instr = Instruction::default();
         std::iter::from_fn(move || {
             decoder.can_decode().then(|| {
-                let instr = decoder.decode();
+                decoder.decode_out(&mut instr);
                 Decoded { addr: instr.ip(), len: instr.len().max(1) as u8, insn: (!instr.is_invalid()).then_some(instr) }
             })
         })
     }
 
-    type Decoder<'a> = (Decoder<'a>, u64);
+    /// The decoder, the address its bytes are loaded at, and the instruction decoded last.
+    type Decoder<'a> = (Decoder<'a>, u64, Instruction);
 
     fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_> {
-        (Decoder::with_ip(BITS, bytes, addr, DecoderOptions::NONE), addr)
+        (Decoder::with_ip(BITS, bytes, addr, DecoderOptions::NONE), addr, Instruction::default())
     }
 
-    fn decode_from<'d>((decoder, base): &'d mut Self::Decoder<'_>, offset: usize) -> impl Iterator<Item = Decoded<Instruction>> + 'd {
+    fn seek((decoder, base, _): &mut Self::Decoder<'_>, offset: usize) {
         decoder.set_position(offset).expect("an offset into the section");
         decoder.set_ip(*base + offset as u64);
-        std::iter::from_fn(move || {
-            decoder.can_decode().then(|| {
-                let instr = decoder.decode();
-                Decoded { addr: instr.ip(), len: instr.len().max(1) as u8, insn: (!instr.is_invalid()).then_some(instr) }
-            })
+    }
+
+    fn decode_next<'d>((decoder, _, instr): &'d mut Self::Decoder<'_>) -> Option<Decoded<&'d Instruction>> {
+        decoder.can_decode().then(|| {
+            decoder.decode_out(instr);
+            Decoded { addr: instr.ip(), len: instr.len().max(1) as u8, insn: (!instr.is_invalid()).then_some(&*instr) }
         })
     }
 
@@ -86,13 +91,16 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
     /// A RIP-relative operand in 64-bit code; in 32-bit code a displacement, which the caller
     /// checks against relocations since any constant offset looks the same.
     fn memory_reference(insn: &Instruction, _: &State) -> Option<u64> {
-        if !insn.op_kinds().any(|kind| kind == OpKind::Memory) || insn.mnemonic() == Mnemonic::Lea {
+        // The address first: most instructions have none, and going through the operands to see
+        // whether one is memory costs more.
+        let address = if insn.is_ip_rel_memory_operand() {
+            insn.ip_rel_memory_address()
+        } else if BITS == 32 && insn.memory_displacement64() != 0 {
+            insn.memory_displacement64()
+        } else {
             return None;
-        }
-        if insn.is_ip_rel_memory_operand() {
-            return Some(insn.ip_rel_memory_address());
-        }
-        (BITS == 32 && insn.memory_displacement64() != 0).then(|| insn.memory_displacement64())
+        };
+        (insn.mnemonic() != Mnemonic::Lea && insn.op_kinds().any(|kind| kind == OpKind::Memory)).then_some(address)
     }
 
     fn through_pointer(insn: &Instruction, state: &State) -> Option<(u64, u64, bool)> {

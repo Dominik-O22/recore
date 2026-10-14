@@ -150,23 +150,31 @@ pub struct Discovery {
 struct AddrSet {
     base: u64,
     bits: Vec<u64>,
-    sorted: Vec<u64>,
+    /// Per word of `bits`, the number of members in the words before it.
+    before: Vec<u32>,
 }
 
 impl AddrSet {
-    /// A range longer than this is looked up in the sorted list instead of scanned bit by bit.
-    const SCAN: u64 = 4096;
-
     /// `addrs` in ascending order.
     fn new(addrs: impl Iterator<Item = u64>) -> AddrSet {
         let sorted: Vec<u64> = addrs.collect();
         let base = sorted.first().copied().unwrap_or(0);
         let span = sorted.last().map_or(0, |last| last - base + 1);
         let mut bits = vec![0u64; span.div_ceil(64) as usize];
+        let mut before = vec![0u32; bits.len()];
         for addr in &sorted {
-            bits[((addr - base) / 64) as usize] |= 1 << ((addr - base) % 64);
+            let word = ((addr - base) / 64) as usize;
+            bits[word] |= 1 << ((addr - base) % 64);
+            if let Some(next) = before.get_mut(word + 1) {
+                *next += 1;
+            }
         }
-        AddrSet { base, bits, sorted }
+        let mut count = 0;
+        for word in &mut before {
+            count += *word;
+            *word = count;
+        }
+        AddrSet { base, bits, before }
     }
 
     fn contains(&self, addr: u64) -> bool {
@@ -175,16 +183,12 @@ impl AddrSet {
 
     /// Whether a member lies in `low..=high`.
     fn any_in(&self, low: u64, high: u64) -> bool {
-        let Some(&last) = self.sorted.last() else { return false };
-        let (low, high) = (low.max(self.base), high.min(last));
-        if low > high {
+        let Some(last) = (self.bits.len() as u64 * 64).checked_sub(1) else { return false };
+        let low = low.max(self.base);
+        if low > high || low - self.base > last {
             return false;
         }
-        if high - low > Self::SCAN {
-            let index = self.sorted.partition_point(|&addr| addr < low);
-            return self.sorted.get(index).is_some_and(|&addr| addr <= high);
-        }
-        let (first, end) = (low - self.base, high - self.base);
+        let (first, end) = (low - self.base, (high - self.base).min(last));
         let (first_word, end_word) = ((first / 64) as usize, (end / 64) as usize);
         // Bits from `first` up in the first word, bits up to `end` in the last.
         let from = u64::MAX << (first % 64);
@@ -192,7 +196,7 @@ impl AddrSet {
         if first_word == end_word {
             return self.bits[first_word] & from & upto != 0;
         }
-        self.bits[first_word] & from != 0 || self.bits[end_word] & upto != 0 || self.bits[first_word + 1..end_word].iter().any(|&word| word != 0)
+        self.bits[first_word] & from != 0 || self.bits[end_word] & upto != 0 || self.before[end_word] != self.before[first_word + 1]
     }
 }
 
@@ -258,14 +262,23 @@ struct Explorer<'a, A: Arch> {
     /// The gap search comes to them one after the other, and each holds as the gap did, so
     /// the gap is decoded once and not once for each.
     tiled: Vec<u64>,
+    /// Whether what this pass finds will be reported. A first pass that has learned a table's
+    /// length is followed by a second, and only its lengths are read: from then on it stops
+    /// recording references and what is referenced, which decide nothing while exploring.
+    recording: bool,
+    /// How many tables without a bounds check a first pass has resolved.
+    unbounded: u32,
 }
 
-impl<A: Arch> Explorer<'_, A> {
+/// One decoder per section, made when first needed. Decoding starts in a new place for every
+/// branch target and every gap, and moving a decoder is cheaper than making one.
+type Decoders<'a, A> = Vec<Option<<A as Arch>::Decoder<'a>>>;
+
+impl<'a, A: Arch> Explorer<'a, A> {
     fn region_index(&self, addr: u64) -> Option<usize> {
         self.regions.iter().position(|r| r.section.contains(addr))
     }
 
-    /// Whether `addr` is in a section that holds no code.
     /// Records that the instruction at `at` reads or writes the data at `target`. Reading a slot
     /// the loader fills with an address in this image also takes that address: a global or a
     /// function reached through the global offset table.
@@ -303,16 +316,20 @@ impl<A: Arch> Explorer<'_, A> {
         let flags = &mut region.flags[(addr - region.section.addr) as usize];
         if referenced && *flags & REFERENCED == 0 {
             *flags |= REFERENCED;
-            self.referenced.insert(addr);
+            if self.recording {
+                self.referenced.insert(addr);
+            }
         }
         // Whether an address becomes an entry point depends neither on who asks nor on when,
-        // and most addresses are asked about many times: once per call to them.
+        // and most addresses are asked about many times: once per call to them. So each is
+        // decided once, and is no entry point yet when it is.
         if *flags & ASKED_AS_START != 0 {
             return;
         }
         *flags |= ASKED_AS_START;
-        if !self.inside_frame(addr) && !self.starts.contains_key(&addr) {
-            self.starts.insert(addr, origin);
+        if !self.inside_frame(addr) {
+            let before = self.starts.insert(addr, origin);
+            debug_assert!(before.is_none());
             self.pending.push(Pending::entry(addr));
         }
     }
@@ -363,9 +380,7 @@ impl<A: Arch> Explorer<'_, A> {
     }
 
     /// Decodes from every pending address until control flow ends or reaches known code.
-    fn drain(&mut self) {
-        // One decoder per section, made when first needed.
-        let mut decoders: Vec<Option<A::Decoder<'_>>> = self.regions.iter().map(|_| None).collect();
+    fn drain(&mut self, decoders: &mut Decoders<'a, A>) {
         loop {
             // Most branch targets have been decoded by the time their turn comes. Those are
             // looked at where they lie: taking one off the queue copies its whole state.
@@ -386,7 +401,8 @@ impl<A: Arch> Explorer<'_, A> {
             }
             let mut after_call = false;
             let decoder = decoders[index].get_or_insert_with(|| A::decoder(&section.data, section.addr));
-            for decoded in A::decode_from(decoder, (start - section.addr) as usize) {
+            A::seek(decoder, (start - section.addr) as usize);
+            while let Some(decoded) = A::decode_next(decoder) {
                 let offset = (decoded.addr - section.addr) as usize;
                 if std::mem::replace(&mut self.regions[index].insn_len[offset], decoded.len.max(1)) != 0 {
                     // Decoded before, and to the same length.
@@ -405,61 +421,44 @@ impl<A: Arch> Explorer<'_, A> {
                 };
                 after_call = false;
                 self.regions[index].cover(offset, usize::from(decoded.len.max(1)));
-                let Some(flow) = A::flow(&insn, &state, self.image) else {
-                    if let Some((base, data)) = A::based_data_address(&insn, &state) {
-                        if self.image.base != 0 && base == self.image.base {
+                let Some(flow) = A::flow(insn, &state, self.image) else {
+                    if let Some((base, data)) = A::based_data_address(insn, &state) {
+                        let from_image_base = self.image.base != 0 && base == self.image.base;
+                        if from_image_base {
                             self.data_refs.push(data);
-                            if !speculative && self.is_data(data) {
-                                self.data_ref_sites.push((decoded.addr, data, true));
-                            }
-                        } else if !speculative && self.is_data(base) && self.is_data(data) {
-                            // A field or an element of the global whose address the register holds.
+                        }
+                        // Off the image base, or a field or an element of the global whose
+                        // address the register holds.
+                        if self.recording && !speculative && (from_image_base || self.is_data(base)) && self.is_data(data) {
                             self.data_ref_sites.push((decoded.addr, data, true));
                         }
                     }
-                    let accessed = A::memory_reference(&insn, &state)
-                        .filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target))
-                        .filter(|&target| self.is_data(target));
-                    match accessed {
-                        Some(target) if speculative => self.uncertain_ref_sites.push((decoded.addr, target, true)),
-                        Some(target) => self.note_access(decoded.addr, target),
-                        None => {}
+                    if self.recording {
+                        self.note_references(insn, &state, decoded.addr, speculative);
                     }
-                    if let Some(target) = A::offset_address(&insn, &state).filter(|&target| !speculative && self.is_data(target)) {
-                        self.data_ref_sites.push((decoded.addr, target, false));
-                    }
-                    /// Offsets from a pointer further than this are not fields of what it points to.
-                    const FARTHEST_FIELD: u64 = 1 << 20;
-                    let through = A::through_pointer(&insn, &state).filter(|&(_, offset, _)| !speculative && offset < FARTHEST_FIELD);
-                    if let Some((pointee, offset, access)) = through.and_then(|(slot, offset, access)| Some((*self.pointer_slots.get(&slot)?, offset, access))) {
-                        if self.is_data(pointee) && self.is_data(pointee + offset) {
-                            if access {
-                                self.note_access(decoded.addr, pointee + offset);
-                            } else {
-                                self.data_ref_sites.push((decoded.addr, pointee + offset, false));
-                            }
-                        }
-                    }
-                    let taken = A::address_taken(&insn, &state).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
-                    if let Some(target) = taken.filter(|_| speculative) {
-                        self.uncertain_ref_sites.push((decoded.addr, target, false));
-                    } else if let Some(target) = taken {
+                    let taken = A::address_taken(insn, &state).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
+                    if let Some(target) = taken.filter(|_| !speculative) {
                         if self.region_index(target).is_some() {
                             self.add_start(target, Origin::AddressTaken);
-                            // Code whose address is taken is a callback or a method table entry,
-                            // and who takes it is worth as much as who calls it.
-                            self.data_ref_sites.push((decoded.addr, target, false));
                         } else {
                             self.data_refs.push(target);
-                            self.data_ref_sites.push((decoded.addr, target, false));
                         }
                     }
-                    A::step(&mut state, &insn);
+                    // Who takes an address is reported for code as for data: code whose address
+                    // is taken is a callback or a method table entry, and who takes it is worth
+                    // as much as who calls it.
+                    match taken.filter(|_| self.recording) {
+                        Some(target) if speculative => self.uncertain_ref_sites.push((decoded.addr, target, false)),
+                        Some(target) => self.data_ref_sites.push((decoded.addr, target, false)),
+                        None => {}
+                    }
+                    A::step(&mut state, insn);
                     continue;
                 };
                 // A call or jump through a variable reads it, as an instruction that loads it
                 // does. An import's slot is reported with the call instead.
                 if let Flow::CallIndirect(Some(slot)) | Flow::JumpIndirect(Some(slot)) = flow
+                    && self.recording
                     && !speculative
                     && self.is_data(slot)
                     && !self.image.import_slots.contains_key(&slot)
@@ -489,7 +488,7 @@ impl<A: Arch> Explorer<'_, A> {
                         true
                     }
                     Flow::Branch(target) => {
-                        let taken = A::branch(&mut state, &insn);
+                        let taken = A::branch(&mut state, insn);
                         if !speculative {
                             self.jumps.push((decoded.addr, target));
                         }
@@ -498,12 +497,12 @@ impl<A: Arch> Explorer<'_, A> {
                     }
                     Flow::JumpIndirect(None) => {
                         let jump = decoded.addr;
-                        let resolved = A::resolve_table(&state, self.image, self.pointer_slots, &insn, &|target| {
+                        let resolved = A::resolve_table(&state, self.image, self.pointer_slots, insn, &|target| {
                             self.is_case_target(jump, target)
                         }, &|target| self.is_case_code(target));
                         let resolved = resolved.map(|table| self.apply_known_length(table));
                         match resolved {
-                            Some(table) => self.accept_table(jump, table, A::after_jump(state, &insn), trusted, speculative),
+                            Some(table) => self.accept_table(jump, table, A::after_jump(state, insn), trusted, speculative),
                             None => {
                                 self.unresolved.insert(jump);
                             }
@@ -521,8 +520,36 @@ impl<A: Arch> Explorer<'_, A> {
                     break;
                 }
                 if matches!(flow, Flow::Call(_) | Flow::CallIndirect(_)) {
-                    A::step(&mut state, &insn);
+                    A::step(&mut state, insn);
                     after_call = true;
+                }
+            }
+        }
+    }
+
+    /// Records the data that `insn`, at `at`, reads, writes or forms the address of, where
+    /// that decides nothing while exploring.
+    fn note_references(&mut self, insn: &A::Insn, state: &A::State, at: u64, speculative: bool) {
+        let accessed = A::memory_reference(insn, state)
+            .filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target))
+            .filter(|&target| self.is_data(target));
+        match accessed {
+            Some(target) if speculative => self.uncertain_ref_sites.push((at, target, true)),
+            Some(target) => self.note_access(at, target),
+            None => {}
+        }
+        if let Some(target) = A::offset_address(insn, state).filter(|&target| !speculative && self.is_data(target)) {
+            self.data_ref_sites.push((at, target, false));
+        }
+        /// Offsets from a pointer further than this are not fields of what it points to.
+        const FARTHEST_FIELD: u64 = 1 << 20;
+        let through = A::through_pointer(insn, state).filter(|&(_, offset, _)| !speculative && offset < FARTHEST_FIELD);
+        if let Some((pointee, offset, access)) = through.and_then(|(slot, offset, access)| Some((*self.pointer_slots.get(&slot)?, offset, access))) {
+            if self.is_data(pointee) && self.is_data(pointee + offset) {
+                if access {
+                    self.note_access(at, pointee + offset);
+                } else {
+                    self.data_ref_sites.push((at, pointee + offset, false));
                 }
             }
         }
@@ -583,12 +610,22 @@ impl<A: Arch> Explorer<'_, A> {
         }
         // Tables sit back to back, so each table's address ends the one before it.
         self.data_refs.push(table.address);
-        if !speculative {
+        if self.recording && !speculative {
             // The jump reads its table, wherever the compiler put it: MSVC keeps tables among
             // the code.
             self.data_ref_sites.push((jump, table.address, true));
         }
+        let first_pass = self.known_lengths.is_empty();
+        let unbounded = !table.bounded;
         self.tables.push((jump, table));
+        // A length learned now is still learned when the pass ends: data addresses only get
+        // closer to a table. Asking sorts all of them, so it is asked ever more rarely.
+        if self.recording && first_pass && unbounded {
+            self.unbounded += 1;
+            if self.unbounded.is_power_of_two() && !self.learned_lengths().is_empty() {
+                self.recording = false;
+            }
+        }
     }
 
     /// Called when a path runs into code that was already decoded. If an unresolved indirect
@@ -907,17 +944,18 @@ impl<A: Arch> Explorer<'_, A> {
             let section = region.section;
             let mut offset = 0;
             while offset < section.data.len() {
-                let len = u64::from(region.insn_len[offset]);
-                if len == 0 {
+                if region.insn_len[offset] == 0 {
                     offset += 1;
                     continue;
                 }
-                let addr = section.addr + offset as u64;
+                // The instruction here and every one that follows it without a gap.
+                let end = region.end_of_run(offset);
+                let (addr, end_addr) = (section.addr + offset as u64, section.addr + end as u64);
                 match ranges.last_mut() {
-                    Some(last) if last.1 == addr => last.1 = addr + len,
-                    _ => ranges.push((addr, addr + len)),
+                    Some(last) if last.1 == addr => last.1 = end_addr,
+                    _ => ranges.push((addr, end_addr)),
                 }
-                offset += len as usize;
+                offset = end;
             }
         }
         ranges
@@ -926,7 +964,7 @@ impl<A: Arch> Explorer<'_, A> {
     /// Finds code that nothing referenced. Code following padding at an aligned address, or
     /// opening with an entry marker, starts a function. Other unreached code continues the
     /// function before it, such as switch cases behind an unresolved indirect jump.
-    fn fill_gaps(&mut self) -> bool {
+    fn fill_gaps(&mut self, decoders: &mut Decoders<'a, A>) -> bool {
         let mut found = false;
         for index in 0..self.regions.len() {
             let section = self.regions[index].section;
@@ -968,22 +1006,26 @@ impl<A: Arch> Explorer<'_, A> {
                         after_data = offset;
                         continue;
                     }
-                    // An unreached stretch: step over padding to the first real instruction.
-                    let mut decoder = A::decode(&section.data[offset..], addr);
+                    // An unreached stretch: step over padding to the first real instruction, and
+                    // take the one after it too.
                     let mut skipped_padding = false;
                     let mut candidate = None;
                     let mut scanned_to = addr;
-                    for decoded in decoder.by_ref() {
+                    let mut next = None;
+                    let decoder = decoders[index].get_or_insert_with(|| A::decoder(&section.data, section.addr));
+                    A::seek(decoder, offset);
+                    while let Some(decoded) = A::decode_next(decoder) {
                         if self.regions[index].insn_len[(decoded.addr - section.addr) as usize] != 0 {
                             break;
                         }
                         scanned_to = decoded.next_addr();
                         let Some(insn) = decoded.insn else { break };
-                        if A::is_padding(&insn) {
+                        if A::is_padding(insn) {
                             skipped_padding = true;
                             continue;
                         }
-                        candidate = Some((decoded.addr, insn));
+                        candidate = Some((decoded.addr, *insn));
+                        next = A::decode_next(decoder).and_then(|d| d.insn.copied());
                         break;
                     }
                     // Always make progress, even past bytes that do not decode.
@@ -1002,7 +1044,6 @@ impl<A: Arch> Explorer<'_, A> {
                     }
                     let aligned = addr % A::FUNCTION_ALIGN == 0;
                     let marked = A::is_entry_marker(&insn);
-                    let next = decoder.next().and_then(|d| d.insn);
                     // An entry marker right after other code may open a landing pad at the end of a
                     // function.
                     let landing_pad = marked && !skipped_padding && next.as_ref().is_some_and(A::opens_landing_pad);
@@ -1041,7 +1082,7 @@ impl<A: Arch> Explorer<'_, A> {
                             if self.frame_of(addr).is_some() && !self.in_table(addr) {
                                 self.deferred.push(Pending { addr, state: A::State::default(), trusted: false, speculative: true });
                                 found = true;
-                                self.drain();
+                                self.drain(decoders);
                             }
                             continue;
                         }
@@ -1052,7 +1093,7 @@ impl<A: Arch> Explorer<'_, A> {
                         self.pending.push(Pending::entry(addr));
                     }
                     found = true;
-                    self.drain();
+                    self.drain(decoders);
                 }
                 self.regions[index].scans[entry.0 / PAGE] = Some(PageScan { time, tables: self.tables.len(), entry, exit: (offset, after_data), found });
                 found |= found_before;
@@ -1077,8 +1118,10 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
         let _phase = phase::scope("discover/pointers");
         Pointers::new(image)
     };
+    // A first pass that learns a length stops recording what only a last pass has to report.
     let first = explore::<A>(image, frames, &pointers, FxHashMap::default());
     let lengths = first.learned_lengths();
+    debug_assert!(first.recording || !lengths.is_empty());
     let mut explorer = if lengths.is_empty() { first } else { explore::<A>(image, frames, &pointers, lengths) };
 
     // An entry point is only real if its first bytes decoded.
@@ -1162,6 +1205,8 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         known_lengths,
         frames,
         clock: 0,
+        recording: true,
+        unbounded: 0,
         data_sections: {
             // Zero-filled memory is data as much as what the file stores.
             let mut ranges: Vec<(u64, u64)> = image.sections.iter().filter(|s| !s.executable).map(|s| (s.addr, s.end())).chain(image.zero_filled.iter().copied()).collect();
@@ -1184,9 +1229,10 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
             explorer.add_start(seed, origin);
         }
     }
+    let mut decoders: Decoders<A> = explorer.regions.iter().map(|_| None).collect();
     {
         let _phase = phase::scope("discover/drain");
-        explorer.drain();
+        explorer.drain(&mut decoders);
     }
 
     loop {
@@ -1196,15 +1242,19 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         };
         {
             let _phase = phase::scope("discover/drain");
-            explorer.drain();
+            explorer.drain(&mut decoders);
         }
         let _phase = phase::scope("discover/fill gaps");
-        let filled = explorer.fill_gaps();
+        let filled = explorer.fill_gaps(&mut decoders);
         if !promoted && !filled {
             break;
         }
     }
 
+    // The entry points of a pass that only learns lengths are not read.
+    if !explorer.recording {
+        return explorer;
+    }
     let _phase = phase::scope("discover/demote");
     explorer.demote_table_addresses();
     explorer.demote_case_targets();

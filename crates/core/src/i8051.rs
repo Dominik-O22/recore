@@ -311,14 +311,22 @@ impl Arch for I8051 {
         })
     }
 
-    type Decoder<'a> = (&'a [u8], u64);
+    /// The bytes, the address they are loaded at, the offset to decode at next, and the
+    /// instruction decoded last.
+    type Decoder<'a> = (&'a [u8], u64, usize, Insn);
 
     fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_> {
-        (bytes, addr)
+        (bytes, addr, 0, Insn { addr, bytes: [0; 3] })
     }
 
-    fn decode_from<'d>(&mut (bytes, base): &'d mut Self::Decoder<'_>, offset: usize) -> impl Iterator<Item = Decoded<Insn>> + 'd {
-        Self::decode(&bytes[offset..], base + offset as u64)
+    fn seek(decoder: &mut Self::Decoder<'_>, offset: usize) {
+        decoder.2 = offset;
+    }
+
+    fn decode_next<'d>((bytes, base, offset, insn): &'d mut Self::Decoder<'_>) -> Option<Decoded<&'d Insn>> {
+        let decoded = Self::decode(bytes.get(*offset..)?, *base + *offset as u64).next()?;
+        *offset += usize::from(decoded.len);
+        Some(Decoded { addr: decoded.addr, len: decoded.len, insn: decoded.insn.map(|decoded| &*{ *insn = decoded; insn }) })
     }
 
     fn flow(insn: &Insn, _: &State, image: &Image) -> Option<Flow> {
