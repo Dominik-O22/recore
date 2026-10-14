@@ -59,3 +59,13 @@ corpus-8051/truth/
 corpus-8051/jumptables/
 corpus-8051/signatures/
 corpus-8051/recore*/
+corpus-thumb/pkgs/
+corpus-thumb/obj/
+corpus-thumb/bin/
+corpus-thumb/image/
+corpus-thumb/debug/
+corpus-thumb/truth/
+corpus-thumb/jumptables/
+corpus-thumb/signatures/
+corpus-thumb/recore*/
+corpus-thumb/ghidra*/
