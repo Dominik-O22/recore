@@ -509,6 +509,9 @@ impl Session {
         for &(function, jump) in &facts.tail_calls {
             self.override_tail_call(function, jump)?;
         }
+        for &(function, jump) in &facts.returns {
+            check(|err, len| unsafe { ffi::rd_override_return(self.raw.as_ptr(), function, jump, err, len) != 0 })?;
+        }
         for &(function, call, slot) in &facts.import_calls {
             self.override_import_call(function, call, slot)?;
         }

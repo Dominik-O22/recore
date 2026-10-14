@@ -131,7 +131,7 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         opens_landing_pad(insn)
     }
 
-    fn argument_write(insn: &Instruction) -> Option<(usize, Option<u64>)> {
+    fn argument_write(insn: &Instruction, _: &State) -> Option<(usize, Option<u64>)> {
         const WINDOWS_ORDER: [Register; 4] = [Register::RCX, Register::RDX, Register::R8, Register::R9];
         const SYSTEM_V_ORDER: [Register; 6] = [Register::RDI, Register::RSI, Register::RDX, Register::RCX, Register::R8, Register::R9];
         let order: &[Register] = if WINDOWS { &WINDOWS_ORDER } else { &SYSTEM_V_ORDER };

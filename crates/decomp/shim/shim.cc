@@ -1316,6 +1316,14 @@ int rd_override_tail_call(RdSession *session, uint64_t function, uint64_t jump, 
   });
 }
 
+// Marks the branch through a register at `jump` inside `function` as a return, which the engine
+// cannot tell from the register alone when the code popped the return address into it.
+int rd_override_return(RdSession *session, uint64_t function, uint64_t jump, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    session->function(function)->getOverride().insertFlowOverride(session->address(jump), "return");
+  });
+}
+
 // Declares that the function at `function` returns what the function at `callee` returns, as it
 // does when it ends by jumping there: the engine sees a call followed by a return and does not
 // connect the two. `callee` must have been decompiled by this session, or be an import with a
@@ -1402,8 +1410,11 @@ int rd_format_call(RdSession *session, uint64_t function, uint64_t call, uint64_
     session->image->loadFill(bytes, sizeof(bytes), session->address(format));
     const uint1 *end = (const uint1 *)memchr(bytes, 0, sizeof(bytes));
     if (end == nullptr) return;
-    vector<bool> floats = format_arguments(string((const char *)bytes, end - bytes), target->getName().find("scanf") != string::npos);
-    if (floats.empty() || floats.size() > 12) return;
+    string text((const char *)bytes, end - bytes);
+    vector<bool> floats = format_arguments(text, target->getName().find("scanf") != string::npos);
+    // recore: text without a `%` asks for nothing more, as firmware's linked `printf` is
+    // called with it. Other text that asks for nothing is no format the parser read.
+    if ((floats.empty() && text.find('%') != string::npos) || floats.size() > 12) return;
 
     const FuncProto &declared = target->getFuncProto();
     PrototypePieces pieces;

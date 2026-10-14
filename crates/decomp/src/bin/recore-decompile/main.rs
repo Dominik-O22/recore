@@ -29,7 +29,7 @@ struct WorkerOptions {
     #[arg(long)]
     emit_c: bool,
     /// Where switch targets come from: recore's jump tables, the engine's own recovery, or
-    /// recore's for PE images and the engine's otherwise.
+    /// recore's for PE images and raw firmware and the engine's otherwise.
     #[arg(long, value_enum, default_value = "auto")]
     jump_tables: JumpTablesArg,
     /// Address-space limit per child process, in GiB. Past it the engine's allocations fail and

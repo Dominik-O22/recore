@@ -26,8 +26,9 @@ use crate::{Facts, Flow, Instruction, Local, Session, Style};
 /// Where switch targets come from.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JumpTables {
-    /// recore's for PE images, which keep tables among the code, and for 8051 code, whose tables
-    /// the engine does not find; the engine's own otherwise.
+    /// recore's for PE images, which keep tables among the code, for 8051 code, whose tables
+    /// the engine does not find, and for Cortex-M code, some of whose tables the engine reads
+    /// past their end; the engine's own otherwise.
     #[default]
     Auto,
     Recore,
@@ -178,7 +179,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     session.add_strings(&analysis)?;
     session.add_classes(&analysis)?;
     session.add_objc(&image)?;
-    let recores = image.format == Format::Pe || image.machine == Machine::I8051;
+    let recores = image.format == Format::Pe || matches!(image.machine, Machine::I8051 | Machine::Thumb);
     if options.jump_tables == JumpTables::Recore || (options.jump_tables == JumpTables::Auto && recores) {
         session.override_jump_tables(&analysis, &facts)?;
     }
@@ -241,7 +242,10 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 CallTarget::Function(callee) => depth > 0 && reaches(calls, library, *callee, depth - 1),
             })
         }
-        move |entry: u64| reaches(&calls, &library, entry, DEPTH)
+        // Where nothing is imported, as in firmware, the library is linked in, and taking a
+        // variable number of arguments is all that speaks for a format.
+        let linked = analysis.imports.is_empty();
+        move |entry: u64| linked || reaches(&calls, &library, entry, DEPTH)
     };
     for function in analysis.functions.iter().filter(|function| function.fragment_of.is_none()) {
         let variadic = function.ranges.first().is_some_and(|&(start, end)| recore::cfg::takes_variable_arguments(&image, start, end));
@@ -278,7 +282,10 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     // Before a function is decompiled, each call in it that passes a format is given the
     // arguments the format asks for. Told beforehand it costs nothing; the engine left to find
     // out for itself gets a good many wrong, and correcting one means decompiling again.
-    let formats: HashSet<u64> = analysis.strings.iter().filter(|string| !string.wide && string.text.contains('%')).map(|string| string.addr).collect();
+    // Where the library is linked in, its `printf` is called with text that has no `%` too,
+    // where a hosted program calls `puts`.
+    let linked = analysis.imports.is_empty();
+    let formats: HashSet<u64> = analysis.strings.iter().filter(|string| !string.wide && (linked || string.text.contains('%'))).map(|string| string.addr).collect();
     let mut formatted: HashSet<u64> = HashSet::new();
     let mut settle_formats = |session: &mut Session, entry: u64| {
         if !formatted.insert(entry) {

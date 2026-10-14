@@ -70,9 +70,11 @@ pub fn field_uses(image: &Image, body: &[(u64, u64)], offset: u64) -> Vec<(u64, 
 pub fn text_arguments(image: &Image, body: &[(u64, u64)], calls: &[u64], is_text: &dyn Fn(u64) -> bool) -> Vec<(u64, usize, u64)> {
     fn with<A: Arch>(image: &Image, body: &[(u64, u64)], calls: &[u64], is_text: &dyn Fn(u64) -> bool) -> Vec<(u64, usize, u64)> {
         let state = A::State::default();
+        // Decoded on past the end of the range and stopped there, so that an instruction sees
+        // the literal it loads from after the code.
         let decoded = |&(start, end): &(u64, u64)| {
             let bytes = image.bytes_from(start).unwrap_or(&[]);
-            A::decode(&bytes[..bytes.len().min((end - start) as usize)], start).filter_map(|decoded| Some((decoded.addr, decoded.insn?)))
+            A::decode(bytes, start).take_while(move |decoded| decoded.addr < end).filter_map(|decoded| Some((decoded.addr, decoded.insn?)))
         };
         // Where a jump lands, what the registers hold depends on where it came from.
         let landings: BTreeSet<u64> = body.iter().flat_map(decoded).filter_map(|(_, insn)| match A::flow(&insn, &state, image)? {
@@ -81,19 +83,20 @@ pub fn text_arguments(image: &Image, body: &[(u64, u64)], calls: &[u64], is_text
         }).collect();
         let mut found = Vec::new();
         for range in body {
-            let mut held = [None; 8];
+            let (mut held, mut registers) = ([None; 8], A::State::default());
             for (addr, insn) in decoded(range) {
                 if landings.contains(&addr) {
-                    held = [None; 8];
+                    (held, registers) = ([None; 8], A::State::default());
                 }
                 if calls.binary_search(&addr).is_ok() {
                     found.extend(held.iter().enumerate().find_map(|(position, held)| Some((addr, position, held.filter(|&text| is_text(text))?))));
                 }
-                match (A::flow(&insn, &state, image), A::argument_write(&insn)) {
-                    (Some(_), _) => held = [None; 8],
+                match (A::flow(&insn, &state, image), A::argument_write(&insn, &registers)) {
+                    (Some(_), _) => (held, registers) = ([None; 8], A::State::default()),
                     (None, Some((position, address))) => held[position] = address,
                     (None, None) => {}
                 }
+                A::step(&mut registers, &insn);
             }
         }
         found
@@ -101,7 +104,8 @@ pub fn text_arguments(image: &Image, body: &[(u64, u64)], calls: &[u64], is_text
     match (image.machine, image.format == crate::image::Format::Pe) {
         (Machine::X86_64, true) => with::<X86<64, true>>(image, body, calls, is_text),
         (Machine::X86_64, false) => with::<X86<64, false>>(image, body, calls, is_text),
-        (Machine::X86 | Machine::Aarch64 | Machine::I8051 | Machine::Thumb, _) => Vec::new(),
+        (Machine::Thumb, _) => with::<crate::thumb::Thumb>(image, body, calls, is_text),
+        (Machine::X86 | Machine::Aarch64 | Machine::I8051, _) => Vec::new(),
     }
 }
 
@@ -118,7 +122,8 @@ pub fn takes_variable_arguments(image: &Image, start: u64, end: u64) -> bool {
     }
     match image.machine {
         Machine::X86_64 => with::<X86<64, false>>(image, start, end),
-        Machine::X86 | Machine::I8051 | Machine::Thumb => false,
+        Machine::X86 | Machine::I8051 => false,
+        Machine::Thumb => with::<crate::thumb::Thumb>(image, start, end),
         Machine::Aarch64 => with::<crate::arm64::Arm64>(image, start, end),
     }
 }

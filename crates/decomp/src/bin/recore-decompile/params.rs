@@ -43,6 +43,9 @@ struct Tally {
     /// Functions with DWARF parameters that the run decompiled successfully.
     compared: usize,
     matched: usize,
+    /// The same, of the functions in C units.
+    compared_c: usize,
+    matched_c: usize,
     /// Variadic functions, which are left out of the comparison.
     variadic: usize,
     /// Functions with DWARF parameters that the run has no successful result for.
@@ -57,6 +60,8 @@ impl Tally {
     fn add(&mut self, other: &Tally) {
         self.compared += other.compared;
         self.matched += other.matched;
+        self.compared_c += other.compared_c;
+        self.matched_c += other.matched_c;
         self.variadic += other.variadic;
         self.missing += other.missing;
         for (&difference, count) in &other.differences {
@@ -95,6 +100,8 @@ fn tally(report: &BinaryReport, debug: &DebugInfo) -> Tally {
         }
         let difference = found as i64 - expected.params as i64;
         tally.compared += 1;
+        tally.compared_c += usize::from(expected.c);
+        tally.matched_c += usize::from(expected.c && difference == 0);
         *tally.differences.entry(difference).or_default() += 1;
         if difference == 0 {
             tally.matched += 1;
@@ -148,6 +155,7 @@ pub fn compare(out_dir: &Path, debug_dir: &Path, jobs: usize, list: usize) -> Re
         groups.entry(group(name)).or_default().add(tally);
     }
     total.print(&format!("{} binaries with debug info", tallies.len()));
+    println!("of them in C units: {} of {} match ({:.1}%)", total.matched_c, total.compared_c, 100.0 * total.matched_c as f64 / total.compared_c.max(1) as f64);
     for (group, tally) in &groups {
         tally.print(group);
     }
