@@ -99,7 +99,7 @@ for name in ("coremark_banked", "crypto_banked", "uip_banked"):
             verdict = f"TRUE LOWER by {wrong[0] - true[0]:.0f}"
         rows.append((name, kind, what, *(wrong or (float("nan"), "", "", "")), verdict))
 
-print(f"{'build':<16} {'kind':<19} {'layout':<30} {'bits':>6}  {'end called on-insn runs':<28} {'starts':>8} {'prec':>6}  verdict")
+print(f"{'build':<16} {'kind':<19} {'layout':<30} {'bits':>6}  {'end called on-insn local':<28} {'starts':>8} {'prec':>6}  verdict")
 for row in rows:
     print(f"{row[0]:<16} {row[1]:<19} {row[2]:<30} {row[3]:>6.0f}  {row[4]:<28} {row[5]:>8} {row[6]:>6}  {row[7]}")
 print(f"\n{'kind':<19} {'wrong':>5} {'true higher':>11} {'same analysis':>13} {'tied':>4} {'true lower':>10} {'refused':>7}  margin in bits: least, median, most")

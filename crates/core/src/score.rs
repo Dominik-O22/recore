@@ -6,7 +6,7 @@
 //! such a target is the start of a function. Under a wrong one it is an address like any other.
 //!
 //! So the score follows control flow from the entry points, without guessing at code nothing
-//! reaches, and puts four questions to each target that crosses. Each is a [`Component`]: how
+//! reaches, and puts three questions to each target that crosses. Each is a [`Component`]: how
 //! many targets pass, and how often an address picked blindly from the same sections would.
 //! The evidence is the distance between the two, in bits.
 //!
@@ -76,9 +76,6 @@ pub struct Score {
     pub called_locally: Component,
     /// The target is not in the middle of an instruction that control flow reaches.
     pub on_instruction: Component,
-    /// The code at the target runs to returns and jumps: it reaches no byte that is not an
-    /// instruction and does not run or branch out of its section.
-    pub runs: Component,
     /// The target of a call that stays in its section follows such an instruction too. This
     /// tells the address a section loads at, where calls name their target outright, and not
     /// which bank it is.
@@ -86,12 +83,11 @@ pub struct Score {
 }
 
 impl Score {
-    pub fn components(&self) -> [(&'static str, &Component); 5] {
+    pub fn components(&self) -> [(&'static str, &Component); 4] {
         [
             ("follow a return or jump", &self.follows_end),
             ("called in their own region", &self.called_locally),
             ("on an instruction", &self.on_instruction),
-            ("run to an end", &self.runs),
             ("local calls follow an end", &self.local_follows_end),
         ]
     }
@@ -166,11 +162,6 @@ const INSIDE: u8 = 2;
 /// The byte follows an instruction that execution does not run past.
 const AFTER_END: u8 = 4;
 
-/// Instructions followed from one target before its code counts as running to an end.
-const LONGEST_RUN: usize = 512;
-/// Addresses tried in a section to find how often code runs to an end by chance.
-const SAMPLES: usize = 512;
-
 /// The instructions control flow reaches from a set of addresses, and where it leaves a section.
 struct Walk<'a> {
     image: &'a Image,
@@ -234,7 +225,6 @@ impl<'a> Walk<'a> {
                 }
             }
         }
-        let image = self.image;
         let bytes: usize = sections.values().map(|section| section.data.len()).sum();
         let marked = |flag: u8| sections.keys().flat_map(|&index| &self.marks[index]).filter(|&&mark| mark & flag != 0).count();
         let holds = |flag: u8| places.iter().filter(|(target, place)| place.is_some_and(|(index, section)| self.marks[index][(target - section.addr) as usize] & flag != 0)).count();
@@ -244,14 +234,11 @@ impl<'a> Walk<'a> {
         let local: Vec<(usize, usize)> = self.local_calls.iter().filter_map(|&target| self.code_at(target).filter(|(index, _)| sections.contains_key(index)).map(|(index, section)| (index, (target - section.addr) as usize))).collect();
         let local_calls = local.len();
         let (starts, inside) = (marked(START), marked(INSIDE));
-        let samples: Vec<u64> = sections.values().flat_map(|section| (0..section.data.len()).step_by((section.data.len() / SAMPLES).max(1)).map(|offset| section.addr + offset as u64)).collect();
-        let runs = |addrs: &mut dyn Iterator<Item = u64>| addrs.filter(|&addr| runs_to_end::<A>(image, addr)).count();
         Score {
             follows_end: Component { good: holds(AFTER_END), total, chance: share(marked(AFTER_END), bytes) },
             called_locally: Component { good: places.iter().filter(|(target, _)| self.local_calls.contains(target)).count(), total, chance: share(local_calls, bytes) },
             // A target outside the code is on no instruction. Chance is over the bytes flow reached.
             on_instruction: Component { good: places.iter().filter(|(_, place)| place.is_some()).count() - holds(INSIDE), total, chance: share(starts, starts + inside) },
-            runs: Component { good: runs(&mut places.iter().map(|&(target, _)| target)), total, chance: share(runs(&mut samples.iter().copied()), samples.len()) },
             local_follows_end: Component { good: local.iter().filter(|&&(index, at)| self.marks[index][at] & AFTER_END != 0).count(), total: local_calls, chance: share(marked(AFTER_END), bytes) },
         }
     }
@@ -260,44 +247,6 @@ impl<'a> Walk<'a> {
 /// Whether execution does not go on to the instruction after one with this effect.
 fn ends(flow: Option<Flow>) -> bool {
     matches!(flow, Some(Flow::Jump(_) | Flow::JumpIndirect(_) | Flow::Return | Flow::Halt))
-}
-
-/// Whether the code at `start` runs to returns and jumps, following its branches but not its
-/// calls. A jump out of the section is a way to end, as a tail call is. Running off the
-/// section, a branch out of it and a byte that is no instruction are not.
-fn runs_to_end<A: Arch>(image: &Image, start: u64) -> bool {
-    let Some(section) = image.section_at(start).filter(|section| section.executable) else { return false };
-    let mut seen = FxHashSet::default();
-    let mut pending = vec![start];
-    while let Some(addr) = pending.pop() {
-        let mut state = A::State::default();
-        let mut ended = false;
-        for decoded in A::decode(&section.data[(addr - section.addr) as usize..], addr) {
-            if seen.len() >= LONGEST_RUN {
-                return true;
-            }
-            if !seen.insert(decoded.addr) {
-                ended = true;
-                break;
-            }
-            let Some(insn) = decoded.insn else { return false };
-            let flow = A::flow(&insn, &state, image);
-            A::step(&mut state, &insn);
-            match flow {
-                Some(Flow::Branch(target)) if !section.contains(target) => return false,
-                Some(Flow::Branch(target) | Flow::Jump(target)) if section.contains(target) => pending.push(target),
-                _ => {}
-            }
-            if ends(flow) {
-                ended = true;
-                break;
-            }
-        }
-        if !ended {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(test)]
@@ -328,7 +277,7 @@ mod tests {
         // NOP; NOP; RET, then at 0x8003 the function called: CLR A; LCALL 0x8000; RET.
         let callee = [0x00, 0x00, 0x22, 0xE4, 0x12, 0x80, 0x00, 0x22];
         let right = score(&image(&caller, 0x8000, &callee));
-        assert_eq!((right.follows_end.good, right.on_instruction.good, right.runs.good, right.follows_end.total), (1, 1, 1, 1));
+        assert_eq!((right.follows_end.good, right.on_instruction.good, right.follows_end.total), (1, 1, 1));
         // The function's own call names 0x8000 outright, which is a function only loaded there.
         assert_eq!((right.local_follows_end.good, right.local_follows_end.total), (1, 1));
         assert_eq!(right.crossing().local_follows_end.total, 0);
