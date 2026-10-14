@@ -143,6 +143,9 @@ pub struct Discovery {
     /// `[start, end)` of every jump table that lies in the code straight after its jump, and of
     /// every literal pool, sorted. A function's code goes on after either.
     pub inline_tables: Vec<(u64, u64)>,
+    /// Entry points taken away because the code before them comes back from a call and runs on
+    /// into them, as `(entry, callee)`: entry points after all if the callee never returns.
+    pub after_calls: Vec<(u64, u64)>,
 }
 
 /// A set of addresses, for asking of very many ranges whether any member lies inside. Most
@@ -272,6 +275,11 @@ struct Explorer<'a, A: Arch> {
     literals: Vec<(u64, u64)>,
     /// Calls as `(from, to)`, kept where a call may be a jump: see [`Arch::CALL_MAY_BE_FAR_JUMP`].
     calls: Vec<(u64, u64)>,
+    /// Whether the code has an instruction that rules out a call being a jump: see
+    /// [`Arch::branches_reach_far`].
+    branches_reach_far: bool,
+    /// See [`Discovery::after_calls`].
+    after_calls: Vec<(u64, u64)>,
 }
 
 /// One decoder per section, made when first needed. Decoding starts in a new place for every
@@ -431,6 +439,9 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 self.regions[index].cover(offset, usize::from(decoded.len.max(1)));
                 if let Some((start, end)) = A::literal(insn).filter(|_| !speculative) {
                     self.mark_literal(start, end);
+                }
+                if A::CALL_MAY_BE_FAR_JUMP && !speculative && trusted && A::branches_reach_far(insn) {
+                    self.branches_reach_far = true;
                 }
                 let Some(flow) = A::flow(insn, &state, self.image) else {
                     if let Some((base, data)) = A::based_data_address(insn, &state) {
@@ -837,6 +848,38 @@ impl<'a, A: Arch> Explorer<'a, A> {
         offset > 0 && !region.follows_break(offset) && region.covered[(offset - 1) / 64] >> ((offset - 1) % 64) & 1 != 0
     }
 
+    /// The function called by the call that ends where `addr` begins, past any padding: the call
+    /// may be the last of a function that calls one that never returns, which while discovering
+    /// only an import's name tells.
+    fn call_before(&self, addr: u64) -> Option<u64> {
+        /// The longest instruction of any machine, x86's.
+        const LONGEST_INSN: usize = 15;
+        let region = &self.regions[self.region_index(addr)?];
+        let mut offset = (addr - region.section.addr) as usize;
+        let earliest = offset.saturating_sub(A::LONGEST_PADDING as usize);
+        loop {
+            let before = (1..=offset.min(LONGEST_INSN)).map(|len| offset - len).find(|&at| usize::from(region.insn_len[at]) == offset - at)?;
+            let insn = A::decode(&region.section.data[before..], region.section.addr + before as u64).next()?.insn?;
+            if !A::is_padding(&insn) {
+                let Some(Flow::Call(callee)) = A::flow(&insn, &A::State::default(), self.image) else { return None };
+                return Some(callee);
+            }
+            if before < earliest {
+                return None;
+            }
+            offset = before;
+        }
+    }
+
+    /// Removes `addr` from the entry points, as code runs on into it. Where that code comes back
+    /// from a call, the call is kept, to put the entry point back if it never returns.
+    fn demote_run_into(&mut self, addr: u64) {
+        self.starts.remove(&addr);
+        if let Some(callee) = self.call_before(addr) {
+            self.after_calls.push((addr, callee));
+        }
+    }
+
     /// Removes the entry points that only an address taken or a word in data speaks for, where
     /// that is weak evidence, when code runs on into them: a number that lands inside a
     /// function.
@@ -844,14 +887,18 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let weak = |origin: &Origin| matches!(origin, Origin::AddressTaken | Origin::DataPointer);
         let inside: Vec<u64> = self.starts.iter().filter(|&(&addr, origin)| weak(origin) && self.falls_into(addr)).map(|(&addr, _)| addr).collect();
         for addr in inside {
-            self.starts.remove(&addr);
+            self.demote_run_into(addr);
         }
     }
 
-    /// Removes the entry points that only calls reach which are jumps within a function: no
-    /// other entry point lies between the call and where it goes, and the code before the
-    /// target runs on into it, as it does into a block and not into a function.
+    /// Removes the entry points that only calls reach which are jumps within a function: in code
+    /// whose branches do not reach as far, each call goes farther than a branch, no other entry
+    /// point lies between the call and where it goes, and the code before the target runs on
+    /// into it, as it does into a block and not into a function.
     fn demote_far_jumps(&mut self) {
+        if self.branches_reach_far {
+            return;
+        }
         let mut calls_to: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
         for &(from, to) in &self.calls {
             calls_to.entry(to).or_default().push(from);
@@ -863,11 +910,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let starts = AddrSet::new(self.starts.iter().filter(|&(start, origin)| strong(origin) && !calls_to.contains_key(start)).map(|(&start, _)| start));
         let jumps: Vec<u64> = calls_to
             .into_iter()
-            .filter(|(to, sites)| sites.iter().all(|&from| if from < *to { !starts.any_in(from + 1, to - 1) } else { !starts.any_in(to + 1, from) }))
+            .filter(|(to, sites)| sites.iter().all(|&from| A::beyond_branch(from, *to) && if from < *to { !starts.any_in(from + 1, to - 1) } else { !starts.any_in(to + 1, from) }))
             .map(|(to, _)| to)
             .collect();
         for to in jumps {
-            self.starts.remove(&to);
+            self.demote_run_into(to);
         }
     }
 
@@ -1105,6 +1152,10 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     }
                     if self.regions[index].flags[offset] & IN_TABLE != 0 {
                         offset += 1;
+                        // Nothing runs on out of a literal pool: it follows the end of its code.
+                        if A::LITERAL_POOLS {
+                            after_data = offset;
+                        }
                         continue;
                     }
                     // Relocated pointers in a code section are a jump table. Step over the whole
@@ -1258,7 +1309,8 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
     if A::LITERAL_POOLS {
         inline_tables = merge_touching(inline_tables);
     }
-    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code, inline_tables }
+    let after_calls = std::mem::take(&mut explorer.after_calls);
+    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code, inline_tables, after_calls }
 }
 
 /// Sorted ranges with those that overlap or touch joined, as literals back to back make one pool.
@@ -1335,6 +1387,8 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         unbounded: 0,
         literals: Vec::new(),
         calls: Vec::new(),
+        branches_reach_far: false,
+        after_calls: Vec::new(),
         data_sections: {
             // Zero-filled memory is data as much as what the file stores.
             let mut ranges: Vec<(u64, u64)> = image.sections.iter().filter(|s| !s.executable).map(|s| (s.addr, s.end())).chain(image.zero_filled.iter().copied()).collect();
