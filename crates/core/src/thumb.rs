@@ -628,29 +628,35 @@ pub fn access(bytes: &[u8]) -> Option<(bool, bool)> {
     Some((loads, !loads))
 }
 
-/// The vector table at the start of a Cortex-M's flash: the initial stack pointer, then the
-/// address of the handler of each exception and interrupt, with the Thumb bit, or zero for a
-/// slot not in use. Returns the table's length in bytes and the handlers in table order, reset
-/// first. The table ends at the first word that is neither, which is code, and an address in
-/// the flash is a word that code would hardly begin with.
-pub fn vector_table(flash: &Section) -> (u64, Vec<u64>) {
+/// The vector table at the start of `table`: the initial stack pointer, then the address of the
+/// handler of each exception and interrupt, with the Thumb bit, or zero for a slot not in use.
+/// Returns the table's length in bytes and the handlers in table order, reset first. The table
+/// ends at the first word that is neither, which is code, and an address of code, as `is_code`
+/// tells, is a word that code would hardly begin with. The slots ARMv7-M reserves, words 7 to 10
+/// and 13, may hold anything, as NXP's checksum of the words before it in word 7: they are the
+/// table's where a slot after them is.
+pub fn vector_table(table: &[u8], is_code: impl Fn(u64) -> bool) -> (u64, Vec<u64>) {
     /// The architecture's 16 exceptions and at most 496 interrupts.
     const MOST: usize = 512;
-    let words = flash.data.chunks_exact(4).map(|word| u64::from(u32::from_le_bytes(word.try_into().unwrap())));
+    const RESERVED: [usize; 5] = [7, 8, 9, 10, 13];
+    let words = table.chunks_exact(4).map(|word| u64::from(u32::from_le_bytes(word.try_into().unwrap())));
     let mut handlers = Vec::new();
     let mut length = 4;
-    for word in words.skip(1).take(MOST - 1) {
+    for (index, word) in words.enumerate().skip(1).take(MOST - 1) {
+        if RESERVED.contains(&index) {
+            continue;
+        }
         let handler = word & !1;
-        if word != 0 && (word & 1 == 0 || !flash.contains(handler)) {
+        if word != 0 && (word & 1 == 0 || !is_code(handler)) {
             break;
         }
         if word != 0 {
             handlers.push(handler);
         }
-        length += 4;
+        length = (index as u64 + 1) * 4;
     }
     // Slots not in use after the last that is.
-    while length > 8 && flash.data[length as usize - 4..length as usize] == [0; 4] {
+    while length > 8 && table[length as usize - 4..length as usize] == [0; 4] {
         length -= 4;
     }
     (length, handlers)
@@ -1361,10 +1367,17 @@ mod tests {
 
     #[test]
     fn the_vector_table_ends_at_the_first_word_that_is_no_handler() {
+        let table = |words: &[u32]| vector_table(&words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<u8>>(), |addr| addr < 0x100);
         // SP, reset, NMI, two unused slots, a handler, then code: PUSH {R4, LR}; SUB SP, #0x28.
-        let words: [u32; 7] = [0x2002_0000, 0x0000_0021, 0x0000_0025, 0, 0, 0x0000_0025, 0xB08A_B510];
-        let data: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).chain([0; 0x20]).collect();
-        let flash = Section { name: String::new(), addr: 0, data, file_offset: None, executable: true, writable: false };
-        assert_eq!(vector_table(&flash), (24, vec![0x20, 0x24, 0x24]));
+        assert_eq!(table(&[0x2002_0000, 0x21, 0x25, 0, 0, 0x25, 0xB08A_B510, 0, 0]), (24, vec![0x20, 0x24, 0x24]));
+        // A checksum in reserved word 7 and code in reserved word 13 are the table's only where
+        // a slot after them is: here SVCall in word 11 is, then code in word 13 and 14.
+        let mut words = [0x2002_0000, 0x21, 0x25, 0x25, 0, 0, 0, 0xEFFF_5A3C, 0, 0, 0, 0x29, 0, 0xB08A_B510, 0xB08A_B510];
+        assert_eq!(table(&words), (48, vec![0x20, 0x24, 0x24, 0x28]));
+        // And here PendSV in word 14 is.
+        words[14] = 0x2D;
+        assert_eq!(table(&words), (60, vec![0x20, 0x24, 0x24, 0x28, 0x2C]));
+        // A handler past the code is no handler.
+        assert_eq!(table(&[0x2002_0000, 0x21, 0x101]), (8, vec![0x20]));
     }
 }
