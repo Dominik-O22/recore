@@ -116,7 +116,7 @@ pub trait Arch: 'static {
     const MARKED_CODE_POINTERS: bool = false;
 
     /// Whether a call may be a jump within the function, as Thumb-1 code reaches a block too far
-    /// for a branch with `BL` once it has saved the return address.
+    /// for a branch with `BL` once it has saved the return address: see [`Arch::beyond_branch`].
     const CALL_MAY_BE_FAR_JUMP: bool = false;
 
     /// Whether an address that code takes is only weak evidence of a function, which a jump
@@ -172,6 +172,18 @@ pub trait Arch: 'static {
     /// The address `insn` materialises in a register, if it computes one: how code takes the
     /// address of a function or of data.
     fn address_taken(insn: &Self::Insn, state: &Self::State) -> Option<u64>;
+
+    /// Where [`Arch::CALL_MAY_BE_FAR_JUMP`], whether a call at `call` of `target` goes farther than
+    /// a branch reaches, so that it may be a jump.
+    fn beyond_branch(_call: u64, _target: u64) -> bool {
+        false
+    }
+
+    /// Where [`Arch::CALL_MAY_BE_FAR_JUMP`], whether `insn` is of an instruction set whose branches
+    /// reach as far as its calls, so that code that has it never jumps with a call.
+    fn branches_reach_far(_insn: &Self::Insn) -> bool {
+        false
+    }
 
     /// Whether the code at `target`, an address that code takes or the first instruction after
     /// a gap, can be a function. Where an address is a number like any other, a number that

@@ -1060,6 +1060,21 @@ impl Arch for Thumb {
         false
     }
 
+    /// A `BL` that reaches past the 2 KB of the 16-bit `B`, which is all Thumb-1 has to branch with.
+    fn beyond_branch(call: u64, target: u64) -> bool {
+        let offset = target.wrapping_sub(call + 4) as i64;
+        !(-2048..2048).contains(&offset)
+    }
+
+    /// A 32-bit instruction of Thumb-2, which Thumb-1 code does not have: Thumb-1's are `BL` and
+    /// the system's `MSR`, `MRS`, barriers and `UDF.W`. Thumb-2 has `B.W`.
+    fn branches_reach_far(insn: &Insn) -> bool {
+        let (hw1, hw2) = (insn.hw1, insn.hw2);
+        let thumb1 = hw2 & 0xD000 == 0xD000 && hw1 >> 11 == 0b11110
+            || hw2 & 0x8000 != 0 && (hw1 & 0xFFE0 == 0xF380 || matches!(hw1, 0xF3EF | 0xF3BF) || hw1 & 0xFFF0 == 0xF7F0);
+        insn.wide() && !thumb1
+    }
+
     fn opens_landing_pad(_: &Insn) -> bool {
         false
     }
@@ -1290,6 +1305,43 @@ mod tests {
             let insns: Vec<Insn> = Thumb::decode(&bytes, 0).filter_map(|decoded| decoded.insn).collect();
             assert_eq!(Thumb::takes_variable_arguments(&insns), expected, "{halfwords:04x?}");
         }
+    }
+
+    /// `BL to` at `from`.
+    fn bl(from: u64, to: u64) -> [u16; 2] {
+        let offset = to.wrapping_sub(from + 4) as u32;
+        let (s, i1, i2) = (offset >> 24 & 1, offset >> 23 & 1, offset >> 22 & 1);
+        let (j1, j2) = (!(i1 ^ s) & 1, !(i2 ^ s) & 1);
+        [(0xF000 | s << 10 | offset >> 12 & 0x3FF) as u16, (0xD000 | j1 << 13 | j2 << 11 | offset >> 1 & 0x7FF) as u16]
+    }
+
+    /// The functions that analysis finds in `halfwords` at 0.
+    fn functions(halfwords: &[u16]) -> Vec<u64> {
+        let bytes: Vec<u8> = halfwords.iter().flat_map(|half| half.to_le_bytes()).collect();
+        crate::analysis::analyze(&image(&bytes, 0)).functions.iter().map(|function| function.addr).collect()
+    }
+
+    #[test]
+    fn a_function_after_a_call_that_never_returns_is_one() {
+        // 0x00: PUSH {R4, LR}; LDR R0, =0x17; BL 0x10; POP {R4, PC}; NOP; .word 0x17.
+        // 0x10: PUSH {R4, LR}; BL 0x1A. 0x16: ADDS R0, #1; BX LR, only its address taken.
+        // 0x1A: B . or BX LR.
+        let code = |last: u16| [&[0xB510, 0x4802][..], &bl(0x04, 0x10), &[0xBD10, 0xBF00, 0x0017, 0x0000, 0xB510], &bl(0x12, 0x1A), &[0x3001, 0x4770, last]].concat();
+        // The function at 0x10 runs on into 0x16, which is a function where 0x1A never returns.
+        assert_eq!(functions(&code(0xE7FE)), [0x00, 0x10, 0x16, 0x1A]);
+        assert_eq!(functions(&code(0x4770)), [0x00, 0x10, 0x1A]);
+    }
+
+    #[test]
+    fn a_call_is_a_jump_only_beyond_a_branch_in_thumb_1() {
+        // 0x00: PUSH {LR}; BL to; MOVS R0, #0 or MOVW R0, #0, then MOVS R0, #0 up to `to`: POP {PC}.
+        let code = |to: u64, first: &[u16]| {
+            let filler = vec![0x2000; (to as usize - 6 - 2 * first.len()) / 2];
+            [&[0xB500][..], &bl(0x02, to), first, &filler, &[0xBD00]].concat()
+        };
+        assert_eq!(functions(&code(0xC00, &[0x2000])), [0x00]);
+        assert_eq!(functions(&code(0x100, &[0x2000])), [0x00, 0x100]);
+        assert_eq!(functions(&code(0xC00, &[0xF240, 0x0000])), [0x00, 0xC00]);
     }
 
     #[test]

@@ -473,6 +473,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
     let inline_tables = std::mem::take(&mut discovery.inline_tables);
     let inline_tables = inline_tables.as_slice();
+    let after_calls = std::mem::take(&mut discovery.after_calls);
 
     // Functions by the entry and the bound they were decoded from. A round of the loop below
     // that adds entry points starts over, and all but the functions next to the new entry
@@ -629,6 +630,17 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                 open.due = open.left_extent || passes(open.function);
             }
             noreturn.extend(added);
+        }
+
+        // An entry point that discovery took away, as the code before it comes back from a call
+        // and runs on into it, is one after all where the call never returns.
+        let before = discovery.starts.len();
+        for &(start, _) in after_calls.iter().filter(|(_, callee)| noreturn.contains(callee)) {
+            discovery.starts.entry(start).or_insert(Origin::Unreachable);
+        }
+        if discovery.starts.len() > before {
+            decoded = spans.into_iter().zip(functions).collect();
+            continue;
         }
 
         // Code in a function's extent that no path from its entry reaches belongs to a
