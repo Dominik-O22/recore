@@ -971,12 +971,90 @@ impl Arch for Thumb {
         (position < 4).then(|| (position, Self::completed_address(insn, state).map(u64::from)))
     }
 
-    /// Space made on the stack below the arguments there before anything is saved, which the
-    /// registers that carry the first arguments are stored into, so that all lie in a row for
-    /// `va_arg`: `SUB SP, #4` to `#12` first, or a `PUSH` of R1 to R3 alone.
+    /// R3, the last register that carries an argument, stored before anything writes it right
+    /// below the arguments the caller left on the stack, so that all lie in a row for `va_arg`.
+    /// A function of four arguments that keeps them on the stack stores R3 lower down.
     fn takes_variable_arguments(insns: &[Insn]) -> bool {
-        let Some(first) = insns.first().filter(|first| !first.wide()) else { return false };
-        matches!(first.hw1, 0xB081..=0xB083) || first.hw1 & 0xFF00 == 0xB400 && first.hw1 & 0xF0 == 0 && first.hw1 & 0x08 != 0
+        const SP: usize = 13;
+        // Where each register points, as an offset from the stack pointer at entry, if it does.
+        let mut points: [Option<i64>; 16] = [None; 16];
+        points[SP] = Some(0);
+        // Whether R3 stored at `offset` from what `base` points to lands right below the entry's.
+        let saves = |points: &[Option<i64>; 16], base: usize, offset: i64| points[base].is_some_and(|at| at + offset == -4);
+        // The offset of R3 among the words that a store of `list` writes in ascending order.
+        let place = |list: u16| (list & 8 != 0).then(|| i64::from((list & 7).count_ones()) * 4);
+        for insn in insns {
+            let (hw1, hw2) = (insn.hw1, insn.hw2);
+            let saved = if !insn.wide() {
+                match hw1 >> 11 {
+                    // STR Rt, [Rn, #imm5]; STR Rt, [SP, #imm8].
+                    0b01100 => (hw1 & 7 == 3).then(|| saves(&points, insn.low_register(3), i64::from(hw1 >> 6 & 0x1F) * 4)),
+                    0b10010 => (insn.low_register(8) == 3).then(|| saves(&points, SP, i64::from(hw1 & 0xFF) * 4)),
+                    // STM Rn!, {...}, which moves Rn past what it stores.
+                    0b11000 => {
+                        let (base, list) = (insn.low_register(8), hw1 & 0xFF);
+                        let saved = place(list).map(|offset| saves(&points, base, offset));
+                        points[base] = points[base].map(|at| at + i64::from(list.count_ones()) * 4);
+                        saved
+                    }
+                    // ADD Rd, SP, #imm8.
+                    0b10101 => {
+                        points[insn.low_register(8)] = points[SP].map(|at| at + i64::from(hw1 & 0xFF) * 4);
+                        None
+                    }
+                    // SUB SP, #imm7, and PUSH.
+                    0b10110 if hw1 & 0xFF80 == 0xB080 => {
+                        points[SP] = points[SP].map(|at| at - i64::from(hw1 & 0x7F) * 4);
+                        None
+                    }
+                    0b10110 if hw1 & 0xFE00 == 0xB400 => {
+                        let list = hw1 & 0xFF | (hw1 & 0x100) << 6;
+                        points[SP] = points[SP].map(|at| at - i64::from(list.count_ones()) * 4);
+                        place(list).map(|offset| saves(&points, SP, offset))
+                    }
+                    // MOV Rd, SP.
+                    0b01000 if hw1 & 0xFF78 == 0x4668 => {
+                        points[usize::from(hw1 >> 4 & 8 | hw1 & 7)] = points[SP];
+                        None
+                    }
+                    _ => None,
+                }
+            } else {
+                let imm12 = u32::from(hw1 >> 10 & 1) << 11 | u32::from(hw2 >> 12 & 7) << 8 | u32::from(hw2 & 0xFF);
+                match hw1 {
+                    // PUSH.W, and STMIA.W Rn{!}, {...}.
+                    0xE92D => {
+                        points[SP] = points[SP].map(|at| at - i64::from(hw2.count_ones()) * 4);
+                        place(hw2).map(|offset| saves(&points, SP, offset))
+                    }
+                    _ if hw1 & 0xFFD0 == 0xE880 => place(hw2).map(|offset| saves(&points, insn.rn(), offset)),
+                    // STR.W Rt, [Rn, #imm12].
+                    _ if hw1 & 0xFFF0 == 0xF8C0 => (insn.rt() == 3).then(|| saves(&points, insn.rn(), i64::from(hw2 & 0xFFF))),
+                    // STRD Rt, Rt2, [Rn, #+/-imm8].
+                    _ if hw1 & 0xFF50 == 0xE940 => {
+                        let offset = i64::from(hw2 & 0xFF) * 4 * if hw1 & 0x80 != 0 { 1 } else { -1 };
+                        let second = usize::from(hw2 >> 8 & 15);
+                        (insn.rt() == 3 || second == 3).then(|| saves(&points, insn.rn(), offset + if second == 3 { 4 } else { 0 }))
+                    }
+                    // ADD.W, ADDW, SUB.W and SUBW of SP and an immediate.
+                    _ if hw2 & 0x8000 == 0 && (matches!(hw1 & 0xFBEF, 0xF10D | 0xF1AD) || matches!(hw1 & 0xFBFF, 0xF20D | 0xF2AD)) => {
+                        let value = i64::from(if hw1 & 0x0200 == 0 { expand_immediate(imm12) } else { imm12 });
+                        points[insn.rd()] = points[SP].map(|at| if hw1 & 0x00A0 == 0x00A0 { at - value } else { at + value });
+                        None
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(saved) = saved {
+                return saved;
+            }
+            let mut after = State::default();
+            after.apply(*insn);
+            if after.written & 8 != 0 {
+                return false;
+            }
+        }
+        false
     }
 
     fn opens_landing_pad(_: &Insn) -> bool {
@@ -1162,6 +1240,31 @@ mod tests {
         let accesses = halfwords.map(|halfwords| access(&halfwords.iter().flat_map(|half| half.to_le_bytes()).collect::<Vec<u8>>()));
         let (load, store) = (Some((true, false)), Some((false, true)));
         assert_eq!(accesses, [load, store, store, load, load, store, load, None]);
+    }
+
+    #[test]
+    fn a_variable_number_of_arguments_is_told_by_where_r3_is_saved() {
+        let cases: [(&[u16], bool); 7] = [
+            // clang: SUB SP, #12; PUSH {R7, LR}; SUB SP, #12; MOV R12, R0; ADD R0, SP, #20; STM R0!, {R1-R3}.
+            (&[0xB083, 0xB580, 0xB083, 0x4684, 0xA805, 0xC00E], true),
+            // clang: SUB SP, #8; PUSH {R7, LR}; SUB SP, #8; MOV R12, R1; STRD R2, R3, [SP, #16].
+            (&[0xB082, 0xB580, 0xB082, 0x468C, 0xE9CD, 0x2304], true),
+            // clang -O0: SUB SP, #12; PUSH {R7, LR}; SUB SP, #20; STR R3, [SP, #36].
+            (&[0xB083, 0xB580, 0xB085, 0x9309], true),
+            // GCC: PUSH {R1-R3}; PUSH {LR}.
+            (&[0xB40E, 0xB500], true),
+            // Four arguments kept on the stack: SUB SP, #16; STR R0, [SP, #12]; ...; STR R3, [SP].
+            (&[0xB084, 0x9003, 0x9102, 0x9201, 0x9300], false),
+            // A small local: SUB SP, #4; STR R0, [SP]; MOVS R3, #0; STR R3, [SP].
+            (&[0xB081, 0x9000, 0x2300, 0x9300], false),
+            // PUSH {R3, LR}, which keeps the stack aligned.
+            (&[0xB508, 0xB081], false),
+        ];
+        for (halfwords, expected) in cases {
+            let bytes: Vec<u8> = halfwords.iter().flat_map(|half| half.to_le_bytes()).collect();
+            let insns: Vec<Insn> = Thumb::decode(&bytes, 0).filter_map(|decoded| decoded.insn).collect();
+            assert_eq!(Thumb::takes_variable_arguments(&insns), expected, "{halfwords:04x?}");
+        }
     }
 
     #[test]
