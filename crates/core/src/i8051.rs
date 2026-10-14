@@ -256,12 +256,26 @@ fn jump_slots(bytes: &[u8], count: usize) -> Option<usize> {
 }
 
 /// The interrupt vectors in `code`, which lies at address 0, that hold a jump to a handler.
-/// The hardware enters interrupt N at `3 + 8 * N`. A program that handles interrupts fills the
-/// slots up to its last handler, each with an `LJMP` to one or with a `RETI`, so the first slot
-/// that holds neither is where its other code begins.
+/// The hardware enters interrupt N at `3 + 8 * N`, N below 32. A slot whose interrupt is
+/// unused holds a `RETI` in code from SDCC, but in code from Keil whatever its linker put
+/// there: other code, or nothing. So a slot is a vector where it holds an `LJMP` to code that,
+/// read on in order and through every jump that is not conditional, comes to a `RETI` before
+/// a `RET`, as only the end of a handler does.
 pub fn interrupt_vectors(code: &[u8]) -> impl Iterator<Item = u64> + '_ {
-    let slots = (3..code.len()).step_by(8).take_while(|&slot| matches!(code[slot], 0x02 | 0x32));
-    slots.filter(|&slot| code[slot] == 0x02).map(|slot| slot as u64)
+    let returns_from_interrupt = |mut at: u16| {
+        // A jump may lead round in a loop.
+        for _ in 0..4096 {
+            let Some(Decoded { insn: Some(insn), len, .. }) = code.get(usize::from(at)..).and_then(|bytes| I8051::decode(bytes, u64::from(at)).next()) else { return false };
+            match (insn.opcode(), insn.transfer()) {
+                (0x32, _) => return true,
+                (0x22, _) => return false,
+                (_, Some((Transfer::Jump, target))) => at = target,
+                _ => at = at.wrapping_add(u16::from(len)),
+            }
+        }
+        false
+    };
+    (3..code.len().min(3 + 8 * 32)).step_by(8).filter(move |&slot| code[slot] == 0x02 && code.len() >= slot + 3 && returns_from_interrupt(u16::from_be_bytes([code[slot + 1], code[slot + 2]]))).map(|slot| slot as u64)
 }
 
 /// The 8051 and its descendants with the original instruction set.
@@ -710,13 +724,20 @@ mod tests {
     }
 
     #[test]
-    fn a_vector_is_a_slot_with_a_jump_before_the_first_that_is_no_vector() {
-        // Reset, then RETI at 0x03, LJMP at 0x0B and 0x13, and code from 0x1B that has the
-        // byte of an LJMP at 0x23.
-        let mut code = [0xFF; 0x28];
-        code[..4].copy_from_slice(&[0x02, 0x00, 0x1B, 0x32]);
-        (code[0x0B], code[0x13], code[0x1B], code[0x23]) = (0x02, 0x02, 0xE4, 0x02);
-        assert_eq!(interrupt_vectors(&code).collect::<Vec<_>>(), [0x0B, 0x13]);
+    fn a_vector_is_a_slot_that_jumps_to_code_ending_in_a_return_from_interrupt() {
+        // Reset: LJMP 0x0040. At 0x03, RETI, as SDCC fills an unused slot. At 0x0B, LJMP 0x0040.
+        // At 0x0E, code Keil's linker put there: MOV A, #0x02; LJMP 0x004A; LJMP 0x004A, the
+        // second in the slot at 0x13. At 0x1B, LJMP 0x004A, and at 0x23, LJMP 0x0050.
+        let mut code = [0xFF; 0x58];
+        code[..4].copy_from_slice(&[0x02, 0x00, 0x40, 0x32]);
+        code[0x0B..0x16].copy_from_slice(&[0x02, 0x00, 0x40, 0x74, 0x02, 0x02, 0x00, 0x4A, 0x02, 0x00, 0x4A]);
+        code[0x1B..0x1E].copy_from_slice(&[0x02, 0x00, 0x4A]);
+        code[0x23..0x26].copy_from_slice(&[0x02, 0x00, 0x50]);
+        // At 0x40, a handler: PUSH ACC; JNB 0x20, 0x0050; INC 0x30; SJMP 0x0050. At 0x4A, a
+        // function: CLR A; RET. At 0x50, the handler's end: POP ACC; RETI.
+        code[0x40..0x4C].copy_from_slice(&[0xC0, 0xE0, 0x30, 0x20, 0x0B, 0x05, 0x30, 0x80, 0x07, 0xFF, 0xE4, 0x22]);
+        code[0x50..0x53].copy_from_slice(&[0xD0, 0xE0, 0x32]);
+        assert_eq!(interrupt_vectors(&code).collect::<Vec<_>>(), [0x0B, 0x23]);
     }
 
     #[test]

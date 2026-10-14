@@ -65,8 +65,8 @@ use crate::image::{Banking, Compiler, Format, Image, Machine, Section};
 pub(crate) struct Layout {
     pub(crate) machine: Machine,
     /// Where execution starts: the reset address first, then any other the hardware enters.
-    /// The interrupt vectors of an 8051 need no listing where they follow one another from
-    /// the first: see [`crate::i8051::interrupt_vectors`].
+    /// The interrupt vectors of an 8051 that jump to a handler need no listing: see
+    /// [`crate::i8051::interrupt_vectors`].
     pub(crate) entry: Vec<u64>,
     pub(crate) region: Vec<Region>,
     pub(crate) banking: Option<BankingLayout>,
