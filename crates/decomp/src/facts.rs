@@ -133,6 +133,16 @@ impl Facts {
                 }
             }
         }
+        if image.machine == Machine::Thumb {
+            // A `BL` that is a jump through a table calls one of libgcc's helpers for a Thumb-1
+            // `switch`, which picks the case by R0.
+            for table in &analysis.jump_tables {
+                let bl = |bytes: &[u8]| matches!(bytes, &[_, high, _, low, ..] if high & 0xF8 == 0xF0 && low & 0xD0 == 0xD0);
+                if image.bytes_from(table.jump).is_some_and(bl) {
+                    facts.switch_calls.push(SwitchCall { call: table.jump, selector: c"r0", cases: None });
+                }
+            }
+        }
         // `(routine, register)`: what a library routine brings back though its code writes it.
         let mut restored: Vec<(u64, &str)> = Vec::new();
         // The analysis names a routine of the compiler's library that the image has no name
