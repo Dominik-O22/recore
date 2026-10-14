@@ -269,7 +269,7 @@ enum Value {
     Const(u32),
     /// An index proven to be at most so large.
     Bounded(Limit),
-    /// An index shifted left, by a bounds check or not.
+    /// An index shifted left, by a bounds check or not. Every `shift` here is under 32.
     Scaled { limit: Option<Limit>, shift: u8 },
     /// `base + (index << shift)`, where `base` is the PC an `ADD Rd, PC` read.
     PcIndexed { base: u32, limit: Option<Limit>, shift: u8 },
@@ -286,13 +286,15 @@ const _: () = assert!(size_of::<Value>() <= 12);
 
 impl Value {
     /// The value shifted left: an index on its way to a table, or an entry on its way to a case.
+    /// `by` is under 32, as an instruction's shift is; shifted out of the word, it is no index.
     fn shifted(self, by: u8) -> Value {
+        let total = |shift: u8| Some(shift + by).filter(|&total| total < 32);
         match self {
             _ if by == 0 => self,
             Value::Unknown => Value::Scaled { limit: None, shift: by },
             Value::Bounded(limit) => Value::Scaled { limit: Some(limit), shift: by },
-            Value::Scaled { limit, shift } => Value::Scaled { limit, shift: shift + by },
-            Value::Entry { table, size, limit, shift } => Value::Entry { table, size, limit, shift: shift + by },
+            Value::Scaled { limit, shift } => total(shift).map_or(Value::Unknown, |shift| Value::Scaled { limit, shift }),
+            Value::Entry { table, size, limit, shift } => total(shift).map_or(Value::Unknown, |shift| Value::Entry { table, size, limit, shift }),
             _ => Value::Unknown,
         }
     }
@@ -386,9 +388,9 @@ impl State {
                     match operation {
                         // ADD Rd, PC: the PC plus an index, or plus an offset into a table.
                         0 if rm == PC => {
-                            let value = match self.registers[rd].index() {
-                                Some((limit, shift)) => Value::PcIndexed { base: (insn.addr + 4) as u32, limit, shift },
-                                None => Value::Unknown,
+                            let value = match (self.registers[rd].index(), u32::try_from(insn.addr + 4)) {
+                                (Some((limit, shift)), Ok(base)) => Value::PcIndexed { base, limit, shift },
+                                _ => Value::Unknown,
                             };
                             self.set(rd, value);
                         }
@@ -428,8 +430,9 @@ impl State {
                 };
                 let offset = u32::from(hw1 >> 6 & 0x1F) * scale;
                 let value = match self.registers[rn] {
-                    // The shift that made the index makes it count entries of this size.
-                    Value::PcIndexed { base, limit, shift } if 1 << shift == size => Value::Entry { table: base + offset, size: size as u8, limit, shift: 0 },
+                    // The shift that made the index makes it count entries of this size, of a
+                    // table that ends below 4 GB.
+                    Value::PcIndexed { base, limit, shift } if 1 << shift == size => base.checked_add(offset).map_or(Value::Unknown, |table| Value::Entry { table, size: size as u8, limit, shift: 0 }),
                     _ => Value::Unknown,
                 };
                 self.set(rd, value);
@@ -1240,6 +1243,28 @@ mod tests {
         let accesses = halfwords.map(|halfwords| access(&halfwords.iter().flat_map(|half| half.to_le_bytes()).collect::<Vec<u8>>()));
         let (load, store) = (Some((true, false)), Some((false, true)));
         assert_eq!(accesses, [load, store, store, load, load, store, load, None]);
+    }
+
+    /// What R0 to R3 hold after `halfwords` at `addr`.
+    fn registers_after(halfwords: &[u16], addr: u64) -> [Value; 4] {
+        let bytes: Vec<u8> = halfwords.iter().flat_map(|half| half.to_le_bytes()).collect();
+        let mut state = State::default();
+        Thumb::decode(&bytes, addr).for_each(|decoded| state.step(decoded.insn.unwrap()));
+        state.registers[..4].try_into().unwrap()
+    }
+
+    #[test]
+    fn an_index_or_a_table_out_of_32_bits_is_none() {
+        // LSLS R1, R1, #31 twice shifts an index out of the word; LSLS R1, R1, #1 twice does not.
+        assert!(registers_after(&[0x07C9, 0x07C9], 0)[1] == Value::Unknown);
+        assert!(registers_after(&[0x0049, 0x0049], 0)[1] == Value::Scaled { limit: None, shift: 2 });
+        // LSLS R0, R0, #2; ADD R0, PC; LDR R0, [R0, #4]: an entry of the table after the code,
+        // unless that would lie past 4 GB.
+        let entry = |addr: u64| registers_after(&[0x0080, 0x4478, 0x6840], addr)[0];
+        assert!(entry(0x1000) == Value::Entry { table: 0x100A, size: 4, limit: None, shift: 0 });
+        assert!(entry(0xFFFF_FFF8) == Value::Unknown);
+        // ADD R0, PC at an address past 4 GB, which a layout refuses but a hand-made image may hold.
+        assert!(registers_after(&[0x0080, 0x4478], 0x1_0000_0000)[0] == Value::Unknown);
     }
 
     #[test]

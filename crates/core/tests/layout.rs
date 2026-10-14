@@ -158,6 +158,7 @@ fn a_layout_that_places_nothing_where_it_can_load_is_refused() {
     let cases = [
         ("past-the-end", format!("{head}{}", region("0xfffffffffffffff0", "0x20")), "runs past the end of the address space"),
         ("past-the-bank", format!("{head}{}", region("0x1ff80", "0x100")), "runs past the 64 KB of its bank"),
+        ("past-4-gb", format!("machine = \"cortex-m\"\n{}", region("0xffffff80", "0x100")), "runs past a Cortex-M's 4 GB of addresses"),
         ("entry-outside", format!("machine = \"8051\"\nentry = [0x9999]\n{}", region("0", "0x100")), "the entry point 0x9999 is in no region"),
         ("backward-common", format!("{head}{}[banking]\ncommon = [[0x80, 0x10]]\n", region("0", "0x100")), "is no range of 16-bit addresses"),
         ("wide-common", format!("{head}{}[banking]\ncommon = [[0, 0x20000]]\n", region("0", "0x100")), "is no range of 16-bit addresses"),

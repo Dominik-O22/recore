@@ -346,6 +346,7 @@ impl Layout {
                 ensure!(end <= crate::i8051::XDATA, "the region at offset {:#x} runs past the 8051's code space, which ends at {:#x}", region.offset, crate::i8051::XDATA);
                 ensure!((region.address & 0xFFFF) + region.length <= 0x1_0000, "the region at offset {:#x} runs past the 64 KB of its bank", region.offset);
             }
+            ensure!(self.machine != Machine::Thumb || end <= 1 << 32, "the region at offset {:#x} runs past a Cortex-M's 4 GB of addresses", region.offset);
         }
         for &(start, end) in self.banking.iter().flat_map(|banking| &banking.common) {
             ensure!(u32::from(start) < end && end <= 0x1_0000, "the common range [{start:#x}, {end:#x}] is no range of 16-bit addresses");
