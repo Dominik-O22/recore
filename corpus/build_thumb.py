@@ -19,7 +19,7 @@ Usage: build_thumb.py [--force] [name...]
 """
 import hashlib, shutil, subprocess, sys, tarfile, urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -120,6 +120,10 @@ class Program:
     # translation units; their roots are on the include path after `extra_include`.
     extra: dict[str, list[str]] = field(default_factory=dict)
     extra_include: list[str] = field(default_factory=list)
+    # Laid out as GNU ld lays out a vendor's build without -ffunction-sections: one section of
+    # code per translation unit, so a function ending in a call that never returns runs into the
+    # next, and zeros, not lld's traps, in the gaps between the units.
+    gnu_layout: bool = False
 
 
 FREERTOS = {"sources": ["tasks.c", "queue.c", "list.c", "timers.c", "event_groups.c", "portable/MemMang/heap_4.c"],
@@ -190,6 +194,17 @@ PROGRAMS = {
                          extra_include=["CMSIS/Core/Include"]),
     "minmea_m3_O2": Program("minmea", "m3", "O2", ["minmea.c", "example.c"], glue=["thumb/minmea"]),
 }
+# The same projects laid out as a vendor's build is, for Thumb-1 and Thumb-2.
+GNU_LAYOUT = {
+    "freertos_m0_Os_gnu": ("freertos_m0_Os", "m0", "Os"), "freertos_m3_O2_gnu": ("freertos_m3_O2", "m3", "O2"),
+    "coremark_m0_O2_gnu": ("coremark_m0_O2", "m0", "O2"), "coremark_m3_Os_gnu": ("coremark_m3_O0", "m3", "Os"),
+    "fatfs_m0_O2_gnu": ("fatfs_m0_O2", "m0", "O2"), "fatfs_m3_Os_gnu": ("fatfs_m4_Os", "m3", "Os"),
+    "littlefs_m0_O2_gnu": ("littlefs_m0_O2", "m0", "O2"), "littlefs_m3_Os_gnu": ("littlefs_m3_Os", "m3", "Os"),
+    "uip_m0_Os_gnu": ("uip_m3_Os", "m0", "Os"), "uip_m3_O2_gnu": ("uip_m3_Os", "m3", "O2"),
+    "printf_m0_Os_gnu": ("printf_m0_Os", "m0", "Os"), "minmea_m3_O2_gnu": ("minmea_m3_O2", "m3", "O2"),
+}
+for name, (like, core, opt) in GNU_LAYOUT.items():
+    PROGRAMS[name] = replace(PROGRAMS[like], core=core, opt=opt, gnu_layout=True)
 
 
 def run(argv, **kwargs):
@@ -254,7 +269,7 @@ ENTRY(Reset_Handler)
 _estack = ORIGIN(RAM) + LENGTH(RAM);
 SECTIONS {{
   .isr_vector : {{ KEEP(*(.isr_vector)) }} > FLASH
-  .text : {{ *(.text .text.*) }} > FLASH
+  .text : {{ *(.text .text.*) }} > FLASH {fill}
   .rodata : {{ *(.rodata .rodata.*) . = ALIGN(4); }} > FLASH
   .data : {{ _sdata = .; *(.data .data.*) . = ALIGN(4); _edata = .; }} > RAM AT > FLASH
   _sidata = LOADADDR(.data);
@@ -281,7 +296,8 @@ def build(name, program):
                *(f"-I{root / directory}" for directory in [".", *program.include]),
                *(f"-I{extra / directory}" for extra in extra_roots.values() for directory in [".", *program.extra_include]),
                "-isystem", str(RUNTIME / "include")]
-    flags = [*core.flags, f"-{program.opt}", "-g", "-ffreestanding", "-ffunction-sections", "-fdata-sections",
+    sections = [] if program.gnu_layout else ["-ffunction-sections", "-fdata-sections"]
+    flags = [*core.flags, f"-{program.opt}", "-g", "-ffreestanding", *sections,
              "-fno-common", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-w", *program.flags]
 
     def compile_unit(source):
@@ -295,7 +311,7 @@ def build(name, program):
     with ThreadPoolExecutor(JOBS) as pool:
         objects = list(pool.map(compile_unit, sources))
     script = work / "link.ld"
-    script.write_text(LINKER_SCRIPT.format(flash=core.flash, ram=RAM))
+    script.write_text(LINKER_SCRIPT.format(flash=core.flash, ram=RAM, fill="=0" if program.gnu_layout else ""))
     elf = work / f"{name}.elf"
     run([linker(), "-flavor", "gnu", "-T", script, "--gc-sections", "-o", elf, *objects, builtins(program.core)])
     image = CORPUS / "image" / f"{name}.bin"
