@@ -541,8 +541,59 @@ const CALLER_SAVED: u16 = 0b0101_0000_0000_1111;
 enum Cases {
     /// `base + (entry << shift)`.
     Relative { base: u64, shift: u8 },
+    /// The same with the entry signed, and without the Thumb bit the sum may have.
+    Signed { base: u64, shift: u8 },
     /// The entry is the case's address, with the Thumb bit.
     Absolute,
+}
+
+/// One of libgcc's helpers for a Thumb-1 `switch`, `__gnu_thumb1_case_*` of `lib1funcs.S`: called
+/// with the index in R0, it reads the table that follows the call, at its return address, and
+/// goes to the case the entry gives, so that the call never returns.
+struct CaseHelper {
+    /// The helper's code. GCC links it from the library as it is.
+    code: &'static [u16],
+    /// Bytes in an entry, and whether it is signed.
+    size: u64,
+    signed: bool,
+}
+
+impl CaseHelper {
+    /// Written by hand from `lib1funcs.S`, as no GCC was at hand to build it. Each scales the
+    /// index, reads the entry at the return address with the Thumb bit cleared, and adds the
+    /// entry times two to the return address, but `_si`, whose table of words starts at the
+    /// next multiple of 4, and whose entries count from there in bytes.
+    const ALL: [CaseHelper; 6] = [
+        // _uqi: PUSH {R1}; MOV R1, LR; LSRS R1, R1, #1; LSLS R1, R1, #1; LDRB R1, [R1, R0];
+        // LSLS R1, R1, #1; ADD LR, R1; POP {R1}; BX LR. _sqi has LDRSB.
+        CaseHelper { code: &[0xB402, 0x4671, 0x0849, 0x0049, 0x5C09, 0x0049, 0x448E, 0xBC02, 0x4770], size: 1, signed: false },
+        CaseHelper { code: &[0xB402, 0x4671, 0x0849, 0x0049, 0x5609, 0x0049, 0x448E, 0xBC02, 0x4770], size: 1, signed: true },
+        // _uhi: PUSH {R0, R1}; MOV R1, LR; LSRS R1, R1, #1; LSLS R0, R0, #1; LSLS R1, R1, #1;
+        // LDRH R1, [R1, R0]; LSLS R1, R1, #1; ADD LR, R1; POP {R0, R1}; BX LR. _shi has LDRSH.
+        CaseHelper { code: &[0xB403, 0x4671, 0x0849, 0x0040, 0x0049, 0x5A09, 0x0049, 0x448E, 0xBC03, 0x4770], size: 2, signed: false },
+        CaseHelper { code: &[0xB403, 0x4671, 0x0849, 0x0040, 0x0049, 0x5E09, 0x0049, 0x448E, 0xBC03, 0x4770], size: 2, signed: true },
+        // _si: PUSH {R0, R1}; MOV R1, LR; ADDS R1, R1, #2, in either encoding; LSRS R1, R1, #2;
+        // LSLS R0, R0, #2; LSLS R1, R1, #2; LDR R0, [R1, R0]; ADDS R0, R0, R1; MOV LR, R0;
+        // POP {R0, R1}; MOV PC, LR.
+        CaseHelper { code: &[0xB403, 0x4671, 0x1C89, 0x0889, 0x0080, 0x0089, 0x5808, 0x1840, 0x4686, 0xBC03, 0x46F7], size: 4, signed: true },
+        CaseHelper { code: &[0xB403, 0x4671, 0x3102, 0x0889, 0x0080, 0x0089, 0x5808, 0x1840, 0x4686, 0xBC03, 0x46F7], size: 4, signed: true },
+    ];
+
+    /// The helper whose code is at `addr`, if any.
+    fn at(image: &Image, addr: u64) -> Option<&'static CaseHelper> {
+        let bytes = image.bytes_from(addr)?;
+        let is = |helper: &CaseHelper| bytes.len() >= 2 * helper.code.len() && helper.code.iter().zip(bytes.chunks_exact(2)).all(|(&half, bytes)| half.to_le_bytes() == bytes);
+        Self::ALL.iter().find(|helper| is(helper))
+    }
+
+    /// The table of a call to the helper that returns to `next`, as `read_table` takes it.
+    fn table(&self, next: u64) -> (u64, Cases) {
+        match self.size {
+            4 => (next.next_multiple_of(4), Cases::Signed { base: next.next_multiple_of(4), shift: 0 }),
+            _ if self.signed => (next, Cases::Signed { base: next, shift: 1 }),
+            _ => (next, Cases::Relative { base: next, shift: 1 }),
+        }
+    }
 }
 
 /// Reads the table of `size`-byte entries at `table`. Without a bound it ends at the first entry
@@ -560,6 +611,10 @@ fn read_table(image: &Image, table: u64, size: u64, limit: Option<Limit>, cases:
         let value = entry.iter().rev().fold(0u64, |value, &byte| value << 8 | u64::from(byte));
         let target = match cases {
             Cases::Relative { base, shift } => Some(base + (value << shift)),
+            Cases::Signed { base, shift } => {
+                let unused = 64 - 8 * size as u32;
+                base.checked_add_signed(((value << unused) as i64 >> unused) << shift).map(|target| target & !1)
+            }
             Cases::Absolute => (value & 1 != 0).then_some(value & !1),
         };
         // A case is never the table itself, which a padding byte of zero would give.
@@ -784,7 +839,7 @@ impl Arch for Thumb {
         Some(Decoded { addr: decoded.addr, len: decoded.len, insn: decoded.insn.map(|decoded| &*{ *insn = decoded; insn }) })
     }
 
-    fn flow(insn: &Insn, state: &State, _: &Image) -> Option<Flow> {
+    fn flow(insn: &Insn, state: &State, image: &Image) -> Option<Flow> {
         let constant = |register: usize| match state.registers[register] {
             Value::Const(value) if value & 1 != 0 => Some(u64::from(value & !1)),
             _ => None,
@@ -797,6 +852,9 @@ impl Arch for Thumb {
                 return None;
             }
             return Some(match transfer {
+                // A call that hands its return address to a helper that switches comes back
+                // nowhere: it is an indirect jump, and its table follows it.
+                Transfer::Call if !insn.conditional && CaseHelper::at(image, target).is_some() => Flow::JumpIndirect(None),
                 Transfer::Call => Flow::Call(target),
                 Transfer::Jump if !insn.conditional => Flow::Jump(target),
                 Transfer::Jump | Transfer::Branch => Flow::Branch(target),
@@ -1130,6 +1188,15 @@ impl Arch for Thumb {
         _: &dyn Fn(u64) -> bool,
     ) -> Option<Table> {
         let next = jump.addr + 4;
+        if let Some((target, Transfer::Call)) = jump.direct() {
+            let helper = CaseHelper::at(image, target)?;
+            let (table, cases) = helper.table(next);
+            let limit = match state.registers[0] {
+                Value::Bounded(limit) => Some(limit),
+                _ => None,
+            };
+            return read_table(image, table, helper.size, limit, cases, is_target);
+        }
         // TBB and TBH: the table follows, and each entry is half the way from it to the case.
         if let Some((PC, rm, size)) = jump.table_branch() {
             let limit = match state.registers[rm] {
@@ -1363,6 +1430,30 @@ mod tests {
         assert_eq!(functions(&code(0xBD10)), [0x00, 0x08, 0x0C, 0x14, 0x1C]);
         // ADDS R0, #2, which runs on into the function at 0x1C: the bytes are no functions.
         assert_eq!(functions(&code(0x3002)), [0x00, 0x1C]);
+    }
+
+    #[test]
+    fn a_call_to_a_gcc_switch_helper_jumps_through_the_table_after_it() {
+        let helper = |kind: usize| CaseHelper::ALL[kind].code.to_vec();
+        let tables = |halfwords: &[u16]| {
+            let bytes: Vec<u8> = halfwords.iter().flat_map(|half| half.to_le_bytes()).collect();
+            let analysis = crate::analysis::analyze(&image(&bytes, 0));
+            let tables: Vec<(u64, Vec<u64>)> = analysis.jump_tables.iter().map(|table| (table.jump, table.targets.clone())).collect();
+            (tables, analysis.functions.into_iter().map(|function| (function.addr, function.ranges)).collect::<Vec<_>>())
+        };
+        // CMP R0, #2; BHI 0x14; BL __gnu_thumb1_case_uqi; the bytes 2, 4, 6 and padding; at 0x0C,
+        // 0x10 and 0x14 MOVS R0, #n; BX LR. The helper at 0x18.
+        let code = [&[0x2802, 0xD807][..], &bl(0x04, 0x18), &[0x0402, 0x0006, 0x200A, 0x4770, 0x200B, 0x4770, 0x2000, 0x4770], &helper(0)].concat();
+        let expected = vec![(0x00, vec![(0x00, 0x08), (0x0C, 0x18)]), (0x18, vec![(0x18, 0x2A)])];
+        assert_eq!(tables(&code), (vec![(0x04, vec![0x0C, 0x10, 0x14])], expected));
+        // B 0x06; a case at 0x02; CMP R0, #1; BHI 0x14; BL __gnu_thumb1_case_sqi; the bytes -6 and
+        // 1; cases at 0x10 and 0x14. The helper at 0x18.
+        let code = [&[0xE001, 0x200A, 0x4770, 0x2801, 0xD804][..], &bl(0x0A, 0x18), &[0x01FA, 0x200B, 0x4770, 0x2000, 0x4770], &helper(1)].concat();
+        assert_eq!(tables(&code).0, [(0x0A, vec![0x02, 0x10])]);
+        // ADDS R0, #0; CMP R0, #1; BHI 0x1C; BL __gnu_thumb1_case_si; padding to the words 8 and 12
+        // at 0x0C, which count from there; cases at 0x14, 0x18 and 0x1C. The helper at 0x20.
+        let code = [&[0x3000, 0x2801, 0xD80A][..], &bl(0x06, 0x20), &[0x0000, 0x0008, 0x0000, 0x000C, 0x0000, 0x2014, 0x4770, 0x2015, 0x4770, 0x2000, 0x4770], &helper(4)].concat();
+        assert_eq!(tables(&code).0, [(0x06, vec![0x14, 0x18])]);
     }
 
     #[test]
