@@ -85,7 +85,7 @@ The key took six calls that mattered: `summary`, `strings`, `imports`, `function
 
 The analysis is written from scratch in Rust: loading, function discovery, calls that never return, jump tables, strings, references, library function names by fingerprint, and C++, Objective-C and Swift classes with their methods. The C comes from Ghidra's decompiler engine, compiled into recore and fed recore's analysis instead of Ghidra's.
 
-It reads ELF, Windows PE and Mach-O for x86, x86-64 and AArch64, and raw 8051 firmware that a layout file describes.
+It reads ELF, Windows PE and Mach-O for x86, x86-64 and AArch64, and raw firmware that a layout file describes: 8051 and ARM Cortex-M.
 
 ## Fast is not sloppy
 
@@ -172,9 +172,18 @@ The decompiler names the compiler's library routines by a hash of their code, so
 
 A `names` file gives the hardware's registers and bits their names, the standard 8051 ones are built in, and `recore-mcp unnamed` lists the addresses the code uses most that have none. Text is found where it is stored as ASCII. A firmware that stores its menu as indices into its own font, as the monitor's does, shows none of that text.
 
+A Cortex-M layout needs only `machine = "cortex-m"` and its flash region. recore reads the reset handler and every interrupt handler from the vector table at the start of the flash. It is scored against the ELF each image was cut from: 27 programs built by clang for Cortex-M0, M3 and M4 at `-O0`, `-Os` and `-O2`, with Ghidra seeded from the same vector table.
+
+| 27 programs, Cortex-M | Functions found | Precision | Jump tables exact |
+|---|---|---|---|
+| recore | 99.9% | 100.0% | 119 of 119 |
+| Ghidra | 91.5% | 98.6% | 112 of 119 |
+
+recore analyzes all 27 in under 30 ms and Ghidra reports 28 s. Most of the functions Ghidra misses are reached only by a tail call or by an address the code builds with `MOVW` and `MOVT`. Every function decompiles, in 3.5 ms on average, and against DWARF the number of parameters is right for 85.8% of the C functions. The System Control Space registers, such as `SYST_RVR` and the NVIC's, are named without a names file. The corpus has no GCC-built code, because no ARM GCC was at hand.
+
 ## What Ghidra does that recore does not
 
-- **Processors.** Ghidra covers dozens. recore covers four.
+- **Processors.** Ghidra covers dozens. recore covers five.
 - **Types.** Ghidra ships struct layouts for the common libraries and lets a user edit types in a GUI. recore knows the types a caller declares, the prototypes of Windows, C library and macOS functions, classes from MSVC and Itanium type information and Objective-C metadata, and, when a binary has DWARF or a PDB, the structs, prototypes and globals in it.
 - **A GUI**, a debugger, scripting, and a database of everything it found.
 
@@ -202,7 +211,7 @@ For Claude Code, in `.mcp.json`:
 
 ## Reproducing the numbers
 
-The corpora are not in the repository. `corpus/fetch*.py` download them, `corpus/build_8051.py` builds the 8051 programs with SDCC, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. `recore-bench run analysis --save <name>` and `--compare <name>` hold a change against an earlier build. Next to the times they report the processor instructions executed, which stay the same to a few hundredths of a percent whatever else the machine is doing.
+The corpora are not in the repository. `corpus/fetch*.py` download them, `corpus/build_8051.py` builds the 8051 programs with SDCC, `corpus/build_thumb.py` the Cortex-M ones with clang, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. `recore-bench run analysis --save <name>` and `--compare <name>` hold a change against an earlier build. Next to the times they report the processor instructions executed, which stay the same to a few hundredths of a percent whatever else the machine is doing.
 
 The speed table compares Ghidra's `Total Time` per binary with the wall time of `recore-mcp summary`, fastest of three runs, and `ghidra/speed.py` measures it. Both ran on the same Ryzen 7 9850X3D. Ghidra analyzed several binaries at a time with 4 cores each, and recore one at a time, with all cores or pinned to one with `taskset`.
 
