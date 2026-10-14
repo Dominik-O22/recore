@@ -21,10 +21,12 @@ const MARKS: [(&str, fn(&str) -> bool); 8] = [
     ("unreachable block", |c| c.contains("Removing unreachable block")),
 ];
 
-/// Whether a line of C only declares a variable, as `  char extraout_PSW;` does.
+/// Whether a line of C only declares a variable, as `  char extraout_PSW;` does, and is no
+/// statement of two words such as `return in_CY;`.
 fn declares(line: &str) -> bool {
     let mut words = line.trim().strip_suffix(';').unwrap_or("=").split(' ');
-    words.clone().count() == 2 && words.all(|word| word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    let statement = words.clone().next().is_some_and(|first| ["return", "goto"].contains(&first));
+    !statement && words.clone().count() == 2 && words.all(|word| word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 /// Whether a word of C names the 8051's status register, or a flag of it that the function
@@ -89,6 +91,7 @@ mod tests {
         assert!(found("  if (-1 < extraout_PSW) break;\n"));
         assert!(found("  if (extraout_CY_00 != '\\0') {\n"));
         assert!(!found("  bool in_CY;\n  if (param_1 < 3) {\n"));
+        assert!(found("  bool in_CY;\n  return in_CY;\n"));
     }
 
     #[test]
