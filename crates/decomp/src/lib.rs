@@ -88,9 +88,9 @@ fn frame_pointer(image: &Image) -> Option<u8> {
 }
 
 impl Target {
-    /// The target an image was built for, when the decompiler has language files for it.
-    pub fn of(image: &Image) -> Result<Target> {
-        Ok(match (image.machine, image.format) {
+    /// The target an image was built for.
+    pub fn of(image: &Image) -> Target {
+        match (image.machine, image.format) {
             (Machine::X86, Format::Pe) => Target::X86Windows,
             (Machine::X86, Format::Elf | Format::MachO | Format::Raw) => Target::X86Gcc,
             (Machine::X86_64, Format::Pe) => Target::X86_64Windows,
@@ -99,7 +99,7 @@ impl Target {
             (Machine::Aarch64, _) => Target::Aarch64,
             (Machine::I8051, _) if image.compiler == Some(Compiler::Sdcc) => Target::I8051Sdcc,
             (Machine::I8051, _) => Target::I8051,
-        })
+        }
     }
 
     /// Ghidra's `processor:endian:size:variant:compiler` id.
@@ -363,7 +363,7 @@ impl Session {
     pub fn load(image: &Image) -> Result<Session> {
         let loaded = facts::loaded(image);
         let sections: Vec<Section> = loaded.iter().map(|l| Section { addr: l.addr, data: &l.data, readonly: l.constant, code: l.code }).collect();
-        let session_target = Target::of(image)?;
+        let session_target = Target::of(image);
         let mut session = Session::new(&vendored_spec_dir()?, session_target, &sections)?;
         // Banked code: every bank shows the code all banks share, which the image holds once,
         // as bank 0, and a trampoline entry stands for the function it reaches.
@@ -381,7 +381,9 @@ impl Session {
         }
         // Through the frame pointer a function reaches what it was passed on the stack and
         // what it keeps there, which the engine follows only if a call leaves the pointer be.
-        if let Some(direct) = frame_pointer(image).filter(|_| session_target == Target::I8051Sdcc) {
+        if session_target == Target::I8051Sdcc
+            && let Some(direct) = frame_pointer(image)
+        {
             session.register_at(recore::i8051::IDATA + u64::from(direct))?;
         }
         Ok(session)
@@ -410,7 +412,7 @@ impl Session {
         for import in &analysis.imports {
             self.add_import(import.slot, &import.name, import.noreturn)?;
         }
-        prototypes::declare(self, Target::of(image)?, image.format, analysis.imports.iter().map(|i| i.name.as_str()))
+        prototypes::declare(self, Target::of(image), image.format, analysis.imports.iter().map(|i| i.name.as_str()))
     }
 
     /// Declares that the GOT entry at `slot` points to the imported function `name`. Indirect
@@ -706,8 +708,6 @@ impl Session {
         })
     }
 
-    /// Runs the session's [`Style`] on the function starting at `addr`. The function need not
-    /// have been declared.
     /// Says where the function at `addr` takes its arguments and leaves its result, when a
     /// calling convention does not: `ACC(B:DPTR,stack:0xbf/1)` for a result in ACC, an argument
     /// in B and DPTR and one of a byte on the stack. `?` for the result leaves it to be found.
@@ -761,6 +761,8 @@ impl Session {
         self.decompile_as_declared(addr)
     }
 
+    /// Runs the session's [`Style`] on the function starting at `addr`. The function need not
+    /// have been declared.
     fn decompile_as_declared(&mut self, addr: u64) -> Result<Decompiled> {
         let mut out = std::mem::MaybeUninit::<ffi::RdDecompiled>::uninit();
         check(|err, len| unsafe { ffi::rd_decompile(self.raw.as_ptr(), addr, out.as_mut_ptr(), err, len) != 0 })?;

@@ -231,3 +231,22 @@ fn a_format_says_what_a_call_passes() {
     assert!(c_text.contains("func_0x00001180(param_1,\"built from commit: %s\\n\",(char *)*param_2);"), "{c_text}");
     assert!(c_text.contains("func_0x00001180(param_1,\"no commit\\n\");"), "{c_text}");
 }
+
+#[test]
+fn memory_the_file_has_no_bytes_for_takes_a_name() {
+    // An 8051 program: SETB 0xAF; MOV DPTR, #0x8100; MOVX @DPTR, A; RET.
+    let dir = edits_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("code.bin"), [0xD2, 0xAF, 0x90, 0x81, 0x00, 0xF0, 0x22]).unwrap();
+    std::fs::write(dir.join("image.toml"), "machine = \"8051\"\nentry = [0]\n[[region]]\nfile = \"code.bin\"\noffset = 0\nlength = 7\naddress = 0\nexecutable = true\n").unwrap();
+    let path = dir.join("image.toml");
+    let mut client = Client::start_in(&dir.join("edits"));
+    // A bit, and a byte of external memory.
+    client.tool("rename", json!({ "path": path, "addr": "0x4000000af", "name": "IRQ_ON" })).unwrap();
+    client.tool("rename", json!({ "path": path, "addr": "0x100008100", "name": "LCD" })).unwrap();
+    assert!(client.tool("rename", json!({ "path": path, "addr": "0x900000000", "name": "NOWHERE" })).unwrap_err().contains("is not in any section"));
+    let c_text = client.tool("decompile", json!({ "path": path, "functions": ["0x0"] })).unwrap();
+    drop(client);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(c_text.contains("IRQ_ON = 1;") && c_text.contains("LCD"), "{c_text}");
+}

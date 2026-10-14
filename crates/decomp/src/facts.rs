@@ -143,7 +143,7 @@ impl Facts {
                 restored.extend(routine.restores.iter().map(|&register| (function, register)));
             }
         }
-        let fixups: HashMap<String, String> = Target::of(image).map(Target::call_fixups).unwrap_or_default().into_iter().collect();
+        let fixups: HashMap<String, String> = Target::of(image).call_fixups().into_iter().collect();
         // 32-bit C names carry one more leading underscore in some symbol sources than others.
         let fixup_of = |name: &str| fixups.get(name).or_else(|| fixups.get(&format!("_{name}"))).cloned();
         facts.call_fixups = facts.names.iter().filter_map(|(function, name)| Some((*function, fixup_of(name)?))).collect();
@@ -152,7 +152,7 @@ impl Facts {
             // convention, which much of an 8051 program is not held to.
             let declared: std::collections::HashSet<u64> = facts.functions.iter().map(|function| function.0).collect();
             let described: std::collections::HashSet<u64> = facts.storage.iter().map(|storage| storage.0).chain(facts.call_fixups.iter().map(|fixup| fixup.0)).collect();
-            let c51 = Target::of(image).is_ok_and(|target| target == Target::I8051);
+            let c51 = Target::of(image) == Target::I8051;
             let mut uses: Vec<_> = recore::i8051::registers::uses(image, analysis).into_iter().filter(|(function, _)| declared.contains(function)).collect();
             uses.sort_unstable_by_key(|&(function, _)| function);
             for (function, registers) in uses {
