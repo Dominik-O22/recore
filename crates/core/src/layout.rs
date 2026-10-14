@@ -49,9 +49,11 @@
 //! `compiler = "sdcc"` at the top says what built the code, where that decides how functions
 //! are called. An 8051 image without it is taken as built by Keil's C51.
 //!
-//! A Cortex-M (`machine = "cortex-m"`) needs no `entry`: the lowest region starts with the
-//! vector table, which names the reset handler and the handlers of the exceptions and
-//! interrupts. The table is loaded as data, apart from the code after it.
+//! A Cortex-M (`machine = "cortex-m"`) needs no `entry`: its vector table names the reset
+//! handler and the handlers of the exceptions and interrupts. The table starts the lowest
+//! executable region unless `vectors` gives its address, as `vectors = 0x10000100` does for an
+//! RP2040's, which follows the boot code. It is loaded as data, apart from the code around it.
+//! `vectors = "none"` says the image has none, and `entry` names where execution starts.
 //!
 //! [`Image::load`] takes a layout wherever it takes an executable.
 
@@ -74,6 +76,8 @@ pub(crate) struct Layout {
     /// [`crate::thumb::vector_table`], after which these are further entries.
     #[serde(default)]
     pub(crate) entry: Vec<u64>,
+    /// Where a Cortex-M's vector table is, if not at the start of its lowest executable region.
+    pub(crate) vectors: Option<Vectors>,
     pub(crate) region: Vec<Region>,
     pub(crate) banking: Option<BankingLayout>,
     /// A file of names for the hardware's addresses, relative to the layout file: see
@@ -100,6 +104,20 @@ pub(crate) struct Region {
     pub(crate) writable: bool,
     /// The section's name, which is the file's name and the offset when the layout gives none.
     pub(crate) name: Option<String>,
+}
+
+/// Where a Cortex-M's vector table is: at an address, or `"none"`.
+#[derive(Deserialize, Clone, Copy)]
+#[serde(untagged)]
+pub(crate) enum Vectors {
+    At(u64),
+    None(NoVectors),
+}
+
+#[derive(Deserialize, Clone, Copy)]
+pub(crate) enum NoVectors {
+    #[serde(rename = "none")]
+    None,
 }
 
 /// What a layout writes for the bank of a region when it does not know it.
@@ -379,7 +397,20 @@ impl Layout {
             ensure!(sections.iter().any(|section| section.contains(addr)), "the entry point {addr:#x} is in no region");
         }
         sections.sort_by_key(|section| section.addr);
-        let handlers = if self.machine == Machine::Thumb { split_vector_table(&mut sections)? } else { Vec::new() };
+        let handlers = match (self.machine, self.vectors) {
+            (Machine::Thumb, Some(Vectors::None(_))) => Vec::new(),
+            (Machine::Thumb, at) => {
+                let at = match at {
+                    Some(Vectors::At(addr)) => addr,
+                    _ => sections.iter().find(|section| section.executable).context("a Cortex-M's vector table starts its lowest executable region, and there is none")?.addr,
+                };
+                split_vector_table(&mut sections, at)?
+            }
+            (_, vectors) => {
+                ensure!(vectors.is_none(), "only a Cortex-M has a vector table");
+                Vec::new()
+            }
+        };
         let entries: Vec<u64> = handlers.iter().chain(&self.entry).copied().collect();
         let (&entry, vectors) = entries.split_first().context("the layout names no entry point")?;
         for pair in sections.windows(2) {
@@ -427,15 +458,30 @@ impl Layout {
     }
 }
 
-/// Takes the vector table at the start of the lowest region of a Cortex-M out of the code, as a
-/// section of data of its own, and returns the handlers it names, reset first.
-fn split_vector_table(sections: &mut Vec<Section>) -> Result<Vec<u64>> {
-    let flash = sections.first_mut().filter(|section| section.executable).context("a Cortex-M's lowest region is its flash, which starts with the vector table and is executable")?;
-    let (length, handlers) = crate::thumb::vector_table(flash);
-    ensure!(!handlers.is_empty(), "the lowest region starts with no vector table: no handler after the stack pointer");
-    let code = flash.data.split_off(length as usize);
-    let table = Section { name: "vectors".to_string(), executable: false, ..std::mem::replace(flash, Section { name: flash.name.clone(), addr: flash.addr + length, data: code, file_offset: flash.file_offset.map(|offset| offset + length), executable: true, writable: flash.writable }) };
-    sections.insert(0, table);
+/// Takes the vector table of a Cortex-M at `at` out of the code, as a section of data of its own
+/// between the code before it and the code after it, and returns the handlers it names, reset
+/// first.
+fn split_vector_table(sections: &mut Vec<Section>, at: u64) -> Result<Vec<u64>> {
+    let index = sections.iter().position(|section| section.contains(at)).with_context(|| format!("the vector table at {at:#x} is in no region"))?;
+    let start = (at - sections[index].addr) as usize;
+    let is_code = |addr: u64| sections.iter().any(|section| section.executable && section.contains(addr));
+    let (length, handlers) = crate::thumb::vector_table(&sections[index].data[start..], is_code);
+    ensure!(!handlers.is_empty(), "the vector table at {at:#x} names no handler after the stack pointer");
+    let region = &sections[index];
+    if region.executable {
+        let end = start + length as usize;
+        let piece = |name: &str, from: usize, to: usize, executable: bool| Section {
+            name: name.to_string(),
+            addr: region.addr + from as u64,
+            data: region.data[from..to].to_vec(),
+            file_offset: region.file_offset.map(|offset| offset + from as u64),
+            executable,
+            writable: region.writable,
+        };
+        let before = (start > 0).then(|| piece(&region.name, 0, start, true));
+        let pieces: Vec<Section> = before.into_iter().chain([piece("vectors", start, end, false), piece(&region.name, end, region.data.len(), true)]).collect();
+        sections.splice(index..=index, pieces);
+    }
     let mut unique = Vec::new();
     for handler in handlers {
         if !unique.contains(&handler) {

@@ -162,6 +162,8 @@ fn a_layout_that_places_nothing_where_it_can_load_is_refused() {
         ("entry-outside", format!("machine = \"8051\"\nentry = [0x9999]\n{}", region("0", "0x100")), "the entry point 0x9999 is in no region"),
         ("backward-common", format!("{head}{}[banking]\ncommon = [[0x80, 0x10]]\n", region("0", "0x100")), "is no range of 16-bit addresses"),
         ("wide-common", format!("{head}{}[banking]\ncommon = [[0, 0x20000]]\n", region("0", "0x100")), "is no range of 16-bit addresses"),
+        ("no-entry", format!("machine = \"cortex-m\"\nvectors = \"none\"\n{}", region("0", "0x100")), "the layout names no entry point"),
+        ("8051-vectors", format!("{head}vectors = 0\n{}", region("0", "0x100")), "only a Cortex-M has a vector table"),
         ("signed-byte", format!("{head}{}[banking]\ncommon = [[0, 0x100]]\n[[banking.trampoline]]\nentry = \"+1 hh ll 02 ss ss\"\nstub = \"22\"\n", region("0", "0x100")), "`+1` in the pattern"),
     ];
     for (name, layout, message) in cases {
@@ -209,4 +211,36 @@ fn a_cortex_m_starts_at_the_handlers_its_vector_table_names() {
     assert_eq!(tables, [(0x0800_0036, &[0x0800_003E, 0x0800_0042, 0x0800_0046][..])]);
     let strings: Vec<(u64, &str)> = analysis.strings.iter().map(|string| (string.addr, string.text.as_str())).collect();
     assert_eq!(strings, [(0x0800_004C, "hello")]);
+}
+
+#[test]
+fn a_cortex_m_vector_table_is_where_the_layout_says() {
+    // Boot code as an RP2040 has before its table: at 0x10000000, MOVS R0, #0; BX LR and
+    // padding. At 0x10000010 the table: the stack pointer, reset at 0x10000020, a slot not in
+    // use, a fault handler at 0x10000024. Then both handlers: B itself.
+    let mut bytes = vec![0x00, 0x20, 0x70, 0x47];
+    bytes.resize(0x10, 0);
+    for word in [0x2004_2000u32, 0x1000_0021, 0, 0x1000_0025] {
+        bytes.extend(word.to_le_bytes());
+    }
+    bytes.extend([0xFE, 0xE7, 0x00, 0x00, 0xFE, 0xE7]);
+    let region = |address: &str, executable: bool| format!("[[region]]\nfile = \"code.bin\"\noffset = 0\nlength = {:#x}\naddress = {address}\nexecutable = {executable}\n", bytes.len());
+    let load = |name: &str, layout: String| Image::load(&write(name, &layout, &bytes)).unwrap();
+    let sections = |image: &Image| image.sections.iter().map(|section| (section.addr, section.end(), section.executable)).collect::<Vec<_>>();
+    let functions = |image: &Image| recore::analyze(image).functions.iter().map(|function| function.addr).collect::<Vec<_>>();
+
+    let image = load("rp2040", format!("machine = \"cortex-m\"\nentry = [0x10000000]\nvectors = 0x10000010\n{}", region("0x10000000", true)));
+    assert_eq!((image.entry, image.exports.as_slice()), (0x1000_0020, &[0x1000_0000, 0x1000_0024][..]));
+    assert_eq!(sections(&image), [(0x1000_0000, 0x1000_0010, true), (0x1000_0010, 0x1000_0020, false), (0x1000_0020, 0x1000_0026, true)]);
+    assert_eq!(functions(&image), [0x1000_0000, 0x1000_0020, 0x1000_0024]);
+
+    // Without `vectors` the table starts the lowest executable region, past data below it.
+    let flash = "[[region]]\nfile = \"code.bin\"\noffset = 0x10\nlength = 0x16\naddress = 0x10000010\nexecutable = true\n";
+    let image = load("data-below", format!("machine = \"cortex-m\"\n{}{flash}", region("0x0", false)));
+    assert_eq!(image.entry, 0x1000_0020);
+    assert_eq!(sections(&image), [(0x0, 0x26, false), (0x1000_0010, 0x1000_0020, false), (0x1000_0020, 0x1000_0026, true)]);
+
+    // With `vectors = "none"` the entry points are the layout's alone, and the table is code.
+    let image = load("no-vectors", format!("machine = \"cortex-m\"\nentry = [0x10000000]\nvectors = \"none\"\n{}", region("0x10000000", true)));
+    assert_eq!((image.entry, sections(&image)), (0x1000_0000, vec![(0x1000_0000, 0x1000_0026, true)]));
 }
