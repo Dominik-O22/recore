@@ -428,6 +428,7 @@ pub fn analyze(image: &Image) -> Analysis {
         Machine::X86 => analyze_with::<X86<32, false>>(image),
         Machine::Aarch64 => analyze_with::<crate::arm64::Arm64>(image),
         Machine::I8051 => analyze_with::<crate::i8051::I8051>(image),
+        Machine::Thumb => analyze_with::<crate::thumb::Thumb>(image),
     }
 }
 

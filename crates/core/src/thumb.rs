@@ -1,0 +1,1069 @@
+//! ARM Cortex-M support: Thumb code, the 16-bit instructions and the 32-bit ones of Thumb-2,
+//! decoded directly from their halfwords.
+//!
+//! Only what the analysis needs is told apart: control flow, the `IT` blocks that make the
+//! instructions after them conditional, the literal pools and `MOVW`/`MOVT` pairs that form
+//! addresses, and the compare, scaling and loads that lead to a jump through a table. Everything
+//! else is an instruction that writes the registers it may write.
+//!
+//! A code address is even. A pointer to code has bit 0 set, the mark of Thumb state, which is
+//! the only state a Cortex-M runs in; recore drops the mark where it reads a pointer.
+
+use rustc_hash::FxHashMap;
+
+use crate::arch::{Arch, Decoded, Flow, Limit, Table, TextPointer};
+use crate::image::{Image, Section};
+
+const PC: usize = 15;
+const LR: usize = 14;
+
+/// One instruction and where it sits, which PC-relative forms need.
+#[derive(Clone, Copy)]
+pub struct Insn {
+    addr: u64,
+    hw1: u16,
+    /// The second halfword of a 32-bit instruction, zero for a 16-bit one.
+    hw2: u16,
+    /// Inside an `IT` block: the instruction runs only when the block's condition holds.
+    conditional: bool,
+    /// The word a PC-relative `LDR` loads, when the decoded bytes hold it.
+    literal: Option<u32>,
+}
+
+fn sign_extend(value: u32, bits: u32) -> i64 {
+    let shift = 64 - bits;
+    ((u64::from(value) << shift) as i64) >> shift
+}
+
+/// The 32-bit constant of a Thumb-2 modified immediate, `i:imm3:imm8`.
+fn expand_immediate(imm12: u32) -> u32 {
+    let imm8 = imm12 & 0xFF;
+    if imm12 >> 10 == 0 {
+        match imm12 >> 8 & 3 {
+            0 => imm8,
+            1 => imm8 << 16 | imm8,
+            2 => imm8 << 24 | imm8 << 8,
+            _ => imm8 * 0x0101_0101,
+        }
+    } else {
+        (0x80 | imm12 & 0x7F).rotate_right(imm12 >> 7)
+    }
+}
+
+/// Where a PC-relative operand counts from: the instruction's address plus 4, down to a word.
+fn aligned_pc(addr: u64) -> u64 {
+    (addr + 4) & !3
+}
+
+impl Insn {
+    fn wide(self) -> bool {
+        is_wide(self.hw1)
+    }
+
+    /// A low register in bits `low..low + 3` of the first halfword.
+    fn low_register(self, low: u32) -> usize {
+        usize::from(self.hw1 >> low & 7)
+    }
+
+    /// `Rd` of the 32-bit data-processing forms, and `RdHi` of the long multiplies.
+    fn rd(self) -> usize {
+        usize::from(self.hw2 >> 8 & 15)
+    }
+
+    /// `Rt` of the 32-bit loads and stores, and `RdLo` of the long multiplies.
+    fn rt(self) -> usize {
+        usize::from(self.hw2 >> 12)
+    }
+
+    /// `Rn` of the 32-bit forms.
+    fn rn(self) -> usize {
+        usize::from(self.hw1 & 15)
+    }
+
+    /// The target of a direct branch, and whether it calls: `B`, `B<c>`, `CBZ`, `CBNZ` and `BL`.
+    fn direct(self) -> Option<(u64, Transfer)> {
+        let next = self.addr + 4;
+        let (hw1, hw2) = (u32::from(self.hw1), u32::from(self.hw2));
+        if !self.wide() {
+            return match hw1 >> 11 {
+                // B<c>; condition 14 is UDF and 15 is SVC.
+                0b11010 | 0b11011 if hw1 >> 9 & 7 != 7 => Some((next.wrapping_add_signed(sign_extend((hw1 & 0xFF) << 1, 9)), Transfer::Branch)),
+                0b11100 => Some((next.wrapping_add_signed(sign_extend((hw1 & 0x7FF) << 1, 12)), Transfer::Jump)),
+                // CBZ and CBNZ, forward only.
+                0b10110 | 0b10111 if hw1 & 0x0500 == 0x0100 => Some((next + u64::from((hw1 >> 9 & 1) << 6 | (hw1 >> 3 & 0x1F) << 1), Transfer::Branch)),
+                _ => None,
+            };
+        }
+        if hw1 >> 11 != 0b11110 || hw2 & 0x8000 == 0 {
+            return None;
+        }
+        let s = hw1 >> 10 & 1;
+        let (j1, j2) = (hw2 >> 13 & 1, hw2 >> 11 & 1);
+        match hw2 & 0x5000 {
+            // B<c>.W; the conditions 14 and 15 are other control instructions.
+            0x0000 if hw1 >> 6 & 0xE != 0xE => {
+                let offset = s << 20 | j2 << 19 | j1 << 18 | (hw1 & 0x3F) << 12 | (hw2 & 0x7FF) << 1;
+                Some((next.wrapping_add_signed(sign_extend(offset, 21)), Transfer::Branch))
+            }
+            0x1000 | 0x5000 => {
+                let (i1, i2) = (!(j1 ^ s) & 1, !(j2 ^ s) & 1);
+                let offset = s << 24 | i1 << 23 | i2 << 22 | (hw1 & 0x3FF) << 12 | (hw2 & 0x7FF) << 1;
+                let target = next.wrapping_add_signed(sign_extend(offset, 25));
+                Some((target, if hw2 & 0x4000 != 0 { Transfer::Call } else { Transfer::Jump }))
+            }
+            _ => None,
+        }
+    }
+
+    /// `[start, end)` of the data a PC-relative load reads: a literal `LDR` of any width,
+    /// `LDRD` or `VLDR`.
+    fn literal_range(self) -> Option<(u64, u64)> {
+        let (hw1, hw2) = (self.hw1, self.hw2);
+        let pc = aligned_pc(self.addr);
+        if !self.wide() {
+            return (hw1 >> 11 == 0b01001).then(|| {
+                let at = pc + u64::from(hw1 & 0xFF) * 4;
+                (at, at + 4)
+            });
+        }
+        let up = hw1 & 0x0080 != 0;
+        let (offset, size) = match hw1 & 0xFF7F {
+            // LDRB, LDRH, LDR, LDRSB, LDRSH; a byte or halfword one into PC is a preload.
+            0xF81F | 0xF83F | 0xF91F | 0xF93F if self.rt() == PC => return None,
+            0xF81F | 0xF91F => (u64::from(hw2 & 0xFFF), 1),
+            0xF83F | 0xF93F => (u64::from(hw2 & 0xFFF), 2),
+            0xF85F => (u64::from(hw2 & 0xFFF), 4),
+            0xE95F => (u64::from(hw2 & 0xFF) * 4, 8),
+            // VLDR of a single or a double register.
+            0xED1F | 0xED5F if hw2 & 0x0E00 == 0x0A00 => (u64::from(hw2 & 0xFF) * 4, if hw2 & 0x0100 != 0 { 8 } else { 4 }),
+            _ => return None,
+        };
+        let at = if up { pc + offset } else { pc.wrapping_sub(offset) };
+        Some((at, at + size))
+    }
+
+    /// The register a literal `LDR` of a word loads.
+    fn literal_word_register(self) -> Option<usize> {
+        if !self.wide() {
+            return (self.hw1 >> 11 == 0b01001).then(|| self.low_register(8));
+        }
+        (self.hw1 & 0xFF7F == 0xF85F).then(|| self.rt())
+    }
+
+    /// `ADR` and `ADR.W`: the register and the address it gets.
+    fn adr(self) -> Option<(usize, u64)> {
+        let pc = aligned_pc(self.addr);
+        if !self.wide() {
+            return (self.hw1 >> 11 == 0b10100).then(|| (self.low_register(8), pc + u64::from(self.hw1 & 0xFF) * 4));
+        }
+        let offset = u64::from((self.hw1 >> 10 & 1) << 11 | (self.hw2 >> 12 & 7) << 8 | self.hw2 & 0xFF);
+        match (self.hw1 & 0xFBFF, self.hw2 & 0x8000) {
+            (0xF20F, 0) => Some((self.rd(), pc + offset)),
+            (0xF2AF, 0) => Some((self.rd(), pc.wrapping_sub(offset))),
+            _ => None,
+        }
+    }
+
+    /// `MOVW` and `MOVT`: the register, the 16 bits, and whether they are the top half.
+    fn move_half(self) -> Option<(usize, u32, bool)> {
+        if !self.wide() || self.hw2 & 0x8000 != 0 {
+            return None;
+        }
+        let top = match self.hw1 & 0xFBF0 {
+            0xF240 => false,
+            0xF2C0 => true,
+            _ => return None,
+        };
+        let (hw1, hw2) = (u32::from(self.hw1), u32::from(self.hw2));
+        let value = (hw1 & 15) << 12 | (hw1 >> 10 & 1) << 11 | (hw2 >> 12 & 7) << 8 | hw2 & 0xFF;
+        Some((self.rd(), value, top))
+    }
+
+    /// `TBB [Rn, Rm]` or `TBH [Rn, Rm, LSL #1]`: `(Rn, Rm, entry size)`.
+    fn table_branch(self) -> Option<(usize, usize, u64)> {
+        (self.wide() && self.hw1 & 0xFFF0 == 0xE8D0 && self.hw2 & 0xFFE0 == 0xF000).then(|| (self.rn(), usize::from(self.hw2 & 15), if self.hw2 & 0x10 != 0 { 2 } else { 1 }))
+    }
+
+    /// The 16-bit forms that name a high register: `ADD`, `CMP`, `MOV`, `BX` and `BLX`, as the
+    /// operation (bits 9 and 8), the destination or first operand, and the second operand.
+    fn high(self) -> Option<(u16, usize, usize)> {
+        (!self.wide() && self.hw1 & 0xFC00 == 0x4400).then(|| (self.hw1 >> 8 & 3, usize::from(self.hw1 >> 4 & 8 | self.hw1 & 7), usize::from(self.hw1 >> 3 & 15)))
+    }
+
+    /// Whether this is `POP` or a load of several registers from the stack that includes PC.
+    fn pops_pc(self) -> bool {
+        if !self.wide() {
+            return self.hw1 & 0xFF00 == 0xBD00;
+        }
+        // LDMIA SP!, and LDR PC, [SP], #4.
+        self.hw1 == 0xE8BD && self.hw2 & 0x8000 != 0 || self.hw1 == 0xF85D && self.hw2 == 0xFB04
+    }
+
+    /// A 32-bit load into PC from somewhere other than the stack: through a pointer, or a table.
+    fn loads_pc(self) -> bool {
+        if !self.wide() {
+            return false;
+        }
+        let multiple = matches!(self.hw1 & 0xFFD0, 0xE890 | 0xE910) && self.hw2 & 0x8000 != 0;
+        let single = self.hw1 & 0xFFF0 == 0xF8D0 || self.hw1 & 0xFFF0 == 0xF850;
+        multiple || single && self.rt() == PC
+    }
+
+    /// The 16-bit `CMP Rn, #imm8`, `CMP Rn, Rm`, and the 32-bit `CMP.W Rn, #const`.
+    fn compare(self, state: &State) -> Option<(usize, u32)> {
+        if !self.wide() {
+            return match self.hw1 >> 11 {
+                0b00101 => Some((self.low_register(8), u32::from(self.hw1 & 0xFF))),
+                _ if self.hw1 & 0xFFC0 == 0x4280 => match state.registers[self.low_register(3)] {
+                    Value::Const(bound) => Some((self.low_register(0), bound)),
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+        let imm12 = u32::from(self.hw1 >> 10 & 1) << 11 | u32::from(self.hw2 >> 12 & 7) << 8 | u32::from(self.hw2 & 0xFF);
+        (self.hw1 & 0xFBF0 == 0xF1B0 && self.hw2 & 0x8F00 == 0x0F00).then(|| (self.rn(), expand_immediate(imm12)))
+    }
+}
+
+impl Insn {
+    /// Whether the instruction may set the condition flags. Those that cannot are loads and
+    /// stores, moves of addresses and between high registers, stack adjustments, and the
+    /// 32-bit forms that leave their S bit clear.
+    fn sets_flags(self) -> bool {
+        let hw1 = self.hw1;
+        if !self.wide() {
+            return !(hw1 >> 11 == 0b01001
+                || (0x5..=0x9).contains(&(hw1 >> 12))
+                || matches!(hw1 >> 11, 0b10100 | 0b10101 | 0b11000 | 0b11001)
+                || matches!(hw1 >> 8, 0xB0 | 0xB2 | 0xB4 | 0xB5 | 0xBA | 0xBC | 0xBD | 0xBF | 0x44 | 0x46));
+        }
+        match hw1 >> 9 {
+            0b1110100 | 0b1111100 | 0b1111101 => hw1 & 0xFF80 == 0xFA00 && hw1 & 0x10 != 0,
+            0b1110101 => hw1 & 0x10 != 0,
+            0b1111000..=0b1111011 if self.hw2 & 0x8000 == 0 => hw1 & 0x0200 == 0 && hw1 & 0x10 != 0,
+            0b1110110 | 0b1110111 | 0b1111110 | 0b1111111 => hw1 == 0xEEF1 && self.hw2 & 0xF000 == 0xF000,
+            _ => true,
+        }
+    }
+}
+
+/// Whether a halfword begins a 32-bit instruction.
+fn is_wide(hw1: u16) -> bool {
+    hw1 >> 11 >= 0b11101
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Transfer {
+    Call,
+    Jump,
+    Branch,
+}
+
+/// What a register is known to hold.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Value {
+    #[default]
+    Unknown,
+    /// A number the code put there whole: an address, or not.
+    Const(u32),
+    /// An index proven to be at most so large.
+    Bounded(Limit),
+    /// An index shifted left, by a bounds check or not.
+    Scaled { limit: Option<Limit>, shift: u8 },
+    /// `base + (index << shift)`, where `base` is the PC an `ADD Rd, PC` read.
+    PcIndexed { base: u32, limit: Option<Limit>, shift: u8 },
+    /// An entry of a table, of `size` bytes, shifted left.
+    Entry { table: u32, size: u8, limit: Option<Limit>, shift: u8 },
+}
+
+// A state is copied at every branch that is followed, so its size is part of the analysis time.
+const _: () = assert!(size_of::<Value>() <= 12);
+
+impl Value {
+    /// The value shifted left: an index on its way to a table, or an entry on its way to a case.
+    fn shifted(self, by: u8) -> Value {
+        match self {
+            _ if by == 0 => self,
+            Value::Unknown => Value::Scaled { limit: None, shift: by },
+            Value::Bounded(limit) => Value::Scaled { limit: Some(limit), shift: by },
+            Value::Scaled { limit, shift } => Value::Scaled { limit, shift: shift + by },
+            Value::Entry { table, size, limit, shift } => Value::Entry { table, size, limit, shift: shift + by },
+            _ => Value::Unknown,
+        }
+    }
+
+    /// An index and how far it is shifted left, as far as it is known.
+    fn index(self) -> Option<(Option<Limit>, u8)> {
+        match self {
+            Value::Unknown => Some((None, 0)),
+            Value::Bounded(limit) => Some((Some(limit), 0)),
+            Value::Scaled { limit, shift } => Some((limit, shift)),
+            _ => None,
+        }
+    }
+}
+
+/// Register contents at one program point.
+#[derive(Clone, Copy, Default)]
+pub struct State {
+    registers: [Value; 16],
+    /// Register and number of a compare whose flags a branch may test.
+    compare: Option<(u8, u32)>,
+    /// The registers the instruction being stepped over writes.
+    written: u16,
+}
+
+impl State {
+    fn set(&mut self, register: usize, value: Value) {
+        self.registers[register] = value;
+        self.written |= 1 << register;
+    }
+
+    fn clobber(&mut self, mask: u16) {
+        self.written |= mask;
+        for register in (0..16).filter(|register| mask >> register & 1 != 0) {
+            self.registers[register] = Value::Unknown;
+        }
+    }
+
+    /// A compare's flags stay for a branch after instructions that set none, as long as the
+    /// register it compared keeps its value.
+    fn step(&mut self, insn: Insn) {
+        if let Some((register, bound)) = insn.compare(self) {
+            self.compare = Some((register as u8, bound));
+            return;
+        }
+        let kept = self.compare.filter(|_| !insn.sets_flags());
+        self.written = 0;
+        self.apply(insn);
+        self.compare = kept.filter(|&(register, _)| self.written >> register & 1 == 0);
+    }
+
+    fn apply(&mut self, insn: Insn) {
+        if let Some(register) = insn.literal_word_register() {
+            self.set(register, insn.literal.map_or(Value::Unknown, Value::Const));
+            return;
+        }
+        if let Some((register, address)) = insn.adr() {
+            self.set(register, Value::Const(address as u32));
+            return;
+        }
+        if let Some((register, half, top)) = insn.move_half() {
+            let value = match (top, self.registers[register]) {
+                (false, _) => Value::Const(half),
+                (true, Value::Const(low)) => Value::Const(half << 16 | low & 0xFFFF),
+                (true, _) => Value::Unknown,
+            };
+            self.set(register, value);
+            return;
+        }
+        if let Some((_, Transfer::Call)) = insn.direct() {
+            self.clobber(CALLER_SAVED);
+            return;
+        }
+        if insn.wide() { self.step_wide(insn) } else { self.step_narrow(insn) }
+    }
+
+    fn step_narrow(&mut self, insn: Insn) {
+        let hw1 = insn.hw1;
+        let (rd, rn, rm) = (insn.low_register(0), insn.low_register(3), insn.low_register(6));
+        match hw1 >> 11 {
+            // LSL #imm, of which LSL #0 is MOVS Rd, Rm.
+            0b00000 => {
+                let value = self.registers[rn].shifted((hw1 >> 6 & 0x1F) as u8);
+                self.set(rd, value);
+            }
+            0b00001..=0b00011 => self.set(rd, Value::Unknown),
+            0b00100 => self.set(insn.low_register(8), Value::Const(u32::from(hw1 & 0xFF))),
+            0b00110 | 0b00111 => self.set(insn.low_register(8), Value::Unknown),
+            0b01000 => {
+                if let Some((operation, rd, rm)) = insn.high() {
+                    match operation {
+                        // ADD Rd, PC: the PC plus an index, or plus an offset into a table.
+                        0 if rm == PC => {
+                            let value = match self.registers[rd].index() {
+                                Some((limit, shift)) => Value::PcIndexed { base: (insn.addr + 4) as u32, limit, shift },
+                                None => Value::Unknown,
+                            };
+                            self.set(rd, value);
+                        }
+                        0 if rd != PC => self.set(rd, Value::Unknown),
+                        2 if rd != PC => self.set(rd, self.registers[rm]),
+                        3 if hw1 & 0x80 != 0 => self.clobber(CALLER_SAVED),
+                        _ => {}
+                    }
+                } else {
+                    // Data processing on low registers. TST, CMP and CMN write none.
+                    if !matches!(hw1 >> 6 & 15, 0b1000 | 0b1010 | 0b1011) {
+                        self.set(rd, Value::Unknown);
+                    }
+                }
+            }
+            // Loads and stores with a register offset: STR, STRH, STRB, then the loads.
+            0b01010 | 0b01011 => {
+                let operation = hw1 >> 9 & 7;
+                if operation < 3 {
+                    return;
+                }
+                let size = match operation {
+                    0b100 => 4,
+                    0b101 => 2,
+                    0b110 => 1,
+                    _ => 0,
+                };
+                let value = self.indexed_entry(self.registers[rn], self.registers[rm], size);
+                self.set(rd, value);
+            }
+            // LDR, LDRB and LDRH with an immediate offset.
+            0b01101 | 0b01111 | 0b10001 => {
+                let (size, scale) = match hw1 >> 11 {
+                    0b01101 => (4, 4),
+                    0b01111 => (1, 1),
+                    _ => (2, 2),
+                };
+                let offset = u32::from(hw1 >> 6 & 0x1F) * scale;
+                let value = match self.registers[rn] {
+                    // The shift that made the index makes it count entries of this size.
+                    Value::PcIndexed { base, limit, shift } if 1 << shift == size => Value::Entry { table: base + offset, size: size as u8, limit, shift: 0 },
+                    _ => Value::Unknown,
+                };
+                self.set(rd, value);
+            }
+            // LDR from the stack, ADD Rd, SP, #imm.
+            0b10011 | 0b10101 => self.set(insn.low_register(8), Value::Unknown),
+            0b10110 | 0b10111 => {
+                // POP; extend and reverse bytes.
+                if hw1 & 0xFE00 == 0xBC00 {
+                    self.clobber(hw1 & 0xFF);
+                } else if matches!(hw1 & 0xFF00, 0xB200 | 0xBA00) {
+                    self.set(rd, Value::Unknown);
+                }
+            }
+            // LDM Rn!, {...}.
+            0b11001 => self.clobber(hw1 & 0xFF | 1 << insn.low_register(8)),
+            // STM Rn!, {...}.
+            0b11000 => self.set(insn.low_register(8), Value::Unknown),
+            _ => {}
+        }
+    }
+
+    fn step_wide(&mut self, insn: Insn) {
+        let (hw1, hw2) = (insn.hw1, insn.hw2);
+        let rn = insn.rn();
+        match hw1 >> 9 {
+            // Load and store multiple.
+            0b1110100 if hw1 & 0x40 == 0 => {
+                let writeback = if hw1 & 0x20 != 0 { 1 << rn } else { 0 };
+                self.clobber(if hw1 & 0x10 != 0 { hw2 | writeback } else { writeback });
+            }
+            // Load and store two registers, exclusive, and table branches.
+            0b1110100 => {
+                if insn.table_branch().is_none() {
+                    self.clobber(1 << insn.rt() | 1 << insn.rd() | 1 << (hw2 & 15) | 1 << rn);
+                }
+            }
+            // Data processing with a shifted register. MOV.W and LSL.W are ORR with no Rn.
+            0b1110101 => {
+                let (operation, flags) = (hw1 >> 5 & 15, hw1 & 0x10 != 0);
+                let compares = flags && insn.rd() == PC && matches!(operation, 0b0000 | 0b0100 | 0b1000 | 0b1101);
+                if compares {
+                    return;
+                }
+                let shift = (hw2 >> 10 & 0x1C | hw2 >> 6 & 3) as u8;
+                let value = match (operation, rn, hw2 >> 4 & 3) {
+                    (0b0010, PC, 0) => self.registers[usize::from(hw2 & 15)].shifted(shift),
+                    _ => Value::Unknown,
+                };
+                self.set(insn.rd(), value);
+            }
+            // Coprocessor and floating point: a move to core registers, or a base written back.
+            0b1110110 | 0b1110111 | 0b1111110 | 0b1111111 => self.clobber(1 << insn.rt() | 1 << rn),
+            // Data processing with an immediate.
+            0b1111000..=0b1111011 if hw2 & 0x8000 == 0 => {
+                let modified = hw1 & 0x0200 == 0;
+                let (operation, flags) = (hw1 >> 5 & 15, hw1 & 0x10 != 0);
+                if modified && flags && insn.rd() == PC && matches!(operation, 0b0000 | 0b0100 | 0b1000 | 0b1101) {
+                    return;
+                }
+                let imm12 = u32::from(hw1 >> 10 & 1) << 11 | u32::from(hw2 >> 12 & 7) << 8 | u32::from(hw2 & 0xFF);
+                let value = if modified && operation == 0b0010 && rn == PC { Value::Const(expand_immediate(imm12)) } else { Value::Unknown };
+                self.set(insn.rd(), value);
+            }
+            // Branches and other control: of these only MRS writes a register.
+            0b1111000..=0b1111011 => {
+                if hw1 & 0xFFE0 == 0xF3E0 && hw2 & 0xD000 == 0x8000 {
+                    self.set(insn.rd(), Value::Unknown);
+                }
+            }
+            // Loads and stores of one register.
+            0b1111100 => {
+                // Only the form with an 8-bit offset can write the base back.
+                let writeback = rn != PC && hw1 & 0x80 == 0 && hw2 & 0x0900 == 0x0900;
+                let loads = hw1 & 0x10 != 0 && insn.rt() != PC;
+                self.clobber(if loads { 1 << insn.rt() } else { 0 } | if writeback { 1 << rn } else { 0 });
+            }
+            // Data processing on registers, and multiplies.
+            0b1111101 => {
+                let long = hw1 & 0xFF80 == 0xFB80 && !matches!(hw1 >> 4 & 7, 0b001 | 0b011);
+                self.clobber(1 << insn.rd() | if long { 1 << insn.rt() } else { 0 });
+            }
+            _ => self.clobber(1 << insn.rd() | 1 << insn.rt()),
+        }
+    }
+
+    /// What a load of `size` bytes from `[base, index]` gives: an entry when one of the two is a
+    /// table's address and the other an index scaled to entries of that size.
+    fn indexed_entry(&self, base: Value, index: Value, size: u32) -> Value {
+        let entry = |table: Value, index: Value| match (table, index.index()) {
+            (Value::Const(table), Some((limit, shift))) if size != 0 && 1 << shift == size => Some(Value::Entry { table, size: size as u8, limit, shift: 0 }),
+            _ => None,
+        };
+        entry(base, index).or_else(|| entry(index, base)).unwrap_or(Value::Unknown)
+    }
+}
+
+/// The registers a call may change: R0 to R3, R12 and LR.
+const CALLER_SAVED: u16 = 0b0101_0000_0000_1111;
+
+/// How a table's entry gives its case.
+#[derive(Clone, Copy)]
+enum Cases {
+    /// `base + (entry << shift)`.
+    Relative { base: u64, shift: u8 },
+    /// The entry is the case's address, with the Thumb bit.
+    Absolute,
+}
+
+/// Reads the table of `size`-byte entries at `table`. Without a bound it ends at the first entry
+/// that is not a plausible case, or where the lowest case after the table begins, since the
+/// cases follow it.
+fn read_table(image: &Image, table: u64, size: u64, limit: Option<Limit>, cases: Cases, is_target: &dyn Fn(u64) -> bool) -> Option<Table> {
+    let bytes = image.bytes_from(table)?;
+    let mut entries = Vec::new();
+    let mut lowest = u64::MAX;
+    for (index, entry) in bytes.chunks_exact(size as usize).take(Limit::entries(limit)).enumerate() {
+        let at = table + index as u64 * size;
+        if limit.is_none() && at >= lowest {
+            break;
+        }
+        let value = entry.iter().rev().fold(0u64, |value, &byte| value << 8 | u64::from(byte));
+        let target = match cases {
+            Cases::Relative { base, shift } => Some(base + (value << shift)),
+            Cases::Absolute => (value & 1 != 0).then_some(value & !1),
+        };
+        // A case is never the table itself, which a padding byte of zero would give.
+        let Some(target) = target.filter(|&target| (target < table || target >= at + size) && is_target(target)) else {
+            if limit.is_some() {
+                return None;
+            }
+            break;
+        };
+        if target > table {
+            lowest = lowest.min(target);
+        }
+        entries.push(target);
+    }
+    let end = table + (entries.len() as u64 * size).next_multiple_of(2);
+    (!entries.is_empty()).then_some(Table { address: table, entry_size: size, entries, bounded: limit.is_some(), inline_end: Some(end) })
+}
+
+/// The vector table at the start of a Cortex-M's flash: the initial stack pointer, then the
+/// address of the handler of each exception and interrupt, with the Thumb bit, or zero for a
+/// slot not in use. Returns the table's length in bytes and the handlers in table order, reset
+/// first. The table ends at the first word that is neither, which is code, and an address in
+/// the flash is a word that code would hardly begin with.
+pub fn vector_table(flash: &Section) -> (u64, Vec<u64>) {
+    /// The architecture's 16 exceptions and at most 496 interrupts.
+    const MOST: usize = 512;
+    let words = flash.data.chunks_exact(4).map(|word| u64::from(u32::from_le_bytes(word.try_into().unwrap())));
+    let mut handlers = Vec::new();
+    let mut length = 4;
+    for word in words.skip(1).take(MOST - 1) {
+        let handler = word & !1;
+        if word != 0 && (word & 1 == 0 || !flash.contains(handler)) {
+            break;
+        }
+        if word != 0 {
+            handlers.push(handler);
+        }
+        length += 4;
+    }
+    // Slots not in use after the last that is.
+    while length > 8 && flash.data[length as usize - 4..length as usize] == [0; 4] {
+        length -= 4;
+    }
+    (length, handlers)
+}
+
+/// Thumb code of a Cortex-M.
+pub struct Thumb;
+
+/// Decodes the instruction at `offset` into `bytes`, which are loaded at `base`. `it` counts the
+/// instructions of an `IT` block still to come.
+fn decode_at(bytes: &[u8], base: u64, offset: usize, it: &mut u8) -> Option<Decoded<Insn>> {
+    let hw1 = u16::from_le_bytes(bytes.get(offset..offset + 2)?.try_into().unwrap());
+    let addr = base + offset as u64;
+    let wide = is_wide(hw1);
+    let hw2 = match bytes.get(offset + 2..offset + 4) {
+        Some(half) if wide => u16::from_le_bytes(half.try_into().unwrap()),
+        // A 32-bit instruction cut short by the end of the bytes.
+        None if wide => return Some(Decoded { addr, len: 2, insn: None }),
+        _ => 0,
+    };
+    let conditional = *it != 0;
+    *it = it.saturating_sub(1);
+    // BLX to ARM code, which a Cortex-M does not run.
+    if wide && hw1 >> 11 == 0b11110 && hw2 & 0xD000 == 0xC000 {
+        return Some(Decoded { addr, len: 4, insn: None });
+    }
+    // IT with a mask: the instructions it makes conditional follow.
+    if !wide && hw1 & 0xFF00 == 0xBF00 && hw1 & 15 != 0 {
+        *it = 4 - (hw1 & 15).trailing_zeros() as u8;
+    }
+    let mut insn = Insn { addr, hw1, hw2, conditional, literal: None };
+    if insn.literal_word_register().is_some() {
+        let (at, _) = insn.literal_range()?;
+        let at = at.checked_sub(base).map(|at| at as usize);
+        insn.literal = at.and_then(|at| bytes.get(at..at + 4)).map(|word| u32::from_le_bytes(word.try_into().unwrap()));
+    }
+    Some(Decoded { addr, len: if wide { 4 } else { 2 }, insn: Some(insn) })
+}
+
+/// A decoder over a section, with the state of the `IT` block it is in.
+pub struct Decoder<'a> {
+    bytes: &'a [u8],
+    base: u64,
+    offset: usize,
+    it: u8,
+    insn: Insn,
+}
+
+impl Thumb {
+    /// The address the instruction completes in a register, whatever it is: a literal, an
+    /// `ADR`, or the top half of a `MOVW` and `MOVT` pair.
+    fn completed_address(insn: &Insn, state: &State) -> Option<u32> {
+        if insn.literal_word_register().is_some() {
+            return insn.literal;
+        }
+        if let Some((_, address)) = insn.adr() {
+            return Some(address as u32);
+        }
+        match (insn.move_half(), insn.move_half().map(|(register, _, _)| state.registers[register])) {
+            (Some((_, half, true)), Some(Value::Const(low))) => Some(half << 16 | low & 0xFFFF),
+            _ => None,
+        }
+    }
+}
+
+impl Arch for Thumb {
+    type Insn = Insn;
+    type State = State;
+
+    /// Clang aligns functions to four bytes and packs them at two, a compiler for size at two.
+    const FUNCTION_ALIGN: u64 = 2;
+    /// What aligns a function to 16 bytes, as a linker may the first of a section.
+    const LONGEST_PADDING: u64 = 14;
+    const ALIGNMENT_IS_EVIDENCE: bool = false;
+    const TEXT_IN_CODE: bool = true;
+    const LITERAL_POOLS: bool = true;
+    const TAKEN_IS_WEAK: bool = true;
+    const CALL_MAY_BE_FAR_JUMP: bool = true;
+    const MARKED_CODE_POINTERS: bool = true;
+
+    fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> {
+        let (mut offset, mut it) = (0, 0);
+        std::iter::from_fn(move || {
+            let decoded = decode_at(bytes, addr, offset, &mut it)?;
+            offset += usize::from(decoded.len);
+            Some(decoded)
+        })
+    }
+
+    type Decoder<'a> = Decoder<'a>;
+
+    fn decoder(bytes: &[u8], addr: u64) -> Decoder<'_> {
+        Decoder { bytes, base: addr, offset: 0, it: 0, insn: Insn { addr, hw1: 0, hw2: 0, conditional: false, literal: None } }
+    }
+
+    /// Nothing branches into an `IT` block, so a new place to decode from is outside one.
+    fn seek(decoder: &mut Decoder<'_>, offset: usize) {
+        (decoder.offset, decoder.it) = (offset, 0);
+    }
+
+    fn decode_next<'d>(decoder: &'d mut Decoder<'_>) -> Option<Decoded<&'d Insn>> {
+        let decoded = decode_at(decoder.bytes, decoder.base, decoder.offset, &mut decoder.it)?;
+        decoder.offset += usize::from(decoded.len);
+        let insn = &mut decoder.insn;
+        Some(Decoded { addr: decoded.addr, len: decoded.len, insn: decoded.insn.map(|decoded| &*{ *insn = decoded; insn }) })
+    }
+
+    fn flow(insn: &Insn, state: &State, _: &Image) -> Option<Flow> {
+        let constant = |register: usize| match state.registers[register] {
+            Value::Const(value) if value & 1 != 0 => Some(u64::from(value & !1)),
+            _ => None,
+        };
+        if let Some((target, transfer)) = insn.direct() {
+            // Unoptimised code jumps to the next instruction with the short `B`, which goes
+            // nowhere a fall through would not. A tail call to the next function is a `B.W`.
+            if transfer == Transfer::Jump && !insn.wide() && target == insn.addr + 2 {
+                return None;
+            }
+            return Some(match transfer {
+                Transfer::Call => Flow::Call(target),
+                Transfer::Jump if !insn.conditional => Flow::Jump(target),
+                Transfer::Jump | Transfer::Branch => Flow::Branch(target),
+            });
+        }
+        let hw1 = insn.hw1;
+        // A trap: UDF and UDF.W. BKPT stops for a debugger, which may let the code go on.
+        if !insn.wide() && hw1 & 0xFF00 == 0xDE00 || insn.wide() && hw1 & 0xFFF0 == 0xF7F0 && insn.hw2 & 0xF000 == 0xA000 {
+            return Some(Flow::Halt);
+        }
+        // A call through a register goes on after it, condition or not.
+        if let Some((3, _, rm)) = insn.high().filter(|&(operation, _, _)| operation == 3 && hw1 & 0x80 != 0) {
+            return Some(constant(rm).map_or(Flow::CallIndirect(None), Flow::Call));
+        }
+        // What follows leaves the code here, unless an `IT` block makes it conditional, when the
+        // code goes on after it as well.
+        let leaves = if insn.pops_pc() {
+            Flow::Return
+        } else if let Some((operation, rd, rm)) = insn.high() {
+            match (operation, rd, rm) {
+                (3, _, LR) | (2, PC, LR) => Flow::Return,
+                (3, _, _) | (2, PC, _) => constant(rm).map_or(Flow::JumpIndirect(None), Flow::Jump),
+                (0, PC, _) => Flow::JumpIndirect(None),
+                _ => return None,
+            }
+        } else if insn.table_branch().is_some() {
+            Flow::JumpIndirect(None)
+        } else if insn.loads_pc() {
+            // LDR PC, [PC, #imm] jumps to the literal.
+            match (insn.hw1 & 0xFF7F, insn.literal) {
+                (0xF85F, Some(target)) if target & 1 != 0 => Flow::Jump(u64::from(target & !1)),
+                _ => Flow::JumpIndirect(None),
+            }
+        } else {
+            return None;
+        };
+        (!insn.conditional).then_some(leaves)
+    }
+
+    /// A pointer to code: one with the Thumb bit.
+    fn address_taken(insn: &Insn, state: &State) -> Option<u64> {
+        Self::completed_address(insn, state).filter(|address| address & 1 != 0).map(|address| u64::from(address & !1))
+    }
+
+    fn memory_reference(insn: &Insn, state: &State) -> Option<u64> {
+        let base = |register: usize| match state.registers[register] {
+            Value::Const(base) => Some(u64::from(base)),
+            _ => None,
+        };
+        if !insn.wide() {
+            let hw1 = insn.hw1;
+            // STR, LDR, STRB, LDRB, STRH and LDRH with an immediate offset.
+            let scale = match hw1 >> 12 {
+                0b0110 => 4,
+                0b0111 => 1,
+                0b1000 => 2,
+                _ => return None,
+            };
+            return base(insn.low_register(3)).map(|base| base + u64::from(hw1 >> 6 & 0x1F) * scale);
+        }
+        // The 32-bit loads and stores of one register with a 12-bit offset.
+        (insn.hw1 & 0xFE80 == 0xF880 && insn.rn() != PC).then(|| base(insn.rn()).map(|base| base + u64::from(insn.hw2 & 0xFFF))).flatten()
+    }
+
+    fn literal(insn: &Insn) -> Option<(u64, u64)> {
+        insn.literal_range()
+    }
+
+    /// Whether the code at `target`, whose address with the Thumb bit the code forms or which
+    /// follows a gap, can be a function. An odd number is as often the address of text, which
+    /// begins at any byte, or a number that is no address at all; and data follows the code.
+    /// A function either sets up its frame first, or is short and comes to its end before
+    /// anything that cannot be code.
+    fn code_pointer(image: &Image, target: u64) -> bool {
+        /// How many instructions a function that saves nothing may run to its end.
+        const LONGEST_LEAF: usize = 24;
+        let Some(bytes) = image.bytes_from(target) else { return false };
+        let mut insns = Self::decode(bytes, target).map(|decoded| decoded.insn);
+        let Some(Some(first)) = insns.next() else { return false };
+        // PUSH, PUSH.W, SUB SP, #imm.
+        if Self::opens_function(&first, None) || !first.wide() && first.hw1 & 0xFF80 == 0xB080 {
+            return true;
+        }
+        if Self::is_padding(&first) {
+            return false;
+        }
+        // Text from the odd address on is text, unless it is a short function that returns,
+        // whose `BX LR` reads as "pG".
+        let text = bytes[1..].iter().take_while(|&&byte| matches!(byte, 0x20..=0x7E | b'\t' | b'\n' | b'\r')).count();
+        let is_text = text >= 2 && bytes.get(1 + text) == Some(&0);
+        let state = State::default();
+        let mut insn = Some(first);
+        for _ in 0..LONGEST_LEAF {
+            let Some(current) = insn.filter(|insn| !Self::ends_code(insn)) else { return false };
+            if is_text && current.addr > target + text as u64 {
+                return false;
+            }
+            match Self::flow(&current, &state, image) {
+                Some(Flow::Return) => return true,
+                Some(Flow::Jump(_) | Flow::JumpIndirect(_)) => return !is_text,
+                Some(Flow::Halt) => return false,
+                _ => {}
+            }
+            insn = insns.next().flatten();
+        }
+        false
+    }
+
+    /// The addresses code forms of data in the flash, from a literal, an `ADR` or a `MOVW` and
+    /// `MOVT` pair: text, if text is there. Text may begin at an odd address, which is not
+    /// one of code then.
+    fn text_pointers(image: &Image, start: u64, end: u64) -> Vec<TextPointer> {
+        let Some(bytes) = image.bytes_from(start) else { return Vec::new() };
+        let mut state = State::default();
+        let mut found = Vec::new();
+        // The literals lie past the end of the code that loads them.
+        for insn in Self::decode(bytes, start).take_while(|decoded| decoded.addr < end).filter_map(|decoded| decoded.insn) {
+            if let Some(address) = Self::completed_address(&insn, &state) {
+                found.push(TextPointer { from: insn.addr, to: u64::from(address), marked: true });
+            }
+            match Self::flow(&insn, &state, image) {
+                Some(Flow::Call(_) | Flow::CallIndirect(_)) => state.clobber(CALLER_SAVED),
+                Some(_) => state = State::default(),
+                None => state.step(insn),
+            }
+        }
+        found
+    }
+
+    /// `NOP`, `NOP.W`, `MOV R8, R8`, which pads code for Thumb-1, the halfword lld fills gaps in
+    /// code with, and zeros, which GNU ld does.
+    fn is_padding(insn: &Insn) -> bool {
+        if insn.wide() {
+            return insn.hw1 == 0xF3AF && insn.hw2 == 0x8000;
+        }
+        matches!(insn.hw1, 0xBF00 | 0x46C0 | 0xD4D4 | 0x0000)
+    }
+
+    /// What a linker fills a gap between functions with. `NOP` aligns a loop as well.
+    fn ends_code(insn: &Insn) -> bool {
+        !insn.wide() && matches!(insn.hw1, 0xD4D4 | 0x0000)
+    }
+
+    fn is_entry_marker(_: &Insn) -> bool {
+        false
+    }
+
+    /// `PUSH {..., LR}`, or `PUSH.W` with LR, which save the return address.
+    fn opens_function(first: &Insn, _: Option<&Insn>) -> bool {
+        if first.wide() { first.hw1 == 0xE92D && first.hw2 & 0x4000 != 0 } else { first.hw1 & 0xFF00 == 0xB500 }
+    }
+
+    /// A load from far up the stack before anything is pushed: a block that reads its
+    /// function's variables. Only the arguments past the eighth would be that far from a
+    /// function's entry.
+    fn borrows_frame(insns: &[Insn]) -> bool {
+        const ARGUMENTS: u64 = 0x20;
+        for insn in insns {
+            let offset = match (insn.wide(), insn.hw1 >> 11, insn.hw1) {
+                (false, 0b10011, _) => u64::from(insn.hw1 & 0xFF) * 4,
+                (true, _, 0xF8DD) => u64::from(insn.hw2 & 0xFFF),
+                _ => {
+                    // PUSH, SUB SP and PUSH.W set up a frame of the code's own.
+                    let sets_up = !insn.wide() && (insn.hw1 & 0xFE00 == 0xB400 || insn.hw1 & 0xFF80 == 0xB080) || insn.hw1 == 0xE92D;
+                    if sets_up {
+                        return false;
+                    }
+                    continue;
+                }
+            };
+            return offset >= ARGUMENTS;
+        }
+        false
+    }
+
+    fn opens_landing_pad(_: &Insn) -> bool {
+        false
+    }
+
+    fn step(state: &mut State, insn: &Insn) {
+        state.step(*insn);
+    }
+
+    fn branch(fallthrough: &mut State, insn: &Insn) -> State {
+        let compare = fallthrough.compare.take();
+        let mut taken = *fallthrough;
+        let condition = match (insn.wide(), insn.direct()) {
+            (false, Some((_, Transfer::Branch))) if insn.hw1 >> 12 == 0xD => Some(insn.hw1 >> 8 & 15),
+            (true, Some((_, Transfer::Branch))) => Some(insn.hw1 >> 6 & 15),
+            _ => None,
+        };
+        if let (Some((register, bound)), Some(condition)) = (compare, condition) {
+            let register = usize::from(register);
+            let bounded = |bound: u32| Value::Bounded(Limit::of(u64::from(bound)));
+            match condition {
+                // HI: falling through means the index is at most the bound.
+                8 => fallthrough.set(register, bounded(bound)),
+                // LS: taken means it.
+                9 => taken.set(register, bounded(bound)),
+                // HS and LO: the strict forms.
+                2 if bound > 0 => fallthrough.set(register, bounded(bound - 1)),
+                3 if bound > 0 => taken.set(register, bounded(bound - 1)),
+                _ => {}
+            }
+        }
+        taken
+    }
+
+    fn after_jump(_: State, _: &Insn) -> State {
+        State::default()
+    }
+
+    fn resolve_table(
+        state: &State,
+        image: &Image,
+        _: &FxHashMap<u64, u64>,
+        jump: &Insn,
+        is_target: &dyn Fn(u64) -> bool,
+        _: &dyn Fn(u64) -> bool,
+    ) -> Option<Table> {
+        let next = jump.addr + 4;
+        // TBB and TBH: the table follows, and each entry is half the way from it to the case.
+        if let Some((PC, rm, size)) = jump.table_branch() {
+            let limit = match state.registers[rm] {
+                Value::Bounded(limit) => Some(limit),
+                _ => None,
+            };
+            return read_table(image, next, size, limit, Cases::Relative { base: next, shift: 1 }, is_target);
+        }
+        let (operation, rm) = jump.high().map(|(operation, _, rm)| (operation, rm))?;
+        let Value::Entry { table, size, limit, shift } = state.registers[rm] else { return None };
+        match operation {
+            // ADD PC, Rm: the entry, scaled, counts from the PC the ADD reads.
+            0 => read_table(image, u64::from(table), u64::from(size), limit, Cases::Relative { base: next, shift }, is_target),
+            // MOV PC, Rm: the entry is the case's address.
+            2 if size == 4 && shift == 0 => read_table(image, u64::from(table), 4, limit, Cases::Absolute, is_target),
+            _ => None,
+        }
+    }
+
+    fn plt_stubs(_: &Image) -> FxHashMap<u64, u64> {
+        FxHashMap::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An image with `code` at `addr`.
+    fn image(code: &[u8], addr: u64) -> Image {
+        Image {
+            name: String::new(),
+            format: crate::image::Format::Raw,
+            machine: crate::image::Machine::Thumb,
+            base: 0,
+            branch_targets_marked: false,
+            entry: addr,
+            sections: vec![Section { name: String::new(), addr, data: code.to_vec(), file_offset: None, executable: true, writable: false }],
+            zero_filled: Vec::new(),
+            import_slots: FxHashMap::default(),
+            exports: Vec::new(),
+            symbol_names: FxHashMap::default(),
+            frames: Vec::new(),
+            relative_targets: Vec::new(),
+            data_in_code: true,
+            banking: Default::default(),
+            compiler: None,
+        }
+    }
+
+    /// The length and the control flow of each instruction of `halfwords` at `addr`.
+    fn flows(halfwords: &[u16], addr: u64) -> Vec<(u8, Option<Flow>)> {
+        let bytes: Vec<u8> = halfwords.iter().flat_map(|half| half.to_le_bytes()).collect();
+        let image = image(&bytes, addr);
+        let mut state = State::default();
+        Thumb::decode(&bytes, addr)
+            .map(|decoded| {
+                let insn = decoded.insn.unwrap();
+                let flow = Thumb::flow(&insn, &state, &image);
+                Thumb::step(&mut state, &insn);
+                (decoded.len, flow)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_kind_of_branch_goes_where_its_bits_say() {
+        use Flow::*;
+        let cases: &[(&[u16], u64, &[(u8, Option<Flow>)])] = &[
+            // B<c> T1 back and forward; B T2; CBZ; CBNZ.
+            (&[0xD1FE], 0x1000, &[(2, Some(Branch(0x1000)))]),
+            (&[0xD836], 0x100C, &[(2, Some(Branch(0x107C)))]),
+            (&[0xE7FE], 0x1000, &[(2, Some(Jump(0x1000)))]),
+            (&[0xE022], 0x103C, &[(2, Some(Jump(0x1084)))]),
+            // B to the next instruction, which unoptimised code has, goes nowhere.
+            (&[0xE7FF], 0x1000, &[(2, None)]),
+            (&[0xB170], 0x1000, &[(2, Some(Branch(0x1020)))]),
+            (&[0xBB78], 0x1000, &[(2, Some(Branch(0x1062)))]),
+            // BL back by 0x2D4 and forward by 0x1682; B.W; BHI.W; B<c>.W back.
+            (&[0xF7FF, 0xFE96], 0x8000_0300, &[(4, Some(Call(0x8000_0030)))]),
+            (&[0xF001, 0xFB41], 0x0800_010E, &[(4, Some(Call(0x0800_1794)))]),
+            (&[0xF7FF, 0xBFFE], 0x0800_003E, &[(4, Some(Jump(0x0800_003E)))]),
+            (&[0xF200, 0x81A6], 0x0800_000C, &[(4, Some(Branch(0x0800_035C)))]),
+            (&[0xF47F, 0xAFFE], 0x0800_1000, &[(4, Some(Branch(0x0800_1000)))]),
+            // BX LR; POP {R4, PC}; MOV PC, LR; POP.W {R4-R11, PC}; LDR PC, [SP], #4.
+            (&[0x4770], 0, &[(2, Some(Return))]),
+            (&[0xBD10], 0, &[(2, Some(Return))]),
+            (&[0x46F7], 0, &[(2, Some(Return))]),
+            (&[0xE8BD, 0x8FF0], 0, &[(4, Some(Return))]),
+            (&[0xF85D, 0xFB04], 0, &[(4, Some(Return))]),
+            // BX R3; BLX R3; ADD PC, R1; MOV PC, R0; TBB [PC, R1]; LDR.W PC, [R0, #4].
+            (&[0x4718], 0, &[(2, Some(JumpIndirect(None)))]),
+            (&[0x4798], 0, &[(2, Some(CallIndirect(None)))]),
+            (&[0x448F], 0, &[(2, Some(JumpIndirect(None)))]),
+            (&[0x4687], 0, &[(2, Some(JumpIndirect(None)))]),
+            (&[0xE8DF, 0xF001], 0, &[(4, Some(JumpIndirect(None)))]),
+            (&[0xF8D0, 0xF004], 0, &[(4, Some(JumpIndirect(None)))]),
+            // UDF; BKPT; SVC, which returns; WFI; PUSH; DMB.
+            (&[0xDEFE], 0, &[(2, Some(Halt))]),
+            (&[0xBE00], 0, &[(2, None)]),
+            (&[0xDF00], 0, &[(2, None)]),
+            (&[0xBF30], 0, &[(2, None)]),
+            (&[0xB510], 0, &[(2, None)]),
+            (&[0xF3BF, 0x8F5F], 0, &[(4, None)]),
+            // IT NE; BXNE LR, which may fall through; then B, unconditional again.
+            (&[0xBF18, 0x4770, 0xE7FE], 0x1000, &[(2, None), (2, None), (2, Some(Jump(0x1004)))]),
+            // ITT EQ; POPEQ {R4, PC}; BEQ by the unconditional encoding, which is conditional here.
+            (&[0xBF04, 0xBD10, 0xE7FE], 0x1000, &[(2, None), (2, None), (2, Some(Branch(0x1004)))]),
+            // LDR R3, [PC, #0]; BLX R3: a call of the function whose address is the literal.
+            (&[0x4B00, 0x4798, 0x0035, 0x0000], 0x1000, &[(2, None), (2, Some(Call(0x0034))), (2, None), (2, None)]),
+            // MOVW R0, #0x1235; MOVT R0, #0x0800; BX R0: a jump to 0x08001234.
+            (&[0xF241, 0x2035, 0xF6C0, 0x0000, 0x4700], 0, &[(4, None), (4, None), (2, Some(Jump(0x0800_1234)))]),
+        ];
+        for &(halfwords, addr, expected) in cases {
+            assert_eq!(flows(halfwords, addr), expected, "{halfwords:04x?} at {addr:#x}");
+        }
+    }
+
+    #[test]
+    fn a_literal_load_reads_the_word_of_its_pool() {
+        // At 0x1002, LDR R0, [PC, #4] reads the word at 0x1008: (0x1002 + 4) & !3 is 0x1004.
+        let bytes = [0x00, 0xBF, 0x01, 0x48, 0x70, 0x47, 0x00, 0xBF, 0x35, 0x12, 0x00, 0x08];
+        let insn = Thumb::decode(&bytes, 0x1000).nth(1).unwrap().insn.unwrap();
+        assert_eq!((Thumb::literal(&insn), insn.literal), (Some((0x1008, 0x100C)), Some(0x0800_1235)));
+        assert_eq!(Thumb::address_taken(&insn, &State::default()), Some(0x0800_1234));
+    }
+
+    #[test]
+    fn the_vector_table_ends_at_the_first_word_that_is_no_handler() {
+        // SP, reset, NMI, two unused slots, a handler, then code: PUSH {R4, LR}; SUB SP, #0x28.
+        let words: [u32; 7] = [0x2002_0000, 0x0000_0021, 0x0000_0025, 0, 0, 0x0000_0025, 0xB08A_B510];
+        let data: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).chain([0; 0x20]).collect();
+        let flash = Section { name: String::new(), addr: 0, data, file_offset: None, executable: true, writable: false };
+        assert_eq!(vector_table(&flash), (24, vec![0x20, 0x24, 0x24]));
+    }
+}

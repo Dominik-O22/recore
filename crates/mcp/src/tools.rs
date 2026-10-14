@@ -666,6 +666,7 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
         Machine::X86_64 => "x86-64",
         Machine::Aarch64 => "AArch64",
         Machine::I8051 => "8051",
+        Machine::Thumb => "Cortex-M (Thumb)",
     };
     let mut out = String::new();
     writeln!(out, "{}: {format}, {machine}, image base {:#x}, entry {:#x}", image.name, image.base, image.entry)?;

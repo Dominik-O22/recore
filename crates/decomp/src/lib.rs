@@ -67,6 +67,8 @@ pub enum Target {
     I8051,
     /// The 8051 as SDCC compiles for it.
     I8051Sdcc,
+    /// An ARM Cortex-M, in Thumb code.
+    Thumb,
 }
 
 /// Where SDCC keeps the frame pointer of an 8051 program whose functions have their arguments
@@ -99,6 +101,7 @@ impl Target {
             (Machine::Aarch64, _) => Target::Aarch64,
             (Machine::I8051, _) if image.compiler == Some(Compiler::Sdcc) => Target::I8051Sdcc,
             (Machine::I8051, _) => Target::I8051,
+            (Machine::Thumb, _) => Target::Thumb,
         }
     }
 
@@ -112,6 +115,7 @@ impl Target {
             Target::Aarch64 => c"AARCH64:LE:64:v8A:default",
             Target::I8051 => c"8051:BE:24:cip-51:default",
             Target::I8051Sdcc => c"8051:BE:24:cip-51:sdcc",
+            Target::Thumb => c"ARM:LE:32:Cortex:default",
         }
     }
 
@@ -125,6 +129,7 @@ impl Target {
             Target::Aarch64 => "AARCH64.cspec",
             Target::I8051 => "keil-cx51.cspec",
             Target::I8051Sdcc => "sdcc-mcs51.cspec",
+            Target::Thumb => "ARM.cspec",
         }
     }
 
@@ -183,7 +188,7 @@ impl Target {
 
     pub fn pointer_bytes(self) -> usize {
         match self {
-            Target::X86Windows | Target::X86Gcc => 4,
+            Target::X86Windows | Target::X86Gcc | Target::Thumb => 4,
             Target::X86_64Windows | Target::X86_64Gcc | Target::Aarch64 => 8,
             Target::I8051 | Target::I8051Sdcc => 2,
         }

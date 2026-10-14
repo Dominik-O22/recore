@@ -49,6 +49,10 @@
 //! `compiler = "sdcc"` at the top says what built the code, where that decides how functions
 //! are called. An 8051 image without it is taken as built by Keil's C51.
 //!
+//! A Cortex-M (`machine = "cortex-m"`) needs no `entry`: the lowest region starts with the
+//! vector table, which names the reset handler and the handlers of the exceptions and
+//! interrupts. The table is loaded as data, apart from the code after it.
+//!
 //! [`Image::load`] takes a layout wherever it takes an executable.
 
 use std::fmt;
@@ -66,7 +70,9 @@ pub(crate) struct Layout {
     pub(crate) machine: Machine,
     /// Where execution starts: the reset address first, then any other the hardware enters.
     /// The interrupt vectors of an 8051 that jump to a handler need no listing: see
-    /// [`crate::i8051::interrupt_vectors`].
+    /// [`crate::i8051::interrupt_vectors`]. Nor does a Cortex-M's vector table, see
+    /// [`crate::thumb::vector_table`], after which these are further entries.
+    #[serde(default)]
     pub(crate) entry: Vec<u64>,
     pub(crate) region: Vec<Region>,
     pub(crate) banking: Option<BankingLayout>,
@@ -368,11 +374,13 @@ impl Layout {
 
     /// The image `sections` make, called `name`, with the trampolines `banking` describes.
     pub(crate) fn image(&self, name: String, mut sections: Vec<Section>, banking: Option<&BankingLayout>) -> Result<Image> {
-        let (&entry, vectors) = self.entry.split_first().context("the layout names no entry point")?;
         for &addr in &self.entry {
             ensure!(sections.iter().any(|section| section.contains(addr)), "the entry point {addr:#x} is in no region");
         }
         sections.sort_by_key(|section| section.addr);
+        let handlers = if self.machine == Machine::Thumb { split_vector_table(&mut sections)? } else { Vec::new() };
+        let entries: Vec<u64> = handlers.iter().chain(&self.entry).copied().collect();
+        let (&entry, vectors) = entries.split_first().context("the layout names no entry point")?;
         for pair in sections.windows(2) {
             ensure!(pair[0].end() <= pair[1].addr, "the regions `{}` and `{}` overlap", pair[0].name, pair[1].name);
         }
@@ -404,12 +412,31 @@ impl Layout {
             symbol_names: machinery.into_iter().collect(),
             frames: Vec::new(),
             relative_targets: Vec::new(),
-            // An 8051 reads its constants and its switch tables from the code space.
-            data_in_code: self.machine == Machine::I8051,
+            // An 8051 reads its constants and its switch tables from the code space, a Cortex-M
+            // its literal pools and switch tables from among its code.
+            data_in_code: matches!(self.machine, Machine::I8051 | Machine::Thumb),
             banking,
             compiler: self.compiler,
         })
     }
+}
+
+/// Takes the vector table at the start of the lowest region of a Cortex-M out of the code, as a
+/// section of data of its own, and returns the handlers it names, reset first.
+fn split_vector_table(sections: &mut Vec<Section>) -> Result<Vec<u64>> {
+    let flash = sections.first_mut().filter(|section| section.executable).context("a Cortex-M's lowest region is its flash, which starts with the vector table and is executable")?;
+    let (length, handlers) = crate::thumb::vector_table(flash);
+    ensure!(!handlers.is_empty(), "the lowest region starts with no vector table: no handler after the stack pointer");
+    let code = flash.data.split_off(length as usize);
+    let table = Section { name: "vectors".to_string(), executable: false, ..std::mem::replace(flash, Section { name: flash.name.clone(), addr: flash.addr + length, data: code, file_offset: flash.file_offset.map(|offset| offset + length), executable: true, writable: flash.writable }) };
+    sections.insert(0, table);
+    let mut unique = Vec::new();
+    for handler in handlers {
+        if !unique.contains(&handler) {
+            unique.push(handler);
+        }
+    }
+    Ok(unique)
 }
 
 /// Loads the image the layout at `path` describes.

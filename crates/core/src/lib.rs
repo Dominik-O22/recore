@@ -31,6 +31,7 @@ pub mod signature;
 pub mod strings;
 pub mod sweep;
 pub mod swift;
+pub mod thumb;
 pub mod x86;
 
 pub use analysis::analyze;

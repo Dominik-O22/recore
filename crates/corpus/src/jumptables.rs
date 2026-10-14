@@ -323,6 +323,9 @@ fn direct_dispatches(instrs: &[Instruction], tables: &[Table]) -> BTreeMap<u64, 
 /// Derives jump-table truth for one binary, or `None` if nothing lists its jump tables.
 pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Option<Extracted>> {
     if recore::layout::is_layout(binary_path) {
+        if crate::truth::is_elf_of_raw(debug_path) {
+            return crate::truth::thumb::jump_tables(binary_path, debug_path);
+        }
         return crate::truth::sdcc::jump_tables(binary_path, &debug_path.with_extension("rst"));
     }
     let binary_data = std::fs::read(binary_path).with_context(|| format!("reading {binary_path:?}"))?;

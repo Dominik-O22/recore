@@ -61,7 +61,7 @@ pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u6
         Machine::X86 => x86(32, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS), true),
         Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS), true),
         Machine::Aarch64 => aarch64(bytes, start, end, Some(MIN_WORDS), true),
-        Machine::I8051 => None,
+        Machine::I8051 | Machine::Thumb => None,
     }
 }
 
@@ -87,8 +87,8 @@ fn whole(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u6
         Machine::X86 => x86(32, bytes, pointer_slots, start, end, None, numbers),
         Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, None, numbers),
         Machine::Aarch64 => aarch64(bytes, start, end, None, numbers),
-        // Not fingerprinted yet: nothing says which of its bytes are addresses.
-        Machine::I8051 => None,
+        // Not fingerprinted yet: nothing says which of their bytes are addresses.
+        Machine::I8051 | Machine::Thumb => None,
     }
 }
 

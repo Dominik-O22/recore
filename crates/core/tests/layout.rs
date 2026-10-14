@@ -168,3 +168,44 @@ fn a_layout_that_places_nothing_where_it_can_load_is_refused() {
         assert!(error.contains(message), "{name}: {error}");
     }
 }
+
+#[test]
+fn a_cortex_m_starts_at_the_handlers_its_vector_table_names() {
+    // At 0x08000000 the vector table: the stack pointer, reset at 0x08000010, a slot not in
+    // use, and a fault handler at 0x0800004A. Reset: PUSH {R4, LR}; LDR R0, =callback;
+    // BL install; MOVS R0, #2; BL choose; LDR R0, ="hello"; POP {R4, PC}; padding, and the two
+    // literals. At 0x0800002C install: BX LR. At 0x0800002E callback, which only the literal
+    // names: MOVS R0, #0; BX LR. At 0x08000032 choose: CMP R0, #2; BHI 0x08000048;
+    // TBB [PC, R0] and its three entries and a byte of padding; three cases, the last of which
+    // runs on into the BX LR the BHI goes to. At 0x0800004A the fault handler: B itself; then
+    // the text.
+    let bytes = [
+        0x00, 0x10, 0x00, 0x20, 0x11, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x4b, 0x00, 0x00, 0x08, 0x10, 0xb5, 0x04, 0x48, 0x00, 0xf0,
+        0x0a, 0xf8, 0x02, 0x20, 0x00, 0xf0, 0x0a, 0xf8, 0x02, 0x48, 0x10, 0xbd, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x08, 0x4c, 0x00, 0x00, 0x08,
+        0x70, 0x47, 0x00, 0x20, 0x70, 0x47, 0x02, 0x28, 0x08, 0xd8, 0xdf, 0xe8, 0x00, 0xf0, 0x02, 0x04, 0x06, 0x00, 0x0a, 0x20, 0x70, 0x47,
+        0x14, 0x20, 0x70, 0x47, 0x1e, 0x20, 0x70, 0x47, 0xfe, 0xe7, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x00,
+    ];
+    let layout = r#"
+        machine = "cortex-m"
+
+        [[region]]
+        file = "code.bin"
+        offset = 0
+        length = 82
+        address = 0x08000000
+        executable = true
+    "#;
+    let image = Image::load(&write("cortex-m", layout, &bytes)).unwrap();
+    assert_eq!((image.machine, image.entry, image.exports.as_slice()), (Machine::Thumb, 0x0800_0010, &[0x0800_004A][..]));
+    let sections: Vec<(&str, u64, bool)> = image.sections.iter().map(|section| (section.name.as_str(), section.addr, section.executable)).collect();
+    assert_eq!(sections, [("vectors", 0x0800_0000, false), ("code.bin+0x0", 0x0800_0010, true)]);
+    let analysis = recore::analyze(&image);
+    let functions: Vec<u64> = analysis.functions.iter().map(|function| function.addr).collect();
+    assert_eq!(functions, [0x0800_0010, 0x0800_002C, 0x0800_002E, 0x0800_0032, 0x0800_004A]);
+    // The literals are no part of reset's code, nor the table of choose's.
+    assert_eq!(analysis.functions[0].ranges, [(0x0800_0010, 0x0800_0022)]);
+    let tables: Vec<(u64, &[u64])> = analysis.jump_tables.iter().map(|table| (table.jump, table.targets.as_slice())).collect();
+    assert_eq!(tables, [(0x0800_0036, &[0x0800_003E, 0x0800_0042, 0x0800_0046][..])]);
+    let strings: Vec<(u64, &str)> = analysis.strings.iter().map(|string| (string.addr, string.text.as_str())).collect();
+    assert_eq!(strings, [(0x0800_004C, "hello")]);
+}

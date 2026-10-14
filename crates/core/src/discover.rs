@@ -39,7 +39,7 @@ const FOLLOWS_BREAK: u8 = 1;
 const ASKED_AS_START: u8 = 2;
 /// Something calls the address, takes it, exports it, or points to it from data.
 const REFERENCED: u8 = 4;
-/// The byte is part of a jump table that lies in the code after its jump.
+/// The byte is part of a jump table that lies in the code after its jump, or of a literal pool.
 const IN_TABLE: u8 = 8;
 
 /// The gap scan works through a section in pages of this many bytes.
@@ -140,8 +140,8 @@ pub struct Discovery {
     pub uncertain_refs: Vec<(u64, u64, bool)>,
     /// Every stretch of decoded instructions, as sorted `[start, end)` ranges.
     pub code: Vec<(u64, u64)>,
-    /// `[start, end)` of every jump table that lies in the code straight after its jump,
-    /// sorted. A function's code goes on after it.
+    /// `[start, end)` of every jump table that lies in the code straight after its jump, and of
+    /// every literal pool, sorted. A function's code goes on after either.
     pub inline_tables: Vec<(u64, u64)>,
 }
 
@@ -268,6 +268,10 @@ struct Explorer<'a, A: Arch> {
     recording: bool,
     /// How many tables without a bounds check a first pass has resolved.
     unbounded: u32,
+    /// `[start, end)` of the literals the code reads, in no order.
+    literals: Vec<(u64, u64)>,
+    /// Calls as `(from, to)`, kept where a call may be a jump: see [`Arch::CALL_MAY_BE_FAR_JUMP`].
+    calls: Vec<(u64, u64)>,
 }
 
 /// One decoder per section, made when first needed. Decoding starts in a new place for every
@@ -404,6 +408,10 @@ impl<'a, A: Arch> Explorer<'a, A> {
             A::seek(decoder, (start - section.addr) as usize);
             while let Some(decoded) = A::decode_next(decoder) {
                 let offset = (decoded.addr - section.addr) as usize;
+                // Code does not run on into its constants.
+                if A::LITERAL_POOLS && self.regions[index].flags[offset] & IN_TABLE != 0 {
+                    break;
+                }
                 if std::mem::replace(&mut self.regions[index].insn_len[offset], decoded.len.max(1)) != 0 {
                     // Decoded before, and to the same length.
                     if trusted {
@@ -415,12 +423,15 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 // between functions, not after a call that falls through.
                 let clock = self.clock;
                 self.regions[index].touch(offset, clock);
-                let Some(insn) = decoded.insn.filter(|insn| !(after_call && A::is_padding(insn))) else {
+                let Some(insn) = decoded.insn.filter(|insn| !(after_call && A::ends_code(insn))) else {
                     self.regions[index].insn_len[offset] = 0;
                     break;
                 };
                 after_call = false;
                 self.regions[index].cover(offset, usize::from(decoded.len.max(1)));
+                if let Some((start, end)) = A::literal(insn).filter(|_| !speculative) {
+                    self.mark_literal(start, end);
+                }
                 let Some(flow) = A::flow(insn, &state, self.image) else {
                     if let Some((base, data)) = A::based_data_address(insn, &state) {
                         let from_image_base = self.image.base != 0 && base == self.image.base;
@@ -436,9 +447,13 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     if self.recording {
                         self.note_references(insn, &state, decoded.addr, speculative);
                     }
-                    let taken = A::address_taken(insn, &state).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
+                    let mut taken = A::address_taken(insn, &state).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
+                    let in_code = taken.is_some_and(|target| self.region_index(target).is_some());
+                    if in_code && !A::code_pointer(self.image, taken.unwrap_or_default()) {
+                        taken = None;
+                    }
                     if let Some(target) = taken.filter(|_| !speculative) {
-                        if self.region_index(target).is_some() {
+                        if in_code {
                             self.add_start(target, Origin::AddressTaken);
                         } else {
                             self.data_refs.push(target);
@@ -467,6 +482,9 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 }
                 let ends_flow = match flow {
                     Flow::Call(target) => {
+                        if A::CALL_MAY_BE_FAR_JUMP && !speculative {
+                            self.calls.push((decoded.addr, target));
+                        }
                         if !speculative {
                             self.add_start(target, Origin::Call);
                         }
@@ -525,6 +543,21 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 }
             }
         }
+    }
+
+    /// Marks `[start, end)` as a literal the code reads, which is no instruction.
+    fn mark_literal(&mut self, start: u64, end: u64) {
+        let Some(index) = self.region_index(start) else { return };
+        let clock = self.clock;
+        let region = &mut self.regions[index];
+        let (from, to) = ((start - region.section.addr) as usize, ((end - region.section.addr) as usize).min(region.flags.len()));
+        if region.flags[from..to].iter().all(|flags| flags & IN_TABLE != 0) {
+            return;
+        }
+        region.flags[from..to].iter_mut().for_each(|flags| *flags |= IN_TABLE);
+        region.touch(from, clock);
+        region.touch(to - 1, clock);
+        self.literals.push((start, end));
     }
 
     /// Records the data that `insn`, at `at`, reads, writes or forms the address of, where
@@ -686,8 +719,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let Some(index) = self.region_index(addr) else { return false };
         let region = &self.regions[index];
         let offset = (addr - region.section.addr) as usize;
-        // Padding between functions is shorter than one alignment unit.
-        let earliest = offset.saturating_sub(A::FUNCTION_ALIGN as usize - 1);
+        let earliest = offset.saturating_sub(A::LONGEST_PADDING as usize);
         let pointer_size = self.image.machine.pointer_size() as usize;
         let after_table = |o: usize| {
             self.image.data_in_code && o >= pointer_size && self.pointer_slots.contains_key(&(region.section.addr + (o - pointer_size) as u64))
@@ -706,7 +738,13 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// count, otherwise one wrong guess would promote every jump that crosses it.
     fn promote_tail_calls(&mut self) -> bool {
         let strong = AddrSet::new(
-            self.starts.iter().filter(|(_, origin)| !matches!(origin, Origin::TailCall | Origin::GapAligned | Origin::GapEndbr)).map(|(&addr, _)| addr),
+            self.starts
+                .iter()
+                .filter(|(_, origin)| {
+                    !matches!(origin, Origin::TailCall | Origin::GapAligned | Origin::GapEndbr)
+                        && !(A::TAKEN_IS_WEAK && matches!(origin, Origin::AddressTaken | Origin::DataPointer))
+                })
+                .map(|(&addr, _)| addr),
         );
         let starts = AddrSet::new(self.starts.keys().copied());
         let mut promoted = Vec::new();
@@ -737,6 +775,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let labels_in_data = self.image.data_in_code;
         let is_weak = |addr: u64, origin: &Origin| match origin {
             Origin::TailCall | Origin::GapAligned | Origin::GapEndbr => true,
+            Origin::AddressTaken => A::TAKEN_IS_WEAK,
             Origin::DataPointer => labels_in_data || addr % A::FUNCTION_ALIGN != 0,
             _ => false,
         };
@@ -761,6 +800,75 @@ impl<'a, A: Arch> Explorer<'a, A> {
             self.starts.remove(addr);
         });
         !demoted.is_empty()
+    }
+
+    /// Takes each word among the code that is no instruction and holds the address of code with
+    /// the Thumb bit for a function: a table of handlers or a structure of callbacks in the
+    /// flash. Returns whether that found a new entry point.
+    fn seed_marked_pointers(&mut self) -> bool {
+        let before = self.starts.len();
+        let mut found = Vec::new();
+        for region in &self.regions {
+            let section = region.section;
+            let first = (section.addr.next_multiple_of(4) - section.addr) as usize;
+            for offset in (first..section.data.len().saturating_sub(3)).step_by(4) {
+                // Not code, nor a jump table, whose entries are labels, nor a literal, which the
+                // code that loads it has taken already.
+                let covered = (offset..offset + 4).any(|at| region.covered[at / 64] >> (at % 64) & 1 != 0 || region.flags[at] & IN_TABLE != 0);
+                let word = u64::from(u32::from_le_bytes(section.data[offset..offset + 4].try_into().unwrap()));
+                if !covered && word & 1 != 0 {
+                    found.push(word & !1);
+                }
+            }
+        }
+        for target in found {
+            if self.region_index(target).is_some() && A::code_pointer(self.image, target) {
+                self.add_start(target, Origin::DataPointer);
+            }
+        }
+        self.starts.len() != before
+    }
+
+    /// Whether the instruction before `addr` was decoded and runs on into it.
+    fn falls_into(&self, addr: u64) -> bool {
+        let Some(index) = self.region_index(addr) else { return false };
+        let region = &self.regions[index];
+        let offset = (addr - region.section.addr) as usize;
+        offset > 0 && !region.follows_break(offset) && region.covered[(offset - 1) / 64] >> ((offset - 1) % 64) & 1 != 0
+    }
+
+    /// Removes the entry points that only an address taken or a word in data speaks for, where
+    /// that is weak evidence, when code runs on into them: a number that lands inside a
+    /// function.
+    fn demote_taken_inside_code(&mut self) {
+        let weak = |origin: &Origin| matches!(origin, Origin::AddressTaken | Origin::DataPointer);
+        let inside: Vec<u64> = self.starts.iter().filter(|&(&addr, origin)| weak(origin) && self.falls_into(addr)).map(|(&addr, _)| addr).collect();
+        for addr in inside {
+            self.starts.remove(&addr);
+        }
+    }
+
+    /// Removes the entry points that only calls reach which are jumps within a function: no
+    /// other entry point lies between the call and where it goes, and the code before the
+    /// target runs on into it, as it does into a block and not into a function.
+    fn demote_far_jumps(&mut self) {
+        let mut calls_to: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for &(from, to) in &self.calls {
+            calls_to.entry(to).or_default().push(from);
+        }
+        calls_to.retain(|&to, _| self.starts.get(&to) == Some(&Origin::Call) && self.falls_into(to));
+        // Far jumps within one function lead to each other, and a guessed entry point between
+        // them may be a guess they led to.
+        let strong = |origin: &Origin| !matches!(origin, Origin::TailCall | Origin::GapAligned | Origin::GapEndbr | Origin::AddressTaken | Origin::DataPointer);
+        let starts = AddrSet::new(self.starts.iter().filter(|&(start, origin)| strong(origin) && !calls_to.contains_key(start)).map(|(&start, _)| start));
+        let jumps: Vec<u64> = calls_to
+            .into_iter()
+            .filter(|(to, sites)| sites.iter().all(|&from| if from < *to { !starts.any_in(from + 1, to - 1) } else { !starts.any_in(to + 1, from) }))
+            .map(|(to, _)| to)
+            .collect();
+        for to in jumps {
+            self.starts.remove(&to);
+        }
     }
 
     /// Removes entry points that are targets of a resolved jump table. A switch case or a
@@ -827,9 +935,10 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let known = |at: u64| ((at - section.addr) as usize) < section.data.len() && region.insn_len[(at - section.addr) as usize] != 0;
         let state = A::State::default();
         let mut decoder = A::decode(&section.data[(addr - section.addr) as usize..], addr);
+        let literal = |at: u64| A::LITERAL_POOLS && region.flags.get((at - section.addr) as usize).is_some_and(|flags| flags & IN_TABLE != 0);
         for decoded in decoder.by_ref().take(LONGEST) {
             let Some(insn) = decoded.insn else { return false };
-            let inside = (decoded.addr..decoded.next_addr()).any(|at| known(at) || self.pointer_slots.contains_key(&at));
+            let inside = (decoded.addr..decoded.next_addr()).any(|at| known(at) || literal(at) || self.pointer_slots.contains_key(&at));
             if inside || A::is_padding(&insn) || self.frame_of(decoded.addr).is_some() {
                 return false;
             }
@@ -1015,7 +1124,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     let decoder = decoders[index].get_or_insert_with(|| A::decoder(&section.data, section.addr));
                     A::seek(decoder, offset);
                     while let Some(decoded) = A::decode_next(decoder) {
-                        if self.regions[index].insn_len[(decoded.addr - section.addr) as usize] != 0 {
+                        let at = (decoded.addr - section.addr) as usize;
+                        if self.regions[index].insn_len[at] != 0 || A::LITERAL_POOLS && self.regions[index].flags[at] & IN_TABLE != 0 {
                             break;
                         }
                         scanned_to = decoded.next_addr();
@@ -1074,7 +1184,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                             && (unwound_elsewhere && self.is_whole_function(index, addr, false)
                                 || aligned && self.is_whole_function(index, addr, true)
                                 || A::TILES_GAPS && self.tiles_gap(index, addr));
-                        is_start = (aligned_after_break || opens || whole) && !self.inside_frame(addr);
+                        is_start = (aligned_after_break || opens || whole) && !self.inside_frame(addr) && A::code_pointer(self.image, addr);
                         if !is_start {
                             // Inside an unwind entry the bytes belong to a function, so they are
                             // worth decoding to resolve what they dispatch to, without taking
@@ -1142,9 +1252,25 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
     let code = explorer.code_ranges();
     let uncertain_refs = std::mem::take(&mut explorer.uncertain_ref_sites);
     let mut inline_tables: Vec<(u64, u64)> = explorer.tables.iter().filter_map(|(_, table)| Some((table.address, table.inline_end?))).collect();
+    inline_tables.extend(explorer.literals.iter().copied());
     inline_tables.sort_unstable();
     inline_tables.dedup();
+    if A::LITERAL_POOLS {
+        inline_tables = merge_touching(inline_tables);
+    }
     Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code, inline_tables }
+}
+
+/// Sorted ranges with those that overlap or touch joined, as literals back to back make one pool.
+fn merge_touching(ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
 /// What the image's relative relocations say, in the forms exploring looks them up.
@@ -1207,6 +1333,8 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         clock: 0,
         recording: true,
         unbounded: 0,
+        literals: Vec::new(),
+        calls: Vec::new(),
         data_sections: {
             // Zero-filled memory is data as much as what the file stores.
             let mut ranges: Vec<(u64, u64)> = image.sections.iter().filter(|s| !s.executable).map(|s| (s.addr, s.end())).chain(image.zero_filled.iter().copied()).collect();
@@ -1235,6 +1363,12 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         explorer.drain(&mut decoders);
     }
 
+    // Pointers in data are read once what the code reaches is decoded, so that it is not read
+    // as one, and before the gaps are, which may hold the data.
+    if A::MARKED_CODE_POINTERS && explorer.seed_marked_pointers() {
+        let _phase = phase::scope("discover/drain");
+        explorer.drain(&mut decoders);
+    }
     loop {
         let promoted = {
             let _phase = phase::scope("discover/promote tail calls");
@@ -1260,6 +1394,17 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
     explorer.demote_case_targets();
     while explorer.demote_crossed_starts() {}
     explorer.demote_frame_borrowers();
+    // What these remove may have been all that kept a jump across an entry point from
+    // showing it as a guess.
+    if A::CALL_MAY_BE_FAR_JUMP || A::TAKEN_IS_WEAK {
+        if A::CALL_MAY_BE_FAR_JUMP {
+            explorer.demote_far_jumps();
+        }
+        if A::TAKEN_IS_WEAK {
+            explorer.demote_taken_inside_code();
+        }
+        while explorer.demote_crossed_starts() {}
+    }
 
     explorer
 }
