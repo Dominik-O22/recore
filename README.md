@@ -2,21 +2,20 @@
 
 Binary analysis built for AI agents. recore gets a compiled program ready to query more than 1,000 times faster than Ghidra, and serves it over the Model Context Protocol with no JVM, no GUI and no project database.
 
-| 252 binaries, ELF and Windows PE | Time to analyze all of them |
+| 328 binaries, ELF and Windows PE | Time to analyze all of them |
 |---|---|
-| Ghidra 12.1.4, headless, 4 cores each | 4 hours 30 minutes |
-| recore, one thread | 12.1 seconds |
+| Ghidra 12.1.4, headless, 4 cores each | 5 hours 34 minutes |
 | recore, 16 cores | 8.0 seconds |
 
-That is 1,338 times faster overall, and 881 times for the median binary. The Ghidra figure is its own reported analysis time, without JVM startup or import. The recore figure is a whole new process, from launch to answer.
+That is 2,500 times faster overall, 1,089 times for the median binary, and up to 25,700 times for `eza`, which takes Ghidra 830 s and recore 32 ms. The Ghidra figure is its own reported analysis time, without JVM startup or import, which add 2 to 6 s a binary. The recore figure is a whole new process, from launch to answer. Pinned to a single core while Ghidra keeps its four, recore still takes 22 seconds for all of them, 900 times faster.
 
 Most of Ghidra's time goes to two jobs: 44% to recovering jump tables, for which it runs its decompiler on every function that has one, and 16% to finding the functions that never return. recore settles both during its one pass over the code.
 
 | Binary | Ghidra | recore |
 |---|---|---|
-| `git.exe`, 64-bit, 7,672 functions | 433 s | 0.19 s |
-| `obs-browser.dll`, 64-bit | 21 s | 0.036 s |
-| `bzip2.exe`, 64-bit | 7 s | 0.005 s |
+| `git.exe`, 64-bit, 7,672 functions | 433 s | 0.08 s |
+| `obs-browser.dll`, 64-bit | 20 s | 0.02 s |
+| `bzip2.exe`, 64-bit | 6 s | 0.004 s |
 | coconutBattery, Swift and Objective-C, macOS | 76 s at best, 40 minute timeout by default | 0.028 s |
 
 The last row is from [an issue on the REA project](https://github.com/morluto/rea/issues/1783), where Ghidra's Objective-C analyzer stalls. Those Ghidra times are from the reporter's machine. recore resolves the selector of 4,293 of that program's 4,294 message sends in the same 28 ms.
@@ -205,7 +204,7 @@ For Claude Code, in `.mcp.json`:
 
 The corpora are not in the repository. `corpus/fetch*.py` download them, `corpus/build_8051.py` builds the 8051 programs with SDCC, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. `recore-bench run analysis --save <name>` and `--compare <name>` hold a change against an earlier build. Next to the times they report the processor instructions executed, which stay the same to a few hundredths of a percent whatever else the machine is doing.
 
-The speed table compares Ghidra's `Total Time` per binary with the wall time of `recore-mcp summary`, fastest of three runs. Both ran on the same Ryzen 7 9850X3D. Ghidra analyzed several binaries at a time with 4 cores each, and recore one at a time.
+The speed table compares Ghidra's `Total Time` per binary with the wall time of `recore-mcp summary`, fastest of three runs, and `ghidra/speed.py` measures it. Both ran on the same Ryzen 7 9850X3D. Ghidra analyzed several binaries at a time with 4 cores each, and recore one at a time, with all cores or pinned to one with `taskset`.
 
 | Directory | Contents |
 |---|---|
