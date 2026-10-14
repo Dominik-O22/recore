@@ -332,6 +332,7 @@ struct RdSession {
   bool print_c = true;
   bool keep_prototypes = false;
   bool kept_are_lower_bounds = true;  // see rd_keep_prototypes_exact
+  bool result_in_first_argument = false;  // see rd_result_in_first_argument
   bool want_flow = false;
   bool want_addresses = false;
   set<uint64_t> kept;  // functions whose prototype this session locked
@@ -985,6 +986,9 @@ int rd_call_switches(RdSession *session, uint64_t call, const char *selector, co
 // to: the first function then ends in a call to the second and a return. Without this such
 // flow is cut off, as what follows a call that was not known to never return.
 void rd_functions_run_on(RdSession *session, int on) { session->image->functions_run_on = on != 0; }
+
+// Says that the convention returns a result in the register it passes the first argument in.
+void rd_result_in_first_argument(RdSession *session, int shared) { session->result_in_first_argument = shared != 0; }
 
 // Says that `len` bytes of data follow the call at `call`, and that it returns past them.
 void rd_call_skips(RdSession *session, uint64_t call, uint64_t len) { session->image->data_after[call] = (int4)len; }
@@ -1791,9 +1795,10 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       session->kept.insert(addr);
     }
   }
-  if (fd != nullptr && session->returns_like.erase(addr) != 0 && !session->keep_prototypes) {
+  if (fd != nullptr && session->returns_like.erase(addr) != 0 && !session->keep_prototypes &&
+      session->result_in_first_argument) {
     // A prototype is kept whole or not at all. The engine does not look for an argument of a
-    // call in the place the call is known to return in, and where a convention returns in the
+    // call in the place the call is known to return in, so where the convention returns in the
     // register of its first argument, a result kept without the parameters costs every call
     // that argument.
     fd->getFuncProto().setOutputLock(false);
