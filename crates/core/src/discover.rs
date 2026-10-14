@@ -254,6 +254,10 @@ struct Explorer<'a, A: Arch> {
     clock: u32,
     /// `[start, end)` of every section that holds no code, sorted.
     data_sections: Vec<(u64, u64)>,
+    /// Where each stretch begins of the last gap found to divide into functions, in order.
+    /// The gap search comes to them one after the other, and each holds as the gap did, so
+    /// the gap is decoded once and not once for each.
+    tiled: Vec<u64>,
 }
 
 impl<A: Arch> Explorer<'_, A> {
@@ -818,11 +822,18 @@ impl<A: Arch> Explorer<'_, A> {
     /// ends in a return or a jump, the last of them where the known code begins, every jump
     /// lands on one of the instructions or on known code, and every call on a function. A
     /// stretch of a single return has to be one the code before it jumps to. Bytes that are
-    /// data seldom do all of that.
-    fn tiles_gap(&self, index: usize, addr: u64) -> bool {
+    /// data seldom do all of that. Fill after the last stretch, one byte repeated to the end
+    /// of the region, is left over as no function. Fill that stops short of the end is not
+    /// told from code, as 0x00 and 0xFF are instructions.
+    fn tiles_gap(&mut self, index: usize, addr: u64) -> bool {
+        if self.tiled.binary_search(&addr).is_ok() {
+            return true;
+        }
         let region = &self.regions[index];
         let section = region.section;
         let known = |at: u64| self.region_index(at).is_some_and(|index| self.regions[index].insn_len[(at - self.regions[index].section.addr) as usize] != 0);
+        // Erased flash reads 0xFF, and a linker pads a bank to its size with 0x00.
+        let is_fill = |byte: &u8| matches!(byte, 0x00 | 0xFF);
         let state = A::State::default();
         // Where each instruction and each stretch begins, in order, and where the code goes.
         let (mut instructions, mut stretches, mut jumps, mut calls) = (Vec::new(), vec![addr], Vec::new(), Vec::new());
@@ -857,18 +868,32 @@ impl<A: Arch> Explorer<'_, A> {
                 Some(Flow::CallIndirect(_)) | None => false,
             };
             if ended {
-                // A lone `ret` is more often the tail of the function before it.
+                // A stretch of under three bytes is a lone 8051 `RET` or `SJMP`/`AJMP`, more often
+                // the tail of the function before it.
                 if decoded.next_addr() - stretches[stretches.len() - 1] < 3 {
                     tails.push(stretches[stretches.len() - 1]);
                 }
-                stretches.push(decoded.next_addr());
+                let next = decoded.next_addr();
+                let rest = &section.data[(next - section.addr) as usize..];
+                // Each fill byte is looked at here once: if the fill stops short, the stretch
+                // that follows is decoded past it.
+                let filled = rest.first().is_some_and(|&fill| is_fill(&fill) && rest.iter().all(|&byte| byte == fill) && (next..section.end()).all(|at| !known(at)));
+                if filled {
+                    break;
+                }
+                stretches.push(next);
             }
         }
         // Here it is that tail only if the code before it jumps to it.
-        ended
-            && tails.iter().all(|tail| *tail != addr && jumps.contains(tail))
+        jumps.sort_unstable();
+        let tiles = ended
+            && tails.iter().all(|tail| *tail != addr && jumps.binary_search(tail).is_ok())
             && jumps.iter().all(|target| instructions.binary_search(target).is_ok() || known(*target))
-            && calls.iter().all(|target| self.starts.contains_key(target) || stretches.binary_search(target).is_ok())
+            && calls.iter().all(|target| self.starts.contains_key(target) || stretches.binary_search(target).is_ok());
+        if tiles {
+            self.tiled = stretches;
+        }
+        tiles
     }
 
     fn in_table(&self, addr: u64) -> bool {
@@ -1143,6 +1168,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
             ranges.sort_unstable();
             ranges
         },
+        tiled: Vec::new(),
     };
 
     drop(_phase);
