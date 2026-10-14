@@ -275,6 +275,10 @@ enum Value {
     PcIndexed { base: u32, limit: Option<Limit>, shift: u8 },
     /// An entry of a table, of `size` bytes, shifted left.
     Entry { table: u32, size: u8, limit: Option<Limit>, shift: u8 },
+    /// A word popped off the stack, which a branch through returns: code that saved registers
+    /// beside the return address pops that into a low register when it cannot pop it into PC,
+    /// as Thumb-1 code after a frame of variable arguments does.
+    Popped,
 }
 
 // A state is copied at every branch that is followed, so its size is part of the analysis time.
@@ -436,6 +440,9 @@ impl State {
                 // POP; extend and reverse bytes.
                 if hw1 & 0xFE00 == 0xBC00 {
                     self.clobber(hw1 & 0xFF);
+                    for register in (0..8).filter(|register| hw1 >> register & 1 != 0) {
+                        self.registers[register] = Value::Popped;
+                    }
                 } else if matches!(hw1 & 0xFF00, 0xB200 | 0xBA00) {
                     self.set(rd, Value::Unknown);
                 }
@@ -596,6 +603,23 @@ pub fn vector_table(flash: &Section) -> (u64, Vec<u64>) {
     (length, handlers)
 }
 
+/// The branches through a register in `[start, end)` that return, through the word the code
+/// popped off the stack: where the engine sees an indirect jump it cannot follow.
+pub fn returns_through_register(image: &Image, start: u64, end: u64) -> Vec<u64> {
+    let Some(bytes) = image.bytes_from(start) else { return Vec::new() };
+    let mut state = State::default();
+    let mut found = Vec::new();
+    for insn in Thumb::decode(bytes, start).take_while(|decoded| decoded.addr < end).filter_map(|decoded| decoded.insn) {
+        match (Thumb::flow(&insn, &state, image), insn.high()) {
+            (Some(Flow::Return), Some((2 | 3, _, rm))) if rm != LR => found.push(insn.addr),
+            (Some(Flow::Call(_) | Flow::CallIndirect(_)), _) => state.clobber(CALLER_SAVED),
+            (Some(_), _) => state = State::default(),
+            (None, _) => state.step(insn),
+        }
+    }
+    found
+}
+
 /// Thumb code of a Cortex-M.
 pub struct Thumb;
 
@@ -703,6 +727,7 @@ impl Arch for Thumb {
             Value::Const(value) if value & 1 != 0 => Some(u64::from(value & !1)),
             _ => None,
         };
+        let popped = |register: usize| state.registers[register] == Value::Popped;
         if let Some((target, transfer)) = insn.direct() {
             // Unoptimised code jumps to the next instruction with the short `B`, which goes
             // nowhere a fall through would not. A tail call to the next function is a `B.W`.
@@ -731,6 +756,7 @@ impl Arch for Thumb {
         } else if let Some((operation, rd, rm)) = insn.high() {
             match (operation, rd, rm) {
                 (3, _, LR) | (2, PC, LR) => Flow::Return,
+                (3, _, rm) | (2, PC, rm) if popped(rm) => Flow::Return,
                 (3, _, _) | (2, PC, _) => constant(rm).map_or(Flow::JumpIndirect(None), Flow::Jump),
                 (0, PC, _) => Flow::JumpIndirect(None),
                 _ => return None,
@@ -883,6 +909,24 @@ impl Arch for Thumb {
             return offset >= ARGUMENTS;
         }
         false
+    }
+
+    /// The argument register the instruction writes, the lowest of R0 to R3 it writes, and the
+    /// address it completes there.
+    fn argument_write(insn: &Insn, state: &State) -> Option<(usize, Option<u64>)> {
+        let mut after = *state;
+        after.written = 0;
+        after.apply(*insn);
+        let position = (after.written & 0xF).trailing_zeros() as usize;
+        (position < 4).then(|| (position, Self::completed_address(insn, state).map(u64::from)))
+    }
+
+    /// Space made on the stack below the arguments there before anything is saved, which the
+    /// registers that carry the first arguments are stored into, so that all lie in a row for
+    /// `va_arg`: `SUB SP, #4` to `#12` first, or a `PUSH` of R1 to R3 alone.
+    fn takes_variable_arguments(insns: &[Insn]) -> bool {
+        let Some(first) = insns.first().filter(|first| !first.wide()) else { return false };
+        matches!(first.hw1, 0xB081..=0xB083) || first.hw1 & 0xFF00 == 0xB400 && first.hw1 & 0xF0 == 0 && first.hw1 & 0x08 != 0
     }
 
     fn opens_landing_pad(_: &Insn) -> bool {
@@ -1041,6 +1085,8 @@ mod tests {
             (&[0xBF04, 0xBD10, 0xE7FE], 0x1000, &[(2, None), (2, None), (2, Some(Branch(0x1004)))]),
             // LDR R3, [PC, #0]; BLX R3: a call of the function whose address is the literal.
             (&[0x4B00, 0x4798, 0x0035, 0x0000], 0x1000, &[(2, None), (2, Some(Call(0x0034))), (2, None), (2, None)]),
+            // POP {R4}; POP {R1}; ADD SP, #12; BX R1: a return through the popped word.
+            (&[0xBC10, 0xBC02, 0xB003, 0x4708], 0, &[(2, None), (2, None), (2, None), (2, Some(Return))]),
             // MOVW R0, #0x1235; MOVT R0, #0x0800; BX R0: a jump to 0x08001234.
             (&[0xF241, 0x2035, 0xF6C0, 0x0000, 0x4700], 0, &[(4, None), (4, None), (2, Some(Jump(0x0800_1234)))]),
         ];

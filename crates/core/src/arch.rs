@@ -283,9 +283,9 @@ pub trait Arch: 'static {
     }
 
     /// The register argument `insn` writes, by its position among the arguments, and the address
-    /// it puts there when it puts a fixed one: how a call's string arguments are told before
-    /// the function is decompiled.
-    fn argument_write(_insn: &Self::Insn) -> Option<(usize, Option<u64>)> {
+    /// it puts there when it puts a fixed one, given the state before it: how a call's string
+    /// arguments are told before the function is decompiled.
+    fn argument_write(_insn: &Self::Insn, _state: &Self::State) -> Option<(usize, Option<u64>)> {
         None
     }
 

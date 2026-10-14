@@ -73,6 +73,9 @@ pub struct Facts {
     /// [`crate::Session::set_storage`] takes it: a library routine as [`recore::library::Routine::storage`] has it, and a
     /// function of C51 code as its use of the registers says.
     pub storage: Vec<(u64, String)>,
+    /// `(function, jump)`: a branch through a register that returns, which recore reads from
+    /// the stack it was popped off, and the engine would take for a jump it cannot follow.
+    pub returns: Vec<(u64, u64)>,
 }
 
 /// A call to a library routine that jumps on to one of several places and does not return.
@@ -236,7 +239,15 @@ impl Facts {
                 facts.jump_tables.extend(jumps.map(|(index, _)| (owner, index)));
             }
         }
-        for list in [&mut facts.tail_calls, &mut facts.own_entries] {
+        if image.machine == Machine::Thumb {
+            for function in &analysis.functions {
+                let owner = function.fragment_of.unwrap_or(function.addr);
+                for &(start, end) in &function.ranges {
+                    facts.returns.extend(recore::thumb::returns_through_register(image, start, end).into_iter().map(|jump| (owner, jump)));
+                }
+            }
+        }
+        for list in [&mut facts.tail_calls, &mut facts.own_entries, &mut facts.returns] {
             list.sort_unstable();
             list.dedup();
         }

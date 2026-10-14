@@ -16,6 +16,9 @@ pub struct Function {
     /// Source-level parameters: `DW_TAG_formal_parameter` children of the `DW_TAG_subprogram`.
     pub params: usize,
     pub variadic: bool,
+    /// Whether the function's unit is C. Rust's compiler builtins list no parameters for the
+    /// functions that only call one inlined into them.
+    pub c: bool,
 }
 
 /// The parts of a debug file that signature comparisons need.
@@ -49,6 +52,12 @@ impl DebugInfo {
         let mut units = dwarf.units();
         while let Some(header) = units.next()? {
             let unit = dwarf.unit(header)?;
+            let c = {
+                let mut entries = unit.entries();
+                let root = entries.next_dfs()?;
+                let language = root.and_then(|root| root.attr_value(gimli::DW_AT_language));
+                matches!(language, Some(gimli::AttributeValue::Language(gimli::DW_LANG_C89 | gimli::DW_LANG_C99 | gimli::DW_LANG_C11 | gimli::DW_LANG_C17 | gimli::DW_LANG_C)))
+            };
             // Subprograms enclosing the current entry, as (depth, address); the address is `None`
             // for declarations and abstract instances, whose parameters do not count.
             let mut open: Vec<(isize, Option<u64>)> = Vec::new();
@@ -66,7 +75,7 @@ impl DebugInfo {
                         }
                         .filter(|&addr| addr != 0);
                         if let Some(addr) = addr {
-                            functions.insert(addr, Function { params: 0, variadic: false });
+                            functions.insert(addr, Function { params: 0, variadic: false, c });
                         }
                         open.push((entry.depth(), addr));
                     }
