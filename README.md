@@ -151,12 +151,12 @@ common = [[0x0000, 0x4000]]
 
 [[banking.trampoline]]
 entry = "90 hh ll 02 ss ss"
-stub = "e5 49 c0 e0 02 46 .."
+stub = "e5 2a c0 e0 02 31 .."
 ```
 
 An 8051 addresses 64 KB of code, and larger programs switch banks. recore gives each bank its own range of addresses, loads the code the banks share once, and reads a call through a bank-switching trampoline as a call of the function it reaches. The trampolines are byte patterns in the layout, so a compiler's scheme is data and not code.
 
-What is not yet known can be left open. `recore sweep` then finds which bank each region is, which ranges the banks share and which trampoline scheme the image uses, and writes the completed layout. It ranks candidates by a score that needs no ground truth, which counts where jumps and calls between regions land. On three banked programs of the corpus below and on a 1.1 MB monitor firmware built with Keil C51, with the answers withheld, it places every bank correctly: 3 banks in under 45 ms and 17 banks in 250 ms. Against 124 deliberately wrong layouts of the corpus programs, the right one scores higher in all 113 that change the analysis. The sweep knows two trampoline schemes, Keil's and SDCC's, and does not search for a region's load address.
+What is not yet known can be left open. `recore sweep` then finds which bank each region is, which ranges the banks share and which trampoline scheme the image uses, and writes the completed layout. It ranks candidates by a score that needs no ground truth, which counts where jumps and calls between regions land. On three banked programs of the corpus below and on a 1.1 MB monitor firmware built with Keil C51, with the answers withheld, it places every bank correctly: 3 banks in about 10 ms and 17 banks in 205 ms. Against 122 deliberately wrong layouts of the corpus programs, the right one scores higher in all 111 that change the analysis. The sweep knows two trampoline schemes: SDCC's, and Keil's in every configuration of its bank switch whose table uses `LJMP`. It does not search for a region's load address.
 
 Scored against the debug records of 24 open source programs built with SDCC, 21 of which Ghidra can load as one flat image. Both tools start from the same entry points.
 
@@ -169,9 +169,9 @@ Most of Ghidra's wrong starts are inside SDCC's `printf`, which it cuts into abo
 
 The monitor firmware, 17 banks of Keil C51 code, analyzes in 40 ms: 10,537 functions, 529 jump tables and 1,561 trampolines. An emulator that ran 40% of its instructions executed no byte that recore had not listed as code and called no address that recore had not found as a function. Every function decompiles, in 1.4 ms on average.
 
-The decompiler names the compiler's library routines by a hash of their code, so a call of Keil's 32-bit divide reads as a division. It takes its calling convention from the layout's `compiler`. Against SDCC's debug records it gets the parameters of 54.3% of functions right and whether they return a value for 86.6%. That is well short of the Windows figures above. Two-byte values that the code builds from single bytes still print as `CONCAT11(high,low)` in half of SDCC's functions and a fifth of Keil's.
+The decompiler names the compiler's library routines by a hash of their code, so a call of Keil's 32-bit divide reads as a division. It takes its calling convention from the layout's `compiler`. Against SDCC's debug records it gets the parameters of 54.2% of functions right and whether they return a value for 83.8%. That is well short of the Windows figures above. Two-byte values that the code builds from single bytes still print as `CONCAT11(high,low)` in half of SDCC's functions and a fifth of Keil's.
 
-A `names` file gives the hardware's registers their names, the standard 8051 ones are built in, and `recore-mcp unnamed` lists the addresses the code uses most that have none. Text is found where it is stored as ASCII. A firmware that stores its menu as indices into its own font, as the monitor's does, shows none of that text.
+A `names` file gives the hardware's registers and bits their names, the standard 8051 ones are built in, and `recore-mcp unnamed` lists the addresses the code uses most that have none. Text is found where it is stored as ASCII. A firmware that stores its menu as indices into its own font, as the monitor's does, shows none of that text.
 
 ## What Ghidra does that recore does not
 
