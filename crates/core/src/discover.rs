@@ -1013,11 +1013,13 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// Whether the unreached bytes from `addr` to the next known code divide into functions with
     /// nothing left over: decoded one after the other they are all instructions, each stretch
     /// ends in a return or a jump, the last of them where the known code begins, every jump
-    /// lands on one of the instructions or on known code, and every call on a function. A
+    /// lands on one of the instructions or on code, and every call on a function or on code
+    /// that nothing has reached yet, which may be a function of another such gap. A
     /// stretch of a single return has to be one the code before it jumps to. Bytes that are
-    /// data seldom do all of that. Fill after the last stretch, one byte repeated to the end
-    /// of the region, is left over as no function. Fill that stops short of the end is not
-    /// told from code, as 0x00 and 0xFF are instructions.
+    /// data seldom do all of that. Between stretches, padding and the literal pools that the
+    /// stretches read are no stretch. Fill after the last stretch, one byte repeated to the end
+    /// of the region, is left over as no function. Where 0x00 and 0xFF are instructions and
+    /// not padding, fill that stops short of the end is not told from code.
     fn tiles_gap(&mut self, index: usize, addr: u64) -> bool {
         if self.tiled.binary_search(&addr).is_ok() {
             return true;
@@ -1032,57 +1034,86 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let (mut instructions, mut stretches, mut jumps, mut calls) = (Vec::new(), vec![addr], Vec::new(), Vec::new());
         // The stretches too short to be functions.
         let mut tails = Vec::new();
+        // `[start, end)` of the literals the stretches read.
+        let mut pools: Vec<(u64, u64)> = Vec::new();
         let mut ended = false;
-        for decoded in A::decode(&section.data[(addr - section.addr) as usize..], addr) {
-            if known(decoded.addr) {
-                break;
-            }
-            let Some(insn) = decoded.insn else { return false };
-            let covers = (decoded.addr - section.addr) as usize..(decoded.next_addr() - section.addr) as usize;
-            if (decoded.addr + 1..decoded.next_addr()).any(known) || region.flags[covers].iter().any(|flags| flags & IN_TABLE != 0) {
-                return false;
-            }
-            instructions.push(decoded.addr);
-            ended = match A::flow(&insn, &state, self.image) {
-                Some(Flow::Halt) => return false,
-                Some(Flow::Call(target)) => {
-                    calls.push(target);
-                    false
+        // Where decoding starts again past a literal pool.
+        let mut resume = Some(addr);
+        'gap: while let Some(from) = resume.take() {
+            for decoded in A::decode(&section.data[(from - section.addr) as usize..], from) {
+                if known(decoded.addr) {
+                    break 'gap;
                 }
-                Some(Flow::Branch(target)) => {
-                    jumps.push(target);
-                    false
+                let between = ended && decoded.addr == stretches[stretches.len() - 1];
+                let pool = pools.iter().find(|&&(start, end)| start < decoded.next_addr() && decoded.addr < end).copied();
+                if let Some((start, end)) = pool {
+                    if !between || start > decoded.addr {
+                        return false;
+                    }
+                    *stretches.last_mut().unwrap() = end;
+                    resume = Some(end);
+                    continue 'gap;
                 }
-                Some(Flow::Jump(target)) => {
-                    jumps.push(target);
-                    true
+                let Some(insn) = decoded.insn else { return false };
+                let covers = (decoded.addr - section.addr) as usize..(decoded.next_addr() - section.addr) as usize;
+                if (decoded.addr + 1..decoded.next_addr()).any(known) || region.flags[covers].iter().any(|flags| flags & IN_TABLE != 0) {
+                    return false;
                 }
-                Some(Flow::Return | Flow::JumpIndirect(_)) => true,
-                Some(Flow::CallIndirect(_)) | None => false,
-            };
-            if ended {
-                // A stretch of under three bytes is a lone 8051 `RET` or `SJMP`/`AJMP`, more often
-                // the tail of the function before it.
-                if decoded.next_addr() - stretches[stretches.len() - 1] < 3 {
-                    tails.push(stretches[stretches.len() - 1]);
+                if between && A::is_padding(&insn) {
+                    *stretches.last_mut().unwrap() = decoded.next_addr();
+                    continue;
                 }
-                let next = decoded.next_addr();
-                let rest = &section.data[(next - section.addr) as usize..];
-                // Each fill byte is looked at here once: if the fill stops short, the stretch
-                // that follows is decoded past it.
-                let filled = rest.first().is_some_and(|&fill| is_fill(&fill) && rest.iter().all(|&byte| byte == fill) && (next..section.end()).all(|at| !known(at)));
-                if filled {
-                    break;
+                instructions.push(decoded.addr);
+                if let Some(literal) = A::literal(&insn) {
+                    pools.push(literal);
                 }
-                stretches.push(next);
+                ended = match A::flow(&insn, &state, self.image) {
+                    Some(Flow::Halt) => return false,
+                    Some(Flow::Call(target)) => {
+                        calls.push(target);
+                        false
+                    }
+                    Some(Flow::Branch(target)) => {
+                        jumps.push(target);
+                        false
+                    }
+                    Some(Flow::Jump(target)) => {
+                        jumps.push(target);
+                        true
+                    }
+                    Some(Flow::Return | Flow::JumpIndirect(_)) => true,
+                    Some(Flow::CallIndirect(_)) | None => false,
+                };
+                if ended {
+                    if decoded.next_addr() - stretches[stretches.len() - 1] < A::SHORTEST_TILE {
+                        tails.push(stretches[stretches.len() - 1]);
+                    }
+                    let next = decoded.next_addr();
+                    let rest = &section.data[(next - section.addr) as usize..];
+                    // Each fill byte is looked at here once: if the fill stops short, the stretch
+                    // that follows is decoded past it.
+                    let filled = rest.first().is_some_and(|&fill| is_fill(&fill) && rest.iter().all(|&byte| byte == fill) && (next..section.end()).all(|at| !known(at)));
+                    if filled {
+                        break 'gap;
+                    }
+                    stretches.push(next);
+                }
             }
         }
         // Here it is that tail only if the code before it jumps to it.
         jumps.sort_unstable();
+        // What nothing calls may call or jump to what nothing else calls either, in a gap the
+        // search comes to later.
+        let unreached = |at: u64| {
+            self.region_index(at).is_some_and(|index| {
+                let offset = (at - self.regions[index].section.addr) as usize;
+                self.regions[index].insn_len[offset] == 0 && self.regions[index].flags[offset] & IN_TABLE == 0
+            })
+        };
         let tiles = ended
             && tails.iter().all(|tail| *tail != addr && jumps.binary_search(tail).is_ok())
-            && jumps.iter().all(|target| instructions.binary_search(target).is_ok() || known(*target))
-            && calls.iter().all(|target| self.starts.contains_key(target) || stretches.binary_search(target).is_ok());
+            && jumps.iter().all(|target| instructions.binary_search(target).is_ok() || known(*target) || unreached(*target))
+            && calls.iter().all(|target| self.starts.contains_key(target) || stretches.binary_search(target).is_ok() || unreached(*target));
         if tiles {
             self.tiled = stretches;
         }
@@ -1233,9 +1264,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         let unwound_elsewhere = !self.frames.is_empty() && self.frame_of(addr).is_none();
                         let whole = after_break
                             && (unwound_elsewhere && self.is_whole_function(index, addr, false)
-                                || aligned && self.is_whole_function(index, addr, true)
-                                || A::TILES_GAPS && self.tiles_gap(index, addr));
-                        is_start = (aligned_after_break || opens || whole) && !self.inside_frame(addr) && A::code_pointer(self.image, addr);
+                                || aligned && self.is_whole_function(index, addr, true));
+                        // A whole function, or a gap that divides into functions, is code
+                        // whatever its first instructions look like.
+                        let tiled = after_break && !whole && A::TILES_GAPS && self.tiles_gap(index, addr);
+                        is_start = (aligned_after_break || opens || whole || tiled) && !self.inside_frame(addr) && (whole || tiled || A::code_pointer(self.image, addr));
                         if !is_start {
                             // Inside an unwind entry the bytes belong to a function, so they are
                             // worth decoding to resolve what they dispatch to, without taking

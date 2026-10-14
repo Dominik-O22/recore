@@ -135,8 +135,13 @@ pub trait Arch: 'static {
 
     /// Whether unreached code counts as functions on the strength of dividing into them with
     /// nothing left over, for a machine whose code shows no other sign of where one starts:
-    /// no alignment, no padding between functions, no common opening.
+    /// no alignment, no padding between functions, no opening that every function has.
     const TILES_GAPS: bool = false;
+
+    /// Where [`Arch::TILES_GAPS`], the fewest bytes of a stretch that is a function on its own.
+    /// A shorter one, a lone 8051 `RET` or `SJMP`, is more often the tail of the function before
+    /// it, and only counts where that code jumps to it.
+    const SHORTEST_TILE: u64 = 3;
 
     /// Whether the program keeps its text among the code, as a machine does whose code space
     /// is the only memory that holds anything when it starts.
