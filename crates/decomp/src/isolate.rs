@@ -203,9 +203,11 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     // Data the image has a name for, such as a variable a library exports, goes by that name
     // in the C. An edit, which follows, has the last word.
     let is_function = |addr: u64| analysis.functions.binary_search_by_key(&addr, |function| function.addr).is_ok();
+    // A Cortex-M's registers, the system's and a device's, are words.
+    let register = (image.machine == Machine::Thumb).then_some("uint");
     for (&addr, name) in image.symbol_names.iter().filter(|(addr, _)| !is_function(**addr) && !image.is_code(**addr)) {
         // One the engine does not take is only left without its name.
-        let _ = session.add_global(addr, name, None);
+        let _ = session.add_global(addr, name, register.filter(|_| image.is_zero_filled(addr)));
     }
     for (addr, name, kind) in edits.globals(&analysis) {
         if let Err(error) = session.add_global(addr, &name, kind) {

@@ -397,6 +397,11 @@ impl Layout {
         }
         exports.sort_unstable();
         exports.dedup();
+        let zero_filled = match self.machine {
+            Machine::I8051 => crate::i8051::memory(),
+            Machine::Thumb => crate::thumb::memory(&sections),
+            _ => Vec::new(),
+        };
 
         Ok(Image {
             name,
@@ -406,7 +411,7 @@ impl Layout {
             branch_targets_marked: false,
             entry,
             sections,
-            zero_filled: if self.machine == Machine::I8051 { crate::i8051::memory() } else { Vec::new() },
+            zero_filled,
             import_slots: FxHashMap::default(),
             exports,
             symbol_names: machinery.into_iter().collect(),

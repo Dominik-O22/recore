@@ -575,6 +575,56 @@ fn read_table(image: &Image, table: u64, size: u64, limit: Option<Limit>, cases:
     (!entries.is_empty()).then_some(Table { address: table, entry_size: size, entries, bounded: limit.is_some(), inline_end: Some(end) })
 }
 
+/// The parts of a Cortex-M's address space that the architecture sets aside for data, by
+/// `[start, end)` and what each is for. Below them is the code, which the image holds.
+pub const MEMORY: [(u64, u64, &str); 5] = [
+    (0x2000_0000, 0x4000_0000, "SRAM"),
+    (0x4000_0000, 0x6000_0000, "peripherals"),
+    (0x6000_0000, 0xA000_0000, "external RAM"),
+    (0xA000_0000, 0xE000_0000, "external devices"),
+    (0xE000_0000, 0x1_0000_0000, "system"),
+];
+
+/// `[start, end)` of the memory a Cortex-M program has besides what `sections` load: what it
+/// reaches by address, none of it in the image.
+pub fn memory(sections: &[Section]) -> Vec<(u64, u64)> {
+    let mut free = Vec::new();
+    for &(start, end, _) in &MEMORY {
+        let mut from = start;
+        for section in sections.iter().filter(|section| section.addr < end && section.end() > start) {
+            if from < section.addr {
+                free.push((from, section.addr));
+            }
+            from = from.max(section.end());
+        }
+        if from < end {
+            free.push((from, end));
+        }
+    }
+    free
+}
+
+/// Whether the load or store that `bytes` begin with reads memory, and whether it writes:
+/// `None` for an instruction that is neither.
+pub fn access(bytes: &[u8]) -> Option<(bool, bool)> {
+    let hw1 = u16::from_le_bytes(bytes.get(..2)?.try_into().unwrap());
+    let loads = if is_wide(hw1) {
+        // Loads and stores of one register, of two, and of several.
+        match hw1 >> 9 {
+            0b1111100 | 0b1110100 => hw1 & 0x10 != 0,
+            _ => return None,
+        }
+    } else {
+        match hw1 >> 12 {
+            // With a register offset: STR, STRH and STRB, then the loads.
+            0b0101 => hw1 >> 9 & 7 >= 3,
+            0b0110 | 0b0111 | 0b1000 | 0b1001 | 0b1100 => hw1 & 0x0800 != 0,
+            _ => return None,
+        }
+    };
+    Some((loads, !loads))
+}
+
 /// The vector table at the start of a Cortex-M's flash: the initial stack pointer, then the
 /// address of the handler of each exception and interrupt, with the Thumb bit, or zero for a
 /// slot not in use. Returns the table's length in bytes and the handlers in table order, reset
@@ -1102,6 +1152,16 @@ mod tests {
         let insn = Thumb::decode(&bytes, 0x1000).nth(1).unwrap().insn.unwrap();
         assert_eq!((Thumb::literal(&insn), insn.literal), (Some((0x1008, 0x100C)), Some(0x0800_1235)));
         assert_eq!(Thumb::address_taken(&insn, &State::default()), Some(0x0800_1234));
+    }
+
+    #[test]
+    fn loads_read_and_stores_write() {
+        // LDR R1, [R0, #4]; STR R1, [R0]; STRB R1, [R0, R2]; LDRH R1, [R0, R2]; LDR.W R1, [R0, #0x100];
+        // STR.W R1, [R0, #0x100]; LDM R0!, {R1, R2}; MOVS R0, #1.
+        let halfwords: [&[u16]; 8] = [&[0x6841], &[0x6001], &[0x5481], &[0x5A81], &[0xF8D0, 0x1100], &[0xF8C0, 0x1100], &[0xC806], &[0x2001]];
+        let accesses = halfwords.map(|halfwords| access(&halfwords.iter().flat_map(|half| half.to_le_bytes()).collect::<Vec<u8>>()));
+        let (load, store) = (Some((true, false)), Some((false, true)));
+        assert_eq!(accesses, [load, store, store, load, load, store, load, None]);
     }
 
     #[test]

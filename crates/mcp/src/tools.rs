@@ -582,7 +582,7 @@ pub(crate) fn describe(binary: &Binary, addr: u64) -> String {
         Some(section) if section.executable => format!("code in {}", binary.program.site_label(addr)),
         Some(section) => section.name.clone(),
         // On a machine with several memories, which one says more than that it holds no bytes.
-        None if binary.program.image.is_zero_filled(addr) && binary.program.image.machine == Machine::I8051 => recore::hardware::place(&binary.program.image, addr),
+        None if binary.program.image.is_zero_filled(addr) && recore::hardware::space(&binary.program.image, addr).is_some() => recore::hardware::place(&binary.program.image, addr),
         None if binary.program.image.is_zero_filled(addr) => "uninitialized data".into(),
         None => "not mapped".into(),
     }
