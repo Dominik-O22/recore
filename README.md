@@ -172,14 +172,16 @@ The decompiler names the compiler's library routines by a hash of their code, so
 
 A `names` file gives the hardware's registers and bits their names, the standard 8051 ones are built in, and `recore-mcp unnamed` lists the addresses the code uses most that have none. Text is found where it is stored as ASCII. A firmware that stores its menu as indices into its own font, as the monitor's does, shows none of that text.
 
-A Cortex-M layout needs only `machine = "cortex-m"` and its flash region. recore reads the reset handler and every interrupt handler from the vector table at the start of the flash. It is scored against the ELF each image was cut from: 27 programs built by clang for Cortex-M0, M3 and M4 at `-O0`, `-Os` and `-O2`, with Ghidra seeded from the same vector table.
+A Cortex-M layout needs only `machine = "cortex-m"` and its flash region. recore reads the reset handler and every interrupt handler from the vector table, which it takes to start the lowest executable region unless the layout says `vectors = <address>`, or `vectors = "none"` with the entry points in `entry`. It is scored against the ELF each image was cut from, with Ghidra seeded from the same vector table. 27 programs are built by clang for Cortex-M0, M3 and M4 at `-O0`, `-Os` and `-O2`, each function in its own section. 12 more are laid out as a vendor build usually is, with no per-function sections, so unused library functions stay in the image between the used ones.
 
-| 27 programs, Cortex-M | Functions found | Precision | Jump tables exact |
-|---|---|---|---|
-| recore | 99.9% | 100.0% | 119 of 119 |
-| Ghidra | 91.5% | 98.6% | 112 of 119 |
+| Cortex-M | | Functions found | Precision | Jump tables exact |
+|---|---|---|---|---|
+| 27 programs | recore | 99.9% | 100.0% | 119 of 119 |
+| | Ghidra | 91.5% | 98.6% | 112 of 119 |
+| 12 vendor-style builds | recore | 99.2% | 99.9% | 57 of 59 |
+| | Ghidra | 66.8% | 98.6% | 49 of 59 |
 
-recore analyzes all 27 in under 30 ms and Ghidra reports 28 s. Most of the functions Ghidra misses are reached only by a tail call or by an address the code builds with `MOVW` and `MOVT`. Every function decompiles, in 3.5 ms on average, and against DWARF the number of parameters is right for 85.8% of the C functions. The System Control Space registers, such as `SYST_RVR` and the NVIC's, are named without a names file. The corpus has no GCC-built code, because no ARM GCC was at hand.
+recore analyzes all 39 in 55 ms, none taking more than 3 ms. Most of the functions Ghidra misses are reached only by a tail call, by an address the code builds with `MOVW` and `MOVT`, or, in the vendor-style builds, by nothing at all. recore finds those by dividing the unreached code between functions into whole functions. Every function decompiles, in 3 ms on average, and against DWARF the number of parameters is right for 86.7% of the C functions. The System Control Space registers, such as `SYST_RVR` and the NVIC's, are named without a names file. The corpus has no GCC-built code, because no ARM GCC was at hand. GCC's Thumb-1 switch helpers are recognised, and tested only on hand-assembled code.
 
 ## What Ghidra does that recore does not
 
