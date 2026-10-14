@@ -279,8 +279,13 @@ pub fn jump_tables(layout: &Path, debug_path: &Path) -> Result<Option<Extracted>
                 }
                 Some(Ok(found)) => found,
             };
-            // A run of data may begin with a literal before the table the ADR names.
+            // A run of data may begin with a literal before the table the ADR names, and an ADR
+            // may name data of another run, which is not this table.
             let table = match kind {
+                Dispatch::Absolute { table: named } if !(table..table_end).contains(&named) => {
+                    rejected.push(Rejected { table, reason: format!("an ADR of {named:#x}, outside the data at {table:#x}") });
+                    continue;
+                }
                 Dispatch::Absolute { table } => table,
                 Dispatch::Relative { .. } => table,
             };
