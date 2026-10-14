@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
 
 use crate::image::{Compiler, Image, Section};
-use crate::layout::{BankingLayout, Layout, SCHEMES, Trampoline};
+use crate::layout::{BankingLayout, Layout, Trampoline, schemes};
 use crate::program::Program;
 use crate::score::{Score, landing, score};
 
@@ -326,7 +326,7 @@ pub fn sweep(path: &Path) -> Result<Sweep> {
     let narrow = |common: &[(u64, u64)]| common.iter().map(|&(start, end)| (start as u16, end as u32)).collect();
     let schemes: Vec<(String, BankingLayout)> = if given.trampoline.is_empty() {
         let read = |text: &str| -> Result<Trampoline> { toml::from_str(text).context("reading a trampoline scheme") };
-        SCHEMES.iter().map(|&(name, text)| Ok((name.to_string(), BankingLayout { common: narrow(&common), trampoline: vec![read(text)?] }))).collect::<Result<_>>()?
+        schemes().iter().map(|(name, text)| Ok((name.to_string(), BankingLayout { common: narrow(&common), trampoline: vec![read(text)?] }))).collect::<Result<_>>()?
     } else {
         vec![("the layout's trampolines".to_string(), BankingLayout { common: narrow(&common), trampoline: given.trampoline })]
     };
@@ -334,6 +334,11 @@ pub fn sweep(path: &Path) -> Result<Sweep> {
     let mut spent = [Duration::ZERO; 3];
     for (name, banking) in schemes {
         let start = Instant::now();
+        // An image without the stub has none of the trampolines, and most schemes are not there.
+        if !banking.trampoline.iter().any(|trampoline| bytes.iter().any(|region| trampoline.has_stub(region))) {
+            absent.push(name);
+            continue;
+        }
         match draft.place(&name, banking)? {
             Some((found, [scored, assigned])) => {
                 candidates.extend(found);
@@ -343,6 +348,9 @@ pub fn sweep(path: &Path) -> Result<Sweep> {
         }
     }
     timings.extend([("score each region as each bank", spent[0]), ("assign", spent[1]), ("find trampolines, score the candidates", spent[2])]);
+    // A scheme is absent when the image has none of its forms.
+    absent.dedup();
+    absent.retain(|name| candidates.iter().all(|candidate: &Candidate| candidate.scheme != *name));
     candidates.sort_by(|a, b| b.score.bits().total_cmp(&a.score.bits()));
 
     let start = Instant::now();

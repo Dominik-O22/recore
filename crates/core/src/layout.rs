@@ -124,14 +124,33 @@ pub(crate) struct BankingLayout {
     pub(crate) trampoline: Vec<Trampoline>,
 }
 
+/// What Keil's stub does to the masked bank bits before it pushes them, which turns them into the
+/// offset of `?B_SWITCHn` in its page: nothing, `RL A` or `RR A` once or twice, `SWAP A`, or
+/// `SWAP A` and a rotate. Which one depends on `?B_FIRSTBIT`, the bit of the port or latch the
+/// bank number starts at, and on how far apart the switch routines are (4, 8 or 16 bytes, by
+/// `?B_MODE`, RTX-51 and the number of banks); these eight are every rotation of a byte.
+const KEIL_SHIFTS: [&str; 8] = ["", "23", "23 23", "03", "03 03", "c4", "c4 23", "c4 03"];
+
 /// The trampolines of the compilers recore knows, by what to call each and as a layout writes
-/// it, for an image whose layout names none. The first is the table Keil's linker builds from
-/// `L51_BANK.A51`: the stub loads the current bank, masks and shifts it, and pushes it and the
-/// address of the routine that switches back, all of which vary from one program to the next.
-pub(crate) const SCHEMES: [(&str, &str); 2] = [
-    ("Keil C51 bank table", "entry = \"90 hh ll 02 ss ss\"\nstub = \"e5 .. 54 .. 23 23 c0 e0 74 .. c0 e0 c0 82 c0 83 02 .. ..\"\n"),
-    ("SDCC __sdcc_banked_call", "call = \"78 ll 79 hh 7a bb 12 ss ss\"\nstub = \"c0 b1 c8 c0 e0 e9 c0 e0 ea 54 0f 53 b1 f0 42 b1 c8 22\"\n"),
-];
+/// it, for an image whose layout names none. Several under one name are forms of one scheme, of
+/// which an image has one.
+///
+/// Keil's are the table its linker builds for version 2 of `L51_BANK.A51`. An entry is `MOV
+/// DPTR, #function; LJMP ?B_BANKn`; a table whose entries jump with `AJMP` is not matched. With
+/// the bank in port bits or an XDATA latch (`?B_MODE` 0 and 1), `?B_BANKn` loads the current
+/// bank, masks it, shifts it in one of [`KEIL_SHIFTS`], and pushes it and the page of the
+/// routines that switch back. With switch code of the user's (`?B_MODE` 4) it pushes the current
+/// bank as it is, and the code that switches follows. The addresses vary from one program to
+/// the next. A stub the user has edited beyond those settings needs a pattern in the layout.
+pub(crate) fn schemes() -> Vec<(&'static str, String)> {
+    const KEIL_ENTRY: &str = "entry = \"90 hh ll 02 ss ss\"";
+    let shifted = KEIL_SHIFTS.iter().map(|shift| ("Keil C51 bank table", format!("{KEIL_ENTRY}\nstub = \"e5 .. 54 .. {shift} c0 e0 74 .. c0 e0 c0 82 c0 83 02 .. ..\"\n")));
+    let fixed = [
+        ("Keil C51 bank table with user switch code", format!("{KEIL_ENTRY}\nstub = \"c0 .. 74 .. c0 e0 c0 82 c0 83 75 .. ..\"\n")),
+        ("SDCC __sdcc_banked_call", "call = \"78 ll 79 hh 7a bb 12 ss ss\"\nstub = \"c0 b1 c8 c0 e0 e9 c0 e0 ea 54 0f 53 b1 f0 42 b1 c8 22\"\n".to_string()),
+    ];
+    shifted.chain(fixed).collect()
+}
 
 /// How code reaches a function in another bank: through bytes that name the function and go on
 /// to a stub, which switches to the function's bank. They say which bank with `bb`. Without
@@ -145,6 +164,13 @@ pub(crate) struct Trampoline {
     /// operand is the stub's address, which is where the function is called.
     call: Option<Pattern>,
     stub: Pattern,
+}
+
+impl Trampoline {
+    /// Whether the stub is anywhere in `bytes`.
+    pub(crate) fn has_stub(&self, bytes: &[u8]) -> bool {
+        (0..bytes.len()).any(|at| self.stub.matches(&bytes[at..]).is_some())
+    }
 }
 
 /// One byte of a pattern.
