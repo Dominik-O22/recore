@@ -33,7 +33,8 @@ pub struct Component {
 }
 
 /// A rate is never taken to be nearer to certain than this, so that one count of zero does not
-/// outweigh everything else.
+/// outweigh everything else. Picked by hand: the validation of `corpus/validate_layout_score.py`
+/// and the sweeps of the corpus come out the same at 1e-3 and at 1e-5.
 const FLOOR: f64 = 1e-4;
 
 /// A component whose perfect outcome is worth fewer bits than this cannot tell layouts apart.
@@ -108,6 +109,9 @@ impl Score {
 
 impl fmt::Display for Score {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if self.components().iter().all(|(_, component)| component.total == 0) {
+            return writeln!(f, "0 bits: no target crosses the layout, and no call stays in a region");
+        }
         writeln!(f, "{:.0} bits", self.bits())?;
         // Left out where it was not asked, see [`Score::crossing`].
         let asked = |component: &Component| component.total > 0 || *component != self.local_follows_end;
@@ -286,6 +290,13 @@ mod tests {
         let wrong = score(&image(&caller, 0x7FFE, &callee));
         assert_eq!((wrong.follows_end.good, wrong.follows_end.total), (0, 1));
         assert!(right.bits() > wrong.bits());
+    }
+
+    #[test]
+    fn a_layout_nothing_crosses_says_so() {
+        // RET, and in the other section RET.
+        let found = score(&image(&[0x22], 0x8000, &[0x22]));
+        assert_eq!(found.to_string(), "0 bits: no target crosses the layout, and no call stays in a region\n");
     }
 
     #[test]

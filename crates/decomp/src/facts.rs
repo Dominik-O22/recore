@@ -258,7 +258,9 @@ impl Facts {
         if image.machine == Machine::I8051 {
             let jumps_through_dptr = |index: usize| image.bytes_from(analysis.jump_tables[index].jump).is_some_and(|bytes| bytes.first() == Some(&0x73));
             facts.engine_tables = facts.jump_tables.iter().copied().filter(|&(_, index)| jumps_through_dptr(index)).collect();
-            /// The most bytes of code that is read as part of its callers.
+            /// The most bytes of code that is read as part of its callers: the routine that
+            /// triples an index, `triple_index` in Keil's list, is 11, and this leaves room for one
+            /// that scales by another number.
             const SCALER: u64 = 16;
             let call_at = |at: u64| analysis.calls.binary_search_by_key(&at, |call| call.at).ok().map(|index| &analysis.calls[index]);
             // The call straight before the jump, which is two or three bytes long.
