@@ -746,6 +746,9 @@ impl Arch for Thumb {
     const LITERAL_POOLS: bool = true;
     const TAKEN_IS_WEAK: bool = true;
     const CALL_MAY_BE_FAR_JUMP: bool = true;
+    const TILES_GAPS: bool = true;
+    /// A lone `BX LR` or `B` is a function: an empty one, or one that goes on in another.
+    const SHORTEST_TILE: u64 = 2;
     const MARKED_CODE_POINTERS: bool = true;
 
     fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> {
@@ -1342,6 +1345,18 @@ mod tests {
         assert_eq!(functions(&code(0xC00, &[0x2000])), [0x00]);
         assert_eq!(functions(&code(0x100, &[0x2000])), [0x00, 0x100]);
         assert_eq!(functions(&code(0xC00, &[0xF240, 0x0000])), [0x00, 0xC00]);
+    }
+
+    #[test]
+    fn unreached_code_that_divides_into_functions_is_functions() {
+        // 0x00: PUSH {R4, LR}; BL 0x1C; POP {R4, PC}. 0x08: ADDS R0, #1; BX LR. 0x0C: LDR R0,
+        // =0x12345678; BX LR; the literal. 0x14: PUSH {R4, LR}; BL 0x08; `last`. 0x1C: MOVS R0, #0;
+        // BX LR.
+        let code = |last: u16| [&[0xB510][..], &bl(0x02, 0x1C), &[0xBD10, 0x3001, 0x4770, 0x4800, 0x4770, 0x5678, 0x1234, 0xB510], &bl(0x16, 0x08), &[last, 0x2000, 0x4770]].concat();
+        // POP {R4, PC}: nothing reaches 0x08 to 0x1B, which divide into three functions all the same.
+        assert_eq!(functions(&code(0xBD10)), [0x00, 0x08, 0x0C, 0x14, 0x1C]);
+        // ADDS R0, #2, which runs on into the function at 0x1C: the bytes are no functions.
+        assert_eq!(functions(&code(0x3002)), [0x00, 0x1C]);
     }
 
     #[test]
