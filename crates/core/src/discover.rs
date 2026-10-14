@@ -280,6 +280,11 @@ struct Explorer<'a, A: Arch> {
     branches_reach_far: bool,
     /// See [`Discovery::after_calls`].
     after_calls: Vec<(u64, u64)>,
+    /// Addresses taken that an earlier pass found inside other code, which are no entry points
+    /// on that evidence: see [`Arch::TAKEN_IS_WEAK`].
+    rejected: FxHashSet<u64>,
+    /// The entry points made on the strength of an address taken alone, where that is weak.
+    weak_starts: Vec<u64>,
 }
 
 /// One decoder per section, made when first needed. Decoding starts in a new place for every
@@ -338,8 +343,15 @@ impl<'a, A: Arch> Explorer<'a, A> {
         if *flags & ASKED_AS_START != 0 {
             return;
         }
+        let weak = A::TAKEN_IS_WEAK && matches!(origin, Origin::AddressTaken | Origin::DataPointer);
+        if weak && self.rejected.contains(&addr) {
+            return;
+        }
         *flags |= ASKED_AS_START;
         if !self.inside_frame(addr) {
+            if weak {
+                self.weak_starts.push(addr);
+            }
             let before = self.starts.insert(addr, origin);
             debug_assert!(before.is_none());
             self.pending.push(Pending::entry(addr));
@@ -892,9 +904,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
     }
 
     /// Removes the entry points that only calls reach which are jumps within a function: in code
-    /// whose branches do not reach as far, each call goes farther than a branch, no other entry
-    /// point lies between the call and where it goes, and the code before the target runs on
-    /// into it, as it does into a block and not into a function.
+    /// whose branches do not reach as far, no other entry point lies between each call and where
+    /// it goes, and the code before the target runs on into it, as it does into a block and not
+    /// into a function. A compiler jumps with a call even where a branch would reach, as it
+    /// lays out the function after it chose. Code that runs on into a function from a call that
+    /// never returns is put back by analysis.
     fn demote_far_jumps(&mut self) {
         if self.branches_reach_far {
             return;
@@ -910,7 +924,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let starts = AddrSet::new(self.starts.iter().filter(|&(start, origin)| strong(origin) && !calls_to.contains_key(start)).map(|(&start, _)| start));
         let jumps: Vec<u64> = calls_to
             .into_iter()
-            .filter(|(to, sites)| sites.iter().all(|&from| A::beyond_branch(from, *to) && if from < *to { !starts.any_in(from + 1, to - 1) } else { !starts.any_in(to + 1, from) }))
+            .filter(|(to, sites)| sites.iter().all(|&from| if from < *to { !starts.any_in(from + 1, to - 1) } else { !starts.any_in(to + 1, from) }))
             .map(|(to, _)| to)
             .collect();
         for to in jumps {
@@ -1315,10 +1329,30 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
         Pointers::new(image)
     };
     // A first pass that learns a length stops recording what only a last pass has to report.
-    let first = explore::<A>(image, frames, &pointers, FxHashMap::default());
-    let lengths = first.learned_lengths();
-    debug_assert!(first.recording || !lengths.is_empty());
-    let mut explorer = if lengths.is_empty() { first } else { explore::<A>(image, frames, &pointers, lengths) };
+    let run = |rejected: &FxHashSet<u64>| {
+        let first = explore::<A>(image, frames, &pointers, FxHashMap::default(), rejected.clone());
+        let lengths = first.learned_lengths();
+        debug_assert!(first.recording || !lengths.is_empty());
+        if lengths.is_empty() { first } else { explore::<A>(image, frames, &pointers, lengths, rejected.clone()) }
+    };
+    let mut explorer = run(&FxHashSet::default());
+    // Where an address taken is weak evidence, one that turns out to lie inside other code was
+    // decoded as a function all the same, and what that found stays found: literals in real
+    // code, calls that are none, Thumb-2 where there is none. Passes that leave those addresses
+    // out from the start follow until no more turn out so.
+    if A::TAKEN_IS_WEAK {
+        let mut rejected = FxHashSet::default();
+        loop {
+            let before = rejected.len();
+            // Not one that analysis may put back, where the call before it never returns.
+            let after_call = |addr: &u64| explorer.after_calls.iter().any(|(start, _)| start == addr);
+            rejected.extend(explorer.weak_starts.iter().filter(|addr| !explorer.starts.contains_key(addr) && !after_call(addr)));
+            if rejected.len() == before {
+                break;
+            }
+            explorer = run(&rejected);
+        }
+    }
 
     // An entry point is only real if its first bytes decoded.
     let starts = explorer
@@ -1384,7 +1418,7 @@ impl Pointers {
     }
 }
 
-fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'a Pointers, known_lengths: FxHashMap<u64, usize>) -> Explorer<'a, A> {
+fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'a Pointers, known_lengths: FxHashMap<u64, usize>, rejected: FxHashSet<u64>) -> Explorer<'a, A> {
     let regions = image
         .sections
         .iter()
@@ -1424,6 +1458,8 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         calls: Vec::new(),
         branches_reach_far: false,
         after_calls: Vec::new(),
+        rejected,
+        weak_starts: Vec::new(),
         data_sections: {
             // Zero-filled memory is data as much as what the file stores.
             let mut ranges: Vec<(u64, u64)> = image.sections.iter().filter(|s| !s.executable).map(|s| (s.addr, s.end())).chain(image.zero_filled.iter().copied()).collect();
