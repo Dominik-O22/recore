@@ -1037,8 +1037,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
         // `[start, end)` of the literals the stretches read.
         let mut pools: Vec<(u64, u64)> = Vec::new();
         let mut ended = false;
-        // Where decoding starts again past a literal pool.
-        let mut resume = Some(addr);
+        // Where decoding starts again past a literal pool, and where the gap's instructions end.
+        let (mut resume, mut end) = (Some(addr), addr);
         'gap: while let Some(from) = resume.take() {
             for decoded in A::decode(&section.data[(from - section.addr) as usize..], from) {
                 if known(decoded.addr) {
@@ -1064,6 +1064,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     continue;
                 }
                 instructions.push(decoded.addr);
+                end = decoded.next_addr();
                 if let Some(literal) = A::literal(&insn) {
                     pools.push(literal);
                 }
@@ -1102,18 +1103,19 @@ impl<'a, A: Arch> Explorer<'a, A> {
         }
         // Here it is that tail only if the code before it jumps to it.
         jumps.sort_unstable();
-        // What nothing calls may call or jump to what nothing else calls either, in a gap the
-        // search comes to later.
-        let unreached = |at: u64| {
-            self.region_index(at).is_some_and(|index| {
-                let offset = (at - self.regions[index].section.addr) as usize;
-                self.regions[index].insn_len[offset] == 0 && self.regions[index].flags[offset] & IN_TABLE == 0
-            })
+        // What nothing calls may call or jump to what nothing else calls either, in another gap
+        // the search comes to later.
+        let elsewhere = |at: u64| {
+            !(addr..end).contains(&at)
+                && self.region_index(at).is_some_and(|index| {
+                    let offset = (at - self.regions[index].section.addr) as usize;
+                    self.regions[index].insn_len[offset] == 0 && self.regions[index].flags[offset] & IN_TABLE == 0
+                })
         };
         let tiles = ended
             && tails.iter().all(|tail| *tail != addr && jumps.binary_search(tail).is_ok())
-            && jumps.iter().all(|target| instructions.binary_search(target).is_ok() || known(*target) || unreached(*target))
-            && calls.iter().all(|target| self.starts.contains_key(target) || stretches.binary_search(target).is_ok() || unreached(*target));
+            && jumps.iter().all(|target| instructions.binary_search(target).is_ok() || known(*target) || elsewhere(*target))
+            && calls.iter().all(|target| self.starts.contains_key(target) || stretches.binary_search(target).is_ok() || elsewhere(*target));
         if tiles {
             self.tiled = stretches;
         }
