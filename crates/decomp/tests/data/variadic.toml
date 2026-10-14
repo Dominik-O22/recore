@@ -1,0 +1,8 @@
+machine = "cortex-m"
+
+[[region]]
+file = "variadic.bin"
+offset = 0x0
+length = 0x1bd
+address = 0x0
+executable = true

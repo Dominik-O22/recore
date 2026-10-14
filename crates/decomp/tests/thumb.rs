@@ -57,3 +57,25 @@ fn a_branch_through_the_return_address_popped_off_the_stack_returns() {
     let c = decompiled(&CODE, &[0x1c], 0x1c);
     assert!(c.contains("return CONCAT44(unaff_lr,7);") && !c.contains("UNRECOVERED"), "{c}");
 }
+
+/// The C of the functions at `addrs` of tests/data/variadic.bin, as `recore-decompile` gives it.
+fn decompiled_firmware(addrs: &[u64]) -> Vec<String> {
+    let runner = env!("CARGO_BIN_EXE_recore-decompile");
+    let layout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/variadic.toml");
+    let command = move || {
+        let mut command = std::process::Command::new(runner);
+        command.arg("worker");
+        command
+    };
+    let mut worker = recore_decomp::isolate::Worker::new(command, &layout, &Default::default());
+    addrs.iter().map(|&addr| worker.decompile(addr, std::time::Duration::from_secs(60)).1.expect("C for each function")).collect()
+}
+
+#[test]
+fn only_a_function_passed_a_format_has_its_calls_take_what_the_format_asks_for() {
+    // `words` passes `total` a list of words ended by a null; `greet` passes `say` a format with
+    // two conversions, and text with none.
+    let c = decompiled_firmware(&[0x13c, 0x15c]);
+    assert!(c[0].contains(r#"func_0x000000c4("alpha",0x1ab,0x1a5,0)"#), "{}", c[0]);
+    assert!(c[1].contains("func_0x00000040(0x1b0);") && c[1].contains("func_0x00000040(0x19a,3,4);"), "{}", c[1]);
+}
