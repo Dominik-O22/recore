@@ -455,7 +455,9 @@ pub fn uses(image: &Image, analysis: &Analysis) -> FxHashMap<u64, Use> {
         };
         // Before each instruction, on every way to it: everything, until a way there is seen.
         let mut before = vec![ALL; steps.len()];
-        before[0] = 0;
+        if let Some(entry) = before.first_mut() {
+            *entry = 0;
+        }
         let returned = loop {
             let (mut shrank, mut at_return) = (false, ALL);
             for index in 0..steps.len() {
@@ -542,5 +544,18 @@ mod tests {
         // itself, the outer one by calling it.
         let set = |function: u64| uses[&function].set.names().collect::<Vec<_>>();
         assert_eq!((set(0x20), set(0x10), set(0)), (vec!["ACC"], vec!["R7", "ACC"], vec!["R7", "ACC"]));
+    }
+
+    #[test]
+    fn a_function_of_no_instructions_sets_nothing() {
+        // Two LJMP 0x0010; at 0x0010: MOV A, #0x22; RET. The entry at 0x0011, inside the MOV,
+        // leaves the function the jumps share no room for an instruction.
+        let mut code = [0; 0x13];
+        code[..6].copy_from_slice(&[0x02, 0x00, 0x10, 0x02, 0x00, 0x10]);
+        code[0x10..].copy_from_slice(&[0x74, 0x22, 0x22]);
+        let mut image = super::super::tests::image(&code, 0);
+        image.exports = vec![0x0003, 0x0011];
+        let uses = uses(&image, &crate::analyze(&image));
+        assert_eq!(uses[&0x0010].set.names().count(), 0);
     }
 }
