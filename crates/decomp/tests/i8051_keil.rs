@@ -171,3 +171,15 @@ fn a_switch_through_a_row_of_jumps_has_each_case_by_its_value() {
     assert_eq!(after("case 1:"), "return 0x22;");
     assert_eq!(after("case 2:"), "return 0x33;");
 }
+
+#[test]
+fn a_bit_goes_by_the_name_the_image_gives_it() {
+    // SETB 0xAF; CLR 0x05; RET.
+    let code = [0xD2, 0xAF, 0xC2, 0x05, 0x22];
+    let mut session = Session::new(&vendored_spec_dir().unwrap(), Target::I8051, &[Section { addr: 0, data: &code, readonly: true, code: true }]).unwrap();
+    session.add_functions(&Facts { functions: vec![(0, false)], ..Facts::default() }).unwrap();
+    session.add_global(recore::hardware::BIT + 0xAF, "IRQ_ON", None).unwrap();
+    session.add_global(recore::hardware::BIT + 0x05, "READY", None).unwrap();
+    let c = session.decompile(0).unwrap().c_text;
+    assert!(c.contains("IRQ_ON = 1;") && c.contains("READY = 0;"), "{c}");
+}

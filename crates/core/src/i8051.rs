@@ -23,9 +23,11 @@ pub const IDATA: u64 = 2 << 32;
 /// The special function registers, at their direct addresses 0x80 to 0xFF from here.
 pub const SFR: u64 = 3 << 32;
 
-/// `[start, end)` of the memory an 8051 program has besides its code, none of it in the image.
+/// `[start, end)` of the memory an 8051 program has besides its code, none of it in the image,
+/// and the bits, which are names for bits of that memory.
 pub fn memory() -> Vec<(u64, u64)> {
-    vec![(XDATA, XDATA + 0x1_0000), (IDATA, IDATA + 0x100), (SFR + 0x80, SFR + 0x100)]
+    use crate::hardware::BIT;
+    vec![(XDATA, XDATA + 0x1_0000), (IDATA, IDATA + 0x100), (SFR + 0x80, SFR + 0x100), (BIT, BIT + 0x100)]
 }
 
 /// The direct addresses of the two halves of `DPTR`.

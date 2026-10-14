@@ -159,9 +159,10 @@ impl Target {
     /// The address spaces the target has besides the one its code is in: the address recore
     /// gives the first byte of each, and the engine's name for the space.
     fn spaces(self) -> &'static [(u64, &'static CStr)] {
+        use recore::hardware::BIT;
         use recore::i8051::{IDATA, SFR, XDATA};
         match self {
-            Target::I8051 | Target::I8051Sdcc => &[(XDATA, c"EXTMEM"), (IDATA, c"INTMEM"), (SFR, c"SFR")],
+            Target::I8051 | Target::I8051Sdcc => &[(XDATA, c"EXTMEM"), (IDATA, c"INTMEM"), (SFR, c"SFR"), (BIT, c"BITS")],
             _ => &[],
         }
     }
@@ -171,6 +172,12 @@ impl Target {
     /// function this way, and what recore makes of it is two functions. Elsewhere such code
     /// follows a call that never returns, and is none of the function's.
     fn functions_run_on(self) -> bool {
+        matches!(self, Target::I8051 | Target::I8051Sdcc)
+    }
+
+    /// Whether a result comes back in the register the first argument goes in: `R7` for C51,
+    /// `DPL` for SDCC.
+    fn result_in_first_argument(self) -> bool {
         matches!(self, Target::I8051 | Target::I8051Sdcc)
     }
 
@@ -334,6 +341,7 @@ impl Session {
         let raw = NonNull::new(raw).expect("checked above");
         unsafe { ffi::rd_keep_prototypes_exact(raw.as_ptr(), target.callers_pass_what_is_read().into()) };
         unsafe { ffi::rd_functions_run_on(raw.as_ptr(), target.functions_run_on().into()) };
+        unsafe { ffi::rd_result_in_first_argument(raw.as_ptr(), target.result_in_first_argument().into()) };
         // The session frees the engine's side if a space is not there.
         let session = Session { raw, target, engine_tables: Default::default() };
         for &(base, name) in target.spaces() {
