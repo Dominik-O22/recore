@@ -228,11 +228,36 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
     }
 
+    // The calls in the function at `entry` that pass text `is_text` accepts, as `(call, callee,
+    // position, text)`: the first argument of each that is such text.
+    let text_calls = |entry: u64, is_text: &dyn Fn(u64) -> bool| -> Vec<(u64, CallTarget, usize, u64)> {
+        let body: Vec<(u64, u64)> = analysis.functions.iter().filter(|function| function.fragment_of.unwrap_or(function.addr) == entry).flat_map(|function| function.ranges.iter().copied()).collect();
+        let calls: Vec<&recore::report::CallSite> = analysis.calls.iter().filter(|call| body.iter().any(|&(start, end)| (start..end).contains(&call.at))).collect();
+        let sites: Vec<u64> = calls.iter().map(|call| call.at).collect();
+        recore::cfg::text_arguments(&image, &body, &sites, is_text)
+            .into_iter()
+            .map(|(at, position, text)| (at, calls[sites.binary_search(&at).expect("one of the sites asked about")].target, position, text))
+            .collect()
+    };
+    let conversions: HashSet<u64> = analysis.strings.iter().filter(|string| !string.wide && string.text.contains('%')).map(|string| string.addr).collect();
+    // Raw firmware imports nothing: its C library is linked in, and nothing names its `printf`.
+    // There a function takes a format when some call passes it text with a conversion in it.
+    let raw = image.format == Format::Raw;
+    let passed_formats: HashSet<u64> = analysis
+        .functions
+        .iter()
+        .filter(|function| raw && function.fragment_of.is_none())
+        .flat_map(|function| text_calls(function.addr, &|addr| conversions.contains(&addr)))
+        .filter_map(|(_, callee, _, _)| match callee {
+            CallTarget::Function(entry) => Some(entry),
+            CallTarget::Import(_) => None,
+        })
+        .collect();
     // The functions of the program that take a format and the arguments it asks for: those that
     // set up to read a variable number of arguments, and hand them to the C library's routine
-    // for formats in an argument list, themselves or through a function or two. Taking a
-    // variable number alone does not make a string with a `%` in it a format: a list of words
-    // ended by a null is passed the same way.
+    // for formats in an argument list, themselves or through a function or two, or in raw
+    // firmware are passed a format. Taking a variable number alone does not make a string with
+    // a `%` in it a format: a list of words ended by a null is passed the same way.
     let hands_on_formats = {
         /// Functions between one that takes a format and the library routine it ends in.
         const DEPTH: usize = 3;
@@ -244,10 +269,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 CallTarget::Function(callee) => depth > 0 && reaches(calls, library, *callee, depth - 1),
             })
         }
-        // Where nothing is imported, as in firmware, the library is linked in, and taking a
-        // variable number of arguments is all that speaks for a format.
-        let linked = analysis.imports.is_empty();
-        move |entry: u64| linked || reaches(&calls, &library, entry, DEPTH)
+        move |entry: u64| passed_formats.contains(&entry) || reaches(&calls, &library, entry, DEPTH)
     };
     for function in analysis.functions.iter().filter(|function| function.fragment_of.is_none()) {
         let variadic = function.ranges.first().is_some_and(|&(start, end)| recore::cfg::takes_variable_arguments(&image, start, end));
@@ -284,20 +306,16 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     // Before a function is decompiled, each call in it that passes a format is given the
     // arguments the format asks for. Told beforehand it costs nothing; the engine left to find
     // out for itself gets a good many wrong, and correcting one means decompiling again.
-    // Where the library is linked in, its `printf` is called with text that has no `%` too,
-    // where a hosted program calls `puts`.
-    let linked = analysis.imports.is_empty();
-    let formats: HashSet<u64> = analysis.strings.iter().filter(|string| !string.wide && (linked || string.text.contains('%'))).map(|string| string.addr).collect();
+    // In raw firmware a function known to take a format is called with text that has no `%`
+    // too, where a hosted program calls `puts`; only such a function's calls are given any.
+    let texts: HashSet<u64> = analysis.strings.iter().filter(|string| raw && !string.wide).map(|string| string.addr).collect();
+    let formats = if raw { &texts } else { &conversions };
     let mut formatted: HashSet<u64> = HashSet::new();
     let mut settle_formats = |session: &mut Session, entry: u64| {
         if !formatted.insert(entry) {
             return;
         }
-        let body: Vec<(u64, u64)> = analysis.functions.iter().filter(|function| function.fragment_of.unwrap_or(function.addr) == entry).flat_map(|function| function.ranges.iter().copied()).collect();
-        let calls: Vec<&recore::report::CallSite> = analysis.calls.iter().filter(|call| body.iter().any(|&(start, end)| (start..end).contains(&call.at))).collect();
-        let sites: Vec<u64> = calls.iter().map(|call| call.at).collect();
-        for (at, position, format) in recore::cfg::text_arguments(&image, &body, &sites, &|addr| formats.contains(&addr)) {
-            let target = calls[sites.binary_search(&at).expect("one of the sites asked about")].target;
+        for (at, target, position, format) in text_calls(entry, &|addr| formats.contains(&addr)) {
             // One the engine does not take leaves the call to be worked out as before.
             let _ = session.format_call(entry, at, target, position, format);
         }
