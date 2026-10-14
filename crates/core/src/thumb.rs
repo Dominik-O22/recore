@@ -1127,12 +1127,6 @@ impl Arch for Thumb {
         false
     }
 
-    /// A `BL` that reaches past the 2 KB of the 16-bit `B`, which is all Thumb-1 has to branch with.
-    fn beyond_branch(call: u64, target: u64) -> bool {
-        let offset = target.wrapping_sub(call + 4) as i64;
-        !(-2048..2048).contains(&offset)
-    }
-
     /// A 32-bit instruction of Thumb-2, which Thumb-1 code does not have: Thumb-1's are `BL` and
     /// the system's `MSR`, `MRS`, barriers and `UDF.W`. Thumb-2 has `B.W`.
     fn branches_reach_far(insn: &Insn) -> bool {
@@ -1409,15 +1403,15 @@ mod tests {
     }
 
     #[test]
-    fn a_call_is_a_jump_only_beyond_a_branch_in_thumb_1() {
-        // 0x00: PUSH {LR}; BL to; MOVS R0, #0 or MOVW R0, #0, then MOVS R0, #0 up to `to`: POP {PC}.
-        let code = |to: u64, first: &[u16]| {
-            let filler = vec![0x2000; (to as usize - 6 - 2 * first.len()) / 2];
-            [&[0xB500][..], &bl(0x02, to), first, &filler, &[0xBD00]].concat()
-        };
-        assert_eq!(functions(&code(0xC00, &[0x2000])), [0x00]);
-        assert_eq!(functions(&code(0x100, &[0x2000])), [0x00, 0x100]);
-        assert_eq!(functions(&code(0xC00, &[0xF240, 0x0000])), [0x00, 0xC00]);
+    fn a_call_may_be_a_jump_only_in_thumb_1() {
+        // 0x00: PUSH {LR}; BL to; MOVS R0, #0 or MOVW R0, #0, then MOVS R0, #0 up to `to`: POP
+        // {PC}. Code that has Thumb-2 has `B.W` to jump as far as it calls.
+        let code = |to: usize, first: &[u16]| [&[0xB500][..], &bl(0x02, to as u64), first, &vec![0x2000; (to - 6 - 2 * first.len()) / 2], &[0xBD00]].concat();
+        assert_eq!(functions(&code(0x100, &[0x2000])), [0x00]);
+        assert_eq!(functions(&code(0x100, &[0xF240, 0x0000])), [0x00, 0x100]);
+        // A word after the code that points into the BL at 0x04, where its second halfword reads
+        // as the first of a Thumb-2 store, is no evidence of Thumb-2.
+        assert_eq!(functions(&[code(0x10, &[0x2000]), vec![0x0000, 0x0005, 0x0000]].concat()), [0x00]);
     }
 
     #[test]
