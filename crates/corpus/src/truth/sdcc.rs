@@ -1,12 +1,12 @@
 //! Ground truth for an 8051 program built by `corpus/build_8051.py` with SDCC.
 //!
-//! The linker's debug records (`.cdb`) give each C function's start and the address of its last
-//! instruction: `L:G$name$0$0:ADDR` and `L:XG$name$0$0:ADDR`, with `F<module>` in place of `G`
-//! for a static function. Routines written in assembly have no such records. They come from the
-//! linker's map, which lists each global label of a code area. A label is a function where a C
-//! function calls it. One that code only jumps to or runs into is a piece of some routine with
-//! no agreed owner, which scoring neither demands nor penalises. Either has the code up to the
-//! next label or function.
+//! The linker's debug records (`.cdb`) give each C function's start and the address of the code
+//! of its closing brace: `L:G$name$0$0:ADDR` and `L:XG$name$0$0:ADDR`, with `F<module>` in place
+//! of `G` for a static function. The listing says where that code ends. Routines written in
+//! assembly have no such records. They come from the linker's map, which lists each global label
+//! of a code area. A label is a function where a C function calls it. One that code only jumps
+//! to or runs into is a piece of some routine with no agreed owner, which scoring neither demands
+//! nor penalises. Either has the code up to the next label or function.
 //!
 //! A `switch` over a dense range is `MOV DPTR, #table` and `JMP @A+DPTR` into a run of jumps, one
 //! per case. The listing of each module at its final addresses (`.rst`) shows the run: the lines
@@ -14,12 +14,10 @@
 //! two runs of bytes, the low and then the high halves of the cases' addresses, which the code
 //! reads into `DPTR` with `MOVC A, @A+PC`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use recore::arch::{Arch, Flow};
-use recore::i8051::I8051;
 
 use super::{Function, Truth};
 use crate::jumptables::{Extracted, JumpTable, JumpTables, Rejected};
@@ -29,7 +27,8 @@ fn name(layout: &Path) -> String {
     layout.file_stem().unwrap_or_default().to_string_lossy().into_owned()
 }
 
-/// The start and the last instruction's address of every C function in the debug records.
+/// The start of every C function in the debug records, and where the code of its closing brace
+/// starts.
 fn c_functions(cdb: &str) -> BTreeMap<u64, (String, Option<u64>)> {
     // `F:` records name the functions, which tells them from the variables among the `L:` ones.
     let functions: HashSet<&str> = cdb.lines().filter_map(|line| line.strip_prefix("F:")?.split_once("$0_0$0(")).map(|(symbol, _)| symbol).collect();
@@ -66,47 +65,75 @@ fn code_labels(map: &str) -> Vec<(u64, &str, &str)> {
     labels
 }
 
+/// The functions of the program `layout` loads, from the debug records at `cdb_path` and the
+/// map and listing beside them. Only the layout, which the build wrote from the linker's output,
+/// comes through recore: for the regions of code and the reset address. The rest is read from
+/// what SDCC wrote, so that nothing recore decodes or infers can agree with itself here.
 pub fn extract(layout: &Path, cdb_path: &Path) -> Result<Truth> {
     let image = recore::Image::load(layout)?;
-    let cdb = std::fs::read_to_string(cdb_path).with_context(|| format!("reading {cdb_path:?}"))?;
-    let map_path = cdb_path.with_extension("map");
-    let map = std::fs::read_to_string(&map_path).with_context(|| format!("reading {map_path:?}"))?;
-    let first = |addr: u64| I8051::decode(image.bytes_from(addr)?, addr).next();
-
-    let mut by_addr: BTreeMap<u64, Function> = BTreeMap::new();
-    for (addr, (name, last)) in c_functions(&cdb) {
-        let size = last.and_then(|last| Some(last + u64::from(first(last)?.len) - addr)).unwrap_or(0);
-        by_addr.insert(addr, Function { addr, size, name, fragment: false, noreturn: false, thunk: false });
-    }
-    // The decode of each C function gives the instruction counts, and the calls that say which
-    // labels are functions.
-    let (mut instructions, mut undecodable_bytes) = (0, 0);
-    let mut called = HashSet::new();
-    let c_ranges: Vec<(u64, u64)> = by_addr.values().map(|function| (function.addr, function.addr + function.size)).collect();
-    for function in by_addr.values() {
-        let Some(bytes) = image.bytes_from(function.addr).and_then(|bytes| bytes.get(..function.size as usize)) else { continue };
-        for decoded in I8051::decode(bytes, function.addr) {
-            instructions += u64::from(decoded.insn.is_some());
-            undecodable_bytes += if decoded.insn.is_none() { u64::from(decoded.len) } else { 0 };
-            if let Some(Flow::Call(target)) = decoded.insn.and_then(|insn| I8051::flow(&insn, &Default::default(), &image)) {
-                called.insert(target);
-            }
-        }
-    }
+    let read = |path: &Path| std::fs::read_to_string(path).with_context(|| format!("reading {path:?}"));
+    let (cdb, map, rst) = (read(cdb_path)?, read(&cdb_path.with_extension("map"))?, read(&cdb_path.with_extension("rst"))?);
+    // What assembled to bytes, by address: an instruction, or data such as a `.db`.
+    let listing: BTreeMap<u64, (Vec<u8>, &str)> = rst.lines().filter_map(listed).filter(|(_, bytes, _)| !bytes.is_empty()).map(|(addr, bytes, text)| (addr, (bytes, text))).collect();
+    let is_instruction = |text: &str| !text.starts_with('.');
+    let mnemonic = |text: &str| text.split_whitespace().next().unwrap_or_default().to_string();
     // A lone jump is a thunk, as in a PE image: nothing says whether it is a function or the
     // way to one.
-    let is_thunk = |addr: u64| first(addr).and_then(|decoded| decoded.insn).is_some_and(|insn| matches!(I8051::flow(&insn, &Default::default(), &image), Some(Flow::Jump(_))));
-    for (addr, label, area) in code_labels(&map) {
+    let is_thunk = |addr: u64| listing.get(&addr).is_some_and(|(_, text)| matches!(mnemonic(text).as_str(), "ljmp" | "sjmp" | "ajmp"));
+    let labels: Vec<(u64, &str)> = code_labels(&map)
+        .into_iter()
         // Debug symbols, the linker's own, and constants: only code areas hold routines. `INT2JT`
         // is the FX2 library's table of jumps to interrupt handlers, which the chip enters.
-        if label.contains('$') || !(area == "HOME" || area == "CSEG" || area == "INT2JT" || area.starts_with("GSINIT") || area.starts_with("BANK")) || !image.is_code(addr) {
-            continue;
-        }
-        let thunk = is_thunk(addr);
-        by_addr.entry(addr).or_insert(Function { addr, size: 0, name: label.to_string(), fragment: thunk || !called.contains(&addr), noreturn: false, thunk });
+        .filter(|&(addr, label, area)| !label.contains('$') && (area == "HOME" || area == "CSEG" || area == "INT2JT" || area.starts_with("GSINIT") || area.starts_with("BANK")) && image.is_code(addr))
+        .map(|(addr, label, _)| (addr, label))
+        .collect();
+
+    let c = c_functions(&cdb);
+    let starts: BTreeSet<u64> = c.keys().copied().chain(labels.iter().map(|&(addr, _)| addr)).collect();
+    let section_end = |addr: u64| image.sections.iter().find(|section| section.contains(addr)).map_or(addr, |section| section.end());
+    let mut by_addr: BTreeMap<u64, Function> = BTreeMap::new();
+    for (addr, (name, closing)) in c {
+        // The record that closes a function is at the code of its closing brace, which ends in
+        // the function's return, or in banked code a jump to the routine that returns to the
+        // caller's bank. A naked function has no such code, and its record is where the next
+        // function starts or past its last byte. Either way the function ends by the next one.
+        let returns = closing.filter(|&closing| closing == addr || !starts.contains(&closing)).and_then(|closing| {
+            let (&ret, (bytes, _)) = listing.range(closing..).find(|(_, (_, text))| matches!(mnemonic(text).as_str(), "ret" | "reti" | "ljmp" | "ajmp" | "sjmp"))?;
+            Some(ret + bytes.len() as u64)
+        });
+        let next = starts.range(addr + 1..).next().copied().unwrap_or(u64::MAX);
+        let end = returns.unwrap_or(u64::MAX).min(next).min(section_end(addr));
+        by_addr.insert(addr, Function { addr, size: end - addr, name, fragment: false, noreturn: false, thunk: false });
     }
-    // The hardware enters at the reset and interrupt vectors, each a jump to its handler.
-    for addr in std::iter::once(image.entry).chain(image.exports.iter().copied().filter(|&addr| addr < 0x100 && addr % 8 == 3)) {
+    let c_ranges: Vec<(u64, u64)> = by_addr.values().map(|function| (function.addr, function.addr + function.size)).collect();
+    let in_c = |addr: u64| c_ranges.iter().any(|&(start, end)| (start..end).contains(&addr));
+    // The listing of each C function gives the instruction counts, and the calls that say which
+    // labels are functions.
+    let (mut instructions, mut data_bytes) = (0, 0);
+    let mut called: HashSet<&str> = HashSet::new();
+    for (_, (bytes, text)) in listing.iter().filter(|(addr, _)| in_c(**addr)) {
+        if is_instruction(text) {
+            instructions += 1;
+        } else {
+            data_bytes += bytes.len() as u64;
+        }
+        if let ("lcall" | "acall", Some(callee)) = (mnemonic(text).as_str(), text.split_whitespace().nth(1)) {
+            called.insert(callee);
+        }
+    }
+    for (addr, label) in labels {
+        let thunk = is_thunk(addr);
+        by_addr.entry(addr).or_insert(Function { addr, size: 0, name: label.to_string(), fragment: thunk || !called.contains(label), noreturn: false, thunk });
+    }
+    // The hardware enters at the reset and interrupt vectors, each a jump to its handler. The
+    // vectors follow `__interrupt_vect`, up to the next label.
+    let lines: Vec<(u64, Vec<u8>, &str)> = rst.lines().filter_map(listed).collect();
+    let vectors = lines.iter().position(|(_, _, text)| *text == "__interrupt_vect:").map_or(&lines[..0], |table| {
+        let after = &lines[table + 1..];
+        &after[..after.iter().position(|(_, bytes, text)| bytes.is_empty() && text.ends_with(':')).unwrap_or(after.len())]
+    });
+    let vectors = vectors.iter().filter(|(addr, _, text)| *addr % 8 == 3 && mnemonic(text) == "ljmp").map(|(addr, _, _)| *addr);
+    for addr in std::iter::once(image.entry).chain(vectors) {
         let thunk = is_thunk(addr);
         by_addr.entry(addr).or_insert(Function { addr, size: 0, name: format!("vector_{addr:02x}"), fragment: thunk, noreturn: false, thunk });
     }
@@ -116,8 +143,7 @@ pub fn extract(layout: &Path, cdb_path: &Path) -> Result<Truth> {
     let starts: Vec<u64> = by_addr.keys().copied().collect();
     for (function, next) in by_addr.values_mut().zip(starts.iter().skip(1).copied().chain([u64::MAX])) {
         if c_ranges.binary_search_by_key(&function.addr, |&(start, _)| start).is_err() {
-            let section_end = image.sections.iter().find(|section| section.contains(function.addr)).map_or(function.addr, |section| section.end());
-            function.size = next.min(section_end) - function.addr;
+            function.size = next.min(section_end(function.addr)) - function.addr;
         }
     }
     let exec: Vec<(u64, u64)> = image.sections.iter().filter(|section| section.executable).map(|section| (section.addr, section.end())).collect();
@@ -130,8 +156,8 @@ pub fn extract(layout: &Path, cdb_path: &Path) -> Result<Truth> {
         noreturn_calls: Vec::new(),
         terminal_calls: Vec::new(),
         noreturn_imports: Vec::new(),
-        undecodable_bytes,
-        data_bytes: 0,
+        undecodable_bytes: 0,
+        data_bytes,
     })
 }
 
@@ -212,11 +238,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_function_runs_from_its_record_to_the_record_of_its_last_instruction() {
+    fn a_function_has_the_record_of_its_start_and_of_its_closing_brace() {
         let cdb = "F:G$pick$0_0$0({2}DF,SC:U),C,0,0,0,0,0\nF:Fmod$local$0_0$0({2}DF,SI:S),C,0,0,0,0,0\nS:G$P0$0_0$0({1}SC:U),I,0,0\n\
                    L:G$P0$0_0$0:80\nL:G$pick$0$0:B9\nL:XG$pick$0$0:F3\nL:Fmod$local$0$0:18000\nL:XFmod$local$0$0:1801A\nL:C$t.c$6$1_0$45:B9\n";
         let functions: Vec<_> = c_functions(cdb).into_iter().collect();
         assert_eq!(functions, [(0xB9, ("pick".to_string(), Some(0xF3))), (0x1_8000, ("local".to_string(), Some(0x1_801A)))]);
+    }
+
+    #[test]
+    fn a_function_ends_with_its_return_or_where_the_next_begins() {
+        #[rustfmt::skip]
+        let code = [
+            0x02, 0x00, 0x10,       // 00  ljmp __sdcc_gsinit_startup
+            0x02, 0x00, 0x1B,       // 03  ljmp _isr
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x12, 0x00, 0x17,       // 10  _main: lcall _naked
+            0x12, 0x00, 0x18,       // 13  lcall _routine
+            0x22,                   // 16  ret
+            0xE4,                   // 17  _naked: clr a, and no return
+            0x74, 0x01, 0x22,       // 18  _routine, in assembly: mov a,#1; ret
+            0x32,                   // 1B  _isr: reti
+        ];
+        let line = |addr: u64, bytes: &str, text: &str| format!("      {addr:06X} {bytes:16} [24]   1 \t{text}\n");
+        let label = |addr: u64, name: &str| format!("      {addr:06X}                         1 {name}:\n");
+        let rst = [
+            label(0x00, "__interrupt_vect"),
+            line(0x00, "02 00 10", "ljmp\t__sdcc_gsinit_startup"),
+            line(0x03, "02 00 1B", "ljmp\t_isr"),
+            label(0x10, "_main"),
+            line(0x10, "12 00 17", "lcall\t_naked"),
+            line(0x13, "12 00 18", "lcall\t_routine"),
+            line(0x16, "22", "ret"),
+            label(0x17, "_naked"),
+            line(0x17, "E4", "clr\ta"),
+            label(0x18, "_routine"),
+            line(0x18, "74 01", "mov\ta,#1"),
+            line(0x1A, "22", "ret"),
+            label(0x1B, "_isr"),
+            line(0x1B, "32", "reti"),
+        ]
+        .concat();
+        // The closing record of a function is at the code of its closing brace; of a naked one,
+        // where the next function starts.
+        let cdb = "F:G$main$0_0$0({2}DF,SV:S),C,0,0,0,0,0\nF:G$naked$0_0$0({2}DF,SV:S),C,0,0,0,0,0\nF:G$isr$0_0$0({2}DF,SV:S),C,0,0,0,0,0\n\
+                   L:G$main$0$0:10\nL:XG$main$0$0:16\nL:G$naked$0$0:17\nL:XG$naked$0$0:18\nL:G$isr$0$0:1B\nL:XG$isr$0$0:1B\n";
+        let map = "CSEG                                00000010    0000000C =          12. bytes (REL,CON,CODE)\n\
+                   C:   00000010  _main                              main\n\
+                   C:   00000018  _routine                           routine\n";
+        let dir = std::env::temp_dir().join(format!("recore-sdcc-truth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.bin"), code).unwrap();
+        std::fs::write(dir.join("t.toml"), "machine = \"8051\"\ncompiler = \"sdcc\"\nentry = [0]\n[[region]]\nfile = \"t.bin\"\noffset = 0\nlength = 0x1C\naddress = 0\nexecutable = true\n").unwrap();
+        for (extension, text) in [("cdb", cdb), ("map", map), ("rst", &rst)] {
+            std::fs::write(dir.join(format!("t.{extension}")), text).unwrap();
+        }
+        let truth = extract(&dir.join("t.toml"), &dir.join("t.cdb"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let truth = truth.unwrap();
+        let functions: Vec<(u64, u64, &str, bool)> = truth.functions.iter().map(|function| (function.addr, function.size, function.name.as_str(), function.fragment)).collect();
+        assert_eq!(
+            functions,
+            [(0x00, 0x03, "vector_00", true), (0x03, 0x0D, "vector_03", true), (0x10, 7, "main", false), (0x17, 1, "naked", false), (0x18, 3, "_routine", false), (0x1B, 1, "isr", false)]
+        );
+        assert_eq!(truth.instructions, 5);
     }
 
     #[test]
