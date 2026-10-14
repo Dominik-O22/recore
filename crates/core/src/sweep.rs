@@ -35,7 +35,8 @@ pub struct Sweep {
     pub absent: Vec<String>,
     /// How the analyses of the first two candidates differ.
     pub difference: Option<String>,
-    pub timings: Vec<(&'static str, Duration)>,
+    /// How long the sweep took.
+    pub elapsed: Duration,
     layout: Layout,
     /// The layout's file, which its regions' files are named from.
     path: PathBuf,
@@ -151,9 +152,9 @@ impl Draft<'_> {
         self.layout.image("sweep".into(), self.sections(pieces), Some(banking))
     }
 
-    /// The best ways to place the open regions under the trampolines of `banking`, and the
-    /// time spent scoring pairs and assigning. None when the image has no such trampolines.
-    fn place(&self, scheme: &str, banking: BankingLayout) -> Result<Option<(Vec<Candidate>, [Duration; 2])>> {
+    /// The best ways to place the open regions under the trampolines of `banking`. None when
+    /// the image has no such trampolines.
+    fn place(&self, scheme: &str, banking: BankingLayout) -> Result<Option<Vec<Candidate>>> {
         // Where a trampoline goes does not depend on where its caller is loaded, so any
         // placement shows them all: here each open region in a bank no trampoline can name.
         let apart: Vec<(usize, u64)> = self.open.iter().zip(0x100..).map(|(&region, bank)| (region, bank)).collect();
@@ -171,17 +172,14 @@ impl Draft<'_> {
         }
         let banks: Vec<u64> = targets.keys().copied().collect();
 
-        let start = Instant::now();
         let pairs: Vec<(usize, usize)> = (0..self.open.len()).flat_map(|region| (0..banks.len()).map(move |bank| (region, bank))).collect();
         let scores: Vec<Score> = pairs
             .par_iter()
             .map(|&(region, bank)| Ok(landing(&self.image(&self.pieces(&[(self.open[region], banks[bank])], first), &banking)?, &targets[&banks[bank]])))
             .collect::<Result<_>>()?;
         let evidence = |region: usize, bank: usize| scores[region * banks.len() + bank];
-        let scored = start.elapsed();
 
         // A square of gains: a region without a bank and a bank without a region gain nothing.
-        let start = Instant::now();
         let size = self.open.len().max(banks.len());
         let mut gain = vec![vec![0.0; size]; size];
         for &(region, bank) in &pairs {
@@ -198,7 +196,6 @@ impl Draft<'_> {
                 (if other[region] == best[region] { f64::INFINITY } else { total(&best) - total(&other) }, other)
             })
             .collect();
-        let assigned = start.elapsed();
 
         let candidate = |assignment: &[usize], measured: bool| -> Result<Candidate> {
             let bank = |region: usize| banks.get(assignment[region]).copied();
@@ -225,7 +222,7 @@ impl Draft<'_> {
         if let Some((_, other)) = others.iter().filter(|(margin, _)| margin.is_finite()).min_by(|a, b| a.0.total_cmp(&b.0)) {
             candidates.push(candidate(other, false)?);
         }
-        Ok(Some((candidates, [scored, assigned])))
+        Ok(Some(candidates))
     }
 }
 
@@ -307,9 +304,6 @@ pub fn sweep(path: &Path) -> Result<Sweep> {
     let bytes = layout.bytes(path)?;
     let given = layout.banking.take().unwrap_or_default();
     let open: Vec<usize> = (0..layout.region.len()).filter(|&region| layout.region[region].bank.is_some()).collect();
-    let mut timings = vec![("read", start.elapsed())];
-
-    let start = Instant::now();
     let (common, compared) = if given.common.is_empty() {
         let regions: Vec<(u64, &[u8])> = open.iter().map(|&region| (layout.region[region].address, bytes[region].as_slice())).collect();
         let loaded = |from: u64, to: u64| layout.region.iter().any(|region| region.bank.is_none() && region.address < to && from < region.address + region.length);
@@ -317,7 +311,6 @@ pub fn sweep(path: &Path) -> Result<Sweep> {
     } else {
         (given.common.iter().map(|&(start, end)| (u64::from(start), u64::from(end))).collect(), None)
     };
-    timings.push(("compare regions", start.elapsed()));
 
     let draft = Draft { layout: &layout, bytes: &bytes, open, common: common.clone() };
     let narrow = |common: &[(u64, u64)]| common.iter().map(|&(start, end)| (start as u16, end as u32)).collect();
@@ -328,29 +321,22 @@ pub fn sweep(path: &Path) -> Result<Sweep> {
         vec![("the layout's trampolines".to_string(), BankingLayout { common: narrow(&common), trampoline: given.trampoline })]
     };
     let (mut candidates, mut absent) = (Vec::new(), Vec::new());
-    let mut spent = [Duration::ZERO; 3];
     for (name, banking) in schemes {
-        let start = Instant::now();
         // An image without the stub has none of the trampolines, and most schemes are not there.
         if !banking.trampoline.iter().any(|trampoline| bytes.iter().any(|region| trampoline.has_stub(region))) {
             absent.push(name);
             continue;
         }
         match draft.place(&name, banking)? {
-            Some((found, [scored, assigned])) => {
-                candidates.extend(found);
-                spent = [spent[0] + scored, spent[1] + assigned, spent[2] + start.elapsed() - scored - assigned];
-            }
+            Some(found) => candidates.extend(found),
             None => absent.push(name),
         }
     }
-    timings.extend([("score each region as each bank", spent[0]), ("assign", spent[1]), ("find trampolines, score the candidates", spent[2])]);
     // A scheme is absent when the image has none of its forms.
     absent.dedup();
     absent.retain(|name| candidates.iter().all(|candidate: &Candidate| candidate.scheme != *name));
     candidates.sort_by(|a, b| b.score.bits().total_cmp(&a.score.bits()));
 
-    let start = Instant::now();
     let analyzed = |candidate: &Candidate| -> Result<Program> {
         let image = draft.image(&candidate.pieces, &candidate.banking)?;
         let analysis = crate::analyze(&image);
@@ -360,8 +346,7 @@ pub fn sweep(path: &Path) -> Result<Sweep> {
         [first, second, ..] => Some(differences(first, &analyzed(first)?, second, &analyzed(second)?)),
         _ => None,
     };
-    timings.push(("analyze and compare the first two", start.elapsed()));
-    Ok(Sweep { common, compared, candidates, absent, difference, timings, layout, path: path.to_path_buf() })
+    Ok(Sweep { common, compared, candidates, absent, difference, elapsed: start.elapsed(), layout, path: path.to_path_buf() })
 }
 
 /// How the second candidate differs from the first: in its layout, and in what analysis finds.
@@ -462,9 +447,7 @@ impl fmt::Display for Sweep {
         if let Some(difference) = &self.difference {
             writeln!(f, "\nthe second differs from the first: {difference}")?;
         }
-        let total: Duration = self.timings.iter().map(|timing| timing.1).sum();
-        let phases: Vec<String> = self.timings.iter().map(|(phase, time)| format!("{phase} {:.0} ms", time.as_secs_f64() * 1e3)).collect();
-        writeln!(f, "\nswept in {:.0} ms: {}", total.as_secs_f64() * 1e3, phases.join(", "))
+        writeln!(f, "\nswept in {:.0} ms", self.elapsed.as_secs_f64() * 1e3)
     }
 }
 
