@@ -47,6 +47,9 @@ pub enum Machine {
     /// The 8051 and the many microcontrollers that keep its instruction set.
     #[serde(rename = "8051")]
     I8051,
+    /// An ARM Cortex-M, which runs Thumb code only.
+    #[serde(rename = "cortex-m")]
+    Thumb,
 }
 
 /// The compiler that built an image, where a layout file names it. It decides how functions
@@ -63,7 +66,7 @@ impl Machine {
     /// Bytes in a pointer, which is how wide a code or data address stored in the image is.
     pub fn pointer_size(self) -> u64 {
         match self {
-            Machine::X86 => 4,
+            Machine::X86 | Machine::Thumb => 4,
             Machine::X86_64 | Machine::Aarch64 => 8,
             Machine::I8051 => 2,
         }

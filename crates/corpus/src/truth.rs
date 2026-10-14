@@ -6,14 +6,16 @@
 //! shared; only that decode is per architecture (x86-64 and AArch64).
 //!
 //! PE images take their functions from a PDB instead (see [`pe`]), and Mach-O images from an
-//! unstripped copy (see [`macho`]); both share the classification. 8051 programs take theirs
-//! from SDCC's debug records (see [`sdcc`]).
+//! unstripped copy (see [`macho`]); both share the classification. Raw images take theirs from
+//! what built them: 8051 programs from SDCC's debug records (see [`sdcc`]), Cortex-M programs
+//! from the ELF they were cut from (see [`thumb`]).
 
 mod aarch64;
 mod macho;
 pub mod pe;
 pub mod pe_facts;
 pub mod sdcc;
+pub mod thumb;
 mod x86;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -220,6 +222,11 @@ fn import_slots(binary: &object::File) -> HashMap<u64, String> {
     slots
 }
 
+/// Whether the debug file of a raw image is the ELF it was cut from, and not SDCC's records.
+pub fn is_elf_of_raw(debug_path: &Path) -> bool {
+    debug_path.extension().is_some_and(|extension| extension == "debug")
+}
+
 /// Arm mapping symbols (`$x`, `$d`, `$x.123`) mark code and data runs; they are not functions.
 fn is_mapping_symbol(name: &str) -> bool {
     ["$x", "$d"].iter().any(|prefix| name == *prefix || name.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.')))
@@ -296,7 +303,7 @@ fn classify(scans: impl Iterator<Item = Scan>, callees: &Callees) -> Classified 
 
 pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     if recore::layout::is_layout(binary_path) {
-        return sdcc::extract(binary_path, debug_path);
+        return if is_elf_of_raw(debug_path) { thumb::extract(binary_path, debug_path) } else { sdcc::extract(binary_path, debug_path) };
     }
     let binary_data = std::fs::read(binary_path).with_context(|| format!("reading {binary_path:?}"))?;
     let binary = object::File::parse(&*binary_data)?;

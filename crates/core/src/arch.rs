@@ -103,9 +103,25 @@ pub trait Arch: 'static {
     /// Usual alignment of function entry points in optimised compiler output.
     const FUNCTION_ALIGN: u64;
 
+    /// The most bytes of padding a toolchain puts between two functions.
+    const LONGEST_PADDING: u64 = Self::FUNCTION_ALIGN - 1;
+
     /// Whether that alignment is coarser than a single instruction, so that unreferenced code
     /// sitting on an aligned address is likelier to be a function than a block inside one.
     const ALIGNMENT_IS_EVIDENCE: bool;
+
+    /// Whether a pointer to code is told by a bit of its own, the Thumb bit, so that words among
+    /// the code that are no instructions are worth reading as pointers where nothing relocates
+    /// them. Each is weak evidence, as an address taken is: see [`Arch::code_pointer`].
+    const MARKED_CODE_POINTERS: bool = false;
+
+    /// Whether a call may be a jump within the function, as Thumb-1 code reaches a block too far
+    /// for a branch with `BL` once it has saved the return address.
+    const CALL_MAY_BE_FAR_JUMP: bool = false;
+
+    /// Whether an address that code takes is only weak evidence of a function, which a jump
+    /// across it overrules: so it is where code forms addresses as numbers like any other.
+    const TAKEN_IS_WEAK: bool = false;
 
     /// Whether code embeds absolute addresses that the loader relocates. If so, a value only
     /// counts as an address when some relocation carries it, which rules out constants that
@@ -157,6 +173,13 @@ pub trait Arch: 'static {
     /// address of a function or of data.
     fn address_taken(insn: &Self::Insn, state: &Self::State) -> Option<u64>;
 
+    /// Whether the code at `target`, an address that code takes or the first instruction after
+    /// a gap, can be a function. Where an address is a number like any other, a number that
+    /// happens to land in the code is not, and where data follows the code, nor is the data.
+    fn code_pointer(_image: &Image, _target: u64) -> bool {
+        true
+    }
+
     /// Data that `insn` reads at an offset from a base register whose value is tracked, as
     /// `(base, address)`. When the base is the image base this is how a table is reached, which
     /// tells where the table before it ends. Never treated as code.
@@ -168,6 +191,16 @@ pub trait Arch: 'static {
     /// global variable or a constant table. The address is in the instruction itself, or is
     /// an offset from a register whose value the state knows.
     fn memory_reference(_insn: &Self::Insn, _state: &Self::State) -> Option<u64> {
+        None
+    }
+
+    /// Whether code reads constants from pools among it, at addresses relative to its own: see
+    /// [`Arch::literal`].
+    const LITERAL_POOLS: bool = false;
+
+    /// `[start, end)` of the data among the code that `insn` reads at an address relative to
+    /// its own, as a load from a literal pool does. Nothing there is an instruction.
+    fn literal(_insn: &Self::Insn) -> Option<(u64, u64)> {
         None
     }
 
@@ -220,6 +253,12 @@ pub trait Arch: 'static {
 
     /// Filler the toolchain inserts between functions.
     fn is_padding(insn: &Self::Insn) -> bool;
+
+    /// Filler that a compiler never puts straight after a call that returns, so that the call
+    /// it follows never does: what pads between functions, and not what aligns a loop.
+    fn ends_code(insn: &Self::Insn) -> bool {
+        Self::is_padding(insn)
+    }
 
     /// An instruction compilers place at entry points that can be reached indirectly, such as
     /// `endbr64` or `bti c`.
