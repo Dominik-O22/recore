@@ -1280,11 +1280,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         let unwound_elsewhere = !self.frames.is_empty() && self.frame_of(addr).is_none();
                         let whole = after_break
                             && (unwound_elsewhere && self.is_whole_function(index, addr, false)
-                                || aligned && self.is_whole_function(index, addr, true));
+                                || aligned && self.is_whole_function(index, addr, true)
+                                || A::TILES_GAPS && self.tiles_gap(index, addr));
                         // A whole function, or a gap that divides into functions, is code
                         // whatever its first instructions look like.
-                        let tiled = after_break && !whole && A::TILES_GAPS && self.tiles_gap(index, addr);
-                        is_start = (aligned_after_break || opens || whole || tiled) && !self.inside_frame(addr) && (whole || tiled || A::code_pointer(self.image, addr));
+                        is_start = (aligned_after_break || opens || whole) && !self.inside_frame(addr) && (A::TILES_GAPS && whole || A::code_pointer(self.image, addr));
                         if !is_start {
                             // Inside an unwind entry the bytes belong to a function, so they are
                             // worth decoding to resolve what they dispatch to, without taking
