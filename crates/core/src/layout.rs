@@ -225,7 +225,7 @@ impl TryFrom<String> for Pattern {
             "ll" => Ok(Unit::TargetLow),
             "ss" => Ok(Unit::Stub),
             "bb" => Ok(Unit::Bank),
-            byte if byte.len() == 2 => u8::from_str_radix(byte, 16).map(Unit::Byte).with_context(|| format!("`{byte}` in the pattern `{text}` is not a byte")),
+            byte if byte.len() == 2 && byte.chars().all(|c| c.is_ascii_hexdigit()) => Ok(Unit::Byte(u8::from_str_radix(byte, 16)?)),
             other => anyhow::bail!("`{other}` in the pattern `{text}` is not a byte"),
         };
         Ok(Pattern(text.split_whitespace().map(unit).collect::<Result<_>>()?))
@@ -325,7 +325,26 @@ pub fn is_layout(path: &Path) -> bool {
 impl Layout {
     pub(crate) fn read(path: &Path) -> Result<Layout> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {path:?}"))?;
-        toml::from_str(&text).with_context(|| format!("reading the layout {path:?}"))
+        let layout: Layout = toml::from_str(&text).with_context(|| format!("reading the layout {path:?}"))?;
+        layout.check().with_context(|| format!("in the layout {path:?}"))?;
+        Ok(layout)
+    }
+
+    /// Checks what the format cannot: that each region fits where it loads, and each common
+    /// range is a range of 16-bit addresses.
+    fn check(&self) -> Result<()> {
+        for region in &self.region {
+            let end = region.address.checked_add(region.length).with_context(|| format!("the region at offset {:#x} runs past the end of the address space", region.offset))?;
+            if self.machine == Machine::I8051 {
+                // Code is at `bank << 16 | address`, below the other spaces.
+                ensure!(end <= crate::i8051::XDATA, "the region at offset {:#x} runs past the 8051's code space, which ends at {:#x}", region.offset, crate::i8051::XDATA);
+                ensure!((region.address & 0xFFFF) + region.length <= 0x1_0000, "the region at offset {:#x} runs past the 64 KB of its bank", region.offset);
+            }
+        }
+        for &(start, end) in self.banking.iter().flat_map(|banking| &banking.common) {
+            ensure!(u32::from(start) < end && end <= 0x1_0000, "the common range [{start:#x}, {end:#x}] is no range of 16-bit addresses");
+        }
+        Ok(())
     }
 
     /// The bytes of each region, read from the files beside the layout at `path`.
@@ -350,6 +369,9 @@ impl Layout {
     /// The image `sections` make, called `name`, with the trampolines `banking` describes.
     pub(crate) fn image(&self, name: String, mut sections: Vec<Section>, banking: Option<&BankingLayout>) -> Result<Image> {
         let (&entry, vectors) = self.entry.split_first().context("the layout names no entry point")?;
+        for &addr in &self.entry {
+            ensure!(sections.iter().any(|section| section.contains(addr)), "the entry point {addr:#x} is in no region");
+        }
         sections.sort_by_key(|section| section.addr);
         for pair in sections.windows(2) {
             ensure!(pair[0].end() <= pair[1].addr, "the regions `{}` and `{}` overlap", pair[0].name, pair[1].name);

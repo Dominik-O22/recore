@@ -12,7 +12,7 @@ use std::fmt::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
 use crate::image::{Compiler, Image, Section};
@@ -307,9 +307,6 @@ pub fn sweep(path: &Path) -> Result<Sweep> {
     let bytes = layout.bytes(path)?;
     let given = layout.banking.take().unwrap_or_default();
     let open: Vec<usize> = (0..layout.region.len()).filter(|&region| layout.region[region].bank.is_some()).collect();
-    for region in open.iter().map(|&region| &layout.region[region]) {
-        ensure!(region.address + region.length <= 0x1_0000, "the region at offset {:#x} is open, so its `address` is the 16-bit address it starts at, and it runs past 0x10000", region.offset);
-    }
     let mut timings = vec![("read", start.elapsed())];
 
     let start = Instant::now();

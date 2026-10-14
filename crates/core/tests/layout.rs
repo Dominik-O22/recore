@@ -149,3 +149,22 @@ fn a_start_inside_the_first_instruction_of_a_shared_tail_ends_the_analysis() {
     let functions: Vec<u64> = recore::analyze(&image).functions.iter().map(|function| function.addr).collect();
     assert_eq!(functions, [0x0000, 0x0003, 0x0010, 0x0011]);
 }
+
+#[test]
+fn a_layout_that_places_nothing_where_it_can_load_is_refused() {
+    let region = |address: &str, length: &str| format!("[[region]]\nfile = \"code.bin\"\noffset = 0\nlength = {length}\naddress = {address}\nexecutable = true\n");
+    let refused = |name: &str, layout: String| format!("{:#}", Image::load(&write(name, &layout, &[0x22; 0x100])).err().unwrap());
+    let head = "machine = \"8051\"\nentry = [0]\n";
+    let cases = [
+        ("past-the-end", format!("{head}{}", region("0xfffffffffffffff0", "0x20")), "runs past the end of the address space"),
+        ("past-the-bank", format!("{head}{}", region("0x1ff80", "0x100")), "runs past the 64 KB of its bank"),
+        ("entry-outside", format!("machine = \"8051\"\nentry = [0x9999]\n{}", region("0", "0x100")), "the entry point 0x9999 is in no region"),
+        ("backward-common", format!("{head}{}[banking]\ncommon = [[0x80, 0x10]]\n", region("0", "0x100")), "is no range of 16-bit addresses"),
+        ("wide-common", format!("{head}{}[banking]\ncommon = [[0, 0x20000]]\n", region("0", "0x100")), "is no range of 16-bit addresses"),
+        ("signed-byte", format!("{head}{}[banking]\ncommon = [[0, 0x100]]\n[[banking.trampoline]]\nentry = \"+1 hh ll 02 ss ss\"\nstub = \"22\"\n", region("0", "0x100")), "`+1` in the pattern"),
+    ];
+    for (name, layout, message) in cases {
+        let error = refused(name, layout);
+        assert!(error.contains(message), "{name}: {error}");
+    }
+}
