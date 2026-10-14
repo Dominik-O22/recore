@@ -136,7 +136,7 @@ fn a_start_inside_the_first_instruction_of_a_shared_tail_ends_the_analysis() {
     bytes[0x10..].copy_from_slice(&[0x74, 0x22, 0x22]);
     let layout = r#"
         machine = "8051"
-        entry = [0x0000, 0x0011]
+        entry = [0x0000, 0x0003, 0x0011]
 
         [[region]]
         file = "code.bin"
