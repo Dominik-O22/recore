@@ -57,4 +57,5 @@ corpus-8051/image/
 corpus-8051/debug/
 corpus-8051/truth/
 corpus-8051/jumptables/
+corpus-8051/signatures/
 corpus-8051/recore*/
