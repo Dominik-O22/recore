@@ -30,7 +30,7 @@ name=recore-$version-$os-$arch
 # Without the debug information that the development profile keeps for the profiler.
 cargo build --release -p recore-mcp --config profile.release.debug=0 --config profile.release.strip=true
 rm -rf "dist/$name" && mkdir -p "dist/$name"
-cp target/release/recore-mcp LICENSE README.md "dist/$name/"
+cp target/release/recore-mcp LICENSE NOTICE README.md "dist/$name/"
 cp third_party/ghidra-decompiler/NOTICE "dist/$name/NOTICE.ghidra-decompiler"
 tar -czf "dist/$name.tar.gz" -C dist "$name"
 rm -r "dist/$name"

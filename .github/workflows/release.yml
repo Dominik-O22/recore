@@ -2,7 +2,8 @@ name: release
 
 # A tag `v1.2.3` builds recore-mcp for each platform, publishes the archives as a GitHub release
 # and signs a packslip that lists them, which is what `mise use packslip:github.com/<repo>` and
-# `packslip install` verify before they install.
+# `packslip install` verify before they install. Actions are pinned to commits, since this
+# workflow can write releases and sign with the repository's identity.
 on:
   push:
     tags: ["v*"]
@@ -15,13 +16,13 @@ jobs:
         runner: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
       - run: c++ --version
       - run: mise run dist
         env:
           RECORE_VERSION: ${{ github.ref_name }} # v1.2.3; the task takes off the v
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-${{ matrix.runner }}
           path: dist/*.tar.gz
@@ -35,7 +36,7 @@ jobs:
       id-token: write # Sign with this workflow's identity.
       attestations: write # Attest the archives.
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: dist-*
           path: dist
@@ -44,7 +45,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
-      - uses: jdx/packslip@v1
+      - uses: jdx/packslip@7b32cd29a9240927882ee18b3db1dcfd8e0328b4 # v1.7.0
         with:
           artifacts: dist/*.tar.gz
           bin: recore-mcp

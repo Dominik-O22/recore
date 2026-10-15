@@ -191,6 +191,14 @@ recore analyzes all 39 in 55 ms, none taking more than 3 ms. Most of the functio
 
 Other limits: a Swift method that is only in a vtable is named by its kind and place, as `Type.getter_2`, because the image holds no name for it; `trace` does not follow a value through memory; a name goes on a function, on data or on a variable of a function, not on an address inside a function; arm64e Mach-O loads but is untested.
 
+## Installing
+
+Each [release](https://github.com/Dominik-O22/recore/releases) has `recore-mcp` for Linux on x86-64 and arm64 and for macOS on Apple silicon, as one self-contained binary. With [mise](https://mise.jdx.dev), which checks the release's signature before it installs:
+
+```
+mise use -g packslip:github.com/Dominik-O22/recore
+```
+
 ## Building
 
 A Rust toolchain, a C++ compiler and cmake. The C++ compiler builds the decompiler engine, vendored under `third_party/`, and cmake builds the Swift demangler.
@@ -213,7 +221,7 @@ For Claude Code, in `.mcp.json`:
 
 ## Reproducing the numbers
 
-The corpora are not in the repository. `corpus/fetch*.py` download them, `corpus/build_8051.py` builds the 8051 programs with SDCC, `corpus/build_thumb.py` the Cortex-M ones with clang, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. `recore-bench run analysis --save <name>` and `--compare <name>` hold a change against an earlier build. Next to the times they report the processor instructions executed, which stay the same to a few hundredths of a percent whatever else the machine is doing.
+The corpora are not in the repository. `corpus/fetch*.py` download them, except the monitor firmware, a vendor's image that is not ours to share, `corpus/build_8051.py` builds the 8051 programs with SDCC, `corpus/build_thumb.py` the Cortex-M ones with clang, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. `recore-bench run analysis --save <name>` and `--compare <name>` hold a change against an earlier build. Next to the times they report the processor instructions executed, which stay the same to a few hundredths of a percent whatever else the machine is doing.
 
 The speed table compares Ghidra's `Total Time` per binary with the wall time of `recore-mcp summary`, fastest of three runs, and `ghidra/speed.py` measures it. Both ran on the same Ryzen 7 9850X3D. Ghidra analyzed several binaries at a time with 4 cores each, and recore one at a time, with all cores or pinned to one with `taskset`.
 
@@ -227,4 +235,4 @@ The speed table compares Ghidra's `Total Time` per binary with the wall time of 
 
 ## Licence
 
-Apache 2.0. The vendored decompiler engine is Apache 2.0 from the Ghidra project, with zlib under its own licence.
+Apache 2.0. The vendored decompiler engine is Apache 2.0 from the Ghidra project, with zlib under its own licence. The prototypes in `crates/decomp/data/*.protos` come from Ghidra's type archives, under the same licence.

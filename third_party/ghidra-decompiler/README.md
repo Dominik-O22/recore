@@ -3,8 +3,8 @@
 The C++ decompiler from Ghidra, built as a static library by `build.rs` and used by
 `crates/decomp`. Seven source files, two language files and the SLEIGH sources of the 8051 language are modified, and one compiler spec is added, see below.
 
-Source: `Ghidra/Features/Decompiler/src/decompile/` of the Ghidra repository at commit
-`918d44ebc2` (12.3 DEV), copied from `~/Work/tries/ghidra-profile/master`.
+Source: `Ghidra/Features/Decompiler/src/decompile/` of the
+[Ghidra repository](https://github.com/NationalSecurityAgency/ghidra) at commit `918d44ebc2` (12.3 DEV).
 
 | Directory | Contents |
 |---|---|
