@@ -1,0 +1,5 @@
+recore
+Copyright 2026 Dominik Opwis
+
+Includes the decompiler engine of Ghidra, under Apache 2.0 with the notice of the Ghidra
+project, and zlib, under its own licence.
