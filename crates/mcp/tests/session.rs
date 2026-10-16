@@ -274,6 +274,29 @@ fn a_structure_passed_on_the_stack_reaches_the_call() {
 }
 
 #[test]
+fn short_strings_a_table_points_to_read_as_text() {
+    // One-character strings back to back read as UTF-16 too; pointers into them say otherwise.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/short.elf");
+    let mut client = Client::start();
+    assert_eq!(client.tool("strings", json!({ "path": path })).unwrap(), "0 strings\n");
+    let text = client.tool("addr", json!({ "path": path, "addr": "0x2008" })).unwrap();
+    assert_eq!(text, "address 0x2008, file offset 0x2008, in .rodata: text \"<\"\n");
+}
+
+#[test]
+fn the_command_line_takes_counts_in_hex_and_says_how_it_read_an_address() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/short.elf");
+    let run = |args: &[&str]| {
+        let out = Command::new(SERVER).env(recore::edits::DIR_VAR, edits_dir()).args(args).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
+    };
+    let dump = run(&["bytes", path, "0x2008", "--len", "0x10"]);
+    assert!(dump.starts_with("16 bytes at 0x2008 in .rodata"), "{dump}");
+    let error = run(&["bytes", path, "29760"]);
+    assert!(error.contains("0x29760 (`29760` is read as hex, 0x29760; decimal 29760 is 0x7440) has no bytes in the file"), "{error}");
+}
+
+#[test]
 fn memory_the_file_has_no_bytes_for_takes_a_name() {
     // An 8051 program: SETB 0xAF; MOV DPTR, #0x8100; MOVX @DPTR, A; RET.
     let dir = edits_dir();

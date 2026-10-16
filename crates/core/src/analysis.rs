@@ -816,6 +816,12 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     strings.extend(crate::rtti::type_names(image).into_iter().map(|(addr, text)| StringLiteral { addr, text, wide: false }));
     strings.sort_by_key(|string| string.addr);
     strings.dedup_by_key(|string| string.addr);
+    // A wide string that something points into is short narrow strings packed back to back:
+    // "<", "!" and "(" each with its zero read as the UTF-16 text "<!(".
+    strings.retain(|string| {
+        let end = || string.addr + 2 * string.text.encode_utf16().count() as u64;
+        !string.wide || candidates[candidates.partition_point(|&at| at <= string.addr)..].first().is_none_or(|&at| at >= end())
+    });
     // What is left in the data sections that reads as text, for the strings a program reaches
     // by an address it computes.
     strings.extend(crate::strings::unreferenced(image, &strings));

@@ -477,6 +477,16 @@ pub(crate) fn addr_arg(text: &str) -> Result<u64> {
     parse_addr(text).with_context(|| format!("`{text}` is not a hex address"))
 }
 
+/// How an address written with decimal digits only was read, for an error about it: addresses
+/// are hex with or without `0x`, and `29760` is not the decimal number.
+fn read_as_hex(text: &str) -> String {
+    let text = text.trim();
+    match text.parse::<u64>() {
+        Ok(decimal) if decimal >= 10 => format!(" (`{text}` is read as hex, 0x{text}; decimal {text} is {decimal:#x})"),
+        _ => String::new(),
+    }
+}
+
 /// The entry of the function `text` names or points into. A name first: `add` is a hex number
 /// too.
 pub(crate) fn resolve_function(binary: &Binary, text: &str) -> Result<u64> {
@@ -622,6 +632,11 @@ fn describe_to(binary: &Binary, addr: u64, depth: usize) -> String {
     }
     if let Some(string) = binary.program.string_at(addr) {
         return format!("string {}", quoted(&string.text));
+    }
+    // Text too short to be among the strings, as `xrefs` shows it where a table points to it.
+    let pointed_to = || binary.program.image.relative_targets.iter().any(|&(_, target)| target == addr);
+    if let Some(text) = short_text(&binary.program.image, addr).filter(|_| pointed_to()) {
+        return format!("text {text:?}");
     }
     if let Some(name) = binary.program.image.symbol_names.get(&addr).filter(|_| binary.program.function(addr).is_none()) {
         let image = &binary.program.image;
@@ -1132,7 +1147,7 @@ fn bytes(binary: &mut Binary, args: Bytes) -> Result<String> {
     let image = &binary.program.image;
     let Some(section) = image.section_at(addr) else {
         let mapped: Vec<String> = image.sections.iter().map(|s| format!("{} {:#x}-{:#x}", s.name, s.addr, s.end())).collect();
-        bail!("{addr:#x} has no bytes in the file (unmapped, or data that is only zero-filled at load). Mapped: {}", mapped.join(", "));
+        bail!("{addr:#x}{} has no bytes in the file (unmapped, or data that is only zero-filled at load). Mapped: {}", read_as_hex(&args.addr), mapped.join(", "));
     };
     let available = image.bytes_from(addr).expect("inside a section");
     let data = &available[..len.min(available.len())];

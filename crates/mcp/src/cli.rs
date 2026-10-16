@@ -1,6 +1,6 @@
 //! The tools from a shell: `recore-mcp <tool> <binary> [arguments]` runs one and prints its answer.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use recore::program::parse_addr;
 use serde_json::{Map, Value, json};
 
@@ -47,8 +47,10 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
             continue;
         }
         let Some(value) = rest.next() else { bail!("--{key} needs a value") };
-        let number = || value.parse::<u64>().map(Value::from).or_else(|_| value.parse::<f64>().map(Value::from));
-        let value = if NUMERIC.contains(&key) { number()? } else { json!(value) };
+        // A count in decimal or in hex with `0x`, or seconds with a fraction.
+        let hex = || value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).and_then(|digits| u64::from_str_radix(digits, 16).ok()).map(Value::from);
+        let number = || hex().map(Ok).unwrap_or_else(|| value.parse::<u64>().map(Value::from).or_else(|_| value.parse::<f64>().map(Value::from)));
+        let value = if NUMERIC.contains(&key) { number().with_context(|| format!("--{key} takes a number, in decimal or with 0x in hex, not `{value}`"))? } else { json!(value) };
         named.insert(key.to_string(), value);
     }
     match (tool, plain.as_slice()) {
