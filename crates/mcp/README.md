@@ -9,7 +9,7 @@ Every tool takes `path`, the binary to analyze, and answers with text. Addresses
 | Tool | Arguments | Answer |
 |---|---|---|
 | `summary` | | Format, machine, image base, entry, sections, counts of functions, imports, strings and jump tables, analysis time. |
-| `strings` | `pattern`?, `limit`? (100) | Each string with its address and the functions that use it. Strings in the data sections that nothing found refers to are listed too, with `used by: none`. `pattern` is a regular expression matched anywhere, ignoring case; text that is not a valid expression is matched as written. |
+| `strings` | `pattern`?, `limit`? (100) | Each string with its address and the functions that use it. Strings in the data sections that nothing found refers to are listed too, with `used by: none`. `pattern` is a regular expression matched anywhere, ignoring case, and also matches the text as written, so `chr() arg` finds "chr() arg". |
 | `imports` | `pattern`? | Each imported function with its slot and the functions that call it. |
 | `functions` | `pattern`?, `limit`? (100), `sort`? (`address` or `size`) | Address, size in bytes, number of calling functions, name. `pattern` matches names. |
 | `function` | `addr` or `name` | Extent, callers, calls made (imports by name, Objective-C message sends by selector), strings and globals referred to. `addr` is any address inside the function. |
