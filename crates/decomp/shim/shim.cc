@@ -2088,6 +2088,39 @@ static void recover_structs(RdSession *session, Funcdata &fd) {
   }
 }
 
+// Whether a data type is, or points to, a struct recovery defined.
+static bool mentions_recovered(const RdSession *session, const Datatype *type) {
+  for (int depth = 0; type != nullptr && depth < 8; ++depth) {
+    if (session->recovered.count(type) != 0) return true;
+    if (type->getMetatype() == TYPE_PTR)
+      type = static_cast<const TypePointer *>(type)->getPtrTo();
+    else if (type->getMetatype() == TYPE_ARRAY)
+      type = static_cast<const TypeArray *>(type)->getBase();
+    else
+      return false;
+  }
+  return false;
+}
+
+// The recovered structs that `fd`'s code reaches past the end of: through a field at or past
+// the end, or by stepping a pointer to one that is no element of an array. Each means that
+// `gather` missed a value the engine typed.
+static set<string> wrapped(const RdSession *session, Funcdata *fd) {
+  set<string> names;
+  for (auto it = fd->beginOpAlive(); it != fd->endOpAlive(); ++it) {
+    const PcodeOp *op = *it;
+    if (op->code() != CPUI_PTRSUB && op->code() != CPUI_PTRADD) continue;
+    Datatype *type = op->getIn(0)->getHighTypeReadFacing(op);
+    if (type->getMetatype() != TYPE_PTR) continue;
+    Datatype *to = static_cast<TypePointer *>(type)->getPtrTo();
+    auto found = session->recovered.find(to);
+    if (found == session->recovered.end()) continue;
+    bool past = op->code() == CPUI_PTRSUB ? op->getIn(1)->isConstant() && op->getIn(1)->getOffset() >= (uintb)to->getSize() : !found->second;
+    if (past) names.insert(to->getName());
+  }
+  return names;
+}
+
 // Says how recore plans the structs of the functions this session decompiles: `plan` is asked
 // with each function's evidence, and `wrapped` told of a struct that still wrapped. `ctx` goes
 // with each call.
@@ -2165,6 +2198,18 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
         if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
       }
     }
+    set<string> wraps = wrapped(session, fd);
+    if (!wraps.empty()) {
+      // Once more without them: the walk in `gather` missed a value the engine typed.
+      for (const string &name : wraps) session->wrapped(session->structs, name.c_str());
+      arch->clearAnalysis(fd);
+      root->reset(*fd);
+      if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
+      for (const string &name : wrapped(session, fd)) session->wrapped(session->structs, name.c_str());
+      string names;
+      for (const string &name : wraps) names += (names.empty() ? "" : ", ") + name;
+      fd->warningHeader("Decompiled again without recovered structs the code reaches past the end of: " + names);
+    }
     session->locals = name_locals(session, addr, fd);
     ostringstream text;
     if (session->print_c) {
@@ -2232,6 +2277,8 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       ParameterPieces piece;
       piece.addr = proto.getOutput()->getAddress();
       piece.type = proto.getOutputType();
+      // A recovered struct covers what this function reads of it, not what another one would.
+      if (mentions_recovered(session, piece.type)) piece.type = arch->types->getBase(piece.type->getSize(), TYPE_UNKNOWN);
       piece.flags = 0;
       session->outputs[addr] = piece;
     }
@@ -2250,6 +2297,17 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     if (vector_params < 8 && !reads_unexplained_register(fd) && !spills) {
       // Kept as a lower bound: a call passes these parameters and whatever else the call site
       // shows. A variadic function looks like one with only its fixed parameters.
+      // A recovered struct covers what this function reads of it, and callers read other parts.
+      FuncProto &proto = fd->getFuncProto();
+      for (int4 i = 0; i < proto.numParams(); ++i) {
+        ProtoParameter *param = proto.getParam(i);
+        if (!mentions_recovered(session, param->getType())) continue;
+        ParameterPieces piece;
+        piece.addr = param->getAddress();
+        piece.type = arch->types->getBase(param->getSize(), TYPE_UNKNOWN);
+        piece.flags = 0;
+        proto.setParam(i, param->getName(), piece);
+      }
       fd->getFuncProto().setInputLock(true);
       fd->getFuncProto().setDotdotdot(session->kept_are_lower_bounds);
       session->kept.insert(addr);

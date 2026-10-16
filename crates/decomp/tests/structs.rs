@@ -10,6 +10,7 @@ use recore_decomp::Session;
 const ELF_TOUCH: u64 = 0x401000;
 const ELF_SUM: u64 = 0x401018;
 const ELF_SPREAD: u64 = 0x401042;
+const ELF_RELAY: u64 = 0x40107b;
 const PE_TOUCH: u64 = 0x401000;
 const PE_SUM: u64 = 0x401030;
 
@@ -77,4 +78,16 @@ fn decompiling_again_shows_the_same_structs() {
     let mut session = session("structs.elf");
     let first = session.decompile(ELF_TOUCH).unwrap().c_text;
     assert_eq!(session.decompile(ELF_TOUCH).unwrap().c_text, first);
+}
+
+/// A recovered struct covers what one function reads. Kept prototypes carry what a function
+/// takes to the callers decompiled after it, and those must not see the callee's struct.
+#[test]
+fn a_caller_never_shows_its_callees_struct() {
+    let mut session = session("structs.elf");
+    session.keep_prototypes(true);
+    assert!(session.decompile(ELF_TOUCH).unwrap().c_text.contains("S_401000_RDI *param_1"));
+    let c_text = session.decompile(ELF_RELAY).unwrap().c_text;
+    assert!(c_text.contains("(undefined8 param_1)"), "{c_text}");
+    assert!(!c_text.contains("S_"), "{c_text}");
 }
