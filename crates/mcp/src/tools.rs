@@ -478,20 +478,29 @@ pub(crate) fn resolve_function(binary: &Binary, text: &str) -> Result<u64> {
 /// The names something is listed under in tables of the program's data: for each slot that
 /// holds a pointer to it, the text its partner in the table points to. A scripting language's
 /// library pairs each function with its name this way, and a table of types each type with
-/// its. Which neighbour is the partner shows from where the run of pointers begins: the slots
-/// pair up from there, name first in one table and second in another.
+/// its. In a table of pairs, which neighbour is the partner shows from where the run of
+/// pointers begins: the slots pair up from there, name first in one table and second in
+/// another. A wider record, which may hold a number among its pointers, opens with its name,
+/// as a Python module's list of functions does.
 pub(crate) fn table_names(program: &Program, entry: u64) -> Vec<(u64, String)> {
+    /// How many slots back from the slot the name that opens its record is looked for.
+    const FIELDS: u64 = 8;
     let image = &program.image;
     let pointer = image.machine.pointer_size();
     let target_of = |slot: u64| image.relative_targets.iter().find(|&&(at, _)| at == slot).map(|&(_, target)| target);
     let name_at = |slot: u64| short_text(image, target_of(slot)?);
+    let named = |slot: u64| name_at(slot).is_some();
     let partner = |slot: u64| {
-        let before = (1..).take_while(|back| slot.checked_sub(back * pointer).is_some_and(|earlier| target_of(earlier).is_some())).count() as u64;
-        // An even number of pointers before it: the slot opens a pair, and its partner follows.
-        // Where that one holds no name, as in a record with a number among its pointers, the
-        // other neighbour is tried.
-        let (first, second) = if before % 2 == 0 { (slot + pointer, slot - pointer) } else { (slot - pointer, slot + pointer) };
-        name_at(first).or_else(|| name_at(second))
+        let mut neighbours = [slot.checked_sub(pointer), slot.checked_add(pointer)].into_iter().flatten().filter(|&at| named(at));
+        let pairs = neighbours.any(|name| name.checked_sub(2 * pointer).is_some_and(named) || named(name + 2 * pointer));
+        if pairs {
+            let before = (1..).take_while(|back| slot.checked_sub(back * pointer).is_some_and(|earlier| target_of(earlier).is_some())).count() as u64;
+            // An even number of pointers before it: the slot opens a pair, and its partner follows.
+            let partner = if before.is_multiple_of(2) { slot + pointer } else { slot - pointer };
+            name_at(partner)
+        } else {
+            (1..=FIELDS).map_while(|back| slot.checked_sub(back * pointer)).find_map(name_at)
+        }
     };
     let slots = image.relative_targets.iter().filter(|&&(slot, target)| target == entry && image.section_at(slot).is_some_and(|section| !section.executable));
     slots.filter_map(|&(slot, _)| Some((slot, partner(slot)?))).collect()

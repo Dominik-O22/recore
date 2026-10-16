@@ -233,6 +233,20 @@ fn a_format_says_what_a_call_passes() {
 }
 
 #[test]
+fn a_pointer_in_a_table_is_paired_with_the_name_of_its_own_record() {
+    // A list of functions with a number between a function and its documentation, and a list
+    // of pairs that close with their name.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/tables.elf");
+    let mut client = Client::start();
+    let doc = client.tool("xrefs", json!({ "path": path, "addr": "0x2070" })).unwrap();
+    assert!(doc.contains("\n0x3d98 in .data.rel.ro holds a pointer to it, paired with the name \"negate\"\n"), "{doc}");
+    let function = client.tool("function", json!({ "path": path, "addr": "0x11d0" })).unwrap();
+    assert!(function.contains("listed as \"negate\" in the table at 0x3d88"), "{function}");
+    let first = client.tool("xrefs", json!({ "path": path, "addr": "0x2068" })).unwrap();
+    assert!(first.contains("\n0x3d20 in .data.rel.ro holds a pointer to it, paired with the name \"ValueError\"\n"), "{first}");
+}
+
+#[test]
 fn memory_the_file_has_no_bytes_for_takes_a_name() {
     // An 8051 program: SETB 0xAF; MOV DPTR, #0x8100; MOVX @DPTR, A; RET.
     let dir = edits_dir();
