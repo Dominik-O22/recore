@@ -233,9 +233,13 @@ impl Facts {
                         }
                     }
                     match (call.tail, call.target, bytes.first_chunk::<5>()) {
-                        // A direct call that recore resolves to an import goes to a PLT stub.
-                        (false, CallTarget::Import(slot), Some([0xe8, rel @ ..])) => {
+                        // A direct call that recore resolves to an import goes to a PLT stub, and
+                        // so does a direct jump, as a call that ends a function is compiled.
+                        (_, CallTarget::Import(slot), Some([0xe8 | 0xe9, rel @ ..])) => {
                             stub((call.at + 5).wrapping_add_signed(i32::from_le_bytes(*rel).into()), slot);
+                        }
+                        (true, CallTarget::Import(slot), Some([0xeb, rel, ..])) => {
+                            stub((call.at + 2).wrapping_add_signed((*rel as i8).into()), slot);
                         }
                         // A function that starts by jumping through an import slot is a thunk for it.
                         (true, CallTarget::Import(slot), _) if call.at == function.addr && through_slot => {
