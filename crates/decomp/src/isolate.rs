@@ -209,6 +209,14 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         // One the engine does not take is only left without its name.
         let _ = session.add_global(addr, name, register.filter(|_| image.is_zero_filled(addr)));
     }
+    // An import the code reads and does not call, such as `stderr` or `environ`, has a slot in the
+    // GOT that holds its address: declared, the C reads `*__imp_stderr` and not a raw address. A
+    // variable the loader copies into the program itself, in memory it zero-fills, already goes
+    // by its own name above.
+    let called: recore::FxHashSet<u64> = analysis.imports.iter().map(|import| import.slot).collect();
+    for (&slot, name) in image.import_slots.iter().filter(|&(slot, _)| !called.contains(slot) && !image.is_zero_filled(*slot)) {
+        let _ = session.add_global(slot, &format!("__imp_{name}"), Some("void *"));
+    }
     for (addr, name, kind) in edits.globals(&analysis) {
         if let Err(error) = session.add_global(addr, &name, kind) {
             eprintln!("global {name} at {addr:#x}: {error}");
