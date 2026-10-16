@@ -27,6 +27,8 @@ enum Suite {
     Cold,
     /// A sample of each binary's functions through the decompiler, one after another.
     Decompile,
+    /// An agent's walk through each binary: decompilations with renames between them.
+    Session,
 }
 
 #[derive(Subcommand)]
@@ -48,6 +50,9 @@ enum Command {
         /// Functions sampled per binary in the decompile suite.
         #[arg(long, default_value_t = 150)]
         functions: usize,
+        /// Functions per binary the session suite starts a walk from.
+        #[arg(long, default_value_t = 12)]
+        walks: usize,
         /// Writes the results to `target/bench/<NAME>.json`.
         #[arg(long)]
         save: Option<String>,
@@ -92,8 +97,11 @@ fn saved(name: &str) -> PathBuf {
 }
 
 fn main() -> Result<()> {
+    // Every suite starts from no edits, whatever names and types are saved for these binaries.
+    // SAFETY: no other thread has started yet.
+    unsafe { std::env::set_var(recore::edits::DIR_VAR, std::path::absolute("target/bench/edits")?) };
     match Args::parse().command {
-        Command::Run { suites, set, only, runs, functions, save, compare } => {
+        Command::Run { suites, set, only, runs, functions, walks, save, compare } => {
             let list = std::fs::read_to_string(&set).with_context(|| format!("reading {}", set.display()))?;
             let binaries: Vec<PathBuf> = list
                 .lines()
@@ -124,6 +132,10 @@ fn main() -> Result<()> {
             if wanted(Suite::Decompile) {
                 results.decompile = suites::decompile(&binaries, runs.min(3), functions)?;
                 suites::print_decompile(&results.decompile, before.as_ref().map(|b| b.decompile.as_slice()));
+            }
+            if wanted(Suite::Session) {
+                results.session = suites::session(&binaries, runs.min(3), walks)?;
+                suites::print_session(&results.session, before.as_ref().map(|b| b.session.as_slice()));
             }
             if let Some(name) = save {
                 let path = saved(&name);
