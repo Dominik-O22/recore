@@ -54,9 +54,9 @@ Three tasks on public binaries, each with one answer. List what `git version --b
 
 | Model | Tool | Score of 17 | Session | Analysis first | Tokens read | Cost |
 |---|---|---|---|---|---|---|
-| Haiku 5.5 | recore | 16.8 | 331 s | none | 1.98 M | $0.18 |
+| Haiku 5.5 | recore | 16.8 | 288 s | none | 1.68 M | $0.08 |
 | Haiku 5.5 | Ghidra | 13 | 284 s | 513 s | 3.85 M | $0.26 |
-| Sonnet 5.5 | recore | 16.8 | 126 s | none | 0.54 M | $0.29 |
+| Sonnet 5.5 | recore | 16.0 | 118 s | none | 0.43 M | $0.26 |
 | Sonnet 5.5 | Ghidra | 15 | 541 s | 513 s | 3.11 M | $1.10 |
 
 recore's rows are the mean of four sessions and Ghidra's are one session each, so the table is an illustration and not a benchmark. Ghidra analyzes the four binaries before the session starts. pyghidra-mcp then spends another 906 s decompiling every function to index it for search, which the table leaves out. recore analyzes a binary on every command-line call, in 10 to 100 ms here from a new process to its answer, and once as an MCP server. Tokens read is the context of every response, summed.

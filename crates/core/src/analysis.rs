@@ -803,6 +803,10 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         let ends = section.data.iter().enumerate().filter(|&(_, &byte)| byte == 0).map(|(offset, _)| offset as u64 + 1);
         candidates.extend(std::iter::once(0).chain(ends).map(|offset| section.addr + offset).filter(|&addr| section.contains(addr)));
     }
+    // A slot the loader relocates holds an address, whatever text its bytes spell: in a small
+    // image an address such as 0x202f reads as "/ ".
+    let relocated: FxHashSet<u64> = image.relative_targets.iter().map(|&(slot, _)| slot).collect();
+    candidates.retain(|addr| !relocated.contains(addr));
     candidates.sort_unstable();
     candidates.dedup();
     let is_literal = |addr: u64| from_code.contains(&addr) || literals.is_some_and(|section| section.contains(addr));

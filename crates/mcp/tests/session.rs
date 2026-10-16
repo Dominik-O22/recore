@@ -256,6 +256,14 @@ fn a_pointer_in_a_table_is_paired_with_the_name_of_its_own_record() {
 }
 
 #[test]
+fn data_is_told_by_what_its_pointers_reach() {
+    // The fixture's first method record: its name, its function, a number and its documentation.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/tables.elf");
+    let record = Client::start().tool("addr", json!({ "path": path, "addr": "0x3d60" })).unwrap();
+    assert_eq!(record, "address 0x3d60, file offset 0x2d60, in .data.rel.ro: .data.rel.ro holding {\"twice\", function 0x11b0, 0x8, \"Return the value doubled.\", ...}\n");
+}
+
+#[test]
 fn memory_the_file_has_no_bytes_for_takes_a_name() {
     // An 8051 program: SETB 0xAF; MOV DPTR, #0x8100; MOVX @DPTR, A; RET.
     let dir = edits_dir();
