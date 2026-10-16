@@ -333,6 +333,7 @@ struct RdSession {
   bool keep_prototypes = false;
   bool kept_are_lower_bounds = true;  // see rd_keep_prototypes_exact
   bool result_in_first_argument = false;  // see rd_result_in_first_argument
+  bool stack_aggregates = false;  // see rd_stack_aggregates
   bool want_flow = false;
   bool want_addresses = false;
   set<uint64_t> kept;  // functions whose prototype this session locked
@@ -417,6 +418,37 @@ static bool never_read(const Varnode *vn, set<const Varnode *> &seen) {
     }
   }
   return true;
+}
+
+// The parameters a function takes on the stack beyond those the engine recovered, as 8-byte
+// slots from the first it reads to the last, or none. The System V convention for x86-64 puts a
+// structure of more than 16 bytes on the stack whatever registers are free; the engine's rule
+// that stack arguments come only after all six integer registers leaves such a structure out,
+// reading its fields as `in_stack_...` and dropping it from every call.
+static vector<ParameterPieces> stack_aggregate(Funcdata *fd) {
+  vector<ParameterPieces> slots;
+  AddrSpace *stack = fd->getArch()->getStackSpace();
+  const FuncProto &proto = fd->getFuncProto();
+  if (stack == nullptr) return slots;
+  for (int4 i = 0; i < proto.numParams(); ++i)
+    if (proto.getParam(i)->getAddress().getSpace() == stack) return slots;  // it already takes the stack
+  const int4 word = 8;  // the return address, and the size of a slot
+  intb end = -1;
+  for (auto it = fd->beginDef(Varnode::input); it != fd->endDef(Varnode::input); ++it) {
+    const Varnode *vn = *it;
+    if (vn->getSpace() != stack) continue;
+    intb offset = sign_extend((intb)vn->getOffset(), 8 * stack->getAddrSize() - 1);
+    if (offset >= word) end = max(end, offset + vn->getSize());
+  }
+  if (end < 0 || end - word > 16 * word) return slots;
+  for (intb at = word; at < end; at += word) {
+    ParameterPieces piece;
+    piece.addr = Address(stack, (uintb)at);
+    piece.type = fd->getArch()->types->getBase(word, TYPE_UNKNOWN);
+    piece.flags = 0;
+    slots.push_back(piece);
+  }
+  return slots;
 }
 
 // Whether the function's one register parameter exists only because the register is pushed.
@@ -1366,6 +1398,10 @@ int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int 
 // function's symbol, so that later decompilations of its callers pass at least those parameters.
 void rd_keep_prototypes(RdSession *session, int keep) { session->keep_prototypes = keep != 0; }
 
+// Says that the convention puts a large structure on the stack whatever registers are free, as
+// x86-64 System V does: stack slots a function reads beyond its parameters become parameters.
+void rd_stack_aggregates(RdSession *session, int on) { session->stack_aggregates = on != 0; }
+
 // Puts a note on an instruction of `function`. The C of the function prints it as a comment
 // where that instruction's code is, if the instruction has any left after simplification.
 int rd_add_comment(RdSession *session, uint64_t function, uint64_t addr, const char *text, char *err,
@@ -1715,6 +1751,30 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       arch->clearAnalysis(fd);
       root->reset(*fd);
       if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
+    }
+    if (session->stack_aggregates && !fd->getFuncProto().isInputLocked()) {
+      vector<ParameterPieces> slots = stack_aggregate(fd);
+      if (!slots.empty()) {
+        // The parameters recovered, then the slots, as the prototype it keeps: its callers pass
+        // what is in them, and its own C reads them as parameters.
+        vector<ParameterPieces> params;
+        const FuncProto &recovered = fd->getFuncProto();
+        for (int4 i = 0; i < recovered.numParams(); ++i) {
+          ParameterPieces piece;
+          piece.addr = recovered.getParam(i)->getAddress();
+          piece.type = recovered.getParam(i)->getType();
+          piece.flags = 0;
+          params.push_back(piece);
+        }
+        params.insert(params.end(), slots.begin(), slots.end());
+        arch->clearAnalysis(fd);
+        FuncProto &proto = fd->getFuncProto();
+        proto.clearInput();
+        for (size_t i = 0; i < params.size(); ++i) proto.setParam((int4)i, "", params[i]);
+        proto.setInputLock(true);
+        root->reset(*fd);
+        if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
+      }
     }
     session->locals = name_locals(session, addr, fd);
     ostringstream text;

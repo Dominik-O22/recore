@@ -264,6 +264,16 @@ fn data_is_told_by_what_its_pointers_reach() {
 }
 
 #[test]
+fn a_structure_passed_on_the_stack_reaches_the_call() {
+    // `use` passes a 40-byte structure by value with two registers still free, so it goes on the
+    // stack: its five fields are arguments of the call, and the callee reads them as parameters.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/aggregate.elf");
+    let c_text = Client::start().tool("decompile", json!({ "path": path, "functions": ["0x112e", "0x1119"] })).unwrap();
+    assert!(c_text.contains("func_0x00001119(param_1,7,param_1,2,3,4,param_1 * 2);"), "{c_text}");
+    assert!(c_text.contains("return (param_2 * param_3 + param_1 + param_5) - param_7;"), "{c_text}");
+}
+
+#[test]
 fn memory_the_file_has_no_bytes_for_takes_a_name() {
     // An 8051 program: SETB 0xAF; MOV DPTR, #0x8100; MOVX @DPTR, A; RET.
     let dir = edits_dir();
