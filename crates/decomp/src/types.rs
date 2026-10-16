@@ -27,6 +27,8 @@ pub enum Base {
     Bool,
     /// A character: `char`, `wchar2` or `wchar4` by size.
     Char,
+    /// Bytes the code shows the size of and nothing more: `undefinedN`.
+    Unknown,
 }
 
 /// One member of a struct or union.
@@ -272,12 +274,6 @@ fn escaped(text: &str) -> std::borrow::Cow<'_, str> {
     out.into()
 }
 
-/// The number the engine knows the named type at `id` by, next to its name. Left to itself the
-/// engine makes one up from the name, and its hash gives two of the long, similar names of C++
-/// templates the same number often enough to confuse its bookkeeping for unions.
-fn ident(id: TypeId) -> u64 {
-    u64::from(id) + 1
-}
 
 /// The engine's name for a number of `size` bytes.
 fn base_name(base: Base, size: u64) -> String {
@@ -287,6 +283,7 @@ fn base_name(base: Base, size: u64) -> String {
         (Base::Char, 2 | 4) => format!("wchar{size}"),
         (Base::Float, _) => format!("float{size}"),
         (Base::Int, _) => format!("int{size}"),
+        (Base::Unknown, _) => format!("undefined{size}"),
         (Base::Uint | Base::Bool | Base::Char, _) => format!("uint{size}"),
     }
 }
@@ -303,12 +300,27 @@ pub struct Writer<'a> {
     /// The function types written, by name, each with the entry it was written for. Two that
     /// read the same are one type.
     function_types: HashMap<String, TypeId>,
+    /// The number the engine knows the first entry by: see [`Writer::ident`].
+    first_id: u64,
     out: String,
 }
 
 impl<'a> Writer<'a> {
     pub fn new(types: &'a Types) -> Writer<'a> {
-        Writer { types, written: vec![false; types.types.len()], pending: Vec::new(), function_types: HashMap::new(), out: String::new() }
+        Writer::numbered_from(types, 1)
+    }
+
+    /// A writer whose types the engine knows by numbers from `first_id` on, to keep them apart
+    /// from those of another table given to the same session.
+    pub fn numbered_from(types: &'a Types, first_id: u64) -> Writer<'a> {
+        Writer { types, written: vec![false; types.types.len()], pending: Vec::new(), function_types: HashMap::new(), first_id, out: String::new() }
+    }
+
+    /// The number the engine knows the named type at `id` by, next to its name. Left to itself
+    /// the engine makes one up from the name, and its hash gives two of the long, similar names
+    /// of C++ templates the same number often enough to confuse its bookkeeping for unions.
+    fn ident(&self, id: TypeId) -> u64 {
+        self.first_id + u64::from(id)
     }
 
     /// An array's elements if nothing says how many there are, since the engine has no array
@@ -331,11 +343,12 @@ impl<'a> Writer<'a> {
             Type::Void | Type::Alias(_) => {}
             Type::Base { base, size } => {
                 // The engine starts out with numbers of 1, 2, 4 and 8 bytes, and the floats.
-                let core = matches!((base, size), (Base::Float, 4 | 8 | 10 | 16) | (Base::Int | Base::Uint | Base::Bool | Base::Char, 1 | 2 | 4 | 8));
+                let core = matches!((base, size), (Base::Float, 4 | 8 | 10 | 16) | (Base::Int | Base::Uint | Base::Bool | Base::Char | Base::Unknown, 1 | 2 | 4 | 8));
                 if !core && !std::mem::replace(&mut self.written[id as usize], true) {
                     let meta = match base {
                         Base::Int => "int",
                         Base::Float => "float",
+                        Base::Unknown => "unknown",
                         _ => "uint",
                     };
                     let _ = writeln!(self.out, r#"<type name="{}" metatype="{meta}" size="{size}"/>"#, base_name(*base, *size));
@@ -346,13 +359,13 @@ impl<'a> Writer<'a> {
             Type::Composite { name, union, size, .. } => {
                 if !std::mem::replace(&mut self.written[id as usize], true) {
                     let meta = if *union { "union" } else { "struct" };
-                    let _ = writeln!(self.out, r#"<type name="{}" id="{}" metatype="{meta}" size="{}" incomplete="true"/>"#, escaped(name), ident(id), (*size).max(1));
+                    let _ = writeln!(self.out, r#"<type name="{}" id="{}" metatype="{meta}" size="{}" incomplete="true"/>"#, escaped(name), self.ident(id), (*size).max(1));
                     self.pending.push(id);
                 }
             }
             Type::Enum { name, size, values } => {
                 if !std::mem::replace(&mut self.written[id as usize], true) {
-                    let _ = writeln!(self.out, r#"<type name="{}" id="{}" metatype="enum_uint" size="{}">"#, escaped(name), ident(id), (*size).clamp(1, 8));
+                    let _ = writeln!(self.out, r#"<type name="{}" id="{}" metatype="enum_uint" size="{}">"#, escaped(name), self.ident(id), (*size).clamp(1, 8));
                     for (value_name, value) in values {
                         let _ = writeln!(self.out, r#"<val name="{}" value="{value}"/>"#, escaped(value_name));
                     }
@@ -362,7 +375,7 @@ impl<'a> Writer<'a> {
             Type::Typedef { name, target } => {
                 if !std::mem::replace(&mut self.written[id as usize], true) {
                     self.define(*target);
-                    let _ = write!(self.out, r#"<def name="{}" id="{}">"#, escaped(name), ident(id));
+                    let _ = write!(self.out, r#"<def name="{}" id="{}">"#, escaped(name), self.ident(id));
                     self.reference(*target);
                     self.out.push_str("</def>\n");
                 }
@@ -372,7 +385,7 @@ impl<'a> Writer<'a> {
                     self.define_prototype(prototype);
                     let name = self.function_type(prototype);
                     if !self.function_types.contains_key(&name) {
-                        let _ = write!(self.out, r#"<functype name="{name}" id="{}""#, ident(id));
+                        let _ = write!(self.out, r#"<functype name="{name}" id="{}""#, self.ident(id));
                         self.function_types.insert(name, id);
                         self.prototype(prototype);
                         self.out.push_str("</functype>\n");
@@ -436,12 +449,12 @@ impl<'a> Writer<'a> {
                 self.out.push_str("</type>");
             }
             Type::Composite { name, .. } | Type::Enum { name, .. } | Type::Typedef { name, .. } => {
-                let _ = write!(self.out, r#"<typeref name="{}" id="{}"/>"#, escaped(name), ident(id));
+                let _ = write!(self.out, r#"<typeref name="{}" id="{}"/>"#, escaped(name), self.ident(id));
             }
             Type::Function(prototype) => {
                 let name = self.function_type(prototype);
                 let first = self.function_types.get(&name).copied().unwrap_or(id);
-                let _ = write!(self.out, r#"<typeref name="{name}" id="{}"/>"#, ident(first));
+                let _ = write!(self.out, r#"<typeref name="{name}" id="{}"/>"#, self.ident(first));
             }
         }
     }
@@ -511,7 +524,7 @@ impl<'a> Writer<'a> {
                 self.define(field.kind);
             }
             let meta = if *union { "union" } else { "struct" };
-            let _ = writeln!(self.out, r#"<type name="{}" id="{}" metatype="{meta}" size="{size}">"#, escaped(name), ident(id));
+            let _ = writeln!(self.out, r#"<type name="{}" id="{}" metatype="{meta}" size="{size}">"#, escaped(name), self.ident(id));
             for (index, field) in kept.iter().enumerate() {
                 let offset = if *union { 0 } else { field.offset };
                 match field.bits {
@@ -529,6 +542,12 @@ impl<'a> Writer<'a> {
             }
             self.out.push_str("</type>\n");
         }
+    }
+
+    /// Writes the named type at `id` and the types it is built from.
+    pub fn named(&mut self, id: TypeId) {
+        self.define(id);
+        self.drain();
     }
 
     /// Writes the prototype of `function` and the types it is built from.
@@ -628,8 +647,7 @@ impl<'a> Importer<'a> {
         let words = text.split(|c: char| !(c.is_alphanumeric() || c == '_'));
         for name in std::iter::once(text.trim()).chain(words) {
             if let Some(&(id, _, _)) = self.types.names.get(name).filter(|known| known.2 != TAKEN) {
-                self.writer.define(id);
-                self.writer.drain();
+                self.writer.named(id);
             }
         }
         self.flush(session);
