@@ -650,8 +650,28 @@ impl Session {
 
     /// Disassembles `[start, end)` linearly, with each instruction's raw p-code if `pcode`.
     pub fn listing(&mut self, start: u64, end: u64, pcode: bool) -> Result<Vec<Instruction>> {
+        self.listed(start, end, pcode.into())
+    }
+
+    /// Lifts `[start, end)` to raw p-code for a program to run: each operation as
+    /// `OPNAME out input...`, with `-` for no output and each operand as `space:offset:size`, the
+    /// offset in hex. The first input of a LOAD or STORE is the name of the space it reaches, and
+    /// that of a CALLOTHER the name of the processor operation.
+    pub fn lift(&mut self, start: u64, end: u64) -> Result<Vec<Instruction>> {
+        self.listed(start, end, 2)
+    }
+
+    /// Where the register `name` is: the name of its space, its offset there and its size in bytes.
+    pub fn register(&mut self, name: &str) -> Result<(String, u64, u32)> {
+        let name = CString::new(name)?;
+        let (mut space, mut offset, mut size) = (std::ptr::null(), 0u64, 0i32);
+        check(|err, len| unsafe { ffi::rd_register(self.raw.as_ptr(), name.as_ptr(), &mut space, &mut offset, &mut size, err, len) != 0 })?;
+        Ok((unsafe { CStr::from_ptr(space) }.to_string_lossy().into_owned(), offset, size as u32))
+    }
+
+    fn listed(&mut self, start: u64, end: u64, pcode: i32) -> Result<Vec<Instruction>> {
         let mut out = std::ptr::null();
-        check(|err, len| unsafe { ffi::rd_listing(self.raw.as_ptr(), start, end, pcode.into(), &mut out, err, len) != 0 })?;
+        check(|err, len| unsafe { ffi::rd_listing(self.raw.as_ptr(), start, end, pcode, &mut out, err, len) != 0 })?;
         let text = unsafe { CStr::from_ptr(out) }.to_string_lossy();
         let mut instructions: Vec<Instruction> = Vec::new();
         for line in text.lines() {

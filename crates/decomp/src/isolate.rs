@@ -104,6 +104,7 @@ enum Event {
     /// The functions a function calls whose parameters the session does not hold yet.
     Callees(Vec<u64>),
     Listing(Result<Vec<Instruction>, String>),
+    Register(Result<(String, u64, u32), String>),
     Flow(Result<Flow, String>),
     Locals(Result<Vec<Local>, String>),
     /// The answer to [`Request::Declare`], empty, or to [`Request::Type`].
@@ -120,6 +121,10 @@ enum Request {
     Callees(u64),
     /// Disassemble `[start, end)`.
     Listing { start: u64, end: u64, pcode: bool },
+    /// Lift `[start, end)` to raw p-code for a program to run.
+    Lift { start: u64, end: u64 },
+    /// Where a register is.
+    Register(String),
     /// Decompile the function for its data flow.
     Flow(u64),
     /// Decompile the function for its variables.
@@ -353,6 +358,14 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             }
             Request::Listing { start, end, pcode } => {
                 send(&Event::Listing(session.listing(start, end, pcode).map_err(|error| error.to_string())))?;
+                continue;
+            }
+            Request::Lift { start, end } => {
+                send(&Event::Listing(session.lift(start, end).map_err(|error| error.to_string())))?;
+                continue;
+            }
+            Request::Register(name) => {
+                send(&Event::Register(session.register(&name).map_err(|error| error.to_string())))?;
                 continue;
             }
             Request::Flow(addr) => {
@@ -696,6 +709,22 @@ impl Worker {
     pub fn listing(&mut self, start: u64, end: u64, pcode: bool, timeout: Duration) -> Result<Vec<Instruction>, String> {
         match self.ask(Request::Listing { start, end, pcode }, timeout) {
             Ok(Event::Listing(listing)) => listing,
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Lifts `[start, end)` to raw p-code for a program to run: see [`Session::lift`].
+    pub fn lift(&mut self, start: u64, end: u64, timeout: Duration) -> Result<Vec<Instruction>, String> {
+        match self.ask(Request::Lift { start, end }, timeout) {
+            Ok(Event::Listing(listing)) => listing,
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// The space, offset and size of the register `name`: see [`Session::register`].
+    pub fn register(&mut self, name: &str, timeout: Duration) -> Result<(String, u64, u32), String> {
+        match self.ask(Request::Register(name.to_string()), timeout) {
+            Ok(Event::Register(place)) => place,
             other => Err(unexpected(other)),
         }
     }
