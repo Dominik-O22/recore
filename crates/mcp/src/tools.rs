@@ -1100,7 +1100,8 @@ fn structs(binary: &mut Binary, args: Structs) -> Result<String> {
         };
         let low = object.accesses.iter().map(|&(offset, _)| offset).min().unwrap_or(0);
         let high = object.accesses.iter().map(|&(offset, size)| offset + i64::from(size)).max().unwrap_or(0);
-        let reach = format!("{} reads and writes, +{low:#x} to +{high:#x}", object.accesses.len());
+        let count = object.accesses.len();
+        let reach = format!("{count} {}, +{low:#x} to +{high:#x}", if count == 1 { "access" } else { "accesses" });
         match &object.decision {
             Ok(name) => writeln!(out, "{place}: {name}{}, {reach}", if object.named { " (named)" } else { "" })?,
             Err(refusal) => writeln!(out, "{place}: no struct, {}; {reach}", refusal.reason())?,
