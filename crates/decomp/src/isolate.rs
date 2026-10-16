@@ -155,9 +155,12 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     });
     let mut session = session?;
     let edits = Edits::load(binary)?;
-    edits.apply(&mut analysis);
     session.add_imports(&image, &analysis)?;
+    // What is known of a library routine goes by the name the analysis found, so renaming one
+    // changes its name and no more.
     let mut facts = Facts::derive(&image, &analysis);
+    edits.apply(&mut analysis);
+    facts.names = crate::facts::function_names(&analysis);
     // A function that only jumps to another, as an incremental linker's stub does, is described
     // by what that one's debug information says.
     let importer = debug.as_ref().map(|debug| {
