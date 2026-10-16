@@ -306,7 +306,7 @@ fn shape(object: &Object) -> Result<(Layout, bool), Refusal> {
     // Accesses that start alike are one field, the widest; others print as a cast of it.
     let mut fields: BTreeMap<u64, Field> = BTreeMap::new();
     for access in &object.accesses {
-        let field = Field { size: access.size, ty: access.ty.clone() };
+        let field = Field::new(access.size, access.ty.clone());
         match fields.entry(reduced(access.offset, stride)) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(field);
@@ -418,7 +418,7 @@ mod tests {
     }
 
     fn layout(fields: &[(u64, u32, FieldType)], size: u64) -> Layout {
-        Layout::new(size, fields.iter().map(|(offset, size, ty)| (*offset, Field { size: *size, ty: ty.clone() })).collect()).unwrap()
+        Layout::new(size, fields.iter().map(|(offset, size, ty)| (*offset, Field::new(*size, ty.clone()))).collect()).unwrap()
     }
 
     #[test]
