@@ -52,6 +52,12 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   compiler spec lists. `crates/decomp` uses it for the byte of memory SDCC keeps its frame
   pointer in, which differs from program to program. Marked with a `recore:` comment.
 
+- `cpp/architecture.hh` and `cpp/coreaction.hh`, `Architecture::startTypes`: a virtual method,
+  empty in the engine, that `ActionStartTypes` calls once per run of the pipeline, when type
+  recovery starts. `crates/decomp` reads the function's settled SSA there and gives the
+  pointers it is passed structs before any unlocked varnode is typed. Marked with `recore:`
+  comments.
+
 - `languages/cip-51.sla`: built from `slaspec/`, upstream's `cip-51.slaspec` and
   `8051_main.sinc` with six changes, each marked with a `recore:` comment. To rebuild, run
   `support/sleigh cip-51.slaspec cip-51.sla` of the distribution in a copy of `slaspec/`.

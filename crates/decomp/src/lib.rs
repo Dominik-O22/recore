@@ -16,6 +16,7 @@ pub mod flow;
 pub mod isolate;
 pub mod pdb;
 pub mod prototypes;
+mod structs;
 pub mod types;
 
 // The engine is only reached through the shim, so name the crate to keep it in the link.
@@ -286,6 +287,9 @@ pub struct Session {
     /// Jump tables of recore's, by function, that the engine is first left to read itself:
     /// see [`Facts::engine_tables`].
     engine_tables: std::collections::HashMap<u64, Vec<JumpTable>>,
+    /// The structs recovered so far. The shim's hook holds this pointer, which the session
+    /// owns and touches nowhere else.
+    structs: NonNull<structs::Registry>,
 }
 
 // A session owns all of its C++ state. The engine's globals are written only while a session
@@ -355,7 +359,9 @@ impl Session {
         unsafe { ffi::rd_result_in_first_argument(raw.as_ptr(), target.result_in_first_argument().into()) };
         unsafe { ffi::rd_stack_aggregates(raw.as_ptr(), target.passes_aggregates_on_stack().into()) };
         // The session frees the engine's side if a space is not there.
-        let session = Session { raw, target, engine_tables: Default::default() };
+        let structs = NonNull::from(Box::leak(Box::<structs::Registry>::default()));
+        unsafe { ffi::rd_set_struct_hooks(raw.as_ptr(), structs.as_ptr().cast(), structs::plan_hook, structs::wrapped_hook) };
+        let session = Session { raw, target, engine_tables: Default::default(), structs };
         for &(base, name) in target.spaces() {
             check(|err, len| unsafe { ffi::rd_map_space(raw.as_ptr(), base, name.as_ptr(), err, len) != 0 })?;
         }
@@ -818,7 +824,10 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        unsafe { ffi::rd_session_free(self.raw.as_ptr()) }
+        unsafe {
+            ffi::rd_session_free(self.raw.as_ptr());
+            drop(Box::from_raw(self.structs.as_ptr()));
+        }
     }
 }
 

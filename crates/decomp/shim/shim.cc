@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -62,6 +63,57 @@ struct RdDecompiled {
   // The function's variables, a line each: the name, a tab, and the place rd_name_local takes.
   const char *locals;
 };
+
+// What struct recovery hands to recore and gets back: see `recover_structs`, and
+// crates/decomp/src/ffi.rs for each field.
+struct RdObject {
+  int64_t low, high;
+  uint8_t locked, global, number;
+};
+struct RdRoot {
+  uint32_t object;
+  const char *reg;
+  uint64_t stack;
+  int64_t offset;
+};
+struct RdAccess {
+  uint32_t object;
+  int64_t offset;
+  uint32_t size;
+  uint8_t kind;
+};
+struct RdLink {
+  uint32_t object;
+  int64_t offset;
+  uint32_t child;
+};
+struct RdStride {
+  uint32_t object;
+  uint64_t stride;
+};
+struct RdEvidence {
+  uint64_t function;
+  uint32_t pointer;
+  const RdObject *objects;
+  size_t object_count;
+  const RdRoot *roots;
+  size_t root_count;
+  const RdAccess *accesses;
+  size_t access_count;
+  const RdLink *links;
+  size_t link_count;
+  const RdStride *strides;
+  size_t stride_count;
+};
+struct RdPlan {
+  const char *xml;
+  const char *const *names;
+  const char *const *recovered;
+  const uint8_t *arrays;
+  size_t recovered_count;
+};
+typedef int (*RdPlanHook)(void *ctx, const RdEvidence *evidence, RdPlan *out);
+typedef void (*RdWrappedHook)(void *ctx, const char *name);
 
 }  // extern "C"
 
@@ -294,6 +346,12 @@ class SectionArchitecture : public SleighArchitecture {
 
   // ~SleighArchitecture forgets the translator instead of freeing it, so the session does.
   const Translate *translator() const { return translate; }
+
+  // What the session does when the engine starts typing a function: see `recover_structs`.
+  std::function<void(Funcdata &)> start_types;
+  void startTypes(Funcdata &data) override {
+    if (start_types) start_types(data);
+  }
 };
 
 void fail(char *err, size_t errlen, const string &message) {
@@ -350,6 +408,12 @@ struct RdSession {
   set<uint64_t> returns_like;
   // The registers rd_keep_registers named for each function.
   map<uint64_t, vector<VarnodeData>> kept_registers;
+  // recore's side of struct recovery, which plans the structs: see rd_set_struct_hooks.
+  RdPlanHook plan = nullptr;
+  RdWrappedHook wrapped = nullptr;
+  void *structs = nullptr;
+  // Every struct recovery defined, each with whether it is the element of an array.
+  map<const Datatype *, bool> recovered;
 
   // Backing storage for the last RdDecompiled, listing and type layout.
   string c_text, return_type, flow, locals, text;
@@ -919,6 +983,8 @@ static mutex xml_lock;
 
 extern "C" {
 
+static void recover_structs(RdSession *session, Funcdata &fd);
+
 // `spec_dir` holds the .ldefs/.pspec/.cspec/.sla files. The first session fixes it for the
 // whole process, because the engine caches its language list in static storage.
 RdSession *rd_session_new(const char *spec_dir, const char *language, const RdSection *sections,
@@ -940,6 +1006,7 @@ RdSession *rd_session_new(const char *spec_dir, const char *language, const RdSe
     session->image = new SectionImage(language, sections, count);
     session->arch = new SectionArchitecture(session->image, &session->messages);
     session->arch->init(session->store);
+    session->arch->start_types = [session](Funcdata &fd) { recover_structs(session, fd); };
     // Use the contents of read-only memory as constants, as Ghidra does by default. This is
     // what turns a call through a pointer table into a call to a known function.
     session->arch->readonlypropagate = true;
@@ -1603,57 +1670,61 @@ static void decode_prototype(Architecture *arch, const Element *element, Prototy
 //   <functype name id>     a named function type, for pointers to it; children as below
 //   <function addr>        the prototype of the function at `addr` (hex), from <p> children
 //   <global addr name>     a global variable; its one child is its type
-// A child the engine rejects costs only itself: `*out` lists those, one line each.
+// A child the engine rejects costs only itself: the answer lists those, one line each.
+static string add_types(RdSession *session, const char *xml) {
+  Architecture *arch = session->arch;
+  Scope *global = arch->symboltab->getGlobalScope();
+  unique_ptr<Document> document;
+  {
+    lock_guard<mutex> guard(xml_lock);
+    istringstream text(xml);
+    document.reset(xml_tree(text));
+  }
+  ostringstream rejected;
+  for (const Element *element : document->getRoot()->getChildren()) {
+    const string &tag = element->getName();
+    string name = attribute(element, "name");
+    auto reject = [&](const string &why) { rejected << tag << " " << name << attribute(element, "addr") << ": " << why << "\n"; };
+    try {
+      if (tag == "functype") {
+        PrototypePieces pieces;
+        decode_prototype(arch, element, pieces);
+        arch->types->getTypedef(arch->types->getTypeCode(pieces), name, stoull(attribute(element, "id")), 0);
+      } else if (tag == "function") {
+        PrototypePieces pieces;
+        decode_prototype(arch, element, pieces);
+        // A parameter the convention has no place for would be stored at no address at all.
+        vector<ParameterPieces> storage;
+        pieces.model->assignParameterStorage(pieces, storage, true);
+        for (size_t i = 1; i < storage.size(); ++i)
+          if (storage[i].addr.isInvalid()) throw LowlevelError("the calling convention has no place for a parameter");
+        Funcdata *fd = session->function(stoull(attribute(element, "addr"), nullptr, 16));
+        pieces.name = fd->getName();
+        fd->getFuncProto().setPieces(pieces);
+      } else if (tag == "global") {
+        Address where = session->address(stoull(attribute(element, "addr"), nullptr, 16));
+        Datatype *type = decode_type(arch, element->getChildren().at(0));
+        SymbolEntry *old = global->findAddr(where, Address());
+        if (old != nullptr) global->removeSymbol(old->getSymbol());
+        global->addSymbol(name, type, where, Address());
+      } else {
+        XmlDecode decoder(arch, element);
+        arch->types->decodeType(decoder);
+      }
+    } catch (const LowlevelError &e) {
+      reject(e.explain);
+    } catch (const DecoderError &e) {
+      reject(e.explain);
+    } catch (const std::exception &e) {
+      reject(e.what());
+    }
+  }
+  return rejected.str();
+}
+
 int rd_add_types(RdSession *session, const char *xml, const char **out, char *err, size_t errlen) {
   return guarded(err, errlen, [&] {
-    Architecture *arch = session->arch;
-    Scope *global = arch->symboltab->getGlobalScope();
-    unique_ptr<Document> document;
-    {
-      lock_guard<mutex> guard(xml_lock);
-      istringstream text(xml);
-      document.reset(xml_tree(text));
-    }
-    ostringstream rejected;
-    for (const Element *element : document->getRoot()->getChildren()) {
-      const string &tag = element->getName();
-      string name = attribute(element, "name");
-      auto reject = [&](const string &why) { rejected << tag << " " << name << attribute(element, "addr") << ": " << why << "\n"; };
-      try {
-        if (tag == "functype") {
-          PrototypePieces pieces;
-          decode_prototype(arch, element, pieces);
-          arch->types->getTypedef(arch->types->getTypeCode(pieces), name, stoull(attribute(element, "id")), 0);
-        } else if (tag == "function") {
-          PrototypePieces pieces;
-          decode_prototype(arch, element, pieces);
-          // A parameter the convention has no place for would be stored at no address at all.
-          vector<ParameterPieces> storage;
-          pieces.model->assignParameterStorage(pieces, storage, true);
-          for (size_t i = 1; i < storage.size(); ++i)
-            if (storage[i].addr.isInvalid()) throw LowlevelError("the calling convention has no place for a parameter");
-          Funcdata *fd = session->function(stoull(attribute(element, "addr"), nullptr, 16));
-          pieces.name = fd->getName();
-          fd->getFuncProto().setPieces(pieces);
-        } else if (tag == "global") {
-          Address where = session->address(stoull(attribute(element, "addr"), nullptr, 16));
-          Datatype *type = decode_type(arch, element->getChildren().at(0));
-          SymbolEntry *old = global->findAddr(where, Address());
-          if (old != nullptr) global->removeSymbol(old->getSymbol());
-          global->addSymbol(name, type, where, Address());
-        } else {
-          XmlDecode decoder(arch, element);
-          arch->types->decodeType(decoder);
-        }
-      } catch (const LowlevelError &e) {
-        reject(e.explain);
-      } catch (const DecoderError &e) {
-        reject(e.explain);
-      } catch (const std::exception &e) {
-        reject(e.what());
-      }
-    }
-    session->text = rejected.str();
+    session->text = add_types(session, xml);
     *out = session->text.c_str();
   });
 }
@@ -1706,6 +1777,380 @@ int rd_type_layout(RdSession *session, const char *name, const char **out, char 
     session->text = s.str();
     *out = session->text.c_str();
   });
+}
+
+// The objects a function's parameters point to, as the engine will type them. Each object is a
+// class of pointer-sized values, every one at a known offset from the others: the values the
+// engine spreads one pointer type across once a parameter has it. The edges are the engine's
+// own (TypeOp::propagateType): copies, merges and INDIRECTs in both directions, and an ADD of a
+// constant or of an index times a constant from input to output. A value that comes back to
+// its class at another offset, as a pointer stepped through a loop does, gives the class a
+// stride. Values loaded from or stored to one field of a class are one class too, since the
+// engine gives them all the field's type.
+class Objects {
+  unordered_map<const Varnode *, int> index;
+  vector<int> parent;
+  vector<int64_t> delta;  // a node's value is its parent's plus this
+
+ public:
+  vector<const Varnode *> nodes;
+  map<int, set<uint64_t>> strides;  // by class
+
+  bool has(const Varnode *vn) const { return index.count(vn) != 0; }
+
+  int add(const Varnode *vn) {
+    auto found = index.emplace(vn, (int)nodes.size());
+    if (found.second) {
+      nodes.push_back(vn);
+      parent.push_back(found.first->second);
+      delta.push_back(0);
+    }
+    return found.first->second;
+  }
+
+  // The class of node `i` and the node's offset from the class's value.
+  pair<int, int64_t> find(int i) {
+    int64_t offset = 0;
+    int top = i;
+    while (parent[top] != top) {
+      offset += delta[top];
+      top = parent[top];
+    }
+    for (int64_t rest = offset; parent[i] != i;) {
+      int next = parent[i];
+      int64_t step = delta[i];
+      parent[i] = top;
+      delta[i] = rest;
+      rest -= step;
+      i = next;
+    }
+    return {top, offset};
+  }
+  pair<int, int64_t> find(const Varnode *vn) { return find(add(vn)); }
+
+  void stride(int cls, int64_t step) {
+    if (step != 0) strides[cls].insert((uint64_t)(step < 0 ? -step : step));
+  }
+
+  // Says that `b` holds `a` plus `d`. Answers whether that was news.
+  bool join(const Varnode *a, const Varnode *b, int64_t d) {
+    pair<int, int64_t> x = find(a), y = find(b);
+    if (x.first == y.first) {
+      int64_t known = y.second - x.second;
+      if (known == d) return false;
+      int64_t step = d - known;
+      size_t before = strides[x.first].size();
+      stride(x.first, step);
+      return strides[x.first].size() != before;
+    }
+    parent[y.first] = x.first;
+    delta[y.first] = x.second + d - y.second;
+    auto moved = strides.find(y.first);
+    if (moved != strides.end()) {
+      strides[x.first].insert(moved->second.begin(), moved->second.end());
+      strides.erase(moved);
+    }
+    return true;
+  }
+};
+
+// Whether a value can hold one of the pointers struct recovery follows.
+static bool pointer_value(const Varnode *vn, int4 word) {
+  return vn->getSize() == word && !vn->isConstant() && !vn->isAnnotation() && !vn->isSpacebase() && !vn->isFree();
+}
+
+// What the engine makes of a value from the operations around it, as RdAccess::kind says.
+static uint8_t value_kind(const Varnode *vn) {
+  bool blockup = false;
+  Datatype *type;
+  try {
+    type = vn->getLocalType(blockup);
+  } catch (const LowlevelError &) {
+    return 0;
+  }
+  switch (type->getMetatype()) {
+    case TYPE_INT: return 1;
+    case TYPE_UINT: return 2;
+    case TYPE_FLOAT: return 3;
+    case TYPE_BOOL: return 4;
+    default: return 0;
+  }
+}
+
+// The address and value of a load or store from the data space, or null.
+static const Varnode *accessed(const PcodeOp *op, AddrSpace *data, const Varnode *&value) {
+  if (op->code() != CPUI_LOAD && op->code() != CPUI_STORE) return nullptr;
+  if (op->getIn(0)->getSpaceFromConst() != data) return nullptr;
+  value = op->code() == CPUI_LOAD ? op->getOut() : op->getIn(2);
+  return op->getIn(1);
+}
+
+// The evidence for one function, with the tables it points into and the parameters of each
+// object, which a plan's lock goes on.
+struct Gathered {
+  RdEvidence evidence;
+  vector<RdObject> objects;
+  vector<RdRoot> roots;
+  vector<RdAccess> accesses;
+  vector<RdLink> links;
+  vector<RdStride> strides;
+  vector<string> registers;     // the names RdRoot::reg points to
+  vector<vector<Varnode *>> root_nodes;  // per object
+};
+
+// Builds the evidence for `fd`: the objects its parameters point to, and those that fields
+// of them point to in turn.
+static void gather(RdSession *session, Funcdata &fd, Gathered &out) {
+  Architecture *arch = session->arch;
+  AddrSpace *data = arch->getDefaultDataSpace();
+  AddrSpace *stack = arch->getStackSpace();
+  int4 word = data->getAddrSize();
+  Objects objects;
+  vector<Varnode *> roots;
+  const FuncProto &proto = fd.getFuncProto();
+  for (auto it = fd.beginDef(Varnode::input); it != fd.endDef(Varnode::input); ++it) {
+    Varnode *vn = *it;
+    AddrSpace *space = vn->getSpace();
+    if (!pointer_value(vn, word) || vn->hasNoDescend()) continue;
+    if (space->getType() != IPTR_PROCESSOR && space != stack) continue;
+    if (!proto.possibleInputParam(vn->getAddr(), vn->getSize())) continue;
+    objects.add(vn);
+    roots.push_back(vn);
+  }
+  if (roots.empty()) return;
+  // Values the code uses as numbers, not pointers: an object they belong to is no struct.
+  vector<const Varnode *> numeric;
+  const int64_t far = 0x10000;
+  for (auto it = fd.beginOpAlive(); it != fd.endOpAlive(); ++it) {
+    const PcodeOp *op = *it;
+    auto input = [&](int4 slot) { return op->getIn(slot); };
+    switch (op->code()) {
+      case CPUI_INT_EQUAL:
+      case CPUI_INT_NOTEQUAL:
+      case CPUI_INT_LESS:
+      case CPUI_INT_LESSEQUAL:
+      case CPUI_INT_SLESS:
+      case CPUI_INT_SLESSEQUAL:
+        // A pointer is compared with null, or with another pointer.
+        for (int4 slot = 0; slot < 2; ++slot)
+          if (input(slot)->isConstant() && input(slot)->getOffset() != 0 && pointer_value(input(1 - slot), word))
+            numeric.push_back(input(1 - slot));
+        continue;
+      default:
+        break;
+    }
+    const Varnode *result = op->getOut();
+    if (result == nullptr || !pointer_value(result, word)) continue;
+    switch (op->code()) {
+      case CPUI_COPY:
+      case CPUI_INDIRECT:
+        if (pointer_value(input(0), word)) objects.join(input(0), result, 0);
+        break;
+      case CPUI_MULTIEQUAL:
+        for (int4 i = 0; i < op->numInput(); ++i)
+          if (pointer_value(input(i), word)) objects.join(input(i), result, 0);
+        break;
+      case CPUI_INT_ADD:
+      case CPUI_PTRSUB:
+        for (int4 slot = 1; slot >= 0; --slot) {
+          const Varnode *base = input(1 - slot), *added = input(slot);
+          if (!pointer_value(base, word)) continue;
+          if (added->isConstant()) {
+            int64_t offset = sign_extend((intb)added->getOffset(), 8 * added->getSize() - 1);
+            // So far from a struct's start, the constant is the address of a table, and the
+            // value an index into it.
+            if (offset >= far || offset <= -far)
+              numeric.push_back(base);
+            else
+              objects.join(base, result, offset);
+            break;
+          }
+          // An index times the size of an element.
+          if (op->code() == CPUI_INT_ADD && added->isWritten() && added->getDef()->code() == CPUI_INT_MULT &&
+              added->getDef()->getIn(1)->isConstant()) {
+            const Varnode *factor = added->getDef()->getIn(1);
+            int64_t step = sign_extend((intb)factor->getOffset(), 8 * factor->getSize() - 1);
+            if (step == -1) break;  // a difference of pointers
+            objects.join(base, result, 0);
+            objects.stride(objects.find(base).first, step);
+            break;
+          }
+        }
+        break;
+      case CPUI_PTRADD:
+        if (!pointer_value(input(0), word)) break;
+        if (input(1)->isConstant()) {
+          objects.join(input(0), result, sign_extend((intb)input(1)->getOffset(), 8 * input(1)->getSize() - 1) * (int64_t)input(2)->getOffset());
+        } else {
+          objects.join(input(0), result, 0);
+          objects.stride(objects.find(input(0)).first, (int64_t)input(2)->getOffset());
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  // Fields: what is loaded from or stored to one place of a class is one class. Joining can
+  // make two places one, so again until nothing changes.
+  map<pair<int, int64_t>, const Varnode *> fields;
+  bool settled = false;
+  for (int round = 0; round < 8 && !settled; ++round) {
+    bool changed = false;
+    fields.clear();
+    for (auto it = fd.beginOpAlive(); it != fd.endOpAlive(); ++it) {
+      const Varnode *value = nullptr;
+      const Varnode *addr = accessed(*it, data, value);
+      if (addr == nullptr || !objects.has(addr) || !pointer_value(value, word)) continue;
+      auto found = fields.emplace(objects.find(addr), value);
+      if (found.second)
+        objects.add(value);
+      else
+        changed |= objects.join(found.first->second, value, 0);
+    }
+    settled = !changed;
+  }
+  // Places found before the last join may name a class by a node that is no longer its own.
+  if (!settled) fields.clear();
+  // The classes to hand over: those of parameters, then those their fields point to.
+  map<int, uint32_t> numbers;
+  vector<int> classes;
+  vector<int64_t> bases;
+  auto number = [&](int cls, int64_t base) {
+    auto found = numbers.emplace(cls, (uint32_t)classes.size());
+    if (found.second) {
+      classes.push_back(cls);
+      bases.push_back(base);
+    }
+    return found.first->second;
+  };
+  for (Varnode *root : roots) {
+    pair<int, int64_t> at = objects.find(root);
+    number(at.first, at.second);
+  }
+  map<int, vector<pair<int64_t, const Varnode *>>> pointed;  // per class: field offset, a value
+  for (const auto &field : fields) pointed[objects.find(field.first.first).first].push_back({field.first.second, field.second});
+  for (size_t i = 0; i < classes.size(); ++i) {
+    for (const auto &field : pointed[classes[i]]) {
+      pair<int, int64_t> child = objects.find(field.second);
+      uint32_t at = number(child.first, child.second);
+      out.links.push_back({(uint32_t)i, field.first - bases[i], at});
+    }
+  }
+  out.objects.assign(classes.size(), RdObject{INT64_MAX, INT64_MIN, 0, 0, 0});
+  out.root_nodes.assign(classes.size(), {});
+  for (const Varnode *vn : objects.nodes) {
+    pair<int, int64_t> at = objects.find(vn);
+    auto found = numbers.find(at.first);
+    if (found == numbers.end()) continue;
+    RdObject &object = out.objects[found->second];
+    int64_t offset = at.second - bases[found->second];
+    object.low = min(object.low, offset);
+    object.high = max(object.high, offset);
+    object.locked |= vn->isTypeLock();
+    object.global |= vn->isPersist();
+  }
+  for (const Varnode *vn : numeric) {
+    auto found = numbers.find(objects.find(vn).first);
+    if (found != numbers.end()) out.objects[found->second].number = 1;
+  }
+  out.registers.reserve(roots.size());  // RdRoot points into this, so it must not reallocate
+  for (Varnode *root : roots) {
+    pair<int, int64_t> at = objects.find(root);
+    uint32_t object = numbers[at.first];
+    string reg = root->getSpace() == stack ? "" : arch->translate->getRegisterName(root->getSpace(), root->getOffset(), root->getSize());
+    out.registers.push_back(reg);
+    out.roots.push_back({object, reg.empty() ? nullptr : out.registers.back().c_str(), root->getSpace() == stack ? root->getOffset() : 0, at.second - bases[object]});
+    out.root_nodes[object].push_back(root);
+  }
+  for (auto it = fd.beginOpAlive(); it != fd.endOpAlive(); ++it) {
+    const Varnode *value = nullptr;
+    const Varnode *addr = accessed(*it, data, value);
+    if (addr == nullptr || !objects.has(addr)) continue;
+    pair<int, int64_t> at = objects.find(addr);
+    auto found = numbers.find(at.first);
+    if (found == numbers.end()) continue;
+    out.accesses.push_back({found->second, at.second - bases[found->second], (uint32_t)value->getSize(), value_kind(value)});
+  }
+  for (const auto &steps : objects.strides) {
+    auto found = numbers.find(objects.find(steps.first).first);
+    if (found == numbers.end()) continue;
+    for (uint64_t step : steps.second) out.strides.push_back({found->second, step});
+  }
+  out.evidence = {session->offset(fd.getAddress()), (uint32_t)word,
+                  out.objects.data(), out.objects.size(), out.roots.data(), out.roots.size(),
+                  out.accesses.data(), out.accesses.size(), out.links.data(), out.links.size(),
+                  out.strides.data(), out.strides.size()};
+}
+
+// Gives the parameters of `fd` the structs recore plans for what they point to. Runs when the
+// engine starts typing the function: its SSA is settled and nothing unlocked has a type yet.
+static void recover_structs(RdSession *session, Funcdata &fd) {
+  if (session->plan == nullptr) return;
+  Gathered gathered;
+  gather(session, fd, gathered);
+  if (gathered.objects.empty()) return;
+  RdPlan plan;
+  if (session->plan(session->structs, &gathered.evidence, &plan) == 0) return;
+  Architecture *arch = session->arch;
+  if (plan.xml != nullptr) add_types(session, plan.xml);
+  auto complete = [&](const char *name) -> Datatype * {
+    Datatype *type = arch->types->findByName(name);
+    return type != nullptr && type->getMetatype() == TYPE_STRUCT && !type->isIncomplete() ? type : nullptr;
+  };
+  for (size_t i = 0; i < plan.recovered_count; ++i) {
+    Datatype *type = complete(plan.recovered[i]);
+    if (type != nullptr) session->recovered[type] = plan.arrays[i] != 0;
+  }
+  AddrSpace *data = arch->getDefaultDataSpace();
+  for (size_t i = 0; i < gathered.objects.size(); ++i) {
+    Datatype *type = plan.names[i] != nullptr ? complete(plan.names[i]) : nullptr;
+    if (type == nullptr) continue;
+    Datatype *pointer = arch->types->getTypePointer(data->getAddrSize(), type, data->getWordSize());
+    for (Varnode *root : gathered.root_nodes[i])
+      if (!root->isTypeLock()) root->updateType(pointer, true, false);
+  }
+}
+
+// Whether a data type is, or points to, a struct recovery defined.
+static bool mentions_recovered(const RdSession *session, const Datatype *type) {
+  for (int depth = 0; type != nullptr && depth < 8; ++depth) {
+    if (session->recovered.count(type) != 0) return true;
+    if (type->getMetatype() == TYPE_PTR)
+      type = static_cast<const TypePointer *>(type)->getPtrTo();
+    else if (type->getMetatype() == TYPE_ARRAY)
+      type = static_cast<const TypeArray *>(type)->getBase();
+    else
+      return false;
+  }
+  return false;
+}
+
+// The recovered structs that `fd`'s code reaches past the end of: through a field at or past
+// the end, or by stepping a pointer to one that is no element of an array. Each means that
+// `gather` missed a value the engine typed.
+static set<string> wrapped(const RdSession *session, Funcdata *fd) {
+  set<string> names;
+  for (auto it = fd->beginOpAlive(); it != fd->endOpAlive(); ++it) {
+    const PcodeOp *op = *it;
+    if (op->code() != CPUI_PTRSUB && op->code() != CPUI_PTRADD) continue;
+    Datatype *type = op->getIn(0)->getHighTypeReadFacing(op);
+    if (type->getMetatype() != TYPE_PTR) continue;
+    Datatype *to = static_cast<TypePointer *>(type)->getPtrTo();
+    auto found = session->recovered.find(to);
+    if (found == session->recovered.end()) continue;
+    bool past = op->code() == CPUI_PTRSUB ? op->getIn(1)->isConstant() && op->getIn(1)->getOffset() >= (uintb)to->getSize() : !found->second;
+    if (past) names.insert(to->getName());
+  }
+  return names;
+}
+
+// Says how recore plans the structs of the functions this session decompiles: `plan` is asked
+// with each function's evidence, and `wrapped` told of a struct that still wrapped. `ctx` goes
+// with each call.
+void rd_set_struct_hooks(RdSession *session, void *ctx, RdPlanHook plan, RdWrappedHook wrapped) {
+  session->structs = ctx;
+  session->plan = plan;
+  session->wrapped = wrapped;
 }
 
 int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err, size_t errlen) {
@@ -1776,6 +2221,18 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
         if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
       }
     }
+    set<string> wraps = wrapped(session, fd);
+    if (!wraps.empty()) {
+      // Once more without them: the walk in `gather` missed a value the engine typed.
+      for (const string &name : wraps) session->wrapped(session->structs, name.c_str());
+      arch->clearAnalysis(fd);
+      root->reset(*fd);
+      if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
+      for (const string &name : wrapped(session, fd)) session->wrapped(session->structs, name.c_str());
+      string names;
+      for (const string &name : wraps) names += (names.empty() ? "" : ", ") + name;
+      fd->warningHeader("Decompiled again without recovered structs the code reaches past the end of: " + names);
+    }
     session->locals = name_locals(session, addr, fd);
     ostringstream text;
     if (session->print_c) {
@@ -1843,6 +2300,8 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       ParameterPieces piece;
       piece.addr = proto.getOutput()->getAddress();
       piece.type = proto.getOutputType();
+      // A recovered struct covers what this function reads of it, not what another one would.
+      if (mentions_recovered(session, piece.type)) piece.type = arch->types->getBase(piece.type->getSize(), TYPE_UNKNOWN);
       piece.flags = 0;
       session->outputs[addr] = piece;
     }
@@ -1861,6 +2320,17 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     if (vector_params < 8 && !reads_unexplained_register(fd) && !spills) {
       // Kept as a lower bound: a call passes these parameters and whatever else the call site
       // shows. A variadic function looks like one with only its fixed parameters.
+      // A recovered struct covers what this function reads of it, and callers read other parts.
+      FuncProto &proto = fd->getFuncProto();
+      for (int4 i = 0; i < proto.numParams(); ++i) {
+        ProtoParameter *param = proto.getParam(i);
+        if (!mentions_recovered(session, param->getType())) continue;
+        ParameterPieces piece;
+        piece.addr = param->getAddress();
+        piece.type = arch->types->getBase(param->getSize(), TYPE_UNKNOWN);
+        piece.flags = 0;
+        proto.setParam(i, param->getName(), piece);
+      }
       fd->getFuncProto().setInputLock(true);
       fd->getFuncProto().setDotdotdot(session->kept_are_lower_bounds);
       session->kept.insert(addr);

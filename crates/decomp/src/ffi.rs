@@ -42,7 +42,83 @@ pub struct RdDecompiled {
     pub locals: *const c_char,
 }
 
+/// One object of [`RdEvidence`]: the lowest and highest offset a member points to, and flags
+/// as [`crate::structs::Object`] has them.
+#[repr(C)]
+pub struct RdObject {
+    pub low: i64,
+    pub high: i64,
+    pub locked: u8,
+    pub global: u8,
+    pub number: u8,
+}
+
+/// A parameter that points to an object: a register by name, or with a null name the stack at
+/// `stack`. `offset` is from the object's base.
+#[repr(C)]
+pub struct RdRoot {
+    pub object: u32,
+    pub register: *const c_char,
+    pub stack: u64,
+    pub offset: i64,
+}
+
+/// `kind`: 0 unknown, 1 signed, 2 unsigned, 3 floating point, 4 boolean.
+#[repr(C)]
+pub struct RdAccess {
+    pub object: u32,
+    pub offset: i64,
+    pub size: u32,
+    pub kind: u8,
+}
+
+/// The field at `offset` of `object` holds pointers to `child`.
+#[repr(C)]
+pub struct RdLink {
+    pub object: u32,
+    pub offset: i64,
+    pub child: u32,
+}
+
+#[repr(C)]
+pub struct RdStride {
+    pub object: u32,
+    pub stride: u64,
+}
+
+#[repr(C)]
+pub struct RdEvidence {
+    pub function: u64,
+    pub pointer: u32,
+    pub objects: *const RdObject,
+    pub object_count: usize,
+    pub roots: *const RdRoot,
+    pub root_count: usize,
+    pub accesses: *const RdAccess,
+    pub access_count: usize,
+    pub links: *const RdLink,
+    pub link_count: usize,
+    pub strides: *const RdStride,
+    pub stride_count: usize,
+}
+
+/// What the plan hook answers: XML that defines new structs, or null; per object the name of
+/// its struct, or null; and every struct the plan uses, each with whether it is an element of
+/// an array.
+#[repr(C)]
+pub struct RdPlan {
+    pub xml: *const c_char,
+    pub names: *const *const c_char,
+    pub recovered: *const *const c_char,
+    pub arrays: *const u8,
+    pub recovered_count: usize,
+}
+
+pub type PlanHook = extern "C" fn(ctx: *mut std::ffi::c_void, evidence: *const RdEvidence, out: *mut RdPlan) -> i32;
+pub type WrappedHook = extern "C" fn(ctx: *mut std::ffi::c_void, name: *const c_char);
+
 unsafe extern "C" {
+    pub fn rd_set_struct_hooks(session: *mut RdSession, ctx: *mut std::ffi::c_void, plan: PlanHook, wrapped: WrappedHook);
     pub fn rd_session_new(
         spec_dir: *const c_char,
         language: *const c_char,

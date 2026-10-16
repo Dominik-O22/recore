@@ -80,7 +80,10 @@ public:
     return new ActionStartTypes(getGroup());
   }
   virtual int4 apply(Funcdata &data) {
-    if (data.startTypeRecovery()) count+=1;
+    if (data.startTypeRecovery()) {
+      count+=1;
+      data.getArch()->startTypes(data);	// recore: see Architecture::startTypes
+    }
     return 0;
   }
 };
