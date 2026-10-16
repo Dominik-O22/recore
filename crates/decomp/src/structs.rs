@@ -38,6 +38,9 @@ pub(crate) struct Object {
     pub locked: bool,
     /// A member is in global memory.
     pub global: bool,
+    /// A member is used as a number: compared with a constant other than null, or added to
+    /// the address of a table.
+    pub number: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -268,6 +271,9 @@ fn shape(object: &Object) -> Result<(Layout, bool), Refusal> {
     if object.global {
         return Err(Refusal::Global);
     }
+    if object.number {
+        return Err(Refusal::Number);
+    }
     if object.roots.iter().any(|&(_, offset)| offset != 0) {
         return Err(Refusal::IntoMiddle);
     }
@@ -282,7 +288,11 @@ fn shape(object: &Object) -> Result<(Layout, bool), Refusal> {
     let ends = object.accesses.iter().map(|access| access.offset + i64::from(access.size));
     let size = match stride {
         Some(stride) => {
-            if object.accesses.iter().any(|access| access.offset.rem_euclid(stride) + i64::from(access.size) > stride) {
+            // Through the root itself the code reaches the first element only, and steps to
+            // the next. Further on is a header before the array, or an element by a constant
+            // index, and either would print as one past the struct.
+            let past = object.span.0 < 0 || object.span.1 > stride;
+            if past || object.accesses.iter().any(|access| access.offset < 0 || access.offset + i64::from(access.size) > stride) {
                 return Err(Refusal::Stride);
             }
             stride
@@ -323,7 +333,7 @@ fn shape(object: &Object) -> Result<(Layout, bool), Refusal> {
 unsafe fn evidence(raw: &ffi::RdEvidence) -> Evidence {
     let mut objects: Vec<Object> = unsafe { crate::slice(raw.objects, raw.object_count) }
         .iter()
-        .map(|object| Object { span: (object.low, object.high), locked: object.locked != 0, global: object.global != 0, ..Default::default() })
+        .map(|object| Object { span: (object.low, object.high), locked: object.locked != 0, global: object.global != 0, number: object.number != 0, ..Default::default() })
         .collect();
     for root in unsafe { crate::slice(raw.roots, raw.root_count) } {
         let slot = if root.register.is_null() { Slot::Stack(root.stack) } else { Slot::Register(unsafe { CStr::from_ptr(root.register) }.to_string_lossy().into_owned()) };
@@ -444,18 +454,29 @@ mod tests {
         locked.locked = true;
         let mut global = object(&[0, 4]);
         global.global = true;
-        let decisions = plan(vec![object(&[0, 2]), object(&[0]), object(&[]), middle, second_root, strides, past_stride, locked, global]).decisions;
-        let refusals = [Refusal::Overlap, Refusal::Primitive, Refusal::Unused, Refusal::IntoMiddle, Refusal::IntoMiddle, Refusal::Stride, Refusal::Stride, Refusal::Locked, Refusal::Global];
+        let mut number = object(&[0, 4]);
+        number.number = true;
+        let mut beyond = object(&[0, 4]);
+        (beyond.strides, beyond.span) = (vec![12], (0, 0x20));
+        let decisions = plan(vec![object(&[0, 2]), object(&[0]), object(&[]), middle, second_root, strides, past_stride, locked, global, number, beyond]).decisions;
+        let refusals = [Refusal::Overlap, Refusal::Primitive, Refusal::Unused, Refusal::IntoMiddle, Refusal::IntoMiddle, Refusal::Stride, Refusal::Stride, Refusal::Locked, Refusal::Global, Refusal::Number, Refusal::Stride];
         assert_eq!(decisions, refusals.map(Err));
     }
 
     #[test]
     fn an_array_of_structs_is_one_element() {
-        let mut points = object(&[0x18, 0x20, 0x24]);
+        let mut points = object(&[0, 8]);
         points.strides = vec![12, 12];
         let plan = plan(vec![points]);
         assert_eq!(plan.structs[0].layout, layout(&[(0, 4, FieldType::Int), (8, 4, FieldType::Int)], 12));
         assert!(plan.structs[0].array);
+    }
+
+    #[test]
+    fn a_read_past_the_first_element_refuses_the_array() {
+        let mut header = object(&[0, 0x20]);
+        header.strides = vec![12];
+        assert_eq!(plan(vec![header]).decisions, [Err(Refusal::Stride)]);
     }
 
     #[test]

@@ -68,7 +68,7 @@ struct RdDecompiled {
 // crates/decomp/src/ffi.rs for each field.
 struct RdObject {
   int64_t low, high;
-  uint8_t locked, global;
+  uint8_t locked, global, number;
 };
 struct RdRoot {
   uint32_t object;
@@ -249,9 +249,6 @@ class SectionImage : public LoadImage {
     for (const Section &sec : sections)
       if (sec.readonly && !sec.data.empty()) list.insertRange(space, sec.addr, sec.end() - 1);
   }
-
-  // Whether `addr` is an address of the image.
-  bool mapped(uintb addr) const { return find(addr) != nullptr; }
 
   string getArchType() const override { return language; }
   void adjustVma(long) override {}
@@ -1920,11 +1917,29 @@ static void gather(RdSession *session, Funcdata &fd, Gathered &out) {
     roots.push_back(vn);
   }
   if (roots.empty()) return;
+  // Values the code uses as numbers, not pointers: an object they belong to is no struct.
+  vector<const Varnode *> numeric;
+  const int64_t far = 0x10000;
   for (auto it = fd.beginOpAlive(); it != fd.endOpAlive(); ++it) {
     const PcodeOp *op = *it;
+    auto input = [&](int4 slot) { return op->getIn(slot); };
+    switch (op->code()) {
+      case CPUI_INT_EQUAL:
+      case CPUI_INT_NOTEQUAL:
+      case CPUI_INT_LESS:
+      case CPUI_INT_LESSEQUAL:
+      case CPUI_INT_SLESS:
+      case CPUI_INT_SLESSEQUAL:
+        // A pointer is compared with null, or with another pointer.
+        for (int4 slot = 0; slot < 2; ++slot)
+          if (input(slot)->isConstant() && input(slot)->getOffset() != 0 && pointer_value(input(1 - slot), word))
+            numeric.push_back(input(1 - slot));
+        continue;
+      default:
+        break;
+    }
     const Varnode *result = op->getOut();
     if (result == nullptr || !pointer_value(result, word)) continue;
-    auto input = [&](int4 slot) { return op->getIn(slot); };
     switch (op->code()) {
       case CPUI_COPY:
       case CPUI_INDIRECT:
@@ -1940,10 +1955,13 @@ static void gather(RdSession *session, Funcdata &fd, Gathered &out) {
           const Varnode *base = input(1 - slot), *added = input(slot);
           if (!pointer_value(base, word)) continue;
           if (added->isConstant()) {
-            // A constant that is an address of the image is the base, as of a table: added to
-            // an index, it says nothing of fields.
-            if (!session->image->mapped(added->getOffset()))
-              objects.join(base, result, sign_extend((intb)added->getOffset(), 8 * added->getSize() - 1));
+            int64_t offset = sign_extend((intb)added->getOffset(), 8 * added->getSize() - 1);
+            // So far from a struct's start, the constant is the address of a table, and the
+            // value an index into it.
+            if (offset >= far || offset <= -far)
+              numeric.push_back(base);
+            else
+              objects.join(base, result, offset);
             break;
           }
           // An index times the size of an element.
@@ -2017,7 +2035,7 @@ static void gather(RdSession *session, Funcdata &fd, Gathered &out) {
       out.links.push_back({(uint32_t)i, field.first - bases[i], at});
     }
   }
-  out.objects.assign(classes.size(), RdObject{INT64_MAX, INT64_MIN, 0, 0});
+  out.objects.assign(classes.size(), RdObject{INT64_MAX, INT64_MIN, 0, 0, 0});
   out.root_nodes.assign(classes.size(), {});
   for (const Varnode *vn : objects.nodes) {
     pair<int, int64_t> at = objects.find(vn);
@@ -2029,6 +2047,10 @@ static void gather(RdSession *session, Funcdata &fd, Gathered &out) {
     object.high = max(object.high, offset);
     object.locked |= vn->isTypeLock();
     object.global |= vn->isPersist();
+  }
+  for (const Varnode *vn : numeric) {
+    auto found = numbers.find(objects.find(vn).first);
+    if (found != numbers.end()) out.objects[found->second].number = 1;
   }
   out.registers.reserve(roots.size());  // RdRoot points into this, so it must not reallocate
   for (Varnode *root : roots) {

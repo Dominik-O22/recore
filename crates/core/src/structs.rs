@@ -48,6 +48,8 @@ pub enum Refusal {
     Locked,
     /// A member lives in global memory, which every function shares.
     Global,
+    /// The code uses a member as a number: an index, or a count.
+    Number,
     /// Reached from no parameter, and from no field of a recovered struct.
     NoRoot,
     /// Its struct wrapped in the output once this session.
