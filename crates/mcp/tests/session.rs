@@ -297,6 +297,18 @@ fn the_command_line_takes_counts_in_hex_and_says_how_it_read_an_address() {
 }
 
 #[test]
+fn imported_data_reads_by_name_and_zero_filled_data_has_an_address() {
+    // `report` passes `stderr`, which a shared library reads through its slot in the GOT, and
+    // counts in a variable the loader zero-fills.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/imported.so");
+    let mut client = Client::start();
+    let c_text = client.tool("decompile", json!({ "path": path, "functions": ["report"] })).unwrap();
+    assert!(c_text.contains("((void *)*__imp_stderr,\"%s %ld\\n\",param_1,"), "{c_text}");
+    let counter = client.tool("addr", json!({ "path": path, "addr": "0x4018" })).unwrap();
+    assert_eq!(counter, "address 0x4018, not stored in the file: uninitialized data\n");
+}
+
+#[test]
 fn memory_the_file_has_no_bytes_for_takes_a_name() {
     // An 8051 program: SETB 0xAF; MOV DPTR, #0x8100; MOVX @DPTR, A; RET.
     let dir = edits_dir();

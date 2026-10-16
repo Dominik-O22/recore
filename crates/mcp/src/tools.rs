@@ -1176,7 +1176,13 @@ fn addr(binary: &mut Binary, args: Addr) -> Result<String> {
     let (section, addr) = match (&args.addr, &args.offset) {
         (Some(addr), None) => {
             let addr = addr_arg(addr)?;
-            (image.section_at(addr).with_context(|| format!("{addr:#x} is not in any section stored in the file"))?, addr)
+            match image.section_at(addr) {
+                Some(section) => (section, addr),
+                // Memory the loader zero-fills, as `.bss` is, has no bytes in the file but is
+                // data all the same.
+                None if image.is_zero_filled(addr) => return Ok(format!("address {addr:#x}, not stored in the file: {}\n", describe(binary, addr))),
+                None => bail!("{addr:#x} is in no section of the file, nor in memory the loader fills with zeros"),
+            }
         }
         (None, Some(offset)) => {
             let offset = addr_arg(offset)?;
