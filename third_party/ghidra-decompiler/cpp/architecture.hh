@@ -250,6 +250,9 @@ public:
   virtual void encode(Encoder &encoder) const;		///< Encode \b this architecture to a stream
   virtual void restoreXml(DocumentStorage &store);	///< Restore the Architecture state from XML documents
   virtual void nameFunction(const Address &addr,string &name) const;	///< Pick a default name for a function
+  /// recore: called when data-type recovery starts on a function, after the main loop has
+  /// settled its SSA and before any unlocked varnode has a type.
+  virtual void startTypes(Funcdata &data) {}
   string getScopeDelimiter(void) const { return print->getScopeDelimiter(); }	///< Get the character string separating scope names
 #ifdef OPACTION_DEBUG
   void setDebugStream(ostream *s) { debugstream = s; }	///< Establish the debug console stream
