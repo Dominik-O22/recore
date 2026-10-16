@@ -894,12 +894,16 @@ static string type_name(const Datatype *type) {
   return s.str();
 }
 
-// The decompiler's name for an operation. The two that only exist after analysis share their
+// The decompiler's name for an operation. The four that only exist after analysis share their
 // numbers with operations of the processor specs, whose names get_opname gives.
 static const char *flow_opname(OpCode code) {
-  if (code == CPUI_MULTIEQUAL) return "MULTIEQUAL";
-  if (code == CPUI_INDIRECT) return "INDIRECT";
-  return get_opname(code);
+  switch (code) {
+    case CPUI_MULTIEQUAL: return "MULTIEQUAL";
+    case CPUI_INDIRECT: return "INDIRECT";
+    case CPUI_PTRADD: return "PTRADD";
+    case CPUI_PTRSUB: return "PTRSUB";
+    default: return get_opname(code);
+  }
 }
 
 // Writes the function's simplified p-code as lines of tab-separated fields:
