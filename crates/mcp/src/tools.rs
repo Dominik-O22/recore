@@ -448,9 +448,21 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
         }
     }
     if !renumbered.is_empty() {
-        writeln!(out, "\nchanged in numbers only, {}: the same instructions with other constants or offsets, as when a structure gained a field or an assertion moved to another line of the source", renumbered.len())?;
-        let pairs: Vec<String> = renumbered.iter().take(limit).map(|pair| format!("{} -> {}", old.label(pair.old), new.label(pair.new))).collect();
-        writeln!(out, "{}{}", pairs.join(", "), cut(limit, renumbered.len(), "", &format!("`limit` {} shows all", renumbered.len())))?;
+        /// Numbers shown for each function.
+        const NUMBERS: usize = 6;
+        writeln!(out, "\nchanged in numbers only, {}{}: the same instructions with other constants or offsets, as when a structure gained a field or an assertion moved to another line of the source; after each, the numbers that differ, before -> after", renumbered.len(), shown(renumbered.len(), limit))?;
+        let slots = |program: &Program| -> FxHashMap<u64, u64> { program.image.relative_targets.iter().copied().collect() };
+        let (old_slots, new_slots) = (slots(old), slots(new));
+        // The numbers of a function's code, in order over all of its body.
+        let numbers = |program: &Program, slots: &FxHashMap<u64, u64>, entry: u64| -> Vec<u64> {
+            program.body(entry).into_iter().flat_map(|(start, end)| recore::signature::numbers(&program.image, slots, start, end)).collect()
+        };
+        for pair in renumbered.iter().take(limit) {
+            let (before, after) = (numbers(old, &old_slots, pair.old), numbers(new, &new_slots, pair.new));
+            let differ: Vec<String> = if before.len() == after.len() { before.iter().zip(&after).filter(|(a, b)| a != b).map(|(a, b)| format!("{a:#x} -> {b:#x}")).collect() } else { Vec::new() };
+            let listed = differ.iter().take(NUMBERS).cloned().collect::<Vec<_>>().join(", ");
+            writeln!(out, "{} -> {}  {listed}{}", old.label(pair.old), new.label(pair.new), cut(NUMBERS, differ.len(), "", &format!("`diff` with `function` {:#x} shows the C", pair.old)))?;
+        }
     }
     for (title, entries, program, sizes) in [("removed", &found.removed, old, &old_sizes), ("added", &found.added, new, &new_sizes)] {
         writeln!(out, "\n{title}{}{}", shown(entries.len(), limit), if entries.is_empty() { ": none" } else { "" })?;

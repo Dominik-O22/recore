@@ -209,6 +209,15 @@ fn a_patch_shows_as_the_functions_it_touched() {
 }
 
 #[test]
+fn a_function_changed_in_numbers_only_shows_the_numbers() {
+    // The same function in two builds, with its assertion on line 1001 of the source in one
+    // and on line 1009 in the other.
+    let data = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data");
+    let diff = Client::start().tool("diff", json!({ "path": format!("{data}/lines.elf"), "to": format!("{data}/lines-moved.elf") })).unwrap();
+    assert!(diff.contains("\n0x1160 -> 0x1160  0x3e9 -> 0x3f1\n"), "{diff}");
+}
+
+#[test]
 fn a_line_of_c_is_found_by_the_address_of_its_instruction() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/types.elf");
     let mut client = Client::start();
