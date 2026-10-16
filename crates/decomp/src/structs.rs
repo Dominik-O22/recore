@@ -104,7 +104,7 @@ impl Registry {
     /// Pure policy: the struct for each object of one function.
     pub(crate) fn plan(&mut self, evidence: &Evidence) -> Plan {
         let pointer = evidence.pointer;
-        let mut decisions: Vec<Result<(Layout, bool), Refusal>> = evidence.objects.iter().map(|object| shape(object)).collect();
+        let mut decisions: Vec<Result<(Layout, bool), Refusal>> = evidence.objects.iter().map(shape).collect();
         // Names follow pointers out from the parameters, through recovered structs only: a
         // struct reached otherwise would be given to nothing.
         let mut paths: Vec<Option<(Slot, Vec<u64>)>> = vec![None; decisions.len()];
@@ -145,23 +145,21 @@ impl Registry {
             }
         }
         // A field that holds pointers to one recovered object points to its struct.
-        for index in 0..decisions.len() {
-            let Ok((layout, array)) = &decisions[index] else { continue };
-            let stride = array.then(|| evidence.objects[index].strides[0] as i64);
+        for (object, decision) in evidence.objects.iter().zip(decisions.iter_mut()) {
+            let Ok((layout, array)) = decision else { continue };
+            let stride = array.then(|| object.strides[0] as i64);
             let mut targets: BTreeMap<u64, HashSet<&str>> = BTreeMap::new();
-            for &(offset, child) in &evidence.objects[index].points_to {
+            for &(offset, child) in &object.points_to {
                 if let Some(name) = &names[child] {
                     targets.entry(reduced(offset, stride)).or_default().insert(name);
                 }
             }
-            let mut layout = layout.clone();
             for (offset, targets) in targets {
                 let pointer_sized = layout.fields().get(&offset).is_some_and(|field| field.size == pointer);
                 if let (true, [target]) = (pointer_sized, targets.into_iter().collect::<Vec<_>>().as_slice()) {
                     layout.set_type(offset, FieldType::Struct(target.to_string()));
                 }
             }
-            decisions[index] = Ok((layout, *array));
         }
 
         let based: Vec<(String, Layout, bool)> = decisions.iter().zip(&names).filter_map(|(decision, name)| Some((name.clone()?, decision.as_ref().ok()?.0.clone(), decision.as_ref().ok()?.1))).collect();

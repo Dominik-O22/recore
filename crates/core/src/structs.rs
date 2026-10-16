@@ -42,7 +42,8 @@ pub enum Refusal {
     Overlap,
     /// A member lies below the root, or two roots point to different places of it.
     IntoMiddle,
-    /// Steps between elements disagree, or a field lies past the step.
+    /// Steps between elements disagree, or the code reaches past the first element through
+    /// the pointer it was passed.
     Stride,
     /// A member already has a locked type: declared, or from debug information.
     Locked,

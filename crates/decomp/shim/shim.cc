@@ -1885,7 +1885,8 @@ static const Varnode *accessed(const PcodeOp *op, AddrSpace *data, const Varnode
   return op->getIn(1);
 }
 
-// What recore planned for one function, kept for the locks.
+// The evidence for one function, with the tables it points into and the parameters of each
+// object, which a plan's lock goes on.
 struct Gathered {
   RdEvidence evidence;
   vector<RdObject> objects;
