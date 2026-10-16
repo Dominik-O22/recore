@@ -308,6 +308,12 @@ fn a_named_struct_reaches_a_caller_and_outlives_the_server() {
     let structs = client.tool("structs", json!({ "path": path, "function": "0x401089", "refused": true })).unwrap();
     assert_eq!(structs, "0x401089: 1 pointer with a struct, 0 read through without one\nRDI: S_401089_RDI, 2 reads and writes, +0x4 to +0x20\n");
 
+    // Holders go by address and slot, so naming the function and its parameter leaves them be.
+    client.tool("rename", json!({ "path": path, "names": [{ "addr": "0x401000", "name": "touch" }, { "addr": "0x401000", "var": "param_1", "name": "conn" }] })).unwrap();
+    let live = decompile(&mut client);
+    assert!(live.contains("touch(Connection *conn,int4 param_2)"), "{live}");
+    assert!(live.contains("conn->session->field_0x4 = param_2;"), "{live}");
+
     drop(client);
     assert_eq!(live, decompile(&mut Client::start_in(&edits)));
 }
