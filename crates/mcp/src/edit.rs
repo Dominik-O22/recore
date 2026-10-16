@@ -148,19 +148,20 @@ pub fn rename(binary: &mut Binary, args: Rename) -> Result<String> {
         };
         changes.push((named, name.to_string()));
     }
+    // Struct changes depend on each other and may be refused, so all apply to a copy first.
     let mut edits = binary.edits.clone();
-    let mut out = String::new();
+    let mut said: Vec<Option<String>> = Vec::new();
     for (named, name) in &changes {
-        match named {
-            Named::Address(addr) if name.is_empty() => {
-                edits.names.remove(addr);
-                writeln!(out, "{addr:#x} has the name the analysis gives it again: {}", describe(binary, *addr))?;
-            }
+        said.push(match named {
             Named::Address(addr) => {
-                edits.names.insert(*addr, name.clone());
-                writeln!(out, "{addr:#x} is now {name}")?;
+                if name.is_empty() {
+                    edits.names.remove(addr);
+                } else {
+                    edits.names.insert(*addr, name.clone());
+                }
+                None
             }
-            Named::Local { function, place, was } => {
+            Named::Local { function, place, .. } => {
                 let names = edits.locals.entry(*function).or_default();
                 if name.is_empty() {
                     names.remove(place);
@@ -170,25 +171,30 @@ pub fn rename(binary: &mut Binary, args: Rename) -> Result<String> {
                 if names.is_empty() {
                     edits.locals.remove(function);
                 }
-                match name.as_str() {
-                    "" => writeln!(out, "{was} in {} has the name the decompiler gives it again", binary.program.label(*function))?,
-                    name => writeln!(out, "{was} in {} is now {name}", binary.program.label(*function))?,
-                }
+                None
             }
-            Named::Struct { name: old, recovered } => writeln!(out, "{}", name_struct(binary, &mut edits, old, recovered.as_ref(), name)?)?,
+            Named::Struct { name: old, recovered } => Some(name_struct(binary, &mut edits, old, recovered.as_ref(), name)?),
             Named::Field { name: owner, recovered, field } => {
                 if let Some(recovered) = recovered {
                     edits.adopt(recovered);
                 }
                 edits.name_field(owner, field, name)?;
-                match name.as_str() {
-                    "" => writeln!(out, "{owner}.{field} has its first name again")?,
-                    name => writeln!(out, "{owner}.{field} is now {name}")?,
-                }
+                Some(if name.is_empty() { format!("{owner}.{field} has its first name again") } else { format!("{owner}.{field} is now {name}") })
             }
-        }
+        });
     }
     binary.edit(|saved| *saved = edits)?;
+    let mut out = String::new();
+    for ((named, name), said) in changes.iter().zip(said) {
+        match (named, name.as_str(), said) {
+            (_, _, Some(said)) => writeln!(out, "{said}")?,
+            (Named::Address(addr), "", _) => writeln!(out, "{addr:#x} has the name the analysis gives it again: {}", describe(binary, *addr))?,
+            (Named::Address(addr), name, _) => writeln!(out, "{addr:#x} is now {name}")?,
+            (Named::Local { function, was, .. }, "", _) => writeln!(out, "{was} in {} has the name the decompiler gives it again", binary.program.label(*function))?,
+            (Named::Local { function, was, .. }, name, _) => writeln!(out, "{was} in {} is now {name}", binary.program.label(*function))?,
+            (Named::Struct { .. } | Named::Field { .. }, _, None) => unreachable!("struct changes say what they did"),
+        }
+    }
     writeln!(out, "saved; later answers use the new names")?;
     Ok(out)
 }
