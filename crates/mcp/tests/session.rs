@@ -274,6 +274,16 @@ fn a_structure_passed_on_the_stack_reaches_the_call() {
 }
 
 #[test]
+fn short_strings_a_table_points_to_read_as_text() {
+    // One-character strings back to back read as UTF-16 too; pointers into them say otherwise.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/short.elf");
+    let mut client = Client::start();
+    assert_eq!(client.tool("strings", json!({ "path": path })).unwrap(), "0 strings\n");
+    let text = client.tool("addr", json!({ "path": path, "addr": "0x2008" })).unwrap();
+    assert_eq!(text, "address 0x2008, file offset 0x2008, in .rodata: text \"<\"\n");
+}
+
+#[test]
 fn the_command_line_takes_counts_in_hex_and_says_how_it_read_an_address() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/short.elf");
     let run = |args: &[&str]| {

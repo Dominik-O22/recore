@@ -633,6 +633,11 @@ fn describe_to(binary: &Binary, addr: u64, depth: usize) -> String {
     if let Some(string) = binary.program.string_at(addr) {
         return format!("string {}", quoted(&string.text));
     }
+    // Text too short to be among the strings, as `xrefs` shows it where a table points to it.
+    let pointed_to = || binary.program.image.relative_targets.iter().any(|&(_, target)| target == addr);
+    if let Some(text) = short_text(&binary.program.image, addr).filter(|_| pointed_to()) {
+        return format!("text {text:?}");
+    }
     if let Some(name) = binary.program.image.symbol_names.get(&addr).filter(|_| binary.program.function(addr).is_none()) {
         let image = &binary.program.image;
         // A raw image carries no names: its layout gives them, with its machine or in a names file.
