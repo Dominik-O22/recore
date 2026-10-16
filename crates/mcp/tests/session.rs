@@ -94,7 +94,7 @@ fn speaks_the_protocol() {
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        ["summary", "strings", "imports", "functions", "function", "xrefs", "decompile", "unnamed", "bytes", "classes", "addr", "disassemble", "pcode", "trace", "symbols", "diff", "rename", "comment", "declare", "type"]
+        ["summary", "strings", "imports", "functions", "function", "xrefs", "decompile", "unnamed", "bytes", "classes", "addr", "disassemble", "pcode", "trace", "structs", "symbols", "diff", "rename", "comment", "declare", "type"]
     );
 
     assert_eq!(client.request("resources/list", json!({}))["error"]["code"], -32601);
@@ -278,6 +278,38 @@ fn a_pointer_in_a_table_is_paired_with_the_name_of_its_own_record() {
     assert!(function.contains("listed as \"negate\" in the table at 0x3d88"), "{function}");
     let first = client.tool("xrefs", json!({ "path": path, "addr": "0x2068" })).unwrap();
     assert!(first.contains("\n0x3d20 in .data.rel.ro holds a pointer to it, paired with the name \"ValueError\"\n"), "{first}");
+}
+
+#[test]
+fn a_named_struct_reaches_a_caller_and_outlives_the_server() {
+    // The decompiler's struct fixture: `touch` (0x401000) reads a struct and one it points to,
+    // `relay` (0x40107b) hands its parameter to `touch`, and `late` (0x401089) reads 4 bytes
+    // inside the 8 that `touch` writes at 0x18.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/structs.elf");
+    let edits = edits_dir();
+    let decompile = |client: &mut Client| {
+        let c_text = client.tool("decompile", json!({ "path": path, "functions": ["0x401000", "0x40107b"] })).unwrap();
+        c_text.lines().filter(|line| !line.starts_with("// 0x")).collect::<Vec<_>>().join("\n")
+    };
+    let mut client = Client::start_in(&edits);
+    assert!(decompile(&mut client).contains("(S_401000_RDI *param_1,int4 param_2)"));
+    let renamed = client.tool("rename", json!({ "path": path, "addr": "S_401000_RDI", "name": "Connection" })).unwrap();
+    assert_eq!(renamed, "S_401000_RDI is now Connection, the struct 0x401000 is passed in RDI; kept with it under the names they have: S_401000_RDI_8\nsaved; later answers use the new names\n");
+    client.tool("rename", json!({ "path": path, "addr": "Connection.field_0x8", "name": "session" })).unwrap();
+    let live = decompile(&mut client);
+    assert!(live.contains("func_0x00401000(Connection *param_1,int4 param_2)"), "{live}");
+    assert!(live.contains("param_1->session->field_0x4 = param_2;"), "{live}");
+    assert!(live.contains("func_0x0040107b(Connection *param_1)"), "{live}");
+    let layout = client.tool("type", json!({ "path": path, "name": "Connection" })).unwrap();
+    assert!(layout.contains("+0x8 S_401000_RDI_8 * session (8 bytes)") && layout.ends_with("0x401000 is passed it in RDI\n"), "{layout}");
+
+    let refused = client.tool("rename", json!({ "path": path, "addr": "S_401089_RDI", "name": "Connection" })).unwrap_err();
+    assert_eq!(refused, "cannot join Connection: S_401089_RDI has 4 bytes at +0x1c, across Connection.field_0x18 (+0x18, 8 bytes)");
+    let structs = client.tool("structs", json!({ "path": path, "function": "0x401089", "refused": true })).unwrap();
+    assert_eq!(structs, "0x401089: 1 pointer with a struct, 0 read through without one\nRDI: S_401089_RDI, 2 reads and writes, +0x4 to +0x20\n");
+
+    drop(client);
+    assert_eq!(live, decompile(&mut Client::start_in(&edits)));
 }
 
 #[test]
