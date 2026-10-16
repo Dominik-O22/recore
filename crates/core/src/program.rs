@@ -44,14 +44,15 @@ fn target_addr(target: CallTarget) -> u64 {
 }
 
 /// What a listing is narrowed by: a regular expression matched anywhere in the text, ignoring
-/// case. Text that is not a valid expression, such as `operator()` or `c++`, is matched as it is
-/// written.
+/// case, or the text as it is written. `chr() arg` is a valid expression that finds only
+/// "chr arg", and `c++` is not one at all; both also find what they spell.
 pub struct Pattern(regex::Regex);
 
 impl Pattern {
     pub fn new(pattern: &str) -> Pattern {
         let build = |source: &str| regex::RegexBuilder::new(source).case_insensitive(true).build();
-        Pattern(build(pattern).or_else(|_| build(&regex::escape(pattern))).expect("an escaped pattern is valid"))
+        let written = regex::escape(pattern);
+        Pattern(build(&format!("(?:{pattern})|{written}")).or_else(|_| build(&written)).expect("an escaped pattern is valid"))
     }
 
     pub fn matches(&self, text: &str) -> bool {
@@ -243,5 +244,18 @@ impl Program {
                 bail!("`{name}` matches {} functions: {}{}", several.len(), shown.join(" "), if several.len() > 10 { " ..." } else { "" })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pattern;
+
+    #[test]
+    fn a_pattern_finds_what_it_spells_as_well_as_what_it_matches() {
+        assert!(Pattern::new("chr() arg").matches("chr() arg not in range(0x110000)"));
+        assert!(Pattern::new("c++").matches("libc++abi"));
+        assert!(Pattern::new("^xml_parse").matches("XML_ParseBuffer"));
+        assert!(!Pattern::new("^xml_parse").matches("_XML_Parse"));
     }
 }

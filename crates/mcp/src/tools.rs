@@ -448,9 +448,21 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
         }
     }
     if !renumbered.is_empty() {
-        writeln!(out, "\nchanged in numbers only, {}: the same instructions with other constants or offsets, as when a structure gained a field or an assertion moved to another line of the source", renumbered.len())?;
-        let pairs: Vec<String> = renumbered.iter().take(limit).map(|pair| format!("{} -> {}", old.label(pair.old), new.label(pair.new))).collect();
-        writeln!(out, "{}{}", pairs.join(", "), cut(limit, renumbered.len(), "", &format!("`limit` {} shows all", renumbered.len())))?;
+        /// Numbers shown for each function.
+        const NUMBERS: usize = 6;
+        writeln!(out, "\nchanged in numbers only, {}{}: the same instructions with other constants or offsets, as when a structure gained a field or an assertion moved to another line of the source; after each, the numbers that differ, before -> after", renumbered.len(), shown(renumbered.len(), limit))?;
+        let slots = |program: &Program| -> FxHashMap<u64, u64> { program.image.relative_targets.iter().copied().collect() };
+        let (old_slots, new_slots) = (slots(old), slots(new));
+        // The numbers of a function's code, in order over all of its body.
+        let numbers = |program: &Program, slots: &FxHashMap<u64, u64>, entry: u64| -> Vec<u64> {
+            program.body(entry).into_iter().flat_map(|(start, end)| recore::signature::numbers(&program.image, slots, start, end)).collect()
+        };
+        for pair in renumbered.iter().take(limit) {
+            let (before, after) = (numbers(old, &old_slots, pair.old), numbers(new, &new_slots, pair.new));
+            let differ: Vec<String> = if before.len() == after.len() { before.iter().zip(&after).filter(|(a, b)| a != b).map(|(a, b)| format!("{a:#x} -> {b:#x}")).collect() } else { Vec::new() };
+            let listed = differ.iter().take(NUMBERS).cloned().collect::<Vec<_>>().join(", ");
+            writeln!(out, "{} -> {}  {listed}{}", old.label(pair.old), new.label(pair.new), cut(NUMBERS, differ.len(), "", &format!("`diff` with `function` {:#x} shows the C", pair.old)))?;
+        }
     }
     for (title, entries, program, sizes) in [("removed", &found.removed, old, &old_sizes), ("added", &found.added, new, &new_sizes)] {
         writeln!(out, "\n{title}{}{}", shown(entries.len(), limit), if entries.is_empty() { ": none" } else { "" })?;
@@ -478,20 +490,29 @@ pub(crate) fn resolve_function(binary: &Binary, text: &str) -> Result<u64> {
 /// The names something is listed under in tables of the program's data: for each slot that
 /// holds a pointer to it, the text its partner in the table points to. A scripting language's
 /// library pairs each function with its name this way, and a table of types each type with
-/// its. Which neighbour is the partner shows from where the run of pointers begins: the slots
-/// pair up from there, name first in one table and second in another.
+/// its. In a table of pairs, which neighbour is the partner shows from where the run of
+/// pointers begins: the slots pair up from there, name first in one table and second in
+/// another. A wider record, which may hold a number among its pointers, opens with its name,
+/// as a Python module's list of functions does.
 pub(crate) fn table_names(program: &Program, entry: u64) -> Vec<(u64, String)> {
+    /// How many slots back from the slot the name that opens its record is looked for.
+    const FIELDS: u64 = 8;
     let image = &program.image;
     let pointer = image.machine.pointer_size();
     let target_of = |slot: u64| image.relative_targets.iter().find(|&&(at, _)| at == slot).map(|&(_, target)| target);
     let name_at = |slot: u64| short_text(image, target_of(slot)?);
+    let named = |slot: u64| name_at(slot).is_some();
     let partner = |slot: u64| {
-        let before = (1..).take_while(|back| slot.checked_sub(back * pointer).is_some_and(|earlier| target_of(earlier).is_some())).count() as u64;
-        // An even number of pointers before it: the slot opens a pair, and its partner follows.
-        // Where that one holds no name, as in a record with a number among its pointers, the
-        // other neighbour is tried.
-        let (first, second) = if before % 2 == 0 { (slot + pointer, slot - pointer) } else { (slot - pointer, slot + pointer) };
-        name_at(first).or_else(|| name_at(second))
+        let mut neighbours = [slot.checked_sub(pointer), slot.checked_add(pointer)].into_iter().flatten().filter(|&at| named(at));
+        let pairs = neighbours.any(|name| name.checked_sub(2 * pointer).is_some_and(named) || named(name + 2 * pointer));
+        if pairs {
+            let before = (1..).take_while(|back| slot.checked_sub(back * pointer).is_some_and(|earlier| target_of(earlier).is_some())).count() as u64;
+            // An even number of pointers before it: the slot opens a pair, and its partner follows.
+            let partner = if before.is_multiple_of(2) { slot + pointer } else { slot - pointer };
+            name_at(partner)
+        } else {
+            (1..=FIELDS).map_while(|back| slot.checked_sub(back * pointer)).find_map(name_at)
+        }
     };
     let slots = image.relative_targets.iter().filter(|&&(slot, target)| target == entry && image.section_at(slot).is_some_and(|section| !section.executable));
     slots.filter_map(|&(slot, _)| Some((slot, partner(slot)?))).collect()

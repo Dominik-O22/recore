@@ -48,38 +48,43 @@ recore-mcp rename program.exe check_license param_1 serial
 
 [crates/mcp/README.md](crates/mcp/README.md) describes each one.
 
-## One session
+## Agents on real tasks
 
-A stripped program that checks a licence key, and two stripped builds of Lua 5.4.8 that differ by a small patch. A fresh agent got one tool and no hints: find a key the program accepts, then say what the patch changed. The same two tasks went to Claude Haiku once with `recore-mcp` and once with Ghidra 12.1.4 headless. Both found the key and described every change correctly.
+Three tasks on public binaries, each with one answer. List what `git version --build-options` prints, from Git for Windows' `git.exe`. Find `chr()` in `python313.dll` and say what it rejects. Explain Debian's security update of libexpat from its two builds. A fresh Claude session gets the binaries, one tool and no hints, and its report is scored against a 17-item key. Ghidra 12.1.4 runs as an MCP server, [pyghidra-mcp](https://github.com/clearbluejar/pyghidra-mcp), over binaries it analyzed before the session started, with [ghidriff](https://github.com/clearbluejar/ghidriff) to compare the builds and headless scripting allowed.
 
-| | recore | Ghidra |
-|---|---|---|
-| Find the key | 54 s, 10 calls | 101 s, 4 runs |
-| Explain the patch | 182 s, 22 calls | 445 s, 9 runs |
-| Scripts the agent had to write | none | 5 |
-| Tokens used | 104,000 | 164,000 |
+| Model | Tool | Score of 17 | Session | Analysis first | Tokens read | Cost |
+|---|---|---|---|---|---|---|
+| Haiku 5.5 | recore | 16.8 | 331 s | none | 1.98 M | $0.18 |
+| Haiku 5.5 | Ghidra | 13 | 284 s | 513 s | 3.85 M | $0.26 |
+| Sonnet 5.5 | recore | 16.8 | 126 s | none | 0.54 M | $0.29 |
+| Sonnet 5.5 | Ghidra | 15 | 541 s | 513 s | 3.11 M | $1.10 |
 
-That is one run each, so the times are an illustration and not a benchmark. With Ghidra the agent wrote Java scripts to list strings, decompile and compare, rewrote its comparison twice because addresses inside the decompiled text made unchanged functions look changed, and ended with five functions to rule out by hand. With recore it called `diff`:
+recore's rows are the mean of four sessions and Ghidra's are one session each, so the table is an illustration and not a benchmark. Ghidra analyzes the four binaries before the session starts. pyghidra-mcp then spends another 906 s decompiling every function to index it for search, which the table leaves out. recore analyzes a binary on every command-line call, in 10 to 100 ms here from a new process to its answer, and once as an MCP server. Tokens read is the context of every response, summed.
+
+Both tools get the answers for git and Python. They part on the libexpat update. Both Ghidra sessions missed two of the five functions that set the parser's hash salt, a field at offset `0x398`: they store it through expressions such as `param_1[0x73]`, which a search of the decompiled C for `0x398` does not find. recore's `xrefs --offset 0x398` lists every instruction that writes the field. Haiku with Ghidra also worked from ghidriff's report, which lists 43 functions deleted and 38 added where neither build lost or gained one, and left the modified functions it had not reached "not verified". With recore, each session started from `diff`:
 
 ```
-$ recore-mcp diff lua-before lua-after
-786 functions before, 787 after: 782 the same, 4 changed, 0 removed, 1 added
-
-changed, as before -> after with bytes of code
-0xa5f0 78 -> 0xa630 94  (same place among its neighbours, listed as "rawlen")
-    now calls 0x5bb0
-0x19b10 100 -> 0x19b50 116  (same place among its neighbours, listed as "abs")
-0x22ad0 185 -> 0x22b10 185  (same place among its neighbours, listed as "reverse")
-0x283f0 289 -> 0x28430 337  (same place among its neighbours, listed as "insert")
-    now uses "too many arguments"
-
-removed: none
-
-added
-0x5bb0 71
+$ recore-mcp diff libx-before.so --to libx-after.so
+295 functions before, 295 after: 275 the same, 20 changed, 0 removed, 0 added
+...
+0x88f0(XML_ParseBuffer) 476 -> 0x8780(XML_ParseBuffer) 470  (same name)
+    no longer calls 0x6350 (after: 0x60f0)
+    no longer uses "xml=http://www.w3.org/XML/1998/namespace"
+    + if (param_2 < 0) {
+    + *(undefined4 *)(param_1 + 0x218) = 0x29;
+    + }
+...
+changed in numbers only, 17: the same instructions with other constants or offsets, ...
+0x4930 -> 0x48e0  0x1e7b -> 0x1e94
+0x50e0 -> 0x5090  0x1df2 -> 0x1e0b
+0x91e0(XML_GetParsingStatus) -> 0x9040(XML_GetParsingStatus)  0x8c3 -> 0x8c9
 ```
 
-The key took six calls that mattered: `summary`, `strings`, `imports`, `functions`, one `decompile` of three functions, and `bytes` for the two tables the check reads. The run above is from before `diff` printed the calls, strings and table names of each change, which that run's report asked for.
+Those numbers are source line numbers that assertions and accounting report, moved by the lines the update added.
+
+Opus 5.5 is left out: in three sessions its safeguards stopped the response after `recore-mcp --help`, before the first task.
+
+[`bench/agent`](bench/agent) fetches the binaries, runs a session with either tool and scores it.
 
 ## How
 

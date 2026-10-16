@@ -209,6 +209,15 @@ fn a_patch_shows_as_the_functions_it_touched() {
 }
 
 #[test]
+fn a_function_changed_in_numbers_only_shows_the_numbers() {
+    // The same function in two builds, with its assertion on line 1001 of the source in one
+    // and on line 1009 in the other.
+    let data = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data");
+    let diff = Client::start().tool("diff", json!({ "path": format!("{data}/lines.elf"), "to": format!("{data}/lines-moved.elf") })).unwrap();
+    assert!(diff.contains("\n0x1160 -> 0x1160  0x3e9 -> 0x3f1\n"), "{diff}");
+}
+
+#[test]
 fn a_line_of_c_is_found_by_the_address_of_its_instruction() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/types.elf");
     let mut client = Client::start();
@@ -230,6 +239,20 @@ fn a_format_says_what_a_call_passes() {
     let c_text = Client::start().tool("decompile", json!({ "path": path, "functions": ["0x1220"] })).unwrap();
     assert!(c_text.contains("func_0x00001180(param_1,\"built from commit: %s\\n\",(char *)*param_2);"), "{c_text}");
     assert!(c_text.contains("func_0x00001180(param_1,\"no commit\\n\");"), "{c_text}");
+}
+
+#[test]
+fn a_pointer_in_a_table_is_paired_with_the_name_of_its_own_record() {
+    // A list of functions with a number between a function and its documentation, and a list
+    // of pairs that close with their name.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/tables.elf");
+    let mut client = Client::start();
+    let doc = client.tool("xrefs", json!({ "path": path, "addr": "0x2070" })).unwrap();
+    assert!(doc.contains("\n0x3d98 in .data.rel.ro holds a pointer to it, paired with the name \"negate\"\n"), "{doc}");
+    let function = client.tool("function", json!({ "path": path, "addr": "0x11d0" })).unwrap();
+    assert!(function.contains("listed as \"negate\" in the table at 0x3d88"), "{function}");
+    let first = client.tool("xrefs", json!({ "path": path, "addr": "0x2068" })).unwrap();
+    assert!(first.contains("\n0x3d20 in .data.rel.ro holds a pointer to it, paired with the name \"ValueError\"\n"), "{first}");
 }
 
 #[test]

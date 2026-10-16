@@ -58,8 +58,8 @@ pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u6
     let bytes = image.bytes_from(start)?;
     let bytes = bytes.get(..(end - start) as usize)?;
     match image.machine {
-        Machine::X86 => x86(32, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS), true),
-        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS), true),
+        Machine::X86 => x86(32, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS), true, None),
+        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS), true, None),
         Machine::Aarch64 => aarch64(bytes, start, end, Some(MIN_WORDS), true),
         Machine::I8051 | Machine::Thumb => None,
     }
@@ -84,19 +84,36 @@ pub fn shape_hash(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64
 fn whole(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64, numbers: bool) -> Option<u64> {
     let bytes = image.bytes_from(start)?.get(..end.checked_sub(start)? as usize)?;
     match image.machine {
-        Machine::X86 => x86(32, bytes, pointer_slots, start, end, None, numbers),
-        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, None, numbers),
+        Machine::X86 => x86(32, bytes, pointer_slots, start, end, None, numbers, None),
+        Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, None, numbers, None),
         Machine::Aarch64 => aarch64(bytes, start, end, None, numbers),
         // Not fingerprinted yet: nothing says which of their bytes are addresses.
         Machine::I8051 | Machine::Thumb => None,
     }
 }
 
+/// The numbers in the code of `[start, end)` that [`shape_hash`] leaves out and [`body_hash`]
+/// keeps, in the order of the instructions: where two builds share a shape and not a body,
+/// these say what differs. Empty for code other than x86.
+pub fn numbers(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64) -> Vec<u64> {
+    let mut found = Vec::new();
+    if let Some(bytes) = image.bytes_from(start).and_then(|bytes| bytes.get(..end.checked_sub(start)? as usize)) {
+        match image.machine {
+            Machine::X86 => drop(x86(32, bytes, pointer_slots, start, end, None, true, Some(&mut found))),
+            Machine::X86_64 => drop(x86(64, bytes, pointer_slots, start, end, None, true, Some(&mut found))),
+            Machine::Aarch64 | Machine::I8051 | Machine::Thumb => {}
+        }
+    }
+    found
+}
+
 /// An x86 function: displacements and immediates are blanked where they are relative to the
 /// instruction pointer and leave the function, or where the loader relocates them.
 /// With a least number of instructions the function must have that many and its padding
 /// counts, as the tables of library functions were built; without one, padding is left out.
-fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64, min_instructions: Option<usize>, numbers: bool) -> Option<u64> {
+/// The numbers kept that `numbers` false would blank go to `found`.
+#[allow(clippy::too_many_arguments)]
+fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u64, min_instructions: Option<usize>, numbers: bool, mut found: Option<&mut Vec<u64>>) -> Option<u64> {
     let mut decoder = Decoder::with_ip(bits, bytes, start, DecoderOptions::NONE);
 
     let mut hash = Hash::new();
@@ -125,12 +142,19 @@ fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64,
         let mut blank = [false; 16];
         let mut mark = |at: usize, size: usize| blank[at..(at + size).min(16)].iter_mut().for_each(|b| *b = true);
         let leaves = |target: u64| target < start || target >= end;
+        let mut keep = |at: usize, size: usize| {
+            if let Some(found) = found.as_deref_mut() {
+                found.push(raw[at..at + size].iter().rev().fold(0, |value, &byte| value << 8 | u64::from(byte)));
+            }
+        };
 
         if offsets.has_displacement() {
             let at = offsets.displacement_offset();
             let relocated = pointer_slots.contains_key(&(instr.ip() + at as u64));
             if instr.is_ip_rel_memory_operand() || relocated || !numbers {
                 mark(at, offsets.displacement_size());
+            } else {
+                keep(at, offsets.displacement_size());
             }
         }
         if offsets.has_immediate() {
@@ -146,6 +170,8 @@ fn x86(bits: u32, bytes: &[u8], pointer_slots: &FxHashMap<u64, u64>, start: u64,
             let internal = is_branch && !external && min_instructions.is_none();
             if relocated || external || internal || !numbers {
                 mark(at, offsets.immediate_size());
+            } else if !is_branch {
+                keep(at, offsets.immediate_size());
             }
             if internal {
                 let ordinal = unpadded.partition_point(|&ip| ip < instr.near_branch_target()) as u32;
