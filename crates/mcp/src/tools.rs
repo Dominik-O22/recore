@@ -114,7 +114,7 @@ pub fn list() -> Value {
         ),
         tool(
             "addr",
-            "Converts between an address in the image and an offset in the file, and says what is there. Give `addr` or `offset`.",
+            "What is at an address: a string, a function, a name, or data told by what it holds, with each pointer in it followed to what it reaches. Also converts between the address and its offset in the file. Give `addr` or `offset`.",
             json!({ "addr": addr("Address in the image"), "offset": addr("Offset in the file") }),
             &[],
         ),
@@ -568,6 +568,34 @@ fn labels(binary: &Binary, entries: &BTreeSet<u64>, rest: &str) -> String {
     line + &cut(USERS_SHOWN, entries.len(), "", rest)
 }
 
+/// The first slots at `addr` when one of them is a pointer, as `{"files", function 0x1402534f0,
+/// 0x8}`: each pointer as what it reaches, followed `depth` pointers deep, and other values as
+/// numbers. Numbers alone are raw data, which `bytes` shows.
+fn holding(binary: &Binary, addr: u64, depth: usize) -> Option<String> {
+    let table = pointer_table(binary, addr, RECORD, RECORD);
+    if depth == 0 || !table.iter().any(|(_, held)| held.is_ok()) {
+        return None;
+    }
+    let program = &binary.program;
+    let brief = |text: &str| match text.char_indices().nth(BRIEF) {
+        Some((end, _)) => format!("{:?}...", &text[..end]),
+        None => format!("{text:?}"),
+    };
+    let slots: Vec<String> = table
+        .iter()
+        .map(|&(_, held)| match held {
+            Ok(target) if program.function(target).is_some() => format!("function {}", program.label(target)),
+            Ok(target) => match program.string_at(target).map(|string| string.text.clone()).or_else(|| short_text(&program.image, target)) {
+                Some(text) => brief(&text),
+                None => format!("{target:#x} {}", describe_to(binary, target, depth - 1)),
+            },
+            Err(value) => format!("{value:#x}"),
+        })
+        .collect();
+    let more = if table.len() == RECORD { ", ..." } else { "" };
+    Some(format!("{{{}{more}}}", slots.join(", ")))
+}
+
 /// The comments on addresses inside `body`, in address order.
 fn comments<'a>(binary: &'a Binary, body: &[(u64, u64)]) -> Vec<(u64, &'a str)> {
     let mut found: Vec<(u64, &str)> = body.iter().flat_map(|&(start, end)| binary.edits.comments.range(start..end)).map(|(&addr, text)| (addr, text.as_str())).collect();
@@ -575,10 +603,22 @@ fn comments<'a>(binary: &'a Binary, body: &[(u64, u64)]) -> Vec<(u64, &'a str)> 
     found
 }
 
-/// What lies at a data address, as far as the analysis knows.
+/// What lies at a data address, as far as the analysis knows. Data that has no name of its own
+/// is told by what it holds, its pointers followed to what they reach.
 pub(crate) fn describe(binary: &Binary, addr: u64) -> String {
+    describe_to(binary, addr, FOLLOWED)
+}
+
+/// How many pointers deep `describe` follows data.
+const FOLLOWED: usize = 2;
+/// The slots of a record `describe` shows, and the characters of each string in it.
+const RECORD: usize = 4;
+const BRIEF: usize = 40;
+
+fn describe_to(binary: &Binary, addr: u64, depth: usize) -> String {
+    let held = || holding(binary, addr, depth).map_or_else(String::new, |record| format!(", holding {record}"));
     if let Some((_, name, kind)) = binary.edits.globals(&binary.program.analysis).into_iter().find(|global| global.0 == addr) {
-        return format!("{name}{}", kind.map_or_else(String::new, |kind| format!(" ({kind})")));
+        return format!("{name}{}{}", kind.map_or_else(String::new, |kind| format!(" ({kind})")), held());
     }
     if let Some(string) = binary.program.string_at(addr) {
         return format!("string {}", quoted(&string.text));
@@ -588,7 +628,7 @@ pub(crate) fn describe(binary: &Binary, addr: u64) -> String {
         // A raw image carries no names: its layout gives them, with its machine or in a names file.
         let source = if image.format == Format::Raw { "a name the layout gives" } else { "a name the file carries" };
         let bits: Vec<String> = recore::hardware::bits(image, addr).into_iter().map(|(bit, name)| format!("{name} is bit {bit:#x}")).collect();
-        return format!("{name}, {source}{}", if bits.is_empty() { String::new() } else { format!(" ({})", bits.join(", ")) });
+        return format!("{name}, {source}{}{}", if bits.is_empty() { String::new() } else { format!(" ({})", bits.join(", ")) }, held());
     }
     if let Some(name) = binary.program.import_name(addr) {
         return format!("import slot of {name}");
@@ -601,7 +641,10 @@ pub(crate) fn describe(binary: &Binary, addr: u64) -> String {
     }
     match binary.program.image.section_at(addr) {
         Some(section) if section.executable => format!("code in {}", binary.program.site_label(addr)),
-        Some(section) => section.name.clone(),
+        Some(section) => match holding(binary, addr, depth) {
+            Some(record) => format!("{} holding {record}", section.name),
+            None => section.name.clone(),
+        },
         // On a machine with several memories, which one says more than that it holds no bytes.
         None if binary.program.image.is_zero_filled(addr) && recore::hardware::space(&binary.program.image, addr).is_some() => recore::hardware::place(&binary.program.image, addr),
         None if binary.program.image.is_zero_filled(addr) => "uninitialized data".into(),
@@ -613,7 +656,7 @@ pub(crate) fn describe(binary: &Binary, addr: u64) -> String {
 /// relocates and `Err` any other value, such as a count, a flag or the null that ends a list.
 /// Stops at `longest` slots, after two that are not pointers in a row, or where something
 /// else in the program begins. Empty when no slot is a pointer.
-fn pointer_table(binary: &Binary, addr: u64, longest: usize) -> Vec<(u64, Result<u64, u64>)> {
+fn pointer_table(binary: &Binary, addr: u64, longest: usize, numbers: usize) -> Vec<(u64, Result<u64, u64>)> {
     let program = &binary.program;
     let image = &program.image;
     if image.section_at(addr).is_none_or(|section| section.executable) {
@@ -629,7 +672,7 @@ fn pointer_table(binary: &Binary, addr: u64, longest: usize) -> Vec<(u64, Result
         // Without relocations to say so, a value that lies in the image is taken for a pointer.
         let pointer = if relocated.is_empty() { image.section_at(value).is_some() } else { relocated.contains_key(&slot) };
         slots.push((slot, if pointer { Ok(value) } else { Err(value) }));
-        if matches!(slots.as_slice(), [.., (_, Err(_)), (_, Err(_))]) {
+        if slots.len() >= numbers && slots[slots.len() - numbers..].iter().all(|(_, held)| held.is_err()) {
             break;
         }
     }
@@ -946,7 +989,7 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
     for line in lines.iter().take(limit) {
         writeln!(out, "{line}")?;
     }
-    let table = pointer_table(binary, addr, limit.min(64));
+    let table = pointer_table(binary, addr, limit.min(64), 2);
     if !table.is_empty() {
         writeln!(out, "it holds, a slot at a time:")?;
         for (slot, held) in &table {
