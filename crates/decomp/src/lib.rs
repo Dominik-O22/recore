@@ -186,6 +186,12 @@ impl Target {
         matches!(self, Target::I8051 | Target::I8051Sdcc)
     }
 
+    /// Whether a structure of more than 16 bytes goes on the stack whatever registers are free,
+    /// as x86-64 System V passes it.
+    fn passes_aggregates_on_stack(self) -> bool {
+        matches!(self, Target::X86_64Gcc)
+    }
+
     pub fn pointer_bytes(self) -> usize {
         match self {
             Target::X86Windows | Target::X86Gcc | Target::Thumb => 4,
@@ -347,6 +353,7 @@ impl Session {
         unsafe { ffi::rd_keep_prototypes_exact(raw.as_ptr(), target.callers_pass_what_is_read().into()) };
         unsafe { ffi::rd_functions_run_on(raw.as_ptr(), target.functions_run_on().into()) };
         unsafe { ffi::rd_result_in_first_argument(raw.as_ptr(), target.result_in_first_argument().into()) };
+        unsafe { ffi::rd_stack_aggregates(raw.as_ptr(), target.passes_aggregates_on_stack().into()) };
         // The session frees the engine's side if a space is not there.
         let session = Session { raw, target, engine_tables: Default::default() };
         for &(base, name) in target.spaces() {

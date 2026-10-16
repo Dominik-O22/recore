@@ -85,6 +85,7 @@ unsafe extern "C" {
     pub fn rd_override_tail_call(session: *mut RdSession, function: u64, jump: u64, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_override_return(session: *mut RdSession, function: u64, jump: u64, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_keep_prototypes(session: *mut RdSession, keep: i32);
+    pub fn rd_stack_aggregates(session: *mut RdSession, on: i32);
     pub fn rd_keep_prototypes_exact(session: *mut RdSession, exact: i32);
     pub fn rd_result_in_first_argument(session: *mut RdSession, shared: i32);
     pub fn rd_takes_variable_arguments(session: *mut RdSession, addr: u64);
