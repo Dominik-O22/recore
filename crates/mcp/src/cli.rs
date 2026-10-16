@@ -8,7 +8,9 @@ use crate::binary::Cache;
 use crate::tools;
 
 /// Options whose value is a number. Everything else, addresses included, stays text.
-const NUMERIC: [&str; 7] = ["limit", "len", "timeout", "count", "param", "arg", "depth"];
+const NUMERIC: [&str; 9] = ["limit", "len", "timeout", "count", "param", "arg", "depth", "bits", "steps"];
+/// Options that may be given again and again, and reach the tool as a list.
+const REPEATED: [&str; 4] = ["args", "set", "read", "dump"];
 /// Options that are on or off.
 const FLAGS: [&str; 4] = ["pcode", "returns", "full", "addresses"];
 
@@ -51,7 +53,11 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
         let hex = || value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).and_then(|digits| u64::from_str_radix(digits, 16).ok()).map(Value::from);
         let number = || hex().map(Ok).unwrap_or_else(|| value.parse::<u64>().map(Value::from).or_else(|_| value.parse::<f64>().map(Value::from)));
         let value = if NUMERIC.contains(&key) { number().with_context(|| format!("--{key} takes a number, in decimal or with 0x in hex, not `{value}`"))? } else { json!(value) };
-        named.insert(key.to_string(), value);
+        if REPEATED.contains(&key) {
+            named.entry(key).or_insert_with(|| json!([])).as_array_mut().expect("a list").push(value);
+        } else {
+            named.insert(key.to_string(), value);
+        }
     }
     match (tool, plain.as_slice()) {
         (_, []) => {}
@@ -59,6 +65,11 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
         ("decompile", functions) => drop(named.insert("functions".into(), json!(functions.iter().flat_map(|listed| listed.split(',')).filter(|function| !function.is_empty()).collect::<Vec<_>>()))),
         ("strings" | "imports" | "functions" | "classes" | "symbols", [pattern]) => drop(named.insert("pattern".into(), json!(pattern))),
         ("disassemble" | "pcode" | "trace", [function]) => drop(named.insert("function".into(), json!(function))),
+        // The function, then its arguments: numbers, or `hex:`, `str:` and `buf:` for memory.
+        ("run", [function, args @ ..]) if !named.contains_key("function") => {
+            named.insert("function".into(), json!(function));
+            named.entry("args").or_insert_with(|| json!([])).as_array_mut().expect("a list").extend(args.iter().map(|arg| json!(arg)));
+        }
         ("rename", [addr, name]) => {
             named.insert("addr".into(), json!(addr));
             named.insert("name".into(), json!(name));

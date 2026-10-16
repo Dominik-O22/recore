@@ -21,6 +21,7 @@ Every tool takes `path`, the binary to analyze, and answers with text. Addresses
 | `disassemble` | `function` or `addr`, `count`?, `pcode`? | Instructions as Ghidra's listing prints them, in basic blocks with each block's successors. Each line has the bytes and what the analysis knows: call target, string or data referred to, switch targets, comment. `pcode` adds each instruction's raw p-code. |
 | `pcode` | `function`, `limit`? (400), `timeout`? | The function's data flow after the decompiler has simplified it: blocks, and operations over values assigned once each. |
 | `trace` | `function`, then `param`, `returns`, or `call` with `arg`; `depth`? (2), `timeout`? | One value followed through the code and across calls: a parameter forward, or a returned value or call argument back to where it comes from. |
+| `run` | `function`, `args`?, `set`?, `read`?, `dump`?, `bits`?, `steps`? (10,000,000) | Runs a function as its processor would and answers what it did: the value returned, each buffer passed in as it was left, and the memory written. See below. |
 | `unnamed` | `space`?, `limit`? (100) | The data addresses the code reads or writes that have no name, most accessed first, with read and write counts and the functions that touch each. `space` keeps one memory of an 8051: `sfr`, `xdata` or `idata`. |
 | `symbols` | `pattern`?, `limit`? (100) | Every named address: functions, import slots, vtables, exported data, and names given with `rename`. |
 | `diff` | `to`, `function`?, `limit`? (100), `timeout`? | Compares the build at `path` with a later one at `to`: the functions that changed, with their size before and after, the calls and strings each gained or lost and the name a table of the program lists it under, and the functions removed and added. Functions whose instructions are the same over other constants are listed apart, each with the constants that differ, such as an assertion's line number. With `function`, the lines of that function's C that the later build dropped and added. |
@@ -61,6 +62,17 @@ An answer that leaves something out says so where it does: how many of how many 
 
 `pcode` and `trace` read the decompiler's own intermediate form, the one its C is printed from. Stack bookkeeping and dead code are gone, every value has one definition, and a call lists its arguments in order. `trace` follows a value through at most 16 functions and does not follow it through memory: a value stored to a global or the heap and read back elsewhere is reported at the store and no further.
 
+`run` interprets the p-code of the decompiler's processor specifications, so one interpreter serves x86, x86-64, AArch64, Cortex-M and the 8051. Arguments follow the platform's calling convention for integers and pointers: a number (decimal, or hex as `0x1f`), `hex:4142` for bytes put in memory and passed by address, `str:text` for a string with its end, `buf:16` for 16 zero bytes. `set` takes `RDX=5` for a register, and `0x20000000=hex:0011` or `EXTMEM:0x100=hex:09` for bytes of memory, the second form for a memory other than the one the code is in. `read` shows more registers after the run, `dump` shows `ADDRESS:LENGTH` of memory, which is how to read what a returned pointer reaches, and `bits` cuts the result to the width of the function's return type. Floats go in and out through the registers: `--set XMM0=0x4004000000000000`.
+
+It runs the function and what it calls, not the program. Imports such as `memcpy`, `strlen` and `malloc` run as stand-ins, a call to any other import ends the run and names it, and so does a processor operation or an instruction the specifications give no semantics. A run stops after `steps` instructions, with the bytes a stand-in moves counted as well, and after 30 seconds.
+
+What a run does not tell you:
+- Memory that nothing wrote and the file does not hold reads as zeros. The answer counts those reads and says where the first were, labelled with the region on a Cortex-M. On a chip that memory is the peripherals and the globals the startup code sets, so a result that depends on it needs those given with `set`.
+- A write past the end of a buffer or of a block `malloc` gave is listed with the memory it landed in. The stack is not listed.
+- A register that is read before anything sets it reads as zero without a word. Only memory is counted.
+- Dividing by zero stops an x86 run and gives zero on ARM, as the hardware does. A signed quotient too large for its register, as `INT_MIN / -1`, does not trap on x86 here, because the specification divides in a wider register and cuts the result.
+- On an 8051 the arguments go in with `set`, because where they are depends on the compiler. The result is `DPL` for SDCC and `R7` for Keil, and the registers that hold the rest of a wider result are shown after it. `R0` to `R7` are bytes of internal memory, in the bank that `RS1` and `RS0` select, so a bank switch, a direct address and `@R0` all reach the same bytes, and a function that expects the caller to have picked its bank is run with `--set RS0=1`. The first bank's bytes are not listed among the writes. The internal stack starts at the `SP` the startup code sets, if the reset vector reaches a `MOV SP,#n`, else at 0x40; the answer says which. `SP` set by the caller wins. Banks of code memory are not modelled.
+
 ## From a shell
 
 With a tool name and a binary as arguments, the same binary runs that one tool and prints the answer:
@@ -74,6 +86,7 @@ recore-mcp bytes firmware.dll 0x1002abd0 64
 recore-mcp addr firmware.dll --offset 0x280cc
 recore-mcp disassemble firmware.dll 0x10001260 --count 40 --pcode
 recore-mcp trace firmware.dll 0x10001260 --param 1
+recore-mcp run firmware.dll 0x10001260 5 hex:41424344 --bits 32
 recore-mcp diff firmware-1.0.dll firmware-1.1.dll
 recore-mcp rename firmware.dll 0x10001260 parse_header
 recore-mcp rename firmware.dll parse_header param_1 header

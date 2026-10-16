@@ -1,0 +1,8 @@
+machine = "cortex-m"
+
+[[region]]
+file = "oracle-thumb.bin"
+offset = 0x0
+length = 134
+address = 0x0
+executable = true
