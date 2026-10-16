@@ -59,8 +59,9 @@ impl Binary {
         Ok(Binary { path: path.to_path_buf(), stamp, program, edits, found_names, analysis_ms, worker })
     }
 
-    /// Changes the binary's edits and saves them. The decompiler process is replaced by one that
-    /// starts from the new edits, so the next decompilation waits for it to set up again.
+    /// Changes the binary's edits and saves them. The decompiler process takes names and
+    /// comments as it runs. A declaration, a type or a name taken away replaces it with one
+    /// that starts from the new edits, so the next decompilation waits for it to set up again.
     pub fn edit(&mut self, change: impl FnOnce(&mut Edits)) -> Result<()> {
         let mut edits = self.edits.clone();
         change(&mut edits);
@@ -70,7 +71,7 @@ impl Binary {
             function.name.clone_from(found);
         }
         self.edits.apply(&mut self.program.analysis);
-        self.worker.restart();
+        self.worker.update(&self.edits, QUICK);
         Ok(())
     }
 

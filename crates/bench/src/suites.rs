@@ -84,8 +84,8 @@ pub struct SessionRow {
     pub binary: String,
     /// Functions the walk starts from, each with a callee.
     pub starts: usize,
-    /// One whole walk, renames included. A rename that restarts the decompiler shows up in the
-    /// decompilation after it, which waits for the new process.
+    /// One whole walk, renames included. A rename that replaces the decompiler process shows up
+    /// in the decompilation after it, which waits for the new process.
     pub walk: Stat,
 }
 
@@ -290,7 +290,7 @@ pub fn session(binaries: &[PathBuf], runs: usize, count: usize) -> Result<Vec<Se
                     };
                     edits.names.insert(addr, format!("{name}_{index}"));
                     edits.save(binary)?;
-                    worker.restart();
+                    worker.update(&edits, SLOW);
                 }
             }
             walks.push(ms(start));

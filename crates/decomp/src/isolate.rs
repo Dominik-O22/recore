@@ -5,7 +5,7 @@
 //! wall-clock limit. The child side is [`serve`], which the program reaches through a
 //! subcommand of its own executable.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -108,6 +108,8 @@ enum Event {
     Locals(Result<Vec<Local>, String>),
     /// The answer to [`Request::Declare`], empty, or to [`Request::Type`].
     Text(Result<String, String>),
+    /// Whether the session took [`Request::Edit`] in place.
+    Edited(bool),
 }
 
 /// One line of a worker's stdin.
@@ -130,6 +132,8 @@ enum Request {
     Declare(String),
     /// Describe a data type.
     Type(String),
+    /// Take the binary's edits as they are now, in place if the session can.
+    Edit(Edits),
 }
 
 /// Callees with more code than this, in bytes, are not decompiled ahead of their callers. The few
@@ -154,13 +158,14 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         (session.join().expect("loading does not panic"), analysis, debug.join().ok().flatten())
     });
     let mut session = session?;
-    let edits = Edits::load(binary)?;
+    let mut edits = Edits::load(binary)?;
     session.add_imports(&image, &analysis)?;
     // What is known of a library routine goes by the name the analysis found, so renaming one
-    // changes its name and no more.
+    // changes its name and no more, as it does in a running session.
     let mut facts = Facts::derive(&image, &analysis);
     edits.apply(&mut analysis);
     facts.names = crate::facts::function_names(&analysis);
+    let aliases: HashSet<u64> = facts.import_aliases.iter().map(|alias| alias.0).collect();
     // A function that only jumps to another, as an incremental linker's stub does, is described
     // by what that one's debug information says.
     let importer = debug.as_ref().map(|debug| {
@@ -226,11 +231,9 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
     }
 
-    // A comment goes to the function its address is in, entered where that function starts.
     for (&addr, text) in &edits.comments {
-        let inside = |function: &&recore::report::AnalyzedFunction| function.ranges.iter().any(|&(start, end)| (start..end).contains(&addr));
-        if let Some(function) = analysis.functions.iter().find(inside) {
-            session.add_comment(function.fragment_of.unwrap_or(function.addr), addr, text)?;
+        if let Some(function) = comment_owner(&analysis, addr) {
+            session.add_comment(function, addr, text)?;
         }
     }
     for (&function, names) in &edits.locals {
@@ -410,6 +413,14 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 send(&text(session.type_layout(name)))?;
                 continue;
             }
+            Request::Edit(changed) => {
+                let done = edit_in_place(&mut session, &analysis, &aliases, &edits, &changed).unwrap_or(false);
+                // Results kept for later show the names as they were.
+                ready.clear();
+                edits = changed;
+                send(&Event::Edited(done))?;
+                continue;
+            }
             Request::Decompile(addr) | Request::Parameters(addr) => addr,
         };
         if let (Request::Decompile(_), Some(event)) = (&request, ready.remove(&addr)) {
@@ -475,6 +486,51 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The function a comment at `addr` goes to: the one its address is in, by where that starts.
+fn comment_owner(analysis: &Analysis, addr: u64) -> Option<u64> {
+    let function = analysis.functions.iter().find(|function| function.ranges.iter().any(|&(start, end)| (start..end).contains(&addr)))?;
+    Some(function.fragment_of.unwrap_or(function.addr))
+}
+
+/// Brings `session` from the edits `before` to `after` without a new process, and says whether
+/// it could. It cannot for a change to declarations or types, for a name taken away, or for a
+/// function's name that a declaration mentions, since a declared prototype finds its function
+/// by name as the session starts. Having said no, it may have made part of the change.
+fn edit_in_place(session: &mut Session, analysis: &Analysis, aliases: &HashSet<u64>, before: &Edits, after: &Edits) -> Result<bool> {
+    if before.declarations != after.declarations || before.types != after.types || before.names.keys().any(|addr| !after.names.contains_key(addr)) {
+        return Ok(false);
+    }
+    let declared: HashSet<&str> = after.declarations.iter().flat_map(|text| text.split(|c: char| !(c.is_alphanumeric() || c == '_'))).collect();
+    let is_function = |addr: u64| analysis.functions.binary_search_by_key(&addr, |f| f.addr).is_ok_and(|index| analysis.functions[index].fragment_of.is_none());
+    for (&addr, name) in after.names.iter().filter(|&(addr, name)| before.names.get(addr) != Some(name)) {
+        if !is_function(addr) {
+            session.add_global(addr, name, after.types.get(&addr).map(String::as_str))?;
+        } else if !aliases.contains(&addr) {
+            // A stub of an import keeps the import's name, as it does in a new session.
+            let old = session.rename_function(addr, name)?;
+            if declared.contains(name.as_str()) || declared.contains(old.as_str()) {
+                return Ok(false);
+            }
+        }
+    }
+    // A function's comments and variable names are set afresh wherever one of them changed.
+    let commented: BTreeSet<u64> = before.comments.keys().chain(after.comments.keys()).filter(|&addr| before.comments.get(addr) != after.comments.get(addr)).filter_map(|&addr| comment_owner(analysis, addr)).collect();
+    for function in commented {
+        session.forget_comments(function);
+        for (&addr, text) in after.comments.iter().filter(|&(&addr, _)| comment_owner(analysis, addr) == Some(function)) {
+            session.add_comment(function, addr, text)?;
+        }
+    }
+    let named: BTreeSet<u64> = before.locals.keys().chain(after.locals.keys()).filter(|&function| before.locals.get(function) != after.locals.get(function)).copied().collect();
+    for function in named {
+        session.forget_local_names(function);
+        for (place, name) in after.locals.get(&function).into_iter().flatten() {
+            session.name_local(function, place, name)?;
+        }
+    }
+    Ok(true)
 }
 
 /// Whether an imported function formats or scans with arguments it is handed as a list, as
@@ -739,7 +795,7 @@ impl Worker {
     }
 
     /// Checks that the engine takes a C declaration. The child's session keeps it, but only a
-    /// declaration among the binary's edits is there again after [`Worker::restart`].
+    /// declaration among the binary's edits is there again after [`Worker::update`].
     pub fn declare(&mut self, declaration: &str, timeout: Duration) -> Result<(), String> {
         match self.ask(Request::Declare(declaration.to_string()), timeout) {
             Ok(Event::Text(result)) => result.map(drop),
@@ -755,9 +811,15 @@ impl Worker {
         }
     }
 
-    /// Replaces the child with a new one, which reads the binary's edits as they are now.
-    pub fn restart(&mut self) {
-        self.process = Process::start((self.command)()).ok();
+    /// Brings the child up to `edits`, the binary's edits as just saved. The child takes names,
+    /// comments and variable names in place and keeps the parameters it has found. Any other
+    /// change replaces it with a new child, which reads the edits from their file and sets up
+    /// before the next request.
+    pub fn update(&mut self, edits: &Edits, timeout: Duration) {
+        // With no child, the next one reads the file.
+        if self.process.is_some() && !matches!(self.ask(Request::Edit(edits.clone()), timeout), Ok(Event::Edited(true))) {
+            self.process = Process::start((self.command)()).ok();
+        }
     }
 
     /// Waits until a child is set up, so that what is timed next is the decompiler alone.

@@ -1480,6 +1480,11 @@ int rd_add_comment(RdSession *session, uint64_t function, uint64_t addr, const c
   });
 }
 
+// Drops the comments rd_add_comment entered for `function`.
+void rd_forget_comments(RdSession *session, uint64_t function) {
+  session->arch->commentdb->clearType(session->address(function), Comment::user2);
+}
+
 // Says that the function at `addr` takes a format and a variable number of arguments for it:
 // a call that passes it a printf format then gets the arguments the format asks for.
 void rd_takes_variable_arguments(RdSession *session, uint64_t addr) { session->saves_arguments.insert(addr); }
@@ -1567,6 +1572,23 @@ void rd_set_addresses(RdSession *session, int on) { session->want_addresses = on
 // shows in every later decompilation of the function in which the variable is still there.
 void rd_name_local(RdSession *session, uint64_t function, const char *place, const char *name) {
   session->local_names[function].push_back({place, name});
+}
+
+// Drops the names rd_name_local recorded for `function`.
+void rd_forget_local_names(RdSession *session, uint64_t function) { session->local_names.erase(function); }
+
+// Gives the function at `addr` the name `name` in place of the one it has, which `*old` then
+// holds until the next call on the session. What the session knows of the function stays,
+// its prototype included.
+int rd_rename_function(RdSession *session, uint64_t addr, const char *name, const char **old, char *err,
+                       size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Funcdata *fd = session->function(addr);
+    session->text = fd->getName();
+    fd->getSymbol()->getScope()->renameSymbol(fd->getSymbol(), name);
+    fd->setName(name);
+    *old = session->text.c_str();
+  });
 }
 
 // Disassembles `[start, end)` into `*out`, one line per instruction: its address and length in

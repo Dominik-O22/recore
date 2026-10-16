@@ -654,6 +654,25 @@ impl Session {
         Ok(())
     }
 
+    /// Drops the names [`Session::name_local`] gave the variables of `function`.
+    pub fn forget_local_names(&mut self, function: u64) {
+        unsafe { ffi::rd_forget_local_names(self.raw.as_ptr(), function) }
+    }
+
+    /// Drops the comments [`Session::add_comment`] entered for `function`.
+    pub fn forget_comments(&mut self, function: u64) {
+        unsafe { ffi::rd_forget_comments(self.raw.as_ptr(), function) }
+    }
+
+    /// Renames the function at `addr`, which keeps what the session knows of it, its prototype
+    /// included. Returns the name it had.
+    pub fn rename_function(&mut self, addr: u64, name: &str) -> Result<String> {
+        let name = CString::new(name)?;
+        let mut old = std::ptr::null();
+        check(|err, len| unsafe { ffi::rd_rename_function(self.raw.as_ptr(), addr, name.as_ptr(), &mut old, err, len) != 0 })?;
+        Ok(unsafe { CStr::from_ptr(old) }.to_string_lossy().into_owned())
+    }
+
     /// Disassembles `[start, end)` linearly, with each instruction's raw p-code if `pcode`.
     pub fn listing(&mut self, start: u64, end: u64, pcode: bool) -> Result<Vec<Instruction>> {
         let mut out = std::ptr::null();

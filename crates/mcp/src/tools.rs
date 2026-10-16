@@ -173,7 +173,7 @@ pub fn list() -> Value {
                 "addr": addr("A function entry or a data address; with `var`, the function, by address or name"),
                 "var": { "type": "string", "description": "A parameter or local variable of the function, as `decompile` spells it now: `param_1`, `local_18`, `uVar3`." },
                 "name": { "type": "string", "description": "The new name; empty to remove." },
-                "names": { "type": "array", "items": { "type": "object", "properties": { "addr": { "type": "string" }, "var": { "type": "string" }, "name": { "type": "string" } }, "required": ["addr", "name"] }, "description": "Several renames at once, which restarts the decompiler only once." },
+                "names": { "type": "array", "items": { "type": "object", "properties": { "addr": { "type": "string" }, "var": { "type": "string" }, "name": { "type": "string" } }, "required": ["addr", "name"] }, "description": "Several renames at once." },
             }),
             &[],
         ),

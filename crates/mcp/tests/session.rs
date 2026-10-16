@@ -188,6 +188,31 @@ fn a_variable_keeps_the_name_it_is_given() {
 }
 
 #[test]
+fn edits_made_while_the_decompiler_runs_read_as_in_a_new_server() {
+    // `start` of the decompiler's fixture calls `draw` and `total`, which it decompiles first.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/types.elf");
+    let edits = edits_dir();
+    let decompile = |client: &mut Client| {
+        let c_text = client.tool("decompile", json!({ "path": path, "functions": ["0x40104c", "0x401000"] })).unwrap();
+        // Without the times, which the header of each function gives.
+        c_text.lines().filter(|line| !line.starts_with("// 0x")).collect::<Vec<_>>().join("\n")
+    };
+    let mut client = Client::start_in(&edits);
+    decompile(&mut client);
+    client.tool("rename", json!({ "path": path, "addr": "0x401000", "name": "sum_list" })).unwrap();
+    client.tool("rename", json!({ "path": path, "addr": "0x401000", "var": "iVar1", "name": "sum" })).unwrap();
+    client.tool("comment", json!({ "path": path, "addr": "0x401000", "text": "walks the list once" })).unwrap();
+    let live = decompile(&mut client);
+    assert!(live.contains("  sum_list(head,2);"), "{live}");
+    assert!(live.contains("int4 sum_list(node *list,int4 scale)"), "{live}");
+    assert!(live.contains("sum = sum + scale * list->value;"), "{live}");
+    assert!(live.contains("walks the list once"), "{live}");
+
+    drop(client);
+    assert_eq!(live, decompile(&mut Client::start_in(&edits)));
+}
+
+#[test]
 fn a_patch_shows_as_the_functions_it_touched() {
     // Two builds of the decompiler's fixture: the later one has a check in `total`, which
     // calls a new function, and neither has a name to go by.
