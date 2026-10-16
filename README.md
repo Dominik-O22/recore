@@ -50,14 +50,14 @@ recore-mcp rename program.exe check_license param_1 serial
 
 ## Agents on real tasks
 
-Three tasks on public binaries, each with one answer. List what `git version --build-options` prints, from Git for Windows' `git.exe`. Find `chr()` in `python313.dll` and say what it rejects. Explain Debian's security update of libexpat from its two builds. A fresh Claude session gets the binaries, one tool and no hints, and its report is scored against an 18-item key. Ghidra 12.1.4 runs as an MCP server, [pyghidra-mcp](https://github.com/clearbluejar/pyghidra-mcp), over binaries it analyzed before the session started, with [ghidriff](https://github.com/clearbluejar/ghidriff) to compare the builds and headless scripting allowed.
+Three tasks on public binaries, each with one answer. List what `git version --build-options` prints, from Git for Windows' `git.exe`. Find `chr()` in `python313.dll` and say what it rejects. Explain Debian's security update of libexpat from its two builds. A fresh Claude session gets the binaries, one tool and no hints, and its report is scored against a 17-item key. Ghidra 12.1.4 runs as an MCP server, [pyghidra-mcp](https://github.com/clearbluejar/pyghidra-mcp), over binaries it analyzed before the session started, with [ghidriff](https://github.com/clearbluejar/ghidriff) to compare the builds and headless scripting allowed.
 
-| Model | Tool | Score of 18 | Session | Analysis first | Tokens read | Cost |
+| Model | Tool | Score of 17 | Session | Analysis first | Tokens read | Cost |
 |---|---|---|---|---|---|---|
-| Haiku 5.5 | recore | 17.5 | 331 s | none | 1.98 M | $0.18 |
-| Haiku 5.5 | Ghidra | 14 | 284 s | 513 s | 3.85 M | $0.26 |
+| Haiku 5.5 | recore | 16.8 | 331 s | none | 1.98 M | $0.18 |
+| Haiku 5.5 | Ghidra | 13 | 284 s | 513 s | 3.85 M | $0.26 |
 | Sonnet 5.5 | recore | 16.8 | 126 s | none | 0.54 M | $0.29 |
-| Sonnet 5.5 | Ghidra | 16 | 541 s | 513 s | 3.11 M | $1.10 |
+| Sonnet 5.5 | Ghidra | 15 | 541 s | 513 s | 3.11 M | $1.10 |
 
 recore's rows are the mean of four sessions and Ghidra's are one session each, so the table is an illustration and not a benchmark. Ghidra analyzes the four binaries before the session starts. pyghidra-mcp then spends another 906 s decompiling every function to index it for search, which the table leaves out. recore analyzes a binary on every command-line call, in 10 to 100 ms here from a new process to its answer, and once as an MCP server. Tokens read is the context of every response, summed.
 

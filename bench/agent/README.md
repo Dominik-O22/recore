@@ -6,7 +6,7 @@ A fresh Claude session gets three binaries, one tool and no hints, and works thr
 - **python313.dll**, from Python 3.13.7: find `chr()` and say what it rejects.
 - **libexpat 2.5.0-1 and 2.5.0-1+deb12u1**, from Debian 12: say what the security update changed.
 
-[`key.md`](key.md) has the answers, 18 items in all. The prompts in [`prompts/`](prompts) are the ones the results in the top-level README came from.
+[`key.md`](key.md) has the answers, 17 items in all. The prompts in [`prompts/`](prompts) are the ones the results in the top-level README came from.
 
 ## Run a session
 

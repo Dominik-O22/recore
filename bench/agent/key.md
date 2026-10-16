@@ -6,9 +6,8 @@ One point per item. An item passes when the report states it, and a report that 
 
 - **A1.** The function that prints the build options is at `0x1401b4b60`.
 - **A2.** `--build-options` is handled by `cmd_version` at `0x1401b6920`, which builds the option table and passes it to the generic parser at `0x140219b00`. Either address passes.
-- **A3.** The printer's lines, in order, with these values: `cpu: x86_64`, `built from commit: cc4dbf752a05efdc0e04e71fd3e8110d11bdd35c`, `sizeof-long: 4`, `sizeof-size_t: 8`, `shell-path: D:/git-sdk-64-build-installers/usr/bin/sh`, `rust: disabled`, `feature: fsmonitor--daemon`, `gettext: enabled`, `libcurl: 8.22.0`, `OpenSSL: OpenSSL 3.5.9 29 Sep 2026`, `zlib: 1.3.2`, `SHA-1: SHA1_DC`, `SHA-256: SHA256_BLK`, `default-ref-format: files`, `default-hash: sha1`. `git version 2.56.0.windows.2` before them, from the caller, does not count against it.
-- **A4.** `no commit associated with this build` can be printed in place of the commit line, when the commit string is empty, and in this binary it is not.
-- **A5.** `feature: fsmonitor--daemon` is always printed: the function at `0x1401a7a80` that decides it returns 1.
+- **A3.** The printer's lines, in order, with these values: `cpu: x86_64`, `built from commit: cc4dbf752a05efdc0e04e71fd3e8110d11bdd35c`, `sizeof-long: 4`, `sizeof-size_t: 8`, `shell-path: D:/git-sdk-64-build-installers/usr/bin/sh`, `rust: disabled`, `feature: fsmonitor--daemon`, `gettext: enabled`, `libcurl: 8.22.0`, `OpenSSL: OpenSSL 3.5.9 29 Sep 2026`, `zlib: 1.3.2`, `SHA-1: SHA1_DC`, `SHA-256: SHA256_BLK`, `default-ref-format: files`, `default-hash: sha1`. `git version 2.56.0.windows.2` before them, from the caller, does not count against it, and neither does leaving out `no commit associated with this build`, which the binary cannot print: its commit string is never empty.
+- **A4.** `feature: fsmonitor--daemon` is always printed: the function at `0x1401a7a80` that decides it returns 1.
 
 ## Task B: python313.dll
 
