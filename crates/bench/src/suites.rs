@@ -1,11 +1,13 @@
-//! The three suites, their results, and the tables.
+//! The four suites, their results, and the tables.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use recore::edits::Edits;
 use recore::program::Program;
+use recore::report::CallTarget;
 use recore_decomp::isolate::{Options, Status, Worker};
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +35,8 @@ pub struct Results {
     pub analysis: Vec<AnalysisRow>,
     pub cold: Vec<ColdRow>,
     pub decompile: Vec<DecompileRow>,
+    #[serde(default)]
+    pub session: Vec<SessionRow>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -73,6 +77,16 @@ pub struct DecompileRow {
     pub times: Vec<(u64, f64, f64)>,
     /// The sum of the middle runs of the engine time over the sum of the fastest, minus one.
     pub noise: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SessionRow {
+    pub binary: String,
+    /// Functions the walk starts from, each with a callee.
+    pub starts: usize,
+    /// One whole walk, renames included. A rename that replaces the decompiler process shows up
+    /// in the decompilation after it, which waits for the new process.
+    pub walk: Stat,
 }
 
 /// A function gets this long in the decompile suite.
@@ -239,6 +253,54 @@ pub fn decompile(binaries: &[PathBuf], runs: usize, count: usize) -> Result<Vec<
     Ok(rows)
 }
 
+/// Walks each binary as an agent does: decompiles a function, names it, decompiles a function
+/// it calls, names that, and decompiles the first again. Each run starts a new process with
+/// no edits. Walks start from `count` functions that call another, evenly spaced by address.
+pub fn session(binaries: &[PathBuf], runs: usize, count: usize) -> Result<Vec<SessionRow>> {
+    let tool = sibling("recore-decompile")?;
+    let mut rows = Vec::new();
+    for binary in binaries {
+        let program = Program::load(binary)?;
+        let callee_of = |entry: u64| {
+            program.body(entry).into_iter().flat_map(|(start, end)| program.calls_in(start, end)).find_map(|call| match call.target {
+                CallTarget::Function(callee) if callee != entry && program.function(callee).is_some() => Some(callee),
+                _ => None,
+            })
+        };
+        let callers: Vec<(u64, u64)> = program.functions().filter_map(|f| Some((f.addr, callee_of(f.addr)?))).collect();
+        let starts: Vec<(u64, u64)> = callers.iter().copied().step_by(callers.len().div_ceil(count.max(1)).max(1)).collect();
+        let mut walks = Vec::new();
+        for _ in 0..runs {
+            let _ = std::fs::remove_file(Edits::file(binary)?);
+            let tool = tool.clone();
+            let command = move || {
+                let mut command = Command::new(&tool);
+                command.arg("worker");
+                command
+            };
+            let mut worker = Worker::new(command, binary, &Options::default());
+            ensure!(worker.ready(), "no decompiler for {}", binary.display());
+            let mut edits = Edits::default();
+            let start = Instant::now();
+            for (index, &(function, callee)) in starts.iter().enumerate() {
+                for (addr, name) in [(function, None), (function, Some("walked")), (callee, None), (callee, Some("called")), (function, None)] {
+                    let Some(name) = name else {
+                        worker.decompile(addr, SLOW);
+                        continue;
+                    };
+                    edits.names.insert(addr, format!("{name}_{index}"));
+                    edits.save(binary)?;
+                    worker.update(&edits, SLOW);
+                }
+            }
+            walks.push(ms(start));
+        }
+        let _ = std::fs::remove_file(Edits::file(binary)?);
+        rows.push(SessionRow { binary: name(binary), starts: starts.len(), walk: Stat::of(walks) });
+    }
+    Ok(rows)
+}
+
 /// The change from `before` to `now` as a signed percentage, or nothing without a `before`.
 fn change(now: f64, before: Option<f64>) -> String {
     before.map_or(String::new(), |before| format!("{:+6.1}%", (now / before.max(1e-9) - 1.0) * 100.0))
@@ -377,6 +439,26 @@ pub fn print_decompile(rows: &[DecompileRow], before: Option<&[DecompileRow]>) {
         let slow: Vec<String> = row.slow.iter().map(|addr| format!("{addr:#x}")).collect();
         println!("slow in {}: {}", short(&row.binary), slow.join(" "));
     }
+}
+
+pub fn print_session(rows: &[SessionRow], before: Option<&[SessionRow]>) {
+    let before_of = |binary: &str| before.and_then(|rows| rows.iter().find(|row| row.binary == binary));
+    println!("\nsession: decompile, rename, decompile a callee, rename it, decompile again; fastest run, ms");
+    println!("{:<46} {:>6} {:>9} {:>7} {:>8}", "binary", "starts", "walk", "change", "noise");
+    for row in rows {
+        let old = before_of(&row.binary);
+        println!("{:<46} {:>6} {:>9.1} {:>7} {:>7.1}%", short(&row.binary), row.starts, row.walk.min, change(row.walk.min, old.map(|b| b.walk.min)), row.walk.noise() * 100.0);
+    }
+    // Only the rows both runs have count towards the change of the total.
+    let shared: Vec<(&SessionRow, &SessionRow)> = rows.iter().filter_map(|row| Some((row, before_of(&row.binary)?))).collect();
+    println!(
+        "{:<46} {:>6} {:>9.1} {:>7} {:>7.1}%",
+        "total",
+        rows.iter().map(|row| row.starts).sum::<usize>(),
+        rows.iter().map(|row| row.walk.min).sum::<f64>(),
+        change(shared.iter().map(|pair| pair.0.walk.min).sum(), before.map(|_| shared.iter().map(|pair| pair.1.walk.min).sum())),
+        typical_noise(rows.iter().map(|r| r.walk.noise()).collect()),
+    );
 }
 
 /// Times walking every instruction of the binary's code once, with more of what discovery does

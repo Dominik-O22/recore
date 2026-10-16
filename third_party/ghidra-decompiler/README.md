@@ -43,6 +43,11 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   print each line of C with the address of the instruction it came from. Marked with a
   `recore:` comment.
 
+- `cpp/funcdata.hh`, `Funcdata::setName`: renames a function after it was made. Upstream sets
+  the name only on construction. `crates/decomp` renames the function's symbol and the function
+  together, so a rename keeps the prototype the session found for it. Marked with a `recore:`
+  comment.
+
 - `cpp/funcdata_varnode.cc`, `Funcdata::calcNZMask`: the low byte of the incoming stack
   pointer is taken as zero only if the pointer is wider than a byte. Upstream clears it for
   any, so the 8051's stack pointer was the constant 0 wherever code kept it in memory, as

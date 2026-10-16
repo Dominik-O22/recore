@@ -117,7 +117,7 @@ pub fn rename(binary: &mut Binary, args: Rename) -> Result<String> {
             (Named::Local { function, was, .. }, name) => writeln!(out, "{was} in {} is now {name}", binary.program.label(*function))?,
         }
     }
-    writeln!(out, "saved; the decompiler is starting again with the new names")?;
+    writeln!(out, "saved; later answers use the new names")?;
     Ok(out)
 }
 

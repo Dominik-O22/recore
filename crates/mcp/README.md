@@ -41,7 +41,7 @@ In decompiled C a send through one of the linker's selector stubs reads `objc_ms
 
 `rename`, `comment` and `declare` change what every later answer says, the decompiler's C included. They are saved in one JSON file per binary under `$XDG_DATA_HOME/recore/edits` (or `~/.local/share/recore/edits`), named after the file and a hash of its contents. They survive a restart and a move of the binary, and do not apply to a file whose bytes have changed. `RECORE_EDITS_DIR` names another directory. `summary` prints the path.
 
-An edit replaces the decompiler process with one that starts from the new edits, so the first decompilation after an edit waits for that process to load the binary again. Several renames in one `names` list cost one restart.
+The decompiler process takes renames and comments as it runs and keeps the parameters it has found for the functions it decompiled. A declaration, a type, or a name taken away replaces it with one that starts from the new edits, so the first decompilation after one waits for that process to load the binary again.
 
 A name goes on a function entry, on data, or on a variable of a function. A variable is remembered by where it is stored, so its name holds when other edits change how the function decompiles, and is dropped only if the variable itself is gone. An address inside a function takes a comment, not a name.
 

@@ -109,11 +109,16 @@ impl SwitchCall {
     }
 }
 
+/// The names the analysis gives the functions in their own right.
+pub fn function_names(analysis: &Analysis) -> Vec<(u64, String)> {
+    analysis.functions.iter().filter(|f| f.fragment_of.is_none()).filter_map(|f| Some((f.addr, f.name.clone()?))).collect()
+}
+
 impl Facts {
     pub fn derive(image: &Image, analysis: &Analysis) -> Facts {
         let mut facts = Facts {
             functions: analysis.functions.iter().filter(|f| f.fragment_of.is_none()).map(|f| (f.addr, f.noreturn)).collect(),
-            names: analysis.functions.iter().filter(|f| f.fragment_of.is_none()).filter_map(|f| Some((f.addr, f.name.clone()?))).collect(),
+            names: function_names(analysis),
             ..Facts::default()
         };
         let library = recore::library::routines(image.machine, image.compiler);
