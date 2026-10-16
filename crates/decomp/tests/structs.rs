@@ -1,10 +1,13 @@
 //! Structs recovered from how a function uses the pointers it is passed, in the programs built
 //! from `data/structs.c`: an x86-64 ELF, whose functions take their parameters in registers,
-//! and a 32-bit PE, whose functions take them on the stack.
+//! and a 32-bit PE, whose functions take them on the stack; and checked against the debug
+//! information of the programs built from `data/types.c`.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use recore_decomp::Session;
+use recore_decomp::types::{self, Type};
 
 // The functions of the two builds, which are stripped.
 const ELF_TOUCH: u64 = 0x401000;
@@ -90,4 +93,60 @@ fn a_caller_never_shows_its_callees_struct() {
     let c_text = session.decompile(ELF_RELAY).unwrap().c_text;
     assert!(c_text.contains("(undefined8 param_1)"), "{c_text}");
     assert!(!c_text.contains("S_"), "{c_text}");
+}
+
+/// Where fields start in a type of the debug information, descending into the structs and
+/// arrays inside it, and its size.
+fn true_layout(debug: &types::Types, id: types::TypeId) -> (u64, BTreeSet<u64>) {
+    fn starts(debug: &types::Types, id: types::TypeId, base: u64, out: &mut BTreeSet<u64>) {
+        match debug.get(id) {
+            Type::Composite { fields, .. } => fields.iter().for_each(|field| starts(debug, field.kind, base + field.offset, out)),
+            Type::Array { element, count } => (0..*count).for_each(|index| starts(debug, *element, base + index * debug.size(*element), out)),
+            Type::Typedef { target, .. } => starts(debug, *target, base, out),
+            _ => {
+                out.insert(base);
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    starts(debug, id, 0, &mut out);
+    (debug.size(id), out)
+}
+
+/// The size and field offsets of a struct as `Session::type_layout` describes it.
+fn recovered_layout(text: &str) -> (u64, BTreeSet<u64>) {
+    let size = text.split(", ").nth(1).and_then(|part| part.strip_suffix(" bytes")).unwrap().parse().unwrap();
+    let offsets = text.lines().skip(1).map(|line| u64::from_str_radix(line.trim().strip_prefix("+0x").unwrap().split(' ').next().unwrap(), 16).unwrap()).collect();
+    (size, offsets)
+}
+
+/// The two programs built from `data/types.c` carry DWARF and a PDB, which say what each
+/// parameter really points to. Decompiled without them, every recovered field starts where
+/// a true field does, and no recovered struct is larger than the true one.
+#[test]
+fn recovered_structs_agree_with_the_debug_information() {
+    for name in ["types.elf", "types.exe"] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name);
+        let image = recore::Image::load(&path).unwrap();
+        let debug = types::load(&path, &image).unwrap();
+        let mut session = Session::from_image(&image, &recore::analyze(&image)).unwrap();
+        let mut checked = 0;
+        for function in &debug.functions {
+            let Type::Function(prototype) = debug.get(function.prototype) else { continue };
+            let c_text = session.decompile(function.addr).unwrap().c_text;
+            let signature = c_text.lines().find(|line| line.contains('(')).unwrap();
+            let params = signature.split_once('(').unwrap().1.trim_end_matches(')').split(',');
+            for (param, (_, kind)) in params.zip(&prototype.params) {
+                let Some(recovered) = param.split(' ').next().filter(|type_name| type_name.starts_with("S_")) else { continue };
+                let Type::Pointer(target) = debug.get(*kind) else { panic!("{name}: {recovered} for a parameter that is no pointer") };
+                let (true_size, true_starts) = true_layout(&debug, *target);
+                let (size, starts) = recovered_layout(&session.type_layout(recovered).unwrap());
+                assert!(size <= true_size, "{name}: {recovered} is {size} bytes, the true struct {true_size}");
+                assert!(starts.is_subset(&true_starts), "{name}: {recovered} has fields at {starts:x?}, the true struct at {true_starts:x?}");
+                checked += 1;
+            }
+        }
+        // `total` takes a list and `draw` a shape.
+        assert_eq!(checked, 2, "{name}");
+    }
 }
