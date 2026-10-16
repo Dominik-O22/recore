@@ -1098,7 +1098,9 @@ fn structs(binary: &mut Binary, args: Structs) -> Result<String> {
             ([], None) => "a pointer no parameter reaches".to_string(),
             (slots, _) => slots.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
         };
-        let reach = format!("{} reads and writes, +{:#x} to +{:#x}", object.accesses, object.span.0, object.span.1);
+        let low = object.accesses.iter().map(|&(offset, _)| offset).min().unwrap_or(0);
+        let high = object.accesses.iter().map(|&(offset, size)| offset + i64::from(size)).max().unwrap_or(0);
+        let reach = format!("{} reads and writes, +{low:#x} to +{high:#x}", object.accesses.len());
         match &object.decision {
             Ok(name) => writeln!(out, "{place}: {name}{}, {reach}", if object.named { " (named)" } else { "" })?,
             Err(refusal) => writeln!(out, "{place}: no struct, {}; {reach}", refusal.reason())?,

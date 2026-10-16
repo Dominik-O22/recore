@@ -157,6 +157,23 @@ fn a_field_takes_its_new_name_in_the_running_session() {
     assert!(session.type_layout("Session").unwrap().contains("+0x4 int4 retries (4 bytes)"));
 }
 
+/// Naming the struct a named one points to renames the type the session holds, and the field
+/// that points to it follows.
+#[test]
+fn renaming_a_struct_a_named_one_points_to_stays_in_the_session() {
+    let mut session = session("structs.elf");
+    let mut edits = Edits::default();
+    session.decompile(ELF_TOUCH).unwrap();
+    edits.adopt(&session.recovered("S_401000_RDI").unwrap());
+    edits.name_struct("S_401000_RDI", "Connection").unwrap();
+    assert_eq!(session.set_structs(&edits.structs, &edits.holders).unwrap(), Converged::InPlace);
+    edits.name_struct("S_401000_RDI_8", "Session").unwrap();
+    assert_eq!(session.set_structs(&edits.structs, &edits.holders).unwrap(), Converged::InPlace);
+    let c_text = session.decompile(ELF_TOUCH).unwrap().c_text;
+    assert!(c_text.contains("(Connection *param_1,int4 param_2)"), "{c_text}");
+    assert!(session.type_layout("Connection").unwrap().contains("+0x8 Session * field_0x8 (8 bytes)"));
+}
+
 #[test]
 fn a_named_struct_that_grows_needs_a_new_session() {
     let mut session = session("structs.elf");

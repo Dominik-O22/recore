@@ -134,6 +134,7 @@ pub type WrappedHook = extern "C" fn(ctx: *mut std::ffi::c_void, function: u64, 
 
 unsafe extern "C" {
     pub fn rd_set_struct_hooks(session: *mut RdSession, ctx: *mut std::ffi::c_void, plan: PlanHook, wrapped: WrappedHook);
+    pub fn rd_rename_type(session: *mut RdSession, old: *const c_char, name: *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_name_field(session: *mut RdSession, type_name: *const c_char, offset: u64, name: *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_session_new(
         spec_dir: *const c_char,

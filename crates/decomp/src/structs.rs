@@ -93,10 +93,8 @@ pub struct ObjectReport {
     pub decision: Result<String, Refusal>,
     /// Its struct is one that has a name in the edits.
     pub named: bool,
-    /// Reads and writes through it.
-    pub accesses: usize,
-    /// The lowest offset they touch and the end of the highest.
-    pub span: (i64, i64),
+    /// Reads and writes through it: offset from where its first slot points, and size.
+    pub accesses: Vec<(i64, u32)>,
 }
 
 /// What struct recovery made of one function's objects, as of its last decompilation.
@@ -114,6 +112,8 @@ pub(crate) struct Converge {
     pub restart: bool,
     /// The structs new to the engine.
     pub xml: Option<String>,
+    /// Structs the engine holds to rename, the edits having renamed them: old name, new.
+    pub renamed: Vec<(String, String)>,
     /// Fields of structs the engine holds to rename: struct, offset, name.
     pub renames: Vec<(String, u64, String)>,
 }
@@ -398,17 +398,28 @@ impl Registry {
         }
     }
 
-    /// Brings the named structs and holders to those of the edits. Structs new to the engine
-    /// are defined; one the engine holds with other names of fields has them renamed; one it
-    /// holds with another layout asks for a new session.
+    /// Brings the named structs and holders to those of the edits. A struct the edits renamed
+    /// is renamed in the engine, and one new to it defined; one it holds with other names of
+    /// fields has them renamed; one it holds with another layout asks for a new session.
     pub(crate) fn converge(&mut self, pointer: u32, structs: &BTreeMap<String, Layout>, holders: &BTreeMap<u64, BTreeMap<Slot, String>>) -> Converge {
+        // A name the edits dropped and one they gained, for structs alike but for the names
+        // of the structs their fields point to, are one struct renamed.
+        let mut dropped: Vec<&String> = self.named.keys().filter(|name| !structs.contains_key(*name) && self.defined.contains_key(*name)).collect();
+        let mut renamed: HashMap<String, String> = HashMap::new();
+        for (name, layout) in structs.iter().filter(|(name, _)| !self.defined.contains_key(*name)) {
+            let alike: Vec<usize> = (0..dropped.len()).filter(|&at| alike_but_targets(&self.defined[dropped[at]].0, layout)).collect();
+            if let [at] = alike.as_slice() {
+                renamed.insert(dropped.remove(*at).clone(), name.clone());
+            }
+        }
+        let held = |name: &str| self.defined.get(name).or_else(|| renamed.iter().find(|(_, new)| *new == name).and_then(|(old, _)| self.defined.get(old)));
         let mut renames = Vec::new();
         let mut new = Vec::new();
         for (name, layout) in structs {
-            match self.defined.get(name) {
-                Some((held, _)) if held.same_shape(layout) => {
+            match held(name) {
+                Some((engine, _)) if engine.renamed(|target| renamed.get(target).cloned().unwrap_or_else(|| target.to_string())).same_shape(layout) => {
                     for (&offset, field) in layout.fields() {
-                        if held.fields()[&offset].name != field.name {
+                        if engine.fields()[&offset].name != field.name {
                             renames.push((name.clone(), offset, field_name(offset, field)));
                         }
                     }
@@ -417,13 +428,17 @@ impl Registry {
                 None => new.push(Planned { name: name.clone(), layout: layout.clone(), array: false }),
             }
         }
+        for (old, name) in &renamed {
+            let (_, id) = self.defined.remove(old).expect("held");
+            self.defined.insert(name.clone(), (structs[name].clone(), id));
+        }
         for (name, ..) in &renames {
             self.defined.get_mut(name).expect("held").0 = structs[name].clone();
         }
         self.named = structs.clone();
         self.holders = holders.clone();
         let xml = (!new.is_empty()).then(|| self.xml(pointer, &new));
-        Converge { restart: false, xml, renames }
+        Converge { restart: false, xml, renamed: renamed.into_iter().collect(), renames }
     }
 
     /// The recovered struct `name` stands for in this session, with the one its slot points
@@ -496,6 +511,15 @@ impl Registry {
     }
 }
 
+/// Whether two layouts are alike but for the names of fields and of the structs fields point to.
+fn alike_but_targets(a: &Layout, b: &Layout) -> bool {
+    let kind = |ty: &FieldType| match ty {
+        FieldType::Struct(_) => FieldType::Struct(String::new()),
+        other => other.clone(),
+    };
+    a.size() == b.size() && a.fields().len() == b.fields().len() && a.fields().iter().zip(b.fields()).all(|((x, f), (y, g))| x == y && f.size == g.size && kind(&f.ty) == kind(&g.ty))
+}
+
 /// Says where an object comes from, in a warning.
 fn place(object: &Object) -> String {
     match (object.roots.first(), object.passed.first()) {
@@ -527,8 +551,7 @@ fn report(objects: &[Object], choices: &[Choice], decisions: &[Result<String, Re
             field,
             decision: decision.clone(),
             named: matches!(choice, Choice::Named(_) | Choice::Typed(_)),
-            accesses: object.accesses.len(),
-            span: (object.accesses.iter().map(|access| access.offset).min().unwrap_or(0), object.accesses.iter().map(|access| access.offset + i64::from(access.size)).max().unwrap_or(0)),
+            accesses: object.accesses.iter().map(|access| (access.offset, access.size)).collect(),
         })
         .collect();
     StructReport { objects, warnings: warnings.to_vec() }
@@ -942,5 +965,17 @@ mod tests {
         assert_eq!(registry.converge(8, &structs, &holders).renames, [("Connection".to_string(), 0x10, "session".to_string())]);
         structs.insert("Connection".into(), layout(&[(8, 8, FieldType::Int)], 0x20));
         assert!(registry.converge(8, &structs, &holders).restart);
+    }
+
+    #[test]
+    fn a_renamed_struct_keeps_its_place_in_the_engine() {
+        let mut registry = named();
+        let mut structs = registry.named.clone();
+        let holders = registry.holders.clone();
+        let session = structs.remove("Session").unwrap();
+        structs.insert("State".into(), session);
+        structs.insert("Connection".into(), structs["Connection"].renamed(|target| if target == "Session" { "State".into() } else { target.into() }));
+        let converge = registry.converge(8, &structs, &holders);
+        assert_eq!(converge, Converge { renamed: vec![("Session".into(), "State".into())], ..Default::default() });
     }
 }

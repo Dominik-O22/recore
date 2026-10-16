@@ -686,15 +686,26 @@ impl Session {
         Ok(unsafe { CStr::from_ptr(old) }.to_string_lossy().into_owned())
     }
 
+    /// The machine and compiler the session decompiles for.
+    pub fn target(&self) -> Target {
+        self.target
+    }
+
     /// Brings the named structs and the slots that hold them to those of the edits. Called
-    /// again with the same edits it does nothing. Defines the structs new to the session, gives
-    /// the fields of those it holds the names they have now, and has decompilations put each
-    /// on the objects its holders reach, where it fits.
+    /// again with the same edits it does nothing. Renames the structs the session holds that
+    /// the edits renamed, defines those new to it, gives the fields of those it holds the
+    /// names they have now, and has decompilations put each on the objects its holders reach,
+    /// where it fits.
     pub fn set_structs(&mut self, structs: &BTreeMap<String, Layout>, holders: &BTreeMap<u64, BTreeMap<Slot, String>>) -> Result<Converged> {
         // SAFETY: the session owns the registry, and the shim reads it only inside `rd_decompile`.
         let converge = unsafe { self.structs.as_mut() }.converge(self.target.pointer_bytes() as u32, structs, holders);
         if converge.restart {
             return Ok(Converged::Restart);
+        }
+        // Renamed first: new structs refer to the ones the engine holds by their names now.
+        for (old, name) in converge.renamed {
+            let (old, name) = (CString::new(old)?, CString::new(name)?);
+            check(|err, len| unsafe { ffi::rd_rename_type(self.raw.as_ptr(), old.as_ptr(), name.as_ptr(), err, len) != 0 })?;
         }
         if let Some(xml) = converge.xml {
             let rejected = self.add_types(&xml)?;

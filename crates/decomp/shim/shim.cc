@@ -2216,6 +2216,15 @@ void rd_set_struct_hooks(RdSession *session, void *ctx, RdPlanHook plan, RdWrapp
   session->wrapped = wrapped;
 }
 
+// Calls the type `old` `name` from now on, wherever it prints.
+int rd_rename_type(RdSession *session, const char *old, const char *name, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Datatype *type = session->arch->types->findByName(old);
+    if (type == nullptr) throw LowlevelError(string("no type ") + old);
+    session->arch->types->setName(type, name);
+  });
+}
+
 // Names the field at `offset` of the struct `type_name` `name` from now on, wherever it prints.
 int rd_name_field(RdSession *session, const char *type_name, uint64_t offset, const char *name, char *err, size_t errlen) {
   return guarded(err, errlen, [&] {
