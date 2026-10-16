@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -91,6 +92,13 @@ struct RdStride {
   uint32_t object;
   uint64_t stride;
 };
+struct RdPass {
+  uint32_t object;
+  uint64_t callee;
+  const char *reg;
+  uint64_t stack;
+  int64_t offset;
+};
 struct RdEvidence {
   uint64_t function;
   uint32_t pointer;
@@ -104,6 +112,8 @@ struct RdEvidence {
   size_t link_count;
   const RdStride *strides;
   size_t stride_count;
+  const RdPass *passed;
+  size_t pass_count;
 };
 struct RdPlan {
   const char *xml;
@@ -111,9 +121,11 @@ struct RdPlan {
   const char *const *recovered;
   const uint8_t *arrays;
   size_t recovered_count;
+  const char *const *warnings;
+  size_t warning_count;
 };
 typedef int (*RdPlanHook)(void *ctx, const RdEvidence *evidence, RdPlan *out);
-typedef void (*RdWrappedHook)(void *ctx, const char *name);
+typedef void (*RdWrappedHook)(void *ctx, uint64_t function, const char *name);
 
 }  // extern "C"
 
@@ -1916,7 +1928,8 @@ struct Gathered {
   vector<RdAccess> accesses;
   vector<RdLink> links;
   vector<RdStride> strides;
-  vector<string> registers;     // the names RdRoot::reg points to
+  vector<RdPass> passed;
+  deque<string> registers;      // the names RdRoot::reg and RdPass::reg point to
   vector<vector<Varnode *>> root_nodes;  // per object
 };
 
@@ -2075,7 +2088,6 @@ static void gather(RdSession *session, Funcdata &fd, Gathered &out) {
     auto found = numbers.find(objects.find(vn).first);
     if (found != numbers.end()) out.objects[found->second].number = 1;
   }
-  out.registers.reserve(roots.size());  // RdRoot points into this, so it must not reallocate
   for (Varnode *root : roots) {
     pair<int, int64_t> at = objects.find(root);
     uint32_t object = numbers[at.first];
@@ -2093,6 +2105,29 @@ static void gather(RdSession *session, Funcdata &fd, Gathered &out) {
     if (found == numbers.end()) continue;
     out.accesses.push_back({found->second, at.second - bases[found->second], (uint32_t)value->getSize(), value_kind(value)});
   }
+  // Members handed to calls, where the callee's parameters are settled: a holder of the
+  // callee's slot names the struct it takes.
+  for (auto it = fd.beginOpAlive(); it != fd.endOpAlive(); ++it) {
+    PcodeOp *op = *it;
+    if (op->code() != CPUI_CALL) continue;
+    FuncCallSpecs *fc = fd.getCallSpecs(op);
+    if (fc == nullptr || fc->isInputActive() || fc->getEntryAddress().isInvalid()) continue;
+    for (int4 i = 0; i < fc->numParams() && i + 1 < op->numInput(); ++i) {
+      const Varnode *vn = op->getIn(i + 1);
+      if (!objects.has(vn)) continue;
+      pair<int, int64_t> at = objects.find(vn);
+      auto found = numbers.find(at.first);
+      if (found == numbers.end()) continue;
+      Address where = fc->getParam(i)->getAddress();
+      bool on_stack = where.getSpace() == stack;
+      if (!on_stack && where.getSpace()->getType() != IPTR_PROCESSOR) continue;
+      string reg = on_stack ? "" : arch->translate->getRegisterName(where.getSpace(), where.getOffset(), fc->getParam(i)->getSize());
+      if (!on_stack && reg.empty()) continue;
+      out.registers.push_back(reg);
+      out.passed.push_back({found->second, session->offset(fc->getEntryAddress()), on_stack ? nullptr : out.registers.back().c_str(),
+                            on_stack ? where.getOffset() : 0, at.second - bases[found->second]});
+    }
+  }
   for (const auto &steps : objects.strides) {
     auto found = numbers.find(objects.find(steps.first).first);
     if (found == numbers.end()) continue;
@@ -2101,7 +2136,7 @@ static void gather(RdSession *session, Funcdata &fd, Gathered &out) {
   out.evidence = {session->offset(fd.getAddress()), (uint32_t)word,
                   out.objects.data(), out.objects.size(), out.roots.data(), out.roots.size(),
                   out.accesses.data(), out.accesses.size(), out.links.data(), out.links.size(),
-                  out.strides.data(), out.strides.size()};
+                  out.strides.data(), out.strides.size(), out.passed.data(), out.passed.size()};
 }
 
 // Gives the parameters of `fd` the structs recore plans for what they point to. Runs when the
@@ -2121,8 +2156,10 @@ static void recover_structs(RdSession *session, Funcdata &fd) {
   };
   for (size_t i = 0; i < plan.recovered_count; ++i) {
     Datatype *type = complete(plan.recovered[i]);
-    if (type != nullptr) session->recovered[type] = plan.arrays[i] != 0;
+    // A named struct may be an array's element in one function and not in another.
+    if (type != nullptr) session->recovered[type] |= plan.arrays[i] != 0;
   }
+  for (size_t i = 0; i < plan.warning_count; ++i) fd.warningHeader(plan.warnings[i]);
   AddrSpace *data = arch->getDefaultDataSpace();
   for (size_t i = 0; i < gathered.objects.size(); ++i) {
     Datatype *type = plan.names[i] != nullptr ? complete(plan.names[i]) : nullptr;
@@ -2173,6 +2210,15 @@ void rd_set_struct_hooks(RdSession *session, void *ctx, RdPlanHook plan, RdWrapp
   session->structs = ctx;
   session->plan = plan;
   session->wrapped = wrapped;
+}
+
+// Names the field at `offset` of the struct `type_name` `name` from now on, wherever it prints.
+int rd_name_field(RdSession *session, const char *type_name, uint64_t offset, const char *name, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Datatype *type = session->arch->types->findByName(type_name);
+    if (type == nullptr || type->getMetatype() != TYPE_STRUCT) throw LowlevelError(string("no struct ") + type_name);
+    session->arch->types->setFieldName(static_cast<TypeStruct *>(type), (int4)offset, name);
+  });
 }
 
 int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err, size_t errlen) {
@@ -2246,11 +2292,11 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     set<string> wraps = wrapped(session, fd);
     if (!wraps.empty()) {
       // Once more without them: the walk in `gather` missed a value the engine typed.
-      for (const string &name : wraps) session->wrapped(session->structs, name.c_str());
+      for (const string &name : wraps) session->wrapped(session->structs, session->offset(fd->getAddress()), name.c_str());
       arch->clearAnalysis(fd);
       root->reset(*fd);
       if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
-      for (const string &name : wrapped(session, fd)) session->wrapped(session->structs, name.c_str());
+      for (const string &name : wrapped(session, fd)) session->wrapped(session->structs, session->offset(fd->getAddress()), name.c_str());
       string names;
       for (const string &name : wraps) names += (names.empty() ? "" : ", ") + name;
       fd->warningHeader("Decompiled again without recovered structs the code reaches past the end of: " + names);

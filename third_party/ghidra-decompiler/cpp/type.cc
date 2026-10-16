@@ -3978,6 +3978,18 @@ void TypeFactory::setDisplayFormat(Datatype *ct,uint4 format)
   ct->setDisplayFormat(format);
 }
 
+// recore: names the field at \b offset of \b ct, which keeps its identity, so that every
+// type built on it and every varnode of it prints the new name. A struct is ordered among the
+// factory's types by the names of its fields too, so it leaves the tree while one changes.
+void TypeFactory::setFieldName(TypeStruct *ct,int4 offset,const string &name)
+
+{
+  tree.erase(ct);
+  for(vector<TypeField>::iterator iter=ct->field.begin();iter!=ct->field.end();++iter)
+    if ((*iter).offset == offset) (*iter).name = name;
+  tree.insert(ct);
+}
+
 /// \brief Set fields on a TypeStruct
 ///
 /// Set fields on a structure data-type, establishing its size, alignment, and other properties.

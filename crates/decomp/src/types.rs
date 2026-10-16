@@ -302,6 +302,8 @@ pub struct Writer<'a> {
     function_types: HashMap<String, TypeId>,
     /// The number the engine knows the first entry by: see [`Writer::ident`].
     first_id: u64,
+    /// Types the engine holds already, by the number it knows them by: see [`Writer::known`].
+    known: HashMap<TypeId, u64>,
     out: String,
 }
 
@@ -313,14 +315,21 @@ impl<'a> Writer<'a> {
     /// A writer whose types the engine knows by numbers from `first_id` on, to keep them apart
     /// from those of another table given to the same session.
     pub fn numbered_from(types: &'a Types, first_id: u64) -> Writer<'a> {
-        Writer { types, written: vec![false; types.types.len()], pending: Vec::new(), function_types: HashMap::new(), first_id, out: String::new() }
+        Writer { types, written: vec![false; types.types.len()], pending: Vec::new(), function_types: HashMap::new(), first_id, known: HashMap::new(), out: String::new() }
+    }
+
+    /// Says that the engine holds the named type at `id` already, by the number `engine_id`:
+    /// it is referred to and never written.
+    pub fn known(&mut self, id: TypeId, engine_id: u64) {
+        self.written[id as usize] = true;
+        self.known.insert(id, engine_id);
     }
 
     /// The number the engine knows the named type at `id` by, next to its name. Left to itself
     /// the engine makes one up from the name, and its hash gives two of the long, similar names
     /// of C++ templates the same number often enough to confuse its bookkeeping for unions.
-    fn ident(&self, id: TypeId) -> u64 {
-        self.first_id + u64::from(id)
+    pub fn ident(&self, id: TypeId) -> u64 {
+        self.known.get(&id).copied().unwrap_or(self.first_id + u64::from(id))
     }
 
     /// An array's elements if nothing says how many there are, since the engine has no array
