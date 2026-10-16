@@ -29,6 +29,7 @@ pub mod rtti;
 pub mod score;
 pub mod signature;
 pub mod strings;
+pub mod structs;
 pub mod sweep;
 pub mod swift;
 pub mod thumb;
