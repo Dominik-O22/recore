@@ -309,6 +309,14 @@ fn imported_data_reads_by_name_and_zero_filled_data_has_an_address() {
 }
 
 #[test]
+fn a_jump_to_an_import_reads_as_a_call_to_it() {
+    // `say` ends by calling `puts`, which the compiler makes a jump to its PLT stub.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/tail.so");
+    let c_text = Client::start().tool("decompile", json!({ "path": path, "functions": ["say"] })).unwrap();
+    assert!(c_text.contains("iVar1 = puts(param_1);"), "{c_text}");
+}
+
+#[test]
 fn memory_the_file_has_no_bytes_for_takes_a_name() {
     // An 8051 program: SETB 0xAF; MOV DPTR, #0x8100; MOVX @DPTR, A; RET.
     let dir = edits_dir();
