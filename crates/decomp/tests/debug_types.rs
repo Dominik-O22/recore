@@ -119,3 +119,16 @@ fn cpp_prototypes_are_as_the_machine_code_takes_them() {
     assert_eq!(signature("make"), ("Buffer *".to_string(), vec!["Buffer *".to_string(), "int8".to_string()]));
     assert_eq!(signature("Buffer::~Buffer"), ("void".to_string(), vec!["Buffer *".to_string()]));
 }
+
+/// Where each parameter arrives, read from the DWARF locations: `total(struct node *list, int
+/// scale)` takes `list` in RDI and `scale` in ESI, DWARF registers 5 and 4.
+#[test]
+fn dwarf_locates_each_parameter_where_the_function_is_entered() {
+    let path = fixture("types.elf");
+    let image = recore::Image::load(&path).unwrap();
+    let located = recore_decomp::dwarf::located(&path, image.machine, &[]).unwrap();
+    let total = located.types.functions.iter().find(|found| found.name == "total").unwrap().addr;
+    let params: Vec<(&str, Option<recore_decomp::dwarf::Entry>)> = located.functions[&total].params.iter().map(|param| (param.name.as_str(), param.entry)).collect();
+    use recore_decomp::dwarf::Entry::Register;
+    assert_eq!(params, [("list", Some(Register(5))), ("scale", Some(Register(4)))]);
+}
