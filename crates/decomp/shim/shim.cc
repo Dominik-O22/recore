@@ -2072,6 +2072,9 @@ static void gather(RdSession *session, Funcdata &fd, Gathered &out) {
     for (const auto &field : pointed[classes[i]]) {
       pair<int, int64_t> child = objects.find(field.second);
       uint32_t at = number(child.first, child.second);
+      // A pointer into the middle of an object, as a tree node's link to the header inside the
+      // tree, does not point to the object's struct.
+      if (child.second != bases[at]) continue;
       out.links.push_back({(uint32_t)i, field.first - bases[i], at});
     }
   }

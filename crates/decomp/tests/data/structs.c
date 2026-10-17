@@ -29,6 +29,18 @@ struct point {
     int z;
 };
 
+// A search tree whose empty end is a node inside the tree, as std::map's header is.
+struct tnode {
+    struct tnode *left;
+    struct tnode *right;
+    int key;
+};
+
+struct tree {
+    long long count;
+    struct tnode header;
+};
+
 // A parameter whose struct holds a pointer to another struct.
 __attribute__((noinline)) int touch(struct conn *conn, int value) {
     if (conn->limit < value) {
@@ -63,6 +75,21 @@ __attribute__((noinline)) int late(struct conn *conn) {
     return ((volatile int *)&conn->stamp)[1] + conn->flags;
 }
 
+// The first node with a key of at least `key`, or the header: a node's links and the header's
+// point to the header, 8 bytes into the tree, and not to the tree.
+__attribute__((noinline)) struct tnode *lower(struct tree *tree, int key) {
+    struct tnode *found = &tree->header, *node = tree->header.left;
+    while (node) {
+        if (node->key >= key) {
+            found = node;
+            node = node->left;
+        } else {
+            node = node->right;
+        }
+    }
+    return found;
+}
+
 volatile int sink;
 
 void start(void) {
@@ -70,5 +97,6 @@ void start(void) {
     struct conn conn = {1, 2, &session, 3, 0, 4};
     struct node second = {2, 0}, first = {1, &second};
     struct point points[2] = {{1, 2, 3}, {4, 5, 6}};
-    sink = touch(&conn, 5) + sum(&first) + spread(points, 2) + relay(&conn) + late(&conn);
+    struct tree tree = {0};
+    sink = touch(&conn, 5) + sum(&first) + spread(points, 2) + relay(&conn) + late(&conn) + (lower(&tree, 3) != 0);
 }

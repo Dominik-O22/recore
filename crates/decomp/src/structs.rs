@@ -35,7 +35,8 @@ pub(crate) struct Object {
     pub accesses: Vec<Access>,
     /// Steps between elements: loop steps, and the factors of indexes.
     pub strides: Vec<u64>,
-    /// Fields that hold pointers to other objects: offset, index into [`Evidence::objects`].
+    /// Fields that hold pointers to the base of an object: offset, index into
+    /// [`Evidence::objects`]. A field that points into the middle of one is not among them.
     pub points_to: Vec<(i64, usize)>,
     /// Members handed to calls: the callee, the slot it takes the member in, and the member's
     /// offset from the base.
