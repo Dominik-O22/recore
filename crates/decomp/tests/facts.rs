@@ -12,24 +12,8 @@ const FRAGMENT: u64 = 0x1060;
 const SHARED: u64 = 0x1084;
 
 fn image() -> Image {
-    Image {
-        name: "test".into(),
-        format: Format::Elf,
-        machine: Machine::X86_64,
-        base: 0,
-        zero_filled: Vec::new(),
-        branch_targets_marked: false,
-        entry: A,
-        sections: vec![Section { name: ".text".into(), addr: 0x1000, data: vec![0x90; 0x100], file_offset: None, executable: true, writable: false }],
-        import_slots: Default::default(),
-        exports: Vec::new(),
-        symbol_names: Default::default(),
-        frames: Vec::new(),
-        relative_targets: Vec::new(),
-        data_in_code: false,
-        banking: Default::default(),
-        compiler: None,
-    }
+    let section = Section { name: ".text".into(), addr: 0x1000, data: vec![0x90; 0x100], file_offset: None, executable: true, writable: false };
+    Image::bare("test".into(), Format::Elf, Machine::X86_64, A, vec![section])
 }
 
 /// `A` has a main extent and a block at 0x1080 that it shares with the function `SHARED`, plus

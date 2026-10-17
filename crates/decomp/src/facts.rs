@@ -258,6 +258,12 @@ impl Facts {
                 facts.jump_tables.extend(jumps.map(|(index, _)| (owner, index)));
             }
         }
+        if image.machine == Machine::Arm {
+            // A32 and Thumb code reach an import by BL or BLX to its PLT stub.
+            use recore::arch::Arch;
+            let declared: recore::FxHashSet<u64> = analysis.imports.iter().map(|import| import.slot).collect();
+            facts.import_aliases.extend(recore::arm::Arm::plt_stubs(image).into_iter().filter(|(_, slot)| declared.contains(slot)));
+        }
         if image.machine == Machine::Thumb {
             for function in &analysis.functions {
                 let owner = function.fragment_of.unwrap_or(function.addr);

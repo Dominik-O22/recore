@@ -147,6 +147,7 @@ fn by_machine(image: &Image, targets: Option<&BTreeSet<u64>>) -> Score {
         Machine::Aarch64 => score_with::<crate::arm64::Arm64>(image, targets),
         Machine::I8051 => score_with::<crate::i8051::I8051>(image, targets),
         Machine::Thumb => score_with::<crate::thumb::Thumb>(image, targets),
+        Machine::Arm => score_with::<crate::arm::Arm>(image, targets),
     }
 }
 
@@ -185,7 +186,7 @@ impl<'a> Walk<'a> {
         while let Some(start) = pending.pop() {
             let Some((index, section)) = walk.code_at(start) else { continue };
             let mut state = A::State::default();
-            for decoded in A::decode(&section.data[(start - section.addr) as usize..], start) {
+            for decoded in A::decode(image, &section.data[(start - section.addr) as usize..], start) {
                 let at = (decoded.addr - section.addr) as usize;
                 let Some(insn) = decoded.insn.filter(|_| walk.marks[index][at] & START == 0) else { break };
                 walk.marks[index][at] |= START;
@@ -223,7 +224,7 @@ impl<'a> Walk<'a> {
         for (&index, section) in &sections {
             self.marks[index][0] |= AFTER_END;
             for offset in 0..section.data.len() {
-                let Some(decoded) = A::decode(&section.data[offset..], section.addr + offset as u64).next() else { continue };
+                let Some(decoded) = A::decode(self.image, &section.data[offset..], section.addr + offset as u64).next() else { continue };
                 let after = offset + usize::from(decoded.len);
                 if decoded.insn.is_some_and(|insn| ends(A::flow(&insn, &A::State::default(), self.image))) && after < section.data.len() {
                     self.marks[index][after] |= AFTER_END;

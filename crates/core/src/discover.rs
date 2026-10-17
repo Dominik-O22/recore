@@ -203,6 +203,10 @@ impl AddrSet {
     }
 }
 
+/// How many functions after a whole one, none of them reached, are decoded to show that it ends
+/// where the next begins, where nothing else between functions does.
+const WHOLE_CHAIN: u8 = 8;
+
 /// How far ahead of a path that runs into decoded code an unresolved indirect jump is looked
 /// for: about as far as a dispatch sequence can reasonably end.
 const RETRY_REACH: u64 = 96;
@@ -308,7 +312,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
 
     /// Whether the instruction at `addr` is filler.
     fn is_padding_at(&self, addr: u64) -> bool {
-        self.image.bytes_from(addr).and_then(|bytes| A::decode(bytes, addr).next()?.insn).is_some_and(|insn| A::is_padding(&insn))
+        self.image.bytes_from(addr).and_then(|bytes| A::decode(self.image, bytes, addr).next()?.insn).is_some_and(|insn| A::is_padding(&insn))
     }
 
     fn is_data(&self, addr: u64) -> bool {
@@ -348,7 +352,9 @@ impl<'a, A: Arch> Explorer<'a, A> {
             return;
         }
         *flags |= ASKED_AS_START;
-        if !self.inside_frame(addr) {
+        // Code that only falls or jumps into the inside of a frame is its function's. In a frame
+        // that may hold several functions, the gap search vouches for one that opens as one.
+        if !self.inside_frame(addr) || self.image.frames_merge && (referenced || origin == Origin::GapAligned) {
             if weak {
                 self.weak_starts.push(addr);
             }
@@ -424,7 +430,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 continue;
             }
             let mut after_call = false;
-            let decoder = decoders[index].get_or_insert_with(|| A::decoder(&section.data, section.addr));
+            let decoder = decoders[index].get_or_insert_with(|| A::decoder(self.image, &section.data, section.addr));
             A::seek(decoder, (start - section.addr) as usize);
             while let Some(decoded) = A::decode_next(decoder) {
                 let offset = (decoded.addr - section.addr) as usize;
@@ -443,6 +449,14 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 // between functions, not after a call that falls through.
                 let clock = self.clock;
                 self.regions[index].touch(offset, clock);
+                // Nor does a function save the return address after it called, which it saved
+                // before: what does so after a call opens the next function, where code is not
+                // tiled and no padding marks where it starts.
+                if after_call && A::LITERAL_POOLS && !A::TILES_GAPS && decoded.insn.is_some_and(|insn| A::opens_function(insn, None)) {
+                    self.regions[index].insn_len[offset] = 0;
+                    self.regions[index].flags[offset] |= FOLLOWS_BREAK;
+                    break;
+                }
                 let Some(insn) = decoded.insn.filter(|insn| !(after_call && A::ends_code(insn))) else {
                     self.regions[index].insn_len[offset] = 0;
                     break;
@@ -470,7 +484,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     if self.recording {
                         self.note_references(insn, &state, decoded.addr, speculative);
                     }
-                    let mut taken = A::address_taken(insn, &state).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
+                    let mut taken = A::address_taken(insn, &state, self.image).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
                     let in_code = taken.is_some_and(|target| self.region_index(target).is_some());
                     if in_code && !A::code_pointer(self.image, taken.unwrap_or_default()) {
                         taken = None;
@@ -690,7 +704,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
     fn retry_jump_ahead(&mut self, index: usize, addr: u64, mut state: A::State) {
         let Some(&jump) = self.unresolved.range(addr..addr + RETRY_REACH).next() else { return };
         let section = self.regions[index].section;
-        for decoded in A::decode(&section.data[(addr - section.addr) as usize..], addr) {
+        for decoded in A::decode(self.image, &section.data[(addr - section.addr) as usize..], addr) {
             let Some(insn) = decoded.insn else { return };
             match A::flow(&insn, &state, self.image) {
                 None => A::step(&mut state, &insn),
@@ -736,8 +750,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
         tables
     }
 
-    /// Whether execution cannot fall into `addr`: it sits right after a terminator or a jump
-    /// table, or after one of those followed only by padding.
+    /// Whether execution cannot fall into `addr`: it sits right after a terminator, a jump
+    /// table or a literal pool, or after one of those followed only by padding.
     fn starts_after_break(&self, addr: u64) -> bool {
         let Some(index) = self.region_index(addr) else { return false };
         let region = &self.regions[index];
@@ -746,11 +760,12 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let pointer_size = self.image.machine.pointer_size() as usize;
         let after_table = |o: usize| {
             self.image.data_in_code && o >= pointer_size && self.pointer_slots.contains_key(&(region.section.addr + (o - pointer_size) as u64))
+                || A::LITERAL_POOLS && o > 0 && region.flags[o - 1] & IN_TABLE != 0
         };
         let Some(break_at) = (earliest..=offset).rev().find(|&o| region.follows_break(o) || after_table(o)) else {
             return false;
         };
-        A::decode(&region.section.data[break_at..offset], 0).all(|decoded| decoded.insn.is_some_and(|insn| A::is_padding(&insn)))
+        A::decode(self.image, &region.section.data[break_at..offset], region.section.addr + break_at as u64).all(|decoded| decoded.insn.is_some_and(|insn| A::is_padding(&insn)))
     }
 
     /// Marks a jump target as an entry point when the jump is a tail call: it leaves the function
@@ -871,7 +886,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let earliest = offset.saturating_sub(A::LONGEST_PADDING as usize);
         loop {
             let before = (1..=offset.min(LONGEST_INSN)).map(|len| offset - len).find(|&at| usize::from(region.insn_len[at]) == offset - at)?;
-            let insn = A::decode(&region.section.data[before..], region.section.addr + before as u64).next()?.insn?;
+            let insn = A::decode(self.image, &region.section.data[before..], region.section.addr + before as u64).next()?.insn?;
             if !A::is_padding(&insn) {
                 let Some(Flow::Call(callee)) = A::flow(&insn, &A::State::default(), self.image) else { return None };
                 return Some(callee);
@@ -975,7 +990,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
             .map(|(&addr, _)| addr)
             .filter(|&addr| {
                 let Some(bytes) = self.image.bytes_from(addr) else { return false };
-                let insns: Vec<A::Insn> = A::decode(bytes, addr).take(PROBE).map_while(|d| d.insn).collect();
+                let insns: Vec<A::Insn> = A::decode(self.image, bytes, addr).take(PROBE).map_while(|d| d.insn).collect();
                 A::borrows_frame(&insns)
             })
             .collect();
@@ -984,44 +999,115 @@ impl<'a, A: Arch> Explorer<'a, A> {
         }
     }
 
-    /// Whether `addr` lies in the entries of a resolved jump table.
     /// Whether the unreached bytes at `addr` are a whole function nothing refers to: they decode
     /// without a gap to a return or a jump elsewhere, and padding or known code follows.
     /// `may_call` says whether calls are allowed in it; a function without an unwind entry, where
     /// others have one, is a leaf and makes none.
-    fn is_whole_function(&self, index: usize, addr: u64, may_call: bool) -> bool {
+    ///
+    /// Where code keeps literal pools and unreached code is not tiled into functions, as on
+    /// 32-bit ARM, more shows a function whole: it goes on past a return to where a branch before
+    /// it goes and through a table of known length to its cases, a call that runs into literals
+    /// ends it, its own literals follow its end, and so may another function, one that opens as
+    /// one or up to `chain` more whole ones.
+    fn is_whole_function(&self, index: usize, addr: u64, may_call: bool, chain: u8) -> bool {
         const LONGEST: usize = 48;
+        let extended = A::LITERAL_POOLS && !A::TILES_GAPS;
         let region = &self.regions[index];
         let section = region.section;
         let known = |at: u64| ((at - section.addr) as usize) < section.data.len() && region.insn_len[(at - section.addr) as usize] != 0;
-        let state = A::State::default();
-        let mut decoder = A::decode(&section.data[(addr - section.addr) as usize..], addr);
         let literal = |at: u64| A::LITERAL_POOLS && region.flags.get((at - section.addr) as usize).is_some_and(|flags| flags & IN_TABLE != 0);
-        for decoded in decoder.by_ref().take(LONGEST) {
-            let Some(insn) = decoded.insn else { return false };
-            let inside = (decoded.addr..decoded.next_addr()).any(|at| known(at) || literal(at) || self.pointer_slots.contains_key(&at));
-            if inside || A::is_padding(&insn) || self.frame_of(decoded.addr).is_some() {
-                return false;
+        // Where the branches so far go past the code decoded, and the literals it reads.
+        let (mut ahead, mut pools): (BTreeSet<u64>, Vec<(u64, u64)>) = (BTreeSet::new(), Vec::new());
+        // Where a path through the code ends at `end`: decoding goes on at the nearest place a
+        // branch goes past it, or the function ends there, and then what follows says whether
+        // it is whole.
+        let finish = |mut end: u64, ahead: &BTreeSet<u64>, pools: &[(u64, u64)]| -> Result<bool, u64> {
+            if let Some(&next) = ahead.range(end..).next() {
+                return Err(next);
             }
-            match A::flow(&insn, &state, self.image) {
-                Some(Flow::Call(target)) if !may_call || self.region_index(target).is_none() => return false,
-                Some(Flow::CallIndirect(_)) if !may_call => return false,
-                Some(Flow::Halt | Flow::JumpIndirect(None)) => return false,
-                Some(Flow::Branch(target)) if target < addr || self.region_index(target).is_none() => return false,
-                Some(Flow::Jump(target)) if self.region_index(target).is_none() => return false,
-                Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) => {
-                    let end = decoded.next_addr();
-                    // A lone `ret` is more often the tail of the function before it.
-                    if end - addr < 3 {
-                        return false;
-                    }
-                    let padded = decoder.next().is_some_and(|next| next.insn.as_ref().is_some_and(A::is_padding));
-                    return padded || known(end) || end == section.addr + section.data.len() as u64 || self.frame_of(end).is_some();
+            // A lone `ret` is more often the tail of the function before it.
+            if end - addr < 3 {
+                return Ok(false);
+            }
+            while let Some(&(_, pool_end)) = pools.iter().find(|&&(start, pool_end)| start <= end.next_multiple_of(4) && start >= end && pool_end > end) {
+                end = pool_end;
+            }
+            let Some(rest) = section.data.get((end - section.addr) as usize..) else { return Ok(false) };
+            let mut after = A::decode(self.image, rest, end).map(|decoded| decoded.insn);
+            let (next, second) = (after.next().flatten(), after.next().flatten());
+            let padded = next.as_ref().is_some_and(A::is_padding);
+            let opens = next.as_ref().is_some_and(|next| A::opens_function(next, second.as_ref()));
+            let follows = || literal(end) || chain > 0 && self.is_whole_function(index, end, may_call, chain - 1);
+            Ok(padded || opens || known(end) || end == section.end() || self.frame_of(end).is_some() || follows())
+        };
+        let (mut from, mut decoded_count) = (addr, 0);
+        loop {
+            let mut decoder = A::decode(self.image, &section.data[(from - section.addr) as usize..], from);
+            let (mut after_call, mut state) = (false, A::State::default());
+            let ended = loop {
+                let Some(decoded) = decoder.next() else { return false };
+                decoded_count += 1;
+                if decoded_count > LONGEST {
+                    return false;
                 }
-                _ => {}
+                let own_pool = pools.iter().any(|&(start, end)| start < decoded.next_addr() && decoded.addr < end);
+                let inside = (decoded.addr..decoded.next_addr()).any(|at| known(at) || literal(at) || self.pointer_slots.contains_key(&at));
+                // A call that runs into literals never returns.
+                if after_call && (own_pool || literal(decoded.addr)) {
+                    break finish(decoded.addr, &ahead, &pools);
+                }
+                let Some(insn) = decoded.insn else { return false };
+                if inside || own_pool || A::is_padding(&insn) || self.frame_of(decoded.addr).is_some() {
+                    return false;
+                }
+                if let Some(pool) = A::literal(&insn).filter(|_| extended) {
+                    pools.push(pool);
+                }
+                let flow = A::flow(&insn, &state, self.image);
+                after_call = extended && matches!(flow, Some(Flow::Call(_)));
+                // Where code is not tiled, a call or tail call may go to the PLT, which holds no
+                // functions.
+                let callable = |target: u64| if extended { self.image.is_code(target) } else { self.region_index(target).is_some() };
+                match flow {
+                    Some(Flow::Call(target)) if !may_call || !callable(target) => return false,
+                    Some(Flow::CallIndirect(_)) if !may_call => return false,
+                    Some(Flow::JumpIndirect(None)) if extended => {
+                        let in_reach = |target: u64| target >= addr && self.region_index(target) == Some(index);
+                        let Some(table) = A::resolve_table(&state, self.image, self.pointer_slots, &insn, &in_reach, &in_reach).filter(|table| table.bounded) else { return false };
+                        ahead.extend(table.entries.iter().copied());
+                        pools.extend(table.inline_end.map(|end| (table.address, end)));
+                        break finish(table.inline_end.unwrap_or(decoded.next_addr()).max(decoded.next_addr()), &ahead, &pools);
+                    }
+                    Some(Flow::Halt | Flow::JumpIndirect(None)) => return false,
+                    Some(Flow::Branch(target)) if target < addr || self.region_index(target).is_none() => return false,
+                    // Decoding goes on at a branch's target, which must lie in these bytes.
+                    Some(Flow::Branch(target)) if extended && self.region_index(target) != Some(index) => return false,
+                    Some(Flow::Branch(target)) => {
+                        if extended {
+                            A::branch(&mut state, &insn);
+                            ahead.insert(target);
+                        }
+                    }
+                    Some(Flow::Jump(target)) if !callable(target) => return false,
+                    Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) if extended => break finish(decoded.next_addr(), &ahead, &pools),
+                    Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) => {
+                        let end = decoded.next_addr();
+                        // A lone `ret` is more often the tail of the function before it.
+                        if end - addr < 3 {
+                            return false;
+                        }
+                        let padded = decoder.next().is_some_and(|next| next.insn.as_ref().is_some_and(A::is_padding));
+                        return padded || known(end) || end == section.end() || self.frame_of(end).is_some();
+                    }
+                    _ if extended => A::step(&mut state, &insn),
+                    _ => {}
+                }
+            };
+            match ended {
+                Err(next) => from = next,
+                Ok(whole) => return whole,
             }
         }
-        false
     }
 
     /// Whether the unreached bytes from `addr` to the next known code divide into functions with
@@ -1054,7 +1140,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         // Where decoding starts again past a literal pool, and where the gap's instructions end.
         let (mut resume, mut end) = (Some(addr), addr);
         'gap: while let Some(from) = resume.take() {
-            for decoded in A::decode(&section.data[(from - section.addr) as usize..], from) {
+            for decoded in A::decode(self.image, &section.data[(from - section.addr) as usize..], from) {
                 if known(decoded.addr) {
                     break 'gap;
                 }
@@ -1219,7 +1305,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     let mut candidate = None;
                     let mut scanned_to = addr;
                     let mut next = None;
-                    let decoder = decoders[index].get_or_insert_with(|| A::decoder(&section.data, section.addr));
+                    let decoder = decoders[index].get_or_insert_with(|| A::decoder(self.image, &section.data, section.addr));
                     A::seek(decoder, offset);
                     while let Some(decoded) = A::decode_next(decoder) {
                         let at = (decoded.addr - section.addr) as usize;
@@ -1279,12 +1365,13 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         // alignment boundary straight after a terminator may call.
                         let unwound_elsewhere = !self.frames.is_empty() && self.frame_of(addr).is_none();
                         let whole = after_break
-                            && (unwound_elsewhere && self.is_whole_function(index, addr, false)
-                                || aligned && self.is_whole_function(index, addr, true)
+                            && (unwound_elsewhere && self.is_whole_function(index, addr, false, WHOLE_CHAIN)
+                                || aligned && self.is_whole_function(index, addr, true, WHOLE_CHAIN)
                                 || A::TILES_GAPS && self.tiles_gap(index, addr));
                         // A whole function, or a gap that divides into functions, is code
                         // whatever its first instructions look like.
-                        is_start = (aligned_after_break || opens || whole) && !self.inside_frame(addr) && (A::TILES_GAPS && whole || A::code_pointer(self.image, addr));
+                        let in_frame = || self.inside_frame(addr) && !(self.image.frames_merge && opens);
+                        is_start = (aligned_after_break || opens || whole) && !in_frame() && (A::TILES_GAPS && whole || A::code_pointer(self.image, addr));
                         if !is_start {
                             // Inside an unwind entry the bytes belong to a function, so they are
                             // worth decoding to resolve what they dispatch to, without taking

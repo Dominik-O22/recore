@@ -270,46 +270,53 @@ pub fn jump_tables(layout: &Path, debug_path: &Path) -> Result<Option<Extracted>
         let end = start + size;
         let instructions = code.instructions(start, end);
         for &(table, table_end) in code.data.iter().filter(|&&(table, _)| table > start && table < end) {
-            let before = &instructions[..instructions.partition_point(|&(at, _, _)| at < table)];
-            let (jump, kind) = match dispatch(before) {
-                None => continue,
-                Some(Err(reason)) => {
-                    rejected.push(Rejected { table, reason });
-                    continue;
-                }
-                Some(Ok(found)) => found,
-            };
-            // A run of data may begin with a literal before the table the ADR names, and an ADR
-            // may name data of another run, which is not this table.
-            let table = match kind {
-                Dispatch::Absolute { table: named } if !(table..table_end).contains(&named) => {
-                    rejected.push(Rejected { table, reason: format!("an ADR of {named:#x}, outside the data at {table:#x}") });
-                    continue;
-                }
-                Dispatch::Absolute { table } => table,
-                Dispatch::Relative { .. } => table,
-            };
-            let table_end = literals(&instructions).iter().map(|&(literal, _)| literal).filter(|&literal| literal >= table && literal < table_end).min().unwrap_or(table_end);
-            let bytes = code.bytes(table, table_end).context("a table outside the code")?;
-            let mut targets: Vec<u64> = match kind {
-                Dispatch::Relative { size, base } => bytes
-                    .chunks_exact(size as usize)
-                    .map(|entry| base + 2 * entry.iter().rev().fold(0u64, |value, &byte| value << 8 | u64::from(byte)))
-                    .collect(),
-                Dispatch::Absolute { .. } => bytes.chunks_exact(4).map(|entry| u64::from(u32::from_le_bytes(entry.try_into().unwrap())) & !1).collect(),
-            };
-            // Padding: an entry whose case would be the table itself.
-            targets.retain(|&target| !(table..table_end).contains(&target));
-            targets.sort_unstable();
-            targets.dedup();
-            if let Some(&outside) = targets.iter().find(|&&target| target < start || target >= end) {
-                rejected.push(Rejected { table, reason: format!("a case at {outside:#x} outside the function") });
-                continue;
+            match table_at(&|start, end| code.bytes(start, end), &instructions, table, table_end, start, end) {
+                None => {}
+                Some(Ok(found)) => tables.push(found),
+                Some(Err(reason)) => rejected.push(Rejected { table, reason }),
             }
-            tables.push(JumpTable { jump, table, targets, unreachable: None });
         }
     }
     tables.sort_by_key(|table| table.jump);
     let listed = tables.len() + rejected.len();
     Ok(Some(Extracted { truth: JumpTables { name: name(layout), tables }, listed, rejected }))
+}
+
+/// The table that the data run `[table, table_end)` of the function `[start, end)` holds, if the
+/// Thumb `instructions` of the function before it end in a dispatch that reads it, or why it
+/// cannot be read.
+pub(super) fn table_at<'a>(
+    bytes: &dyn Fn(u64, u64) -> Option<&'a [u8]>,
+    instructions: &[(u64, u8, Option<Instruction>)],
+    table: u64,
+    table_end: u64,
+    start: u64,
+    end: u64,
+) -> Option<Result<JumpTable, String>> {
+    let before = &instructions[..instructions.partition_point(|&(at, _, _)| at < table)];
+    let (jump, kind) = match dispatch(before)? {
+        Err(reason) => return Some(Err(reason)),
+        Ok(found) => found,
+    };
+    // A run of data may begin with a literal before the table the ADR names, and an ADR may name
+    // data of another run, which is not this table.
+    let table = match kind {
+        Dispatch::Absolute { table: named } if !(table..table_end).contains(&named) => return Some(Err(format!("an ADR of {named:#x}, outside the data at {table:#x}"))),
+        Dispatch::Absolute { table } => table,
+        Dispatch::Relative { .. } => table,
+    };
+    let table_end = literals(instructions).iter().map(|&(literal, _)| literal).filter(|&literal| literal >= table && literal < table_end).min().unwrap_or(table_end);
+    let Some(bytes) = bytes(table, table_end) else { return Some(Err("a table outside the code".into())) };
+    let mut targets: Vec<u64> = match kind {
+        Dispatch::Relative { size, base } => bytes.chunks_exact(size as usize).map(|entry| base + 2 * entry.iter().rev().fold(0u64, |value, &byte| value << 8 | u64::from(byte))).collect(),
+        Dispatch::Absolute { .. } => bytes.chunks_exact(4).map(|entry| u64::from(u32::from_le_bytes(entry.try_into().unwrap())) & !1).collect(),
+    };
+    // Padding: an entry whose case would be the table itself.
+    targets.retain(|&target| !(table..table_end).contains(&target));
+    targets.sort_unstable();
+    targets.dedup();
+    if let Some(&outside) = targets.iter().find(|&&target| target < start || target >= end) {
+        return Some(Err(format!("a case at {outside:#x} outside the function")));
+    }
+    Some(Ok(JumpTable { jump, table, targets, unreachable: None }))
 }

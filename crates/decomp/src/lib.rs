@@ -73,6 +73,8 @@ pub enum Target {
     I8051Sdcc,
     /// An ARM Cortex-M, in Thumb code.
     Thumb,
+    /// 32-bit ARM code, A32 and Thumb, with the EABI's conventions.
+    Arm,
 }
 
 /// Where SDCC keeps the frame pointer of an 8051 program whose functions have their arguments
@@ -106,6 +108,7 @@ impl Target {
             (Machine::I8051, _) if image.compiler == Some(Compiler::Sdcc) => Target::I8051Sdcc,
             (Machine::I8051, _) => Target::I8051,
             (Machine::Thumb, _) => Target::Thumb,
+            (Machine::Arm, _) => Target::Arm,
         }
     }
 
@@ -120,6 +123,7 @@ impl Target {
             Target::I8051 => c"8051:BE:24:cip-51:default",
             Target::I8051Sdcc => c"8051:BE:24:cip-51:sdcc",
             Target::Thumb => c"ARM:LE:32:Cortex:default",
+            Target::Arm => c"ARM:LE:32:v7:default",
         }
     }
 
@@ -133,7 +137,7 @@ impl Target {
             Target::Aarch64 => "AARCH64.cspec",
             Target::I8051 => "keil-cx51.cspec",
             Target::I8051Sdcc => "sdcc-mcs51.cspec",
-            Target::Thumb => "ARM.cspec",
+            Target::Thumb | Target::Arm => "ARM.cspec",
         }
     }
 
@@ -157,12 +161,12 @@ impl Target {
     /// Whether a call passes just the parameters its callee was found to read, and not also
     /// whatever else the call site has put in argument registers. GCC and clang keep a caller's
     /// own values in those registers across a call to a function known to leave them alone,
-    /// so there the callee is the better witness. MSVC does not, and 32-bit code passes on
-    /// the stack, where a function may be passed more than it reads: against PDB signatures,
-    /// taking the callee's word alone gets 87.5% of 64-bit parameter lists right and taking
-    /// it as the least gets 89.8%.
+    /// so there the callee is the better witness, on 32-bit ARM as well. MSVC does not, and
+    /// 32-bit x86 code passes on the stack, where a function may be passed more than it reads:
+    /// against PDB signatures, taking the callee's word alone gets 87.5% of 64-bit parameter
+    /// lists right and taking it as the least gets 89.8%.
     fn callers_pass_what_is_read(self) -> bool {
-        matches!(self, Target::X86_64Gcc | Target::Aarch64)
+        matches!(self, Target::X86_64Gcc | Target::Aarch64 | Target::Arm)
     }
 
     /// The address spaces the target has besides the one its code is in: the address recore
@@ -198,7 +202,7 @@ impl Target {
 
     pub fn pointer_bytes(self) -> usize {
         match self {
-            Target::X86Windows | Target::X86Gcc | Target::Thumb => 4,
+            Target::X86Windows | Target::X86Gcc | Target::Thumb | Target::Arm => 4,
             Target::X86_64Windows | Target::X86_64Gcc | Target::Aarch64 => 8,
             Target::I8051 | Target::I8051Sdcc => 2,
         }
@@ -417,7 +421,18 @@ impl Session {
         {
             session.register_at(recore::i8051::IDATA + u64::from(direct))?;
         }
+        // The engine decodes 32-bit ARM code by its TMode: A32, or Thumb where it is 1.
+        for (index, &(start, set)) in image.instruction_sets.iter().enumerate() {
+            let end = image.instruction_sets.get(index + 1).map_or(0, |&(next, _)| next);
+            session.set_context(c"TMode", start, end, u32::from(set == recore::image::InstructionSet::Thumb))?;
+        }
         Ok(session)
+    }
+
+    /// Gives the context variable `name` the value `value` over the code from `start` up to
+    /// `end`, or to the end of the address space where `end` is 0.
+    pub fn set_context(&mut self, name: &CStr, start: u64, end: u64, value: u32) -> Result<()> {
+        check(|err, len| unsafe { ffi::rd_set_context(self.raw.as_ptr(), name.as_ptr(), start, end, value, err, len) != 0 })
     }
 
     /// Says that the `len` bytes of code at `addr` are those at `target`: reading them reads

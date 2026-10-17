@@ -213,7 +213,7 @@ fn abi(image: &Image) -> Result<Abi> {
         Machine::X86_64 => Abi { args: &["RDI", "RSI", "RDX", "RCX", "R8", "R9"], result: "RAX", stack: "RSP", ..SYSTEM_V },
         Machine::X86 => Abi { result: "EAX", stack: "ESP", ..SYSTEM_V },
         Machine::Aarch64 => Abi { args: &["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"], result: "x0", stack: "sp", returns: Returns::Link("x30"), arm_arithmetic: true, ..SYSTEM_V },
-        Machine::Thumb => Abi { args: &["r0", "r1", "r2", "r3"], result: "r0", stack: "sp", returns: Returns::Link("lr"), mode_bit: 1, arm_arithmetic: true, alignment: 8, ..SYSTEM_V },
+        Machine::Thumb | Machine::Arm => Abi { args: &["r0", "r1", "r2", "r3"], result: "r0", stack: "sp", returns: Returns::Link("lr"), mode_bit: 1, arm_arithmetic: true, alignment: 8, ..SYSTEM_V },
         // Arguments of an 8051 function are in places that depend on its compiler and on the
         // function, so the caller sets them. The first byte of a result is in DPL for SDCC and
         // in R7 for Keil, and a wider result goes on in the registers after it.

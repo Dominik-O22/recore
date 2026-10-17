@@ -452,8 +452,10 @@ impl Layout {
             // An 8051 reads its constants and its switch tables from the code space, a Cortex-M
             // its literal pools and switch tables from among its code.
             data_in_code: matches!(self.machine, Machine::I8051 | Machine::Thumb),
+            frames_merge: false,
             banking,
             compiler: self.compiler,
+            instruction_sets: Vec::new(),
         })
     }
 }

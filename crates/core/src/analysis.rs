@@ -59,7 +59,7 @@ fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool, tables: &[(u
         };
         let bytes = &bytes[..bytes.len().min((to - from) as usize)];
         let mut state = A::State::default();
-        for decoded in A::decode(bytes, from) {
+        for decoded in A::decode(image, bytes, from) {
             let Some(insn) = decoded.insn else { continue };
             function.instructions += 1;
             if !A::is_padding(&insn) {
@@ -316,7 +316,7 @@ fn code_end<A: Arch>(image: &Image, start: u64, bound: u64, tables: &FxHashMap<u
     for (from, to) in code_pieces(start, bound, inline_tables) {
         let Some(bytes) = image.bytes_from(from) else { return from };
         let bytes = &bytes[..bytes.len().min((to - from) as usize)];
-        for decoded in A::decode(bytes, from) {
+        for decoded in A::decode(image, bytes, from) {
             let Some(insn) = decoded.insn else { return decoded.addr };
             match A::flow(&insn, &state, image) {
                 Some(Flow::Branch(target)) if target > decoded.addr && target < bound => {
@@ -404,7 +404,7 @@ fn uncovered(code: &[(u64, u64)], covered: &[(u64, u64)]) -> Vec<(u64, u64)> {
 fn next_function_start<A: Arch>(image: &Image, from: u64, end: u64) -> Option<u64> {
     let bytes = image.bytes_from(from)?;
     let bytes = &bytes[..bytes.len().min((end.checked_sub(from)?) as usize)];
-    let mut decoder = A::decode(bytes, from).skip_while(|d| d.insn.as_ref().is_some_and(A::is_padding));
+    let mut decoder = A::decode(image, bytes, from).skip_while(|d| d.insn.as_ref().is_some_and(A::is_padding));
     let first = decoder.next()?;
     let mut insn = first.insn?;
     let marked = A::is_entry_marker(&insn);
@@ -429,6 +429,7 @@ pub fn analyze(image: &Image) -> Analysis {
         Machine::Aarch64 => analyze_with::<crate::arm64::Arm64>(image),
         Machine::I8051 => analyze_with::<crate::i8051::I8051>(image),
         Machine::Thumb => analyze_with::<crate::thumb::Thumb>(image),
+        Machine::Arm => analyze_with::<crate::arm::Arm>(image),
     }
 }
 
@@ -487,6 +488,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .iter()
             .enumerate()
             .map(|(index, &start)| match frame_end.get(&start) {
+                Some(&end) if image.frames_merge => (start, starts.get(index + 1).map_or(end, |&next| end.min(next))),
                 Some(&end) => (start, end),
                 None => {
                     let section_end = image.section_at(start).map_or(start, |s| s.end());
@@ -539,7 +541,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .filter(|start| {
                 let sources = jumped_to.get(start).map_or(0, FxHashSet::len);
                 let opens_function = || {
-                    let mut decoder = A::decode(image.bytes_from(*start)?, *start);
+                    let mut decoder = A::decode(image, image.bytes_from(*start)?, *start);
                     let first = decoder.next()?.insn?;
                     Some(A::opens_function(&first, decoder.next().and_then(|d| d.insn).as_ref()))
                 };
@@ -582,7 +584,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                     // Read the bytes themselves: a trap that pads the end of a function has
                     // been trimmed from its extent.
                     let trap_follows = || {
-                        let insn = A::decode(image.bytes_from(control.next)?, control.next).next()?.insn?;
+                        let insn = A::decode(image, image.bytes_from(control.next)?, control.next).next()?.insn?;
                         Some(A::flow(&insn, &A::State::default(), image) == Some(Flow::Halt))
                     };
                     (ends_function || trap_follows() == Some(true)).then_some(target)
@@ -859,7 +861,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     if image.format == Format::Pe {
         for function in functions.iter().filter(|f| f.instructions <= 8) {
             let Some(bytes) = image.bytes_from(function.start) else { continue };
-            let insns: Vec<A::Insn> = A::decode(bytes, function.start).take(2).map_while(|d| d.insn).collect();
+            let insns: Vec<A::Insn> = A::decode(image, bytes, function.start).take(2).map_while(|d| d.insn).collect();
             if A::checks_stack_cookie(&insns) {
                 names.entry(function.start).or_insert_with(|| "__security_check_cookie".to_string());
             }

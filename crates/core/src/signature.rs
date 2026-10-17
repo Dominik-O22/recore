@@ -61,7 +61,7 @@ pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u6
         Machine::X86 => x86(32, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS), true, None),
         Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, Some(MIN_INSTRUCTIONS), true, None),
         Machine::Aarch64 => aarch64(bytes, start, end, Some(MIN_WORDS), true),
-        Machine::I8051 | Machine::Thumb => None,
+        Machine::I8051 | Machine::Thumb | Machine::Arm => None,
     }
 }
 
@@ -88,7 +88,7 @@ fn whole(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, end: u6
         Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, None, numbers, None),
         Machine::Aarch64 => aarch64(bytes, start, end, None, numbers),
         // Not fingerprinted yet: nothing says which of their bytes are addresses.
-        Machine::I8051 | Machine::Thumb => None,
+        Machine::I8051 | Machine::Thumb | Machine::Arm => None,
     }
 }
 
@@ -101,7 +101,7 @@ pub fn numbers(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u64, e
         match image.machine {
             Machine::X86 => drop(x86(32, bytes, pointer_slots, start, end, None, true, Some(&mut found))),
             Machine::X86_64 => drop(x86(64, bytes, pointer_slots, start, end, None, true, Some(&mut found))),
-            Machine::Aarch64 | Machine::I8051 | Machine::Thumb => {}
+            Machine::Aarch64 | Machine::I8051 | Machine::Thumb | Machine::Arm => {}
         }
     }
     found

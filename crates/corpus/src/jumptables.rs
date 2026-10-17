@@ -336,6 +336,9 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Option<Extracted
     }
     let debug_data = std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?;
     let debug = object::File::parse(&*debug_data)?;
+    if binary.architecture() == object::Architecture::Arm {
+        return crate::truth::arm::jump_tables(name, &binary, &debug);
+    }
 
     let Some(meta) = debug.section_by_name(META_SECTION) else { return Ok(None) };
     let data_sections: Vec<_> = binary.sections().filter(|s| s.kind() == SectionKind::ReadOnlyData).collect();

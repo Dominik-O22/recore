@@ -230,7 +230,7 @@ fn stub_writes(image: &Image, entry: u64) -> u16 {
     for _ in 0..2 {
         let Some(bytes) = image.bytes_from(at) else { break };
         let mut jump = None;
-        for insn in I8051::decode(&bytes[..bytes.len().min(32)], at).filter_map(|decoded| decoded.insn) {
+        for insn in super::decode(&bytes[..bytes.len().min(32)], at).filter_map(|decoded| decoded.insn) {
             writes |= written(insn);
             if let Some((Transfer::Jump, target)) = insn.transfer() {
                 jump = Some(image.banking.reach(insn.addr, target));
@@ -265,7 +265,7 @@ fn steps(image: &Image, analysis: &Analysis) -> FxHashMap<u64, Vec<Step>> {
         body.sort_unstable_by_key(|&(start, end)| (!(start..end).contains(&owner), start));
         for &(start, end) in &body {
             let Some(bytes) = image.bytes_from(start) else { continue };
-            insns.extend(I8051::decode(&bytes[..bytes.len().min((end - start) as usize)], start).filter_map(|decoded| Some((decoded.insn?, decoded.next_addr()))));
+            insns.extend(super::decode(&bytes[..bytes.len().min((end - start) as usize)], start).filter_map(|decoded| Some((decoded.insn?, decoded.next_addr()))));
         }
         let index: FxHashMap<u64, u32> = insns.iter().enumerate().map(|(index, (insn, _))| (insn.addr, index as u32)).collect();
         let mut function = Vec::with_capacity(insns.len());

@@ -115,7 +115,7 @@ impl Insn {
     /// into it.
     fn skipped_block(self, image: &Image) -> Option<u16> {
         let after = self.addr + u64::from(LENGTH[usize::from(self.opcode())]);
-        let next = I8051::decode(image.bytes_from(after)?, after).next()?.insn?;
+        let next = decode(image.bytes_from(after)?, after).next()?.insn?;
         matches!(next.transfer(), Some((Transfer::Jump, beyond)) if beyond > next.next()).then(|| next.next())
     }
 
@@ -267,7 +267,7 @@ pub fn interrupt_vectors(code: &[u8]) -> impl Iterator<Item = u64> + '_ {
     let returns_from_interrupt = |mut at: u16| {
         // A jump may lead round in a loop.
         for _ in 0..4096 {
-            let Some(Decoded { insn: Some(insn), len, .. }) = code.get(usize::from(at)..).and_then(|bytes| I8051::decode(bytes, u64::from(at)).next()) else { return false };
+            let Some(Decoded { insn: Some(insn), len, .. }) = code.get(usize::from(at)..).and_then(|bytes| decode(bytes, u64::from(at)).next()) else { return false };
             match (insn.opcode(), insn.transfer()) {
                 (0x32, _) => return true,
                 (0x22, _) => return false,
@@ -283,6 +283,25 @@ pub fn interrupt_vectors(code: &[u8]) -> impl Iterator<Item = u64> + '_ {
 /// The 8051 and its descendants with the original instruction set.
 pub struct I8051;
 
+/// Decodes consecutive instructions from `bytes`, which are loaded at `addr`. The 8051 has one
+/// instruction set, so nothing else decides what they are.
+pub fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> {
+    let mut offset = 0;
+    std::iter::from_fn(move || {
+        let opcode = *bytes.get(offset)?;
+        let at = addr + offset as u64;
+        // No instruction: the opcode is not one, or its operands run past the end.
+        let insn = bytes.get(offset..offset + usize::from(LENGTH[usize::from(opcode)])).filter(|insn| !insn.is_empty()).map(|insn| {
+            let mut bytes = [0; 3];
+            bytes[..insn.len()].copy_from_slice(insn);
+            Insn { addr: at, bytes }
+        });
+        let len = if insn.is_some() { LENGTH[usize::from(opcode)] } else { 1 };
+        offset += usize::from(len);
+        Some(Decoded { addr: at, len, insn })
+    })
+}
+
 impl Arch for I8051 {
     type Insn = Insn;
     type State = State;
@@ -294,28 +313,15 @@ impl Arch for I8051 {
     const TILES_GAPS: bool = true;
     const TEXT_IN_CODE: bool = true;
 
-    fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> {
-        let mut offset = 0;
-        std::iter::from_fn(move || {
-            let opcode = *bytes.get(offset)?;
-            let at = addr + offset as u64;
-            // No instruction: the opcode is not one, or its operands run past the end.
-            let insn = bytes.get(offset..offset + usize::from(LENGTH[usize::from(opcode)])).filter(|insn| !insn.is_empty()).map(|insn| {
-                let mut bytes = [0; 3];
-                bytes[..insn.len()].copy_from_slice(insn);
-                Insn { addr: at, bytes }
-            });
-            let len = if insn.is_some() { LENGTH[usize::from(opcode)] } else { 1 };
-            offset += usize::from(len);
-            Some(Decoded { addr: at, len, insn })
-        })
+    fn decode<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> + 'a {
+        decode(bytes, addr)
     }
 
     /// The bytes, the address they are loaded at, the offset to decode at next, and the
     /// instruction decoded last.
     type Decoder<'a> = (&'a [u8], u64, usize, Insn);
 
-    fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_> {
+    fn decoder<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> Self::Decoder<'a> {
         (bytes, addr, 0, Insn { addr, bytes: [0; 3] })
     }
 
@@ -324,7 +330,7 @@ impl Arch for I8051 {
     }
 
     fn decode_next<'d>((bytes, base, offset, insn): &'d mut Self::Decoder<'_>) -> Option<Decoded<&'d Insn>> {
-        let decoded = Self::decode(bytes.get(*offset..)?, *base + *offset as u64).next()?;
+        let decoded = decode(bytes.get(*offset..)?, *base + *offset as u64).next()?;
         *offset += usize::from(decoded.len);
         Some(Decoded { addr: decoded.addr, len: decoded.len, insn: decoded.insn.map(|decoded| &*{ *insn = decoded; insn }) })
     }
@@ -360,7 +366,7 @@ impl Arch for I8051 {
     }
 
     /// Nothing: `MOV DPTR, #address` loads the address of data far more often than of code.
-    fn address_taken(_: &Insn, _: &State) -> Option<u64> {
+    fn address_taken(_: &Insn, _: &State, _: &Image) -> Option<u64> {
         None
     }
 
@@ -403,7 +409,7 @@ impl Arch for I8051 {
         let mut dptr = None::<(u64, [u8; 2])>;
         // The number each of `R0` to `R7` was loaded with.
         let mut registers = [None::<u8>; 8];
-        for insn in I8051::decode(&bytes[..bytes.len().min((end - start) as usize)], start).filter_map(|decoded| decoded.insn) {
+        for insn in decode(&bytes[..bytes.len().min((end - start) as usize)], start).filter_map(|decoded| decoded.insn) {
             let [opcode, first, second] = insn.bytes;
             let register = usize::from(opcode & 7);
             // Nothing is known of what another path or a called function leaves.
@@ -622,7 +628,7 @@ pub fn unbanked_transfers(image: &Image, analysis: &Analysis) -> Vec<(u64, u64)>
     let mut found = Vec::new();
     for &(start, end) in analysis.functions.iter().flat_map(|function| &function.ranges) {
         let Some(bytes) = image.bytes_from(start).filter(|_| is_common(start)) else { continue };
-        for insn in I8051::decode(&bytes[..bytes.len().min((end - start) as usize)], start).filter_map(|decoded| decoded.insn) {
+        for insn in decode(&bytes[..bytes.len().min((end - start) as usize)], start).filter_map(|decoded| decoded.insn) {
             if let Some((_, target)) = insn.transfer().filter(|&(_, target)| is_common(insn.addr) && !banking.is_common(target)) {
                 found.push((insn.addr, u64::from(target)));
             }
@@ -646,28 +652,12 @@ pub fn banking_summary(image: &Image, analysis: &Analysis) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image::{Banking, Format, Section};
+    use crate::image::{Format, Section};
 
     /// An image that is not banked, with `code` at `addr`.
     pub(super) fn image(code: &[u8], addr: u64) -> Image {
-        Image {
-            name: String::new(),
-            format: Format::Raw,
-            machine: Machine::I8051,
-            base: 0,
-            branch_targets_marked: false,
-            entry: addr,
-            sections: vec![Section { name: String::new(), addr, data: code.to_vec(), file_offset: None, executable: true, writable: false }],
-            zero_filled: memory(),
-            import_slots: FxHashMap::default(),
-            exports: Vec::new(),
-            symbol_names: FxHashMap::default(),
-            frames: Vec::new(),
-            relative_targets: Vec::new(),
-            data_in_code: true,
-            banking: Banking::default(),
-            compiler: None,
-        }
+        let section = Section { name: String::new(), addr, data: code.to_vec(), file_offset: None, executable: true, writable: false };
+        Image { zero_filled: memory(), ..Image::bare(String::new(), Format::Raw, Machine::I8051, addr, vec![section]) }
     }
 
     /// The code the tests have in place of a routine of Keil's library.
@@ -677,7 +667,7 @@ mod tests {
 
     /// The length and the control flow of the instruction `bytes` holds at `addr`.
     fn decoded(bytes: &[u8], addr: u64) -> (u8, Option<Flow>) {
-        let first = I8051::decode(bytes, addr).next().unwrap();
+        let first = decode(bytes, addr).next().unwrap();
         (first.len, I8051::flow(&first.insn.unwrap(), &State::default(), &image(bytes, addr)))
     }
 
@@ -753,7 +743,7 @@ mod tests {
     #[test]
     fn what_is_not_an_instruction_is_one_byte_of_nothing() {
         // The opcode that is none; LJMP cut short by the end of the code.
-        let lengths = |bytes: &[u8]| I8051::decode(bytes, 0).map(|decoded| (decoded.len, decoded.insn.is_some())).collect::<Vec<_>>();
+        let lengths = |bytes: &[u8]| decode(bytes, 0).map(|decoded| (decoded.len, decoded.insn.is_some())).collect::<Vec<_>>();
         assert_eq!(lengths(&[0xA5, 0x22]), [(1, false), (1, true)]);
         assert_eq!(lengths(&[0x22, 0x02, 0x12]), [(1, true), (1, false), (1, false)]);
     }
@@ -765,7 +755,7 @@ mod tests {
         let code = [0x90, 0x12, 0x34, 0xA3, 0xE0, 0xF5, 0x30, 0xF5, 0x90, 0xD2, 0x0A, 0xC2, 0x93, 0xF5, 0x82, 0xF0];
         let mut state = State::default();
         let mut referred = Vec::new();
-        for insn in I8051::decode(&code, 0).filter_map(|decoded| decoded.insn) {
+        for insn in decode(&code, 0).filter_map(|decoded| decoded.insn) {
             referred.push(I8051::memory_reference(&insn, &state));
             I8051::step(&mut state, &insn);
         }

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Adds Debian builds to a corpus: stripped executables plus their -dbgsym debug files.
 
-Usage: fetch_debian.py <arch> <corpus-dir>      e.g. amd64 corpus, or arm64 corpus-arm64
+Usage: fetch_debian.py <arch> <corpus-dir>      e.g. amd64 corpus, arm64 corpus-arm64, armhf corpus-armhf
+                                                or armel corpus-armel
 Writes <corpus-dir>/bin/deb__<pkg>__<name> and <corpus-dir>/debug/deb__<pkg>__<name>.debug.
 Debian builds differ from Arch's: calls go through a PLT, and flags and compiler versions differ.
 """
