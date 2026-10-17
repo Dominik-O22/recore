@@ -80,6 +80,8 @@ What a run does not tell you:
 - Dividing by zero stops an x86 run and gives zero on ARM, as the hardware does. A signed quotient too large for its register, as `INT_MIN / -1`, does not trap on x86 here, because the specification divides in a wider register and cuts the result.
 - On an 8051 the arguments go in with `set`, because where they are depends on the compiler. The result is `DPL` for SDCC and `R7` for Keil, and the registers that hold the rest of a wider result are shown after it. `R0` to `R7` are bytes of internal memory, in the bank that `RS1` and `RS0` select, so a bank switch, a direct address and `@R0` all reach the same bytes, and a function that expects the caller to have picked its bank is run with `--set RS0=1`. The first bank's bytes are not listed among the writes. The internal stack starts at the `SP` the startup code sets, if the reset vector reaches a `MOV SP,#n`, else at 0x40; the answer says which. `SP` set by the caller wins. Banks of code memory are not modelled.
 
+To check the oracle itself after a change to the interpreter, the shim or a processor specification, run `cargo test --release -p recore-mcp --test oracle -- --ignored`. It builds C functions for x86-64, AArch64, x86-32, Thumb and the 8051, and compares the oracle with this machine and with µCsim on thousands of generated cases. It needs gcc, clang, sdcc and `s51`.
+
 ## From a shell
 
 With a tool name and a binary as arguments, the same binary runs that one tool and prints the answer:
