@@ -352,8 +352,9 @@ impl<'a, A: Arch> Explorer<'a, A> {
             return;
         }
         *flags |= ASKED_AS_START;
-        // Code that only falls or jumps into the inside of a frame is its function's.
-        if !self.inside_frame(addr) || self.image.frames_merge && referenced {
+        // Code that only falls or jumps into the inside of a frame is its function's. In a frame
+        // that may hold several functions, the gap search vouches for one that opens as one.
+        if !self.inside_frame(addr) || self.image.frames_merge && (referenced || origin == Origin::GapAligned) {
             if weak {
                 self.weak_starts.push(addr);
             }
@@ -1004,25 +1005,54 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let literal = |at: u64| A::LITERAL_POOLS && region.flags.get((at - section.addr) as usize).is_some_and(|flags| flags & IN_TABLE != 0);
         // Where the branches so far go past the code decoded, and the literals it reads.
         let (mut ahead, mut pools): (BTreeSet<u64>, Vec<(u64, u64)>) = (BTreeSet::new(), Vec::new());
+        // Where a path through the code ends at `end`: decoding goes on at the nearest place a
+        // branch goes past it, or the function ends there, and then what follows says whether
+        // it is whole.
+        let finish = |mut end: u64, ahead: &BTreeSet<u64>, pools: &[(u64, u64)]| -> Result<bool, u64> {
+            if let Some(&next) = ahead.range(end..).next().filter(|_| A::LITERAL_POOLS) {
+                return Err(next);
+            }
+            // A lone `ret` is more often the tail of the function before it.
+            if end - addr < 3 {
+                return Ok(false);
+            }
+            while let Some(&(_, pool_end)) = pools.iter().find(|&&(start, pool_end)| start <= end.next_multiple_of(4) && start >= end && pool_end > end) {
+                end = pool_end;
+            }
+            let Some(bytes) = self.image.bytes_from(end) else { return Ok(true) };
+            let mut after = A::decode(self.image, bytes, end).map(|decoded| decoded.insn);
+            let (next, second) = (after.next().flatten(), after.next().flatten());
+            let padded = next.as_ref().is_some_and(A::is_padding);
+            let opens = A::LITERAL_POOLS && next.as_ref().is_some_and(|next| A::opens_function(next, second.as_ref()));
+            let whole = || A::LITERAL_POOLS && chain > 0 && self.is_whole_function(index, end, may_call, chain - 1);
+            Ok(padded || opens || known(end) || literal(end) || end == section.end() || self.frame_of(end).is_some() || whole())
+        };
         let (mut from, mut decoded_count) = (addr, 0);
         loop {
             let mut decoder = A::decode(self.image, &section.data[(from - section.addr) as usize..], from);
-            let mut resume = None;
-            while let Some(decoded) = decoder.next() {
+            let mut after_call = false;
+            let ended = loop {
+                let Some(decoded) = decoder.next() else { return false };
                 decoded_count += 1;
                 if decoded_count > LONGEST {
                     return false;
                 }
-                let Some(insn) = decoded.insn else { return false };
                 let own_pool = pools.iter().any(|&(start, end)| start < decoded.next_addr() && decoded.addr < end);
                 let inside = (decoded.addr..decoded.next_addr()).any(|at| known(at) || literal(at) || self.pointer_slots.contains_key(&at));
+                // A call that runs into literals never returns.
+                if after_call && A::LITERAL_POOLS && (own_pool || literal(decoded.addr)) {
+                    break finish(decoded.addr, &ahead, &pools);
+                }
+                let Some(insn) = decoded.insn else { return false };
                 if inside || own_pool || A::is_padding(&insn) || self.frame_of(decoded.addr).is_some() {
                     return false;
                 }
                 if let Some(pool) = A::literal(&insn).filter(|_| A::LITERAL_POOLS) {
                     pools.push(pool);
                 }
-                match A::flow(&insn, &state, self.image) {
+                let flow = A::flow(&insn, &state, self.image);
+                after_call = matches!(flow, Some(Flow::Call(_)));
+                match flow {
                     Some(Flow::Call(target)) if !may_call || !self.image.is_code(target) => return false,
                     Some(Flow::CallIndirect(_)) if !may_call => return false,
                     Some(Flow::Halt | Flow::JumpIndirect(None)) => return false,
@@ -1031,33 +1061,13 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         ahead.insert(target);
                     }
                     Some(Flow::Jump(target)) if self.region_index(target).is_none() => return false,
-                    Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) => {
-                        let mut end = decoded.next_addr();
-                        if let Some(&next) = ahead.range(end..).next().filter(|_| A::LITERAL_POOLS) {
-                            resume = Some(next);
-                            break;
-                        }
-                        // A lone `ret` is more often the tail of the function before it.
-                        if end - addr < 3 {
-                            return false;
-                        }
-                        while let Some(&(_, pool_end)) = pools.iter().find(|&&(start, pool_end)| start <= end.next_multiple_of(4) && start >= end && pool_end > end) {
-                            end = pool_end;
-                        }
-                        let Some(bytes) = self.image.bytes_from(end) else { return true };
-                        let mut after = A::decode(self.image, bytes, end).map(|decoded| decoded.insn);
-                        let (next, second) = (after.next().flatten(), after.next().flatten());
-                        let padded = next.as_ref().is_some_and(A::is_padding);
-                        let opens = A::LITERAL_POOLS && next.as_ref().is_some_and(|next| A::opens_function(next, second.as_ref()));
-                        let whole = || A::LITERAL_POOLS && chain > 0 && self.is_whole_function(index, end, may_call, chain - 1);
-                        return padded || opens || known(end) || literal(end) || end == section.end() || self.frame_of(end).is_some() || whole();
-                    }
+                    Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) => break finish(decoded.next_addr(), &ahead, &pools),
                     _ => {}
                 }
-            }
-            match resume {
-                Some(at) => from = at,
-                None => return false,
+            };
+            match ended {
+                Err(next) => from = next,
+                Ok(whole) => return whole,
             }
         }
     }
@@ -1322,7 +1332,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
                                 || A::TILES_GAPS && self.tiles_gap(index, addr));
                         // A whole function, or a gap that divides into functions, is code
                         // whatever its first instructions look like.
-                        is_start = (aligned_after_break || opens || whole) && !self.inside_frame(addr) && (A::TILES_GAPS && whole || A::code_pointer(self.image, addr));
+                        let in_frame = self.inside_frame(addr) && !(self.image.frames_merge && opens);
+                        is_start = (aligned_after_break || opens || whole) && !in_frame && (A::TILES_GAPS && whole || A::code_pointer(self.image, addr));
                         if !is_start {
                             // Inside an unwind entry the bytes belong to a function, so they are
                             // worth decoding to resolve what they dispatch to, without taking
