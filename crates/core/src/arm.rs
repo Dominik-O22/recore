@@ -352,16 +352,16 @@ fn completed_address(insn: &Insn, state: &State, image: &Image) -> Option<u32> {
         Value::Const(value) => Some(value),
         _ => None,
     };
-    let literals = image.relative_targets.is_empty();
+    let absolute = image.relative_targets.is_empty();
     match insn {
         Insn::Thumb(insn) => match pc_sum_thumb(insn) {
             Some(rd) => constant(rd).map(|offset| offset.wrapping_add(insn.addr as u32 + 4)),
-            None if insn.adr().is_some() || !literals && insn.literal_word_register().is_some() => None,
+            None if insn.adr().is_some() || !absolute && insn.literal_word_register().is_some() => None,
             None => Thumb::completed_address(insn, state),
         },
         Insn::A32(insn) => {
             if insn.literal_word_register().is_some() {
-                return insn.literal.filter(|_| literals);
+                return insn.literal.filter(|_| absolute);
             }
             if let Some((_, other)) = insn.adds_pc() {
                 return constant(other).map(|offset| offset.wrapping_add(insn.pc() as u32));
@@ -716,14 +716,13 @@ impl Arch for Arm {
         };
         // BX and BLX of an address that has no Thumb bit go to A32 code, which a Cortex-M has
         // not.
-        if let (Some((3, _, rm)), Value::Const(value)) = (insn.high(), state.registers[insn.high().map_or(0, |(_, _, rm)| rm)]) {
-            if value & 1 == 0 && rm != LR {
-                let target = u64::from(value);
-                return match insn.hw1 & 0x80 != 0 {
-                    true => Some(Flow::Call(target)),
-                    false => (!insn.conditional).then_some(Flow::Jump(target)),
-                };
-            }
+        if let Some((3, _, rm)) = insn.high()
+            && rm != LR
+            && let Value::Const(value) = state.registers[rm]
+            && value & 1 == 0
+        {
+            let calls = insn.hw1 & 0x80 != 0;
+            return if calls { Some(Flow::Call(u64::from(value))) } else { (!insn.conditional).then_some(Flow::Jump(u64::from(value))) };
         }
         Thumb::flow(insn, state, image)
     }
@@ -817,19 +816,12 @@ impl Arch for Arm {
 
     /// A Thumb block that reads its function's variables before setting up a frame.
     fn borrows_frame(insns: &[Insn]) -> bool {
-        let thumb: Vec<thumb::Insn> = insns.iter().map_while(|insn| match insn {
-            Insn::Thumb(insn) => Some(*insn),
-            Insn::A32(_) => None,
-        }).collect();
-        thumb.len() == insns.len() && Thumb::borrows_frame(&thumb)
+        thumb_only(insns).is_some_and(|insns| Thumb::borrows_frame(&insns))
     }
 
+    /// Thumb code that saves R3 where `va_arg` looks for it, as on a Cortex-M.
     fn takes_variable_arguments(insns: &[Insn]) -> bool {
-        let thumb: Vec<thumb::Insn> = insns.iter().map_while(|insn| match insn {
-            Insn::Thumb(insn) => Some(*insn),
-            Insn::A32(_) => None,
-        }).collect();
-        !thumb.is_empty() && Thumb::takes_variable_arguments(&thumb)
+        thumb_only(insns).is_some_and(|insns| Thumb::takes_variable_arguments(&insns))
     }
 
     fn opens_landing_pad(_: &Insn) -> bool {
@@ -840,14 +832,17 @@ impl Arch for Arm {
         match insn {
             Insn::A32(insn) => step_a32(state, *insn),
             // ADD Rd, PC of an offset a literal holds: the address of what the offset names.
-            Insn::Thumb(insn) => match (pc_sum_thumb(insn), pc_sum_thumb(insn).map(|rd| state.registers[rd])) {
-                (Some(rd), Some(Value::Const(offset))) => {
+            Insn::Thumb(insn) => {
+                if let Some(rd) = pc_sum_thumb(insn)
+                    && let Value::Const(offset) = state.registers[rd]
+                {
                     let kept = state.compare.filter(|&(register, _)| usize::from(register) != rd);
                     state.set(rd, Value::Const(offset.wrapping_add(insn.addr as u32 + 4)));
                     state.compare = kept;
+                } else {
+                    state.step(*insn);
                 }
-                _ => state.step(*insn),
-            },
+            }
         }
     }
 
@@ -884,6 +879,17 @@ impl Arch for Arm {
     }
 }
 
+/// `insns` where all are Thumb, which the Cortex-M arch can read as it reads its own.
+fn thumb_only(insns: &[Insn]) -> Option<Vec<thumb::Insn>> {
+    insns
+        .iter()
+        .map(|insn| match insn {
+            Insn::Thumb(insn) => Some(*insn),
+            Insn::A32(_) => None,
+        })
+        .collect()
+}
+
 /// Each PLT stub of `section` with the slot it jumps through. GNU ld's stub is A32: `ADD IP, PC,
 /// #a; ADD IP, IP, #b; LDR PC, [IP, #c]!`. A Thumb caller that cannot `BLX` reaches it through
 /// `BX PC; NOP` right before it.
@@ -914,7 +920,10 @@ fn marked(pointer: u64) -> (u64, InstructionSet) {
 /// file gives with it, and makes the map of instruction sets.
 pub(crate) fn load(file: &object::File, image: &mut Image) {
     use object::{Object, ObjectSection, ObjectSymbol};
-    let is_code = |image: &Image, addr: u64| image.is_code(addr);
+    let code: Vec<(u64, u64)> = image.sections.iter().filter(|section| section.executable).map(|section| (section.addr, section.end())).collect();
+    let is_code = |addr: u64| code.iter().any(|&(start, end)| (start..end).contains(&addr));
+    // A32 where the code at `start` reads as A32, see `reads_as_a32`.
+    let reads = |start: u64| start % 4 == 0 && image.bytes_from(start).is_some_and(|bytes| reads_as_a32(&bytes[..bytes.len().min(48)]));
     // Where the set is known for sure: the entry point, the exports and the pointers that the
     // loader relocates into code, each with the Thumb bit or without it, and the PLT, which
     // GNU ld writes in A32.
@@ -926,7 +935,7 @@ pub(crate) fn load(file: &object::File, image: &mut Image) {
         image
             .relative_targets
             .iter()
-            .filter(|&&(_, target)| is_code(image, target & !1) && (target & 1 != 0 || target % 4 == 0 && image.bytes_from(target).is_some_and(|bytes| reads_as_a32(&bytes[..bytes.len().min(48)]))))
+            .filter(|&&(_, target)| is_code(target & !1) && (target & 1 != 0 || reads(target)))
             .map(|&(_, target)| marked(target)),
     );
     seeds.extend(dynamic_code_pointers(file).into_iter().map(marked));
@@ -934,17 +943,15 @@ pub(crate) fn load(file: &object::File, image: &mut Image) {
     // Last, and so only where nothing above reaches: the functions .ARM.exidx lists whose code
     // reads as A32, as the Rust code of an armhf program, which calls among itself, does.
     let frames = exception_index(file);
-    let reads = |start: u64| image.bytes_from(start).is_some_and(|bytes| start % 4 == 0 && reads_as_a32(&bytes[..bytes.len().min(48)]));
     seeds.extend(frames.iter().filter(|&&(start, _)| reads(start)).map(|&(start, _)| (start, InstructionSet::A32)));
 
     image.entry &= !1;
     for export in &mut image.exports {
         *export &= !1;
     }
-    image.symbol_names = std::mem::take(&mut image.symbol_names).into_iter().map(|(addr, name)| (if is_code(image, addr & !1) { addr & !1 } else { addr }, name)).collect();
-    let code_targets: Vec<usize> = (0..image.relative_targets.len()).filter(|&index| is_code(image, image.relative_targets[index].1 & !1)).collect();
-    for index in code_targets {
-        image.relative_targets[index].1 &= !1;
+    image.symbol_names = std::mem::take(&mut image.symbol_names).into_iter().map(|(addr, name)| (if is_code(addr & !1) { addr & !1 } else { addr }, name)).collect();
+    for (_, target) in image.relative_targets.iter_mut().filter(|(_, target)| is_code(*target & !1)) {
+        *target &= !1;
     }
 
     image.frames = frames;
