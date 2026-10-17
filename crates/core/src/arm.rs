@@ -273,8 +273,14 @@ impl A32 {
     }
 
     /// `PUSH {..., LR}` or `STR LR, [SP, #-4]!`, which save the return address.
-    fn opens_function(self) -> bool {
+    fn saves_return(self) -> bool {
         self.word & 0xFFFF_4000 == 0xE92D_4000 || self.word == 0xE52D_E004
+    }
+
+    /// `MOV IP, #4096`, with which code that probes its stack against a clash opens, before it
+    /// saves anything.
+    fn probes_stack(self) -> bool {
+        self.word == 0xE3A0_CA01
     }
 }
 
@@ -770,7 +776,8 @@ impl Arch for Arm {
 
     fn opens_function(first: &Insn, second: Option<&Insn>) -> bool {
         match (first, second) {
-            (Insn::A32(insn), _) => insn.opens_function(),
+            (Insn::A32(insn), Some(Insn::A32(second))) if insn.probes_stack() => second.saves_return(),
+            (Insn::A32(insn), _) => insn.saves_return(),
             (Insn::Thumb(insn), Some(Insn::Thumb(second))) => Thumb::opens_function(insn, Some(second)),
             (Insn::Thumb(insn), _) => Thumb::opens_function(insn, None),
         }
@@ -895,6 +902,9 @@ pub(crate) fn load(file: &object::File, image: &mut Image) {
         image.relative_targets[index].1 &= !1;
     }
 
+    image.frames = exception_index(file);
+    image.frames_merge = true;
+
     // An unstripped file says where the sets change itself.
     let mut mapping: Vec<(u64, InstructionSet)> = file
         .symbols()
@@ -911,6 +921,30 @@ pub(crate) fn load(file: &object::File, image: &mut Image) {
         mapping.sort_unstable_by_key(|&(addr, _)| addr);
         mapping
     };
+}
+
+/// The functions that `.ARM.exidx`, ARM's table for unwinding, lists, each from where its entry
+/// says up to the next. An entry may hold several functions that the linker merged, see
+/// [`Image::frames_merge`]. One that says the code cannot be unwound is left out: the linker
+/// also writes those to cover code that has no entry of its own, any number of functions. So
+/// is the last, whose end nothing says.
+fn exception_index(file: &object::File) -> Vec<(u64, u64)> {
+    use object::{Object, ObjectSection};
+    const CANNOT_UNWIND: u32 = 1;
+    let Some(section) = file.section_by_name(".ARM.exidx") else { return Vec::new() };
+    let Ok(data) = section.data() else { return Vec::new() };
+    // The first word of each entry is a 31-bit offset from the entry to the function.
+    let mut entries: Vec<(u64, bool)> = data
+        .chunks_exact(8)
+        .enumerate()
+        .map(|(index, entry)| {
+            let word = |at: usize| u32::from_le_bytes(entry[at..at + 4].try_into().unwrap());
+            let start = (section.address() + 8 * index as u64).wrapping_add_signed(sign_extend(word(0) & 0x7FFF_FFFF, 31)) & 0xFFFF_FFFF;
+            (start, word(4) != CANNOT_UNWIND)
+        })
+        .collect();
+    entries.sort_unstable();
+    entries.windows(2).filter(|pair| pair[0].1 && pair[0].0 < pair[1].0).map(|pair| (pair[0].0, pair[1].0)).collect()
 }
 
 /// `DT_INIT` and `DT_FINI`, the functions the loader calls before and after the program, with

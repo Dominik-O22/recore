@@ -162,8 +162,13 @@ pub struct Image {
     /// a raw image, what its layout says the trampoline tables and stubs are.
     pub symbol_names: FxHashMap<u64, String>,
     /// `[start, end)` of every function the image describes: a frame description entry in
-    /// `.eh_frame`, a PE `RUNTIME_FUNCTION`, or a Mach-O function start up to the next one.
+    /// `.eh_frame`, a PE `RUNTIME_FUNCTION`, a Mach-O function start up to the next one, or an
+    /// entry of ARM's `.ARM.exidx` up to the next one.
     pub frames: Vec<(u64, u64)>,
+    /// Whether a frame may hold several functions: the linker merges the `.ARM.exidx` entries of
+    /// functions next to each other that unwind alike. What calls or points into such a frame
+    /// is a function all the same, and the frame ends a function only where no other starts.
+    pub frames_merge: bool,
     /// Pointers stored in data by relative relocations, as `(slot address, target)`. Targets in
     /// code are function pointers or, in computed-goto tables, labels.
     pub relative_targets: Vec<(u64, u64)>,
@@ -198,6 +203,7 @@ impl Image {
             frames: Vec::new(),
             relative_targets: Vec::new(),
             data_in_code: matches!(format, Format::Pe | Format::Raw),
+            frames_merge: false,
             banking: Banking::default(),
             compiler: None,
             instruction_sets: Vec::new(),
@@ -296,6 +302,7 @@ impl Image {
             relative_targets,
             // ARM code reads its constants from pools among it.
             data_in_code: is_pe || machine == Machine::Arm,
+            frames_merge: false,
             banking: Banking::default(),
             compiler: None,
             instruction_sets: Vec::new(),

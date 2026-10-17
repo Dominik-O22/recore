@@ -348,7 +348,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
             return;
         }
         *flags |= ASKED_AS_START;
-        if !self.inside_frame(addr) {
+        // Code that only falls or jumps into the inside of a frame is its function's.
+        if !self.inside_frame(addr) || self.image.frames_merge && referenced {
             if weak {
                 self.weak_starts.push(addr);
             }
@@ -984,44 +985,74 @@ impl<'a, A: Arch> Explorer<'a, A> {
         }
     }
 
-    /// Whether `addr` lies in the entries of a resolved jump table.
     /// Whether the unreached bytes at `addr` are a whole function nothing refers to: they decode
     /// without a gap to a return or a jump elsewhere, and padding or known code follows.
     /// `may_call` says whether calls are allowed in it; a function without an unwind entry, where
-    /// others have one, is a leaf and makes none.
+    /// others have one, is a leaf and makes none. Where code keeps literal pools, the function
+    /// goes on past a return to where a branch before it goes, its own literals follow its end,
+    /// and so may another function, which opens as one.
     fn is_whole_function(&self, index: usize, addr: u64, may_call: bool) -> bool {
         const LONGEST: usize = 48;
         let region = &self.regions[index];
         let section = region.section;
         let known = |at: u64| ((at - section.addr) as usize) < section.data.len() && region.insn_len[(at - section.addr) as usize] != 0;
         let state = A::State::default();
-        let mut decoder = A::decode(self.image, &section.data[(addr - section.addr) as usize..], addr);
         let literal = |at: u64| A::LITERAL_POOLS && region.flags.get((at - section.addr) as usize).is_some_and(|flags| flags & IN_TABLE != 0);
-        for decoded in decoder.by_ref().take(LONGEST) {
-            let Some(insn) = decoded.insn else { return false };
-            let inside = (decoded.addr..decoded.next_addr()).any(|at| known(at) || literal(at) || self.pointer_slots.contains_key(&at));
-            if inside || A::is_padding(&insn) || self.frame_of(decoded.addr).is_some() {
-                return false;
-            }
-            match A::flow(&insn, &state, self.image) {
-                Some(Flow::Call(target)) if !may_call || self.region_index(target).is_none() => return false,
-                Some(Flow::CallIndirect(_)) if !may_call => return false,
-                Some(Flow::Halt | Flow::JumpIndirect(None)) => return false,
-                Some(Flow::Branch(target)) if target < addr || self.region_index(target).is_none() => return false,
-                Some(Flow::Jump(target)) if self.region_index(target).is_none() => return false,
-                Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) => {
-                    let end = decoded.next_addr();
-                    // A lone `ret` is more often the tail of the function before it.
-                    if end - addr < 3 {
-                        return false;
-                    }
-                    let padded = decoder.next().is_some_and(|next| next.insn.as_ref().is_some_and(A::is_padding));
-                    return padded || known(end) || end == section.addr + section.data.len() as u64 || self.frame_of(end).is_some();
+        // The furthest a branch so far goes, and the literals the code so far reads.
+        let (mut furthest, mut pools) = (addr, Vec::new());
+        let (mut from, mut decoded_count) = (addr, 0);
+        loop {
+            let mut decoder = A::decode(self.image, &section.data[(from - section.addr) as usize..], from);
+            let mut resume = None;
+            while let Some(decoded) = decoder.next() {
+                decoded_count += 1;
+                if decoded_count > LONGEST {
+                    return false;
                 }
-                _ => {}
+                let Some(insn) = decoded.insn else { return false };
+                let own_pool = pools.iter().any(|&(start, end)| start < decoded.next_addr() && decoded.addr < end);
+                let inside = (decoded.addr..decoded.next_addr()).any(|at| known(at) || literal(at) || self.pointer_slots.contains_key(&at));
+                if inside || own_pool || A::is_padding(&insn) || self.frame_of(decoded.addr).is_some() {
+                    return false;
+                }
+                if let Some(pool) = A::literal(&insn).filter(|_| A::LITERAL_POOLS) {
+                    pools.push(pool);
+                }
+                match A::flow(&insn, &state, self.image) {
+                    Some(Flow::Call(target)) if !may_call || self.region_index(target).is_none() => return false,
+                    Some(Flow::CallIndirect(_)) if !may_call => return false,
+                    Some(Flow::Halt | Flow::JumpIndirect(None)) => return false,
+                    Some(Flow::Branch(target)) if target < addr || self.region_index(target).is_none() => return false,
+                    Some(Flow::Branch(target)) => furthest = furthest.max(target),
+                    Some(Flow::Jump(target)) if self.region_index(target).is_none() => return false,
+                    Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) => {
+                        let mut end = decoded.next_addr();
+                        if A::LITERAL_POOLS && furthest >= end {
+                            resume = Some(furthest);
+                            break;
+                        }
+                        // A lone `ret` is more often the tail of the function before it.
+                        if end - addr < 3 {
+                            return false;
+                        }
+                        while let Some(&(_, pool_end)) = pools.iter().find(|&&(start, pool_end)| start <= end.next_multiple_of(4) && start >= end && pool_end > end) {
+                            end = pool_end;
+                        }
+                        let Some(bytes) = self.image.bytes_from(end) else { return true };
+                        let mut after = A::decode(self.image, bytes, end).map(|decoded| decoded.insn);
+                        let (next, second) = (after.next().flatten(), after.next().flatten());
+                        let padded = next.as_ref().is_some_and(A::is_padding);
+                        let opens = A::LITERAL_POOLS && next.as_ref().is_some_and(|next| A::opens_function(next, second.as_ref()));
+                        return padded || opens || known(end) || literal(end) || end == section.end() || self.frame_of(end).is_some();
+                    }
+                    _ => {}
+                }
+            }
+            match resume {
+                Some(at) => from = at,
+                None => return false,
             }
         }
-        false
     }
 
     /// Whether the unreached bytes from `addr` to the next known code divide into functions with

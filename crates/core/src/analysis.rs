@@ -488,6 +488,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .iter()
             .enumerate()
             .map(|(index, &start)| match frame_end.get(&start) {
+                Some(&end) if image.frames_merge => (start, starts.get(index + 1).map_or(end, |&next| end.min(next))),
                 Some(&end) => (start, end),
                 None => {
                     let section_end = image.section_at(start).map_or(start, |s| s.end());
