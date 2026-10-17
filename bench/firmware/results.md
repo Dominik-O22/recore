@@ -23,7 +23,7 @@ Without truth for OpenWrt itself, Ghidra's functions are the cross-check. On the
 
 Findings:
 
-- **Retpoline import calls.** OpenWrt 19.07 built x86_64 with Spectre v2 thunks, so each import call goes to a local stub, `push [slot]; jmp __x86_indirect_thunk`. recore takes the stubs for parts of their callers: in 19.07.10's dropbear it sees 3 imports of 152 and 376 functions where Ghidra has about 2,250, most of them the stubs. Every 19.07 x86_64 image has this. Not fixed here.
+- **Retpoline import calls.** OpenWrt 19.07 built x86_64 with Spectre v2 thunks, so each import call goes to a local stub, `push [slot]; jmp __x86_indirect_thunk`. recore takes the stubs for parts of their callers: in 19.07.10's dropbear it sees 3 imports of 152 and 376 functions where Ghidra has about 2,250, most of them the stubs. The dropbear of every 19.07 x86_64 image carries the thunks, and 18.06 and 21.02 do not. Not fixed here.
 - **Kernel modules.** recore loads `.ko` files and finds nothing in them.
 - **musl's libc.so** places `.fini` in the middle of its code. The first version of the rebuild ended `.text` there and found 225 of the library's 1,822 functions. Fixed: code now runs to the end of the last exported function as well.
 
