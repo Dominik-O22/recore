@@ -994,12 +994,16 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// Whether the unreached bytes at `addr` are a whole function nothing refers to: they decode
     /// without a gap to a return or a jump elsewhere, and padding or known code follows.
     /// `may_call` says whether calls are allowed in it; a function without an unwind entry, where
-    /// others have one, is a leaf and makes none. Where code keeps literal pools, the function
-    /// goes on past a return to where a branch before it goes, its own literals follow its end,
-    /// and so may another function: one that opens as one, or up to `chain` more whole ones. A
-    /// jump through a table of known length goes on to its cases there.
+    /// others have one, is a leaf and makes none.
+    ///
+    /// Where code keeps literal pools and unreached code is not tiled into functions, as on
+    /// 32-bit ARM, more shows a function whole: it goes on past a return to where a branch before
+    /// it goes and through a table of known length to its cases, a call that runs into literals
+    /// ends it, its own literals follow its end, and so may another function, one that opens as
+    /// one or up to `chain` more whole ones.
     fn is_whole_function(&self, index: usize, addr: u64, may_call: bool, chain: u8) -> bool {
         const LONGEST: usize = 48;
+        let extended = A::LITERAL_POOLS && !A::TILES_GAPS;
         let region = &self.regions[index];
         let section = region.section;
         let known = |at: u64| ((at - section.addr) as usize) < section.data.len() && region.insn_len[(at - section.addr) as usize] != 0;
@@ -1010,7 +1014,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         // branch goes past it, or the function ends there, and then what follows says whether
         // it is whole.
         let finish = |mut end: u64, ahead: &BTreeSet<u64>, pools: &[(u64, u64)]| -> Result<bool, u64> {
-            if let Some(&next) = ahead.range(end..).next().filter(|_| A::LITERAL_POOLS) {
+            if let Some(&next) = ahead.range(end..).next() {
                 return Err(next);
             }
             // A lone `ret` is more often the tail of the function before it.
@@ -1020,13 +1024,13 @@ impl<'a, A: Arch> Explorer<'a, A> {
             while let Some(&(_, pool_end)) = pools.iter().find(|&&(start, pool_end)| start <= end.next_multiple_of(4) && start >= end && pool_end > end) {
                 end = pool_end;
             }
-            let Some(bytes) = self.image.bytes_from(end) else { return Ok(true) };
-            let mut after = A::decode(self.image, bytes, end).map(|decoded| decoded.insn);
+            let Some(rest) = section.data.get((end - section.addr) as usize..) else { return Ok(false) };
+            let mut after = A::decode(self.image, rest, end).map(|decoded| decoded.insn);
             let (next, second) = (after.next().flatten(), after.next().flatten());
             let padded = next.as_ref().is_some_and(A::is_padding);
-            let opens = A::LITERAL_POOLS && next.as_ref().is_some_and(|next| A::opens_function(next, second.as_ref()));
-            let whole = || A::LITERAL_POOLS && chain > 0 && self.is_whole_function(index, end, may_call, chain - 1);
-            Ok(padded || opens || known(end) || literal(end) || end == section.end() || self.frame_of(end).is_some() || whole())
+            let opens = next.as_ref().is_some_and(|next| A::opens_function(next, second.as_ref()));
+            let follows = || literal(end) || chain > 0 && self.is_whole_function(index, end, may_call, chain - 1);
+            Ok(padded || opens || known(end) || end == section.end() || self.frame_of(end).is_some() || follows())
         };
         let (mut from, mut decoded_count) = (addr, 0);
         loop {
@@ -1041,22 +1045,24 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 let own_pool = pools.iter().any(|&(start, end)| start < decoded.next_addr() && decoded.addr < end);
                 let inside = (decoded.addr..decoded.next_addr()).any(|at| known(at) || literal(at) || self.pointer_slots.contains_key(&at));
                 // A call that runs into literals never returns.
-                if after_call && A::LITERAL_POOLS && (own_pool || literal(decoded.addr)) {
+                if after_call && (own_pool || literal(decoded.addr)) {
                     break finish(decoded.addr, &ahead, &pools);
                 }
                 let Some(insn) = decoded.insn else { return false };
                 if inside || own_pool || A::is_padding(&insn) || self.frame_of(decoded.addr).is_some() {
                     return false;
                 }
-                if let Some(pool) = A::literal(&insn).filter(|_| A::LITERAL_POOLS) {
+                if let Some(pool) = A::literal(&insn).filter(|_| extended) {
                     pools.push(pool);
                 }
                 let flow = A::flow(&insn, &state, self.image);
-                after_call = matches!(flow, Some(Flow::Call(_)));
+                after_call = extended && matches!(flow, Some(Flow::Call(_)));
+                // Where code is not tiled, a call may go to the PLT, which holds no functions.
+                let callable = |target: u64| if extended { self.image.is_code(target) } else { self.region_index(target).is_some() };
                 match flow {
-                    Some(Flow::Call(target)) if !may_call || !self.image.is_code(target) => return false,
+                    Some(Flow::Call(target)) if !may_call || !callable(target) => return false,
                     Some(Flow::CallIndirect(_)) if !may_call => return false,
-                    Some(Flow::JumpIndirect(None)) if A::LITERAL_POOLS => {
+                    Some(Flow::JumpIndirect(None)) if extended => {
                         let in_reach = |target: u64| target >= addr && self.region_index(target) == Some(index);
                         let Some(table) = A::resolve_table(&state, self.image, self.pointer_slots, &insn, &in_reach, &in_reach).filter(|table| table.bounded) else { return false };
                         ahead.extend(table.entries.iter().copied());
@@ -1066,13 +1072,24 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     Some(Flow::Halt | Flow::JumpIndirect(None)) => return false,
                     Some(Flow::Branch(target)) if target < addr || self.region_index(target).is_none() => return false,
                     Some(Flow::Branch(target)) => {
-                        A::branch(&mut state, &insn);
-                        ahead.insert(target);
+                        if extended {
+                            A::branch(&mut state, &insn);
+                            ahead.insert(target);
+                        }
                     }
                     Some(Flow::Jump(target)) if self.region_index(target).is_none() => return false,
-                    Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) => break finish(decoded.next_addr(), &ahead, &pools),
-                    Some(_) => A::step(&mut state, &insn),
-                    None => A::step(&mut state, &insn),
+                    Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) if extended => break finish(decoded.next_addr(), &ahead, &pools),
+                    Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) => {
+                        let end = decoded.next_addr();
+                        // A lone `ret` is more often the tail of the function before it.
+                        if end - addr < 3 {
+                            return false;
+                        }
+                        let padded = decoder.next().is_some_and(|next| next.insn.as_ref().is_some_and(A::is_padding));
+                        return padded || known(end) || end == section.end() || self.frame_of(end).is_some();
+                    }
+                    _ if extended => A::step(&mut state, &insn),
+                    _ => {}
                 }
             };
             match ended {
@@ -1342,8 +1359,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
                                 || A::TILES_GAPS && self.tiles_gap(index, addr));
                         // A whole function, or a gap that divides into functions, is code
                         // whatever its first instructions look like.
-                        let in_frame = self.inside_frame(addr) && !(self.image.frames_merge && opens);
-                        is_start = (aligned_after_break || opens || whole) && !in_frame && (A::TILES_GAPS && whole || A::code_pointer(self.image, addr));
+                        let in_frame = || self.inside_frame(addr) && !(self.image.frames_merge && opens);
+                        is_start = (aligned_after_break || opens || whole) && !in_frame() && (A::TILES_GAPS && whole || A::code_pointer(self.image, addr));
                         if !is_start {
                             // Inside an unwind entry the bytes belong to a function, so they are
                             // worth decoding to resolve what they dispatch to, without taking
