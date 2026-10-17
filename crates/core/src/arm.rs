@@ -763,10 +763,12 @@ impl Arch for Arm {
         }
     }
 
+    /// Zeros, and in Thumb code the `NOP` that aligns the next function to a word: GCC puts
+    /// neither after a call that returns.
     fn ends_code(insn: &Insn) -> bool {
         match insn {
             Insn::A32(insn) => insn.word == 0,
-            Insn::Thumb(insn) => Thumb::ends_code(insn),
+            Insn::Thumb(insn) => Thumb::ends_code(insn) || !insn.wide() && insn.hw1 == 0xBF00,
         }
     }
 
