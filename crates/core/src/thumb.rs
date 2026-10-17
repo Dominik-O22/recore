@@ -20,17 +20,17 @@ const LR: usize = 14;
 /// One instruction and where it sits, which PC-relative forms need.
 #[derive(Clone, Copy)]
 pub struct Insn {
-    addr: u64,
-    hw1: u16,
+    pub(crate) addr: u64,
+    pub(crate) hw1: u16,
     /// The second halfword of a 32-bit instruction, zero for a 16-bit one.
-    hw2: u16,
+    pub(crate) hw2: u16,
     /// Inside an `IT` block: the instruction runs only when the block's condition holds.
-    conditional: bool,
+    pub(crate) conditional: bool,
     /// The word a PC-relative `LDR` loads, when the decoded bytes hold it.
-    literal: Option<u32>,
+    pub(crate) literal: Option<u32>,
 }
 
-fn sign_extend(value: u32, bits: u32) -> i64 {
+pub(crate) fn sign_extend(value: u32, bits: u32) -> i64 {
     let shift = 64 - bits;
     ((u64::from(value) << shift) as i64) >> shift
 }
@@ -56,32 +56,32 @@ fn aligned_pc(addr: u64) -> u64 {
 }
 
 impl Insn {
-    fn wide(self) -> bool {
+    pub(crate) fn wide(self) -> bool {
         is_wide(self.hw1)
     }
 
     /// A low register in bits `low..low + 3` of the first halfword.
-    fn low_register(self, low: u32) -> usize {
+    pub(crate) fn low_register(self, low: u32) -> usize {
         usize::from(self.hw1 >> low & 7)
     }
 
     /// `Rd` of the 32-bit data-processing forms, and `RdHi` of the long multiplies.
-    fn rd(self) -> usize {
+    pub(crate) fn rd(self) -> usize {
         usize::from(self.hw2 >> 8 & 15)
     }
 
     /// `Rt` of the 32-bit loads and stores, and `RdLo` of the long multiplies.
-    fn rt(self) -> usize {
+    pub(crate) fn rt(self) -> usize {
         usize::from(self.hw2 >> 12)
     }
 
     /// `Rn` of the 32-bit forms.
-    fn rn(self) -> usize {
+    pub(crate) fn rn(self) -> usize {
         usize::from(self.hw1 & 15)
     }
 
     /// The target of a direct branch, and whether it calls: `B`, `B<c>`, `CBZ`, `CBNZ` and `BL`.
-    fn direct(self) -> Option<(u64, Transfer)> {
+    pub(crate) fn direct(self) -> Option<(u64, Transfer)> {
         let next = self.addr + 4;
         let (hw1, hw2) = (u32::from(self.hw1), u32::from(self.hw2));
         if !self.wide() {
@@ -105,10 +105,12 @@ impl Insn {
                 let offset = s << 20 | j2 << 19 | j1 << 18 | (hw1 & 0x3F) << 12 | (hw2 & 0x7FF) << 1;
                 Some((next.wrapping_add_signed(sign_extend(offset, 21)), Transfer::Branch))
             }
-            0x1000 | 0x5000 => {
+            // B.W and BL; BLX, which only code that may run A32 has, goes to A32 code at a word.
+            0x1000 | 0x5000 | 0x4000 => {
                 let (i1, i2) = (!(j1 ^ s) & 1, !(j2 ^ s) & 1);
                 let offset = s << 24 | i1 << 23 | i2 << 22 | (hw1 & 0x3FF) << 12 | (hw2 & 0x7FF) << 1;
-                let target = next.wrapping_add_signed(sign_extend(offset, 25));
+                let from = if hw2 & 0x5000 == 0x4000 { next & !3 } else { next };
+                let target = from.wrapping_add_signed(sign_extend(offset, 25));
                 Some((target, if hw2 & 0x4000 != 0 { Transfer::Call } else { Transfer::Jump }))
             }
             _ => None,
@@ -117,7 +119,7 @@ impl Insn {
 
     /// `[start, end)` of the data a PC-relative load reads: a literal `LDR` of any width,
     /// `LDRD` or `VLDR`.
-    fn literal_range(self) -> Option<(u64, u64)> {
+    pub(crate) fn literal_range(self) -> Option<(u64, u64)> {
         let (hw1, hw2) = (self.hw1, self.hw2);
         let pc = aligned_pc(self.addr);
         if !self.wide() {
@@ -143,7 +145,7 @@ impl Insn {
     }
 
     /// The register a literal `LDR` of a word loads.
-    fn literal_word_register(self) -> Option<usize> {
+    pub(crate) fn literal_word_register(self) -> Option<usize> {
         if !self.wide() {
             return (self.hw1 >> 11 == 0b01001).then(|| self.low_register(8));
         }
@@ -151,7 +153,7 @@ impl Insn {
     }
 
     /// `ADR` and `ADR.W`: the register and the address it gets.
-    fn adr(self) -> Option<(usize, u64)> {
+    pub(crate) fn adr(self) -> Option<(usize, u64)> {
         let pc = aligned_pc(self.addr);
         if !self.wide() {
             return (self.hw1 >> 11 == 0b10100).then(|| (self.low_register(8), pc + u64::from(self.hw1 & 0xFF) * 4));
@@ -165,7 +167,7 @@ impl Insn {
     }
 
     /// `MOVW` and `MOVT`: the register, the 16 bits, and whether they are the top half.
-    fn move_half(self) -> Option<(usize, u32, bool)> {
+    pub(crate) fn move_half(self) -> Option<(usize, u32, bool)> {
         if !self.wide() || self.hw2 & 0x8000 != 0 {
             return None;
         }
@@ -180,18 +182,18 @@ impl Insn {
     }
 
     /// `TBB [Rn, Rm]` or `TBH [Rn, Rm, LSL #1]`: `(Rn, Rm, entry size)`.
-    fn table_branch(self) -> Option<(usize, usize, u64)> {
+    pub(crate) fn table_branch(self) -> Option<(usize, usize, u64)> {
         (self.wide() && self.hw1 & 0xFFF0 == 0xE8D0 && self.hw2 & 0xFFE0 == 0xF000).then(|| (self.rn(), usize::from(self.hw2 & 15), if self.hw2 & 0x10 != 0 { 2 } else { 1 }))
     }
 
     /// The 16-bit forms that name a high register: `ADD`, `CMP`, `MOV`, `BX` and `BLX`, as the
     /// operation (bits 9 and 8), the destination or first operand, and the second operand.
-    fn high(self) -> Option<(u16, usize, usize)> {
+    pub(crate) fn high(self) -> Option<(u16, usize, usize)> {
         (!self.wide() && self.hw1 & 0xFC00 == 0x4400).then(|| (self.hw1 >> 8 & 3, usize::from(self.hw1 >> 4 & 8 | self.hw1 & 7), usize::from(self.hw1 >> 3 & 15)))
     }
 
     /// Whether this is `POP` or a load of several registers from the stack that includes PC.
-    fn pops_pc(self) -> bool {
+    pub(crate) fn pops_pc(self) -> bool {
         if !self.wide() {
             return self.hw1 & 0xFF00 == 0xBD00;
         }
@@ -200,7 +202,7 @@ impl Insn {
     }
 
     /// A 32-bit load into PC from somewhere other than the stack: through a pointer, or a table.
-    fn loads_pc(self) -> bool {
+    pub(crate) fn loads_pc(self) -> bool {
         if !self.wide() {
             return false;
         }
@@ -210,7 +212,7 @@ impl Insn {
     }
 
     /// The 16-bit `CMP Rn, #imm8`, `CMP Rn, Rm`, and the 32-bit `CMP.W Rn, #const`.
-    fn compare(self, state: &State) -> Option<(usize, u32)> {
+    pub(crate) fn compare(self, state: &State) -> Option<(usize, u32)> {
         if !self.wide() {
             return match self.hw1 >> 11 {
                 0b00101 => Some((self.low_register(8), u32::from(self.hw1 & 0xFF))),
@@ -228,7 +230,7 @@ impl Insn {
     /// Whether the instruction may set the condition flags. Those that cannot are loads and
     /// stores, moves of addresses and between high registers, stack adjustments, and the
     /// 32-bit forms that leave their S bit clear.
-    fn sets_flags(self) -> bool {
+    pub(crate) fn sets_flags(self) -> bool {
         let hw1 = self.hw1;
         if !self.wide() {
             return !(hw1 >> 11 == 0b01001
@@ -254,7 +256,7 @@ fn is_wide(hw1: u16) -> bool {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Transfer {
+pub(crate) enum Transfer {
     Call,
     Jump,
     Branch,
@@ -262,7 +264,7 @@ enum Transfer {
 
 /// What a register is known to hold.
 #[derive(Clone, Copy, Default, PartialEq)]
-enum Value {
+pub(crate) enum Value {
     #[default]
     Unknown,
     /// A number the code put there whole: an address, or not.
@@ -273,8 +275,9 @@ enum Value {
     Scaled { limit: Option<Limit>, shift: u8 },
     /// `base + (index << shift)`, where `base` is the PC an `ADD Rd, PC` read.
     PcIndexed { base: u32, limit: Option<Limit>, shift: u8 },
-    /// An entry of a table, of `size` bytes, shifted left.
-    Entry { table: u32, size: u8, limit: Option<Limit>, shift: u8 },
+    /// An entry of a table, of `size` bytes, shifted left, and whether it was loaded as a
+    /// signed number.
+    Entry { table: u32, size: u8, limit: Option<Limit>, shift: u8, signed: bool },
     /// A word popped off the stack, which a branch through returns: code that saved registers
     /// beside the return address pops that into a low register when it cannot pop it into PC,
     /// as Thumb-1 code after a frame of variable arguments does.
@@ -287,20 +290,20 @@ const _: () = assert!(size_of::<Value>() <= 12);
 impl Value {
     /// The value shifted left: an index on its way to a table, or an entry on its way to a case.
     /// `by` is under 32, as an instruction's shift is; shifted out of the word, it is no index.
-    fn shifted(self, by: u8) -> Value {
+    pub(crate) fn shifted(self, by: u8) -> Value {
         let total = |shift: u8| Some(shift + by).filter(|&total| total < 32);
         match self {
             _ if by == 0 => self,
             Value::Unknown => Value::Scaled { limit: None, shift: by },
             Value::Bounded(limit) => Value::Scaled { limit: Some(limit), shift: by },
             Value::Scaled { limit, shift } => total(shift).map_or(Value::Unknown, |shift| Value::Scaled { limit, shift }),
-            Value::Entry { table, size, limit, shift } => total(shift).map_or(Value::Unknown, |shift| Value::Entry { table, size, limit, shift }),
+            Value::Entry { table, size, limit, shift, signed } => total(shift).map_or(Value::Unknown, |shift| Value::Entry { table, size, limit, shift, signed }),
             _ => Value::Unknown,
         }
     }
 
     /// An index and how far it is shifted left, as far as it is known.
-    fn index(self) -> Option<(Option<Limit>, u8)> {
+    pub(crate) fn index(self) -> Option<(Option<Limit>, u8)> {
         match self {
             Value::Unknown => Some((None, 0)),
             Value::Bounded(limit) => Some((Some(limit), 0)),
@@ -313,20 +316,20 @@ impl Value {
 /// Register contents at one program point.
 #[derive(Clone, Copy, Default)]
 pub struct State {
-    registers: [Value; 16],
+    pub(crate) registers: [Value; 16],
     /// Register and number of a compare whose flags a branch may test.
-    compare: Option<(u8, u32)>,
+    pub(crate) compare: Option<(u8, u32)>,
     /// The registers the instruction being stepped over writes.
-    written: u16,
+    pub(crate) written: u16,
 }
 
 impl State {
-    fn set(&mut self, register: usize, value: Value) {
+    pub(crate) fn set(&mut self, register: usize, value: Value) {
         self.registers[register] = value;
         self.written |= 1 << register;
     }
 
-    fn clobber(&mut self, mask: u16) {
+    pub(crate) fn clobber(&mut self, mask: u16) {
         self.written |= mask;
         for register in (0..16).filter(|register| mask >> register & 1 != 0) {
             self.registers[register] = Value::Unknown;
@@ -335,7 +338,7 @@ impl State {
 
     /// A compare's flags stay for a branch after instructions that set none, as long as the
     /// register it compared keeps its value.
-    fn step(&mut self, insn: Insn) {
+    pub(crate) fn step(&mut self, insn: Insn) {
         if let Some((register, bound)) = insn.compare(self) {
             self.compare = Some((register as u8, bound));
             return;
@@ -346,7 +349,7 @@ impl State {
         self.compare = kept.filter(|&(register, _)| self.written >> register & 1 == 0);
     }
 
-    fn apply(&mut self, insn: Insn) {
+    pub(crate) fn apply(&mut self, insn: Insn) {
         if let Some(register) = insn.literal_word_register() {
             self.set(register, insn.literal.map_or(Value::Unknown, Value::Const));
             return;
@@ -418,7 +421,7 @@ impl State {
                     0b110 => 1,
                     _ => 0,
                 };
-                let value = self.indexed_entry(self.registers[rn], self.registers[rm], size);
+                let value = self.indexed_entry(self.registers[rn], self.registers[rm], size, false);
                 self.set(rd, value);
             }
             // LDR, LDRB and LDRH with an immediate offset.
@@ -432,7 +435,7 @@ impl State {
                 let value = match self.registers[rn] {
                     // The shift that made the index makes it count entries of this size, of a
                     // table that ends below 4 GB.
-                    Value::PcIndexed { base, limit, shift } if 1 << shift == size => base.checked_add(offset).map_or(Value::Unknown, |table| Value::Entry { table, size: size as u8, limit, shift: 0 }),
+                    Value::PcIndexed { base, limit, shift } if 1 << shift == size => base.checked_add(offset).map_or(Value::Unknown, |table| Value::Entry { table, size: size as u8, limit, shift: 0, signed: false }),
                     _ => Value::Unknown,
                 };
                 self.set(rd, value);
@@ -522,11 +525,34 @@ impl State {
         }
     }
 
+    /// Splits the state at a branch taken on `condition`: returns the state where it is taken
+    /// and leaves this one as it is where it is not. A compare's bound holds on the side of the
+    /// branch it proves.
+    pub(crate) fn split(&mut self, condition: Option<u16>) -> State {
+        let compare = self.compare.take();
+        let mut taken = *self;
+        if let (Some((register, bound)), Some(condition)) = (compare, condition) {
+            let register = usize::from(register);
+            let bounded = |bound: u32| Value::Bounded(Limit::of(u64::from(bound)));
+            match condition {
+                // HI: falling through means the index is at most the bound.
+                8 => self.set(register, bounded(bound)),
+                // LS: taken means it.
+                9 => taken.set(register, bounded(bound)),
+                // HS and LO: the strict forms.
+                2 if bound > 0 => self.set(register, bounded(bound - 1)),
+                3 if bound > 0 => taken.set(register, bounded(bound - 1)),
+                _ => {}
+            }
+        }
+        taken
+    }
+
     /// What a load of `size` bytes from `[base, index]` gives: an entry when one of the two is a
     /// table's address and the other an index scaled to entries of that size.
-    fn indexed_entry(&self, base: Value, index: Value, size: u32) -> Value {
+    pub(crate) fn indexed_entry(&self, base: Value, index: Value, size: u32, signed: bool) -> Value {
         let entry = |table: Value, index: Value| match (table, index.index()) {
-            (Value::Const(table), Some((limit, shift))) if size != 0 && 1 << shift == size => Some(Value::Entry { table, size: size as u8, limit, shift: 0 }),
+            (Value::Const(table), Some((limit, shift))) if size != 0 && 1 << shift == size => Some(Value::Entry { table, size: size as u8, limit, shift: 0, signed }),
             _ => None,
         };
         entry(base, index).or_else(|| entry(index, base)).unwrap_or(Value::Unknown)
@@ -534,17 +560,18 @@ impl State {
 }
 
 /// The registers a call may change: R0 to R3, R12 and LR.
-const CALLER_SAVED: u16 = 0b0101_0000_0000_1111;
+pub(crate) const CALLER_SAVED: u16 = 0b0101_0000_0000_1111;
 
 /// How a table's entry gives its case.
 #[derive(Clone, Copy)]
-enum Cases {
+pub(crate) enum Cases {
     /// `base + (entry << shift)`.
     Relative { base: u64, shift: u8 },
     /// The same with the entry signed, and without the Thumb bit the sum may have.
     Signed { base: u64, shift: u8 },
-    /// The entry is the case's address, with the Thumb bit.
-    Absolute,
+    /// The entry is the case's address, with the Thumb bit where `thumb` and without it
+    /// elsewhere.
+    Absolute { thumb: bool },
 }
 
 /// One of libgcc's helpers for a Thumb-1 `switch`, `__gnu_thumb1_case_*` of `lib1funcs.S`: called
@@ -599,7 +626,7 @@ impl CaseHelper {
 /// Reads the table of `size`-byte entries at `table`. Without a bound it ends at the first entry
 /// that is not a plausible case, or where the lowest case after the table begins, since the
 /// cases follow it.
-fn read_table(image: &Image, table: u64, size: u64, limit: Option<Limit>, cases: Cases, is_target: &dyn Fn(u64) -> bool) -> Option<Table> {
+pub(crate) fn read_table(image: &Image, table: u64, size: u64, limit: Option<Limit>, cases: Cases, is_target: &dyn Fn(u64) -> bool) -> Option<Table> {
     let bytes = image.bytes_from(table)?;
     let mut entries = Vec::new();
     let mut lowest = u64::MAX;
@@ -615,7 +642,7 @@ fn read_table(image: &Image, table: u64, size: u64, limit: Option<Limit>, cases:
                 let unused = 64 - 8 * size as u32;
                 base.checked_add_signed(((value << unused) as i64 >> unused) << shift).map(|target| target & !1)
             }
-            Cases::Absolute => (value & 1 != 0).then_some(value & !1),
+            Cases::Absolute { thumb } => (value & 1 == u64::from(thumb)).then_some(value & !1),
         };
         // A case is never the table itself, which a padding byte of zero would give.
         let Some(target) = target.filter(|&target| (target < table || target >= at + size) && is_target(target)) else {
@@ -756,8 +783,9 @@ fn scan(image: &Image, start: u64, end: u64, mut visit: impl FnMut(&Insn, &State
 pub struct Thumb;
 
 /// Decodes the instruction at `offset` into `bytes`, which are loaded at `base`. `it` counts the
-/// instructions of an `IT` block still to come.
-fn decode_at(bytes: &[u8], base: u64, offset: usize, it: &mut u8) -> Option<Decoded<Insn>> {
+/// instructions of an `IT` block still to come. `BLX` to A32 code is an instruction only where
+/// the processor runs A32 as well.
+pub(crate) fn decode_at(bytes: &[u8], base: u64, offset: usize, it: &mut u8, a32: bool) -> Option<Decoded<Insn>> {
     let hw1 = u16::from_le_bytes(bytes.get(offset..offset + 2)?.try_into().unwrap());
     let addr = base + offset as u64;
     let wide = is_wide(hw1);
@@ -769,8 +797,7 @@ fn decode_at(bytes: &[u8], base: u64, offset: usize, it: &mut u8) -> Option<Deco
     };
     let conditional = *it != 0;
     *it = it.saturating_sub(1);
-    // BLX to ARM code, which a Cortex-M does not run.
-    if wide && hw1 >> 11 == 0b11110 && hw2 & 0xD000 == 0xC000 {
+    if !a32 && wide && hw1 >> 11 == 0b11110 && hw2 & 0xD000 == 0xC000 {
         return Some(Decoded { addr, len: 4, insn: None });
     }
     // IT with a mask: the instructions it makes conditional follow.
@@ -798,7 +825,7 @@ pub struct Decoder<'a> {
 impl Thumb {
     /// The address the instruction completes in a register, whatever it is: a literal, an
     /// `ADR`, or the top half of a `MOVW` and `MOVT` pair.
-    fn completed_address(insn: &Insn, state: &State) -> Option<u32> {
+    pub(crate) fn completed_address(insn: &Insn, state: &State) -> Option<u32> {
         if insn.literal_word_register().is_some() {
             return insn.literal;
         }
@@ -833,7 +860,7 @@ impl Arch for Thumb {
     fn decode<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> + 'a {
         let (mut offset, mut it) = (0, 0);
         std::iter::from_fn(move || {
-            let decoded = decode_at(bytes, addr, offset, &mut it)?;
+            let decoded = decode_at(bytes, addr, offset, &mut it, false)?;
             offset += usize::from(decoded.len);
             Some(decoded)
         })
@@ -851,7 +878,7 @@ impl Arch for Thumb {
     }
 
     fn decode_next<'d>(decoder: &'d mut Decoder<'_>) -> Option<Decoded<&'d Insn>> {
-        let decoded = decode_at(decoder.bytes, decoder.base, decoder.offset, &mut decoder.it)?;
+        let decoded = decode_at(decoder.bytes, decoder.base, decoder.offset, &mut decoder.it, false)?;
         decoder.offset += usize::from(decoded.len);
         let insn = &mut decoder.insn;
         Some(Decoded { addr: decoded.addr, len: decoded.len, insn: decoded.insn.map(|decoded| &*{ *insn = decoded; insn }) })
@@ -914,7 +941,7 @@ impl Arch for Thumb {
     }
 
     /// A pointer to code: one with the Thumb bit.
-    fn address_taken(insn: &Insn, state: &State) -> Option<u64> {
+    fn address_taken(insn: &Insn, state: &State, _: &Image) -> Option<u64> {
         Self::completed_address(insn, state).filter(|address| address & 1 != 0).map(|address| u64::from(address & !1))
     }
 
@@ -1156,28 +1183,12 @@ impl Arch for Thumb {
     }
 
     fn branch(fallthrough: &mut State, insn: &Insn) -> State {
-        let compare = fallthrough.compare.take();
-        let mut taken = *fallthrough;
         let condition = match (insn.wide(), insn.direct()) {
             (false, Some((_, Transfer::Branch))) if insn.hw1 >> 12 == 0xD => Some(insn.hw1 >> 8 & 15),
             (true, Some((_, Transfer::Branch))) => Some(insn.hw1 >> 6 & 15),
             _ => None,
         };
-        if let (Some((register, bound)), Some(condition)) = (compare, condition) {
-            let register = usize::from(register);
-            let bounded = |bound: u32| Value::Bounded(Limit::of(u64::from(bound)));
-            match condition {
-                // HI: falling through means the index is at most the bound.
-                8 => fallthrough.set(register, bounded(bound)),
-                // LS: taken means it.
-                9 => taken.set(register, bounded(bound)),
-                // HS and LO: the strict forms.
-                2 if bound > 0 => fallthrough.set(register, bounded(bound - 1)),
-                3 if bound > 0 => taken.set(register, bounded(bound - 1)),
-                _ => {}
-            }
-        }
-        taken
+        fallthrough.split(condition)
     }
 
     fn after_jump(_: State, _: &Insn) -> State {
@@ -1211,12 +1222,12 @@ impl Arch for Thumb {
             return read_table(image, next, size, limit, Cases::Relative { base: next, shift: 1 }, is_target);
         }
         let (operation, rm) = jump.high().map(|(operation, _, rm)| (operation, rm))?;
-        let Value::Entry { table, size, limit, shift } = state.registers[rm] else { return None };
+        let Value::Entry { table, size, limit, shift, .. } = state.registers[rm] else { return None };
         match operation {
             // ADD PC, Rm: the entry, scaled, counts from the PC the ADD reads.
             0 => read_table(image, u64::from(table), u64::from(size), limit, Cases::Relative { base: next, shift }, is_target),
             // MOV PC, Rm: the entry is the case's address.
-            2 if size == 4 && shift == 0 => read_table(image, u64::from(table), 4, limit, Cases::Absolute, is_target),
+            2 if size == 4 && shift == 0 => read_table(image, u64::from(table), 4, limit, Cases::Absolute { thumb: true }, is_target),
             _ => None,
         }
     }
@@ -1313,7 +1324,7 @@ mod tests {
         let bytes = [0x00, 0xBF, 0x01, 0x48, 0x70, 0x47, 0x00, 0xBF, 0x35, 0x12, 0x00, 0x08];
         let insn = Thumb::decode(&image(&bytes, 0x1000), &bytes, 0x1000).nth(1).unwrap().insn.unwrap();
         assert_eq!((Thumb::literal(&insn), insn.literal), (Some((0x1008, 0x100C)), Some(0x0800_1235)));
-        assert_eq!(Thumb::address_taken(&insn, &State::default()), Some(0x0800_1234));
+        assert_eq!(Thumb::address_taken(&insn, &State::default(), &image(&bytes, 0x1000)), Some(0x0800_1234));
     }
 
     #[test]
@@ -1342,7 +1353,7 @@ mod tests {
         // LSLS R0, R0, #2; ADD R0, PC; LDR R0, [R0, #4]: an entry of the table after the code,
         // unless that would lie past 4 GB.
         let entry = |addr: u64| registers_after(&[0x0080, 0x4478, 0x6840], addr)[0];
-        assert!(entry(0x1000) == Value::Entry { table: 0x100A, size: 4, limit: None, shift: 0 });
+        assert!(entry(0x1000) == Value::Entry { table: 0x100A, size: 4, limit: None, shift: 0, signed: false });
         assert!(entry(0xFFFF_FFF8) == Value::Unknown);
         // ADD R0, PC at an address past 4 GB, which a layout refuses but a hand-made image may hold.
         assert!(registers_after(&[0x0080, 0x4478], 0x1_0000_0000)[0] == Value::Unknown);

@@ -147,6 +147,7 @@ fn by_machine(image: &Image, targets: Option<&BTreeSet<u64>>) -> Score {
         Machine::Aarch64 => score_with::<crate::arm64::Arm64>(image, targets),
         Machine::I8051 => score_with::<crate::i8051::I8051>(image, targets),
         Machine::Thumb => score_with::<crate::thumb::Thumb>(image, targets),
+        Machine::Arm => score_with::<crate::arm::Arm>(image, targets),
     }
 }
 

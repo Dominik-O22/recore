@@ -59,6 +59,7 @@ pub fn field_uses(image: &Image, body: &[(u64, u64)], offset: u64) -> Vec<(u64, 
         Machine::Aarch64 => with::<crate::arm64::Arm64>(image, body, offset),
         Machine::I8051 => with::<crate::i8051::I8051>(image, body, offset),
         Machine::Thumb => with::<crate::thumb::Thumb>(image, body, offset),
+        Machine::Arm => with::<crate::arm::Arm>(image, body, offset),
     }
 }
 
@@ -105,7 +106,7 @@ pub fn text_arguments(image: &Image, body: &[(u64, u64)], calls: &[u64], is_text
         (Machine::X86_64, true) => with::<X86<64, true>>(image, body, calls, is_text),
         (Machine::X86_64, false) => with::<X86<64, false>>(image, body, calls, is_text),
         (Machine::Thumb, _) => with::<crate::thumb::Thumb>(image, body, calls, is_text),
-        (Machine::X86 | Machine::Aarch64 | Machine::I8051, _) => Vec::new(),
+        (Machine::X86 | Machine::Aarch64 | Machine::I8051 | Machine::Arm, _) => Vec::new(),
     }
 }
 
@@ -125,6 +126,7 @@ pub fn takes_variable_arguments(image: &Image, start: u64, end: u64) -> bool {
         Machine::X86 | Machine::I8051 => false,
         Machine::Thumb => with::<crate::thumb::Thumb>(image, start, end),
         Machine::Aarch64 => with::<crate::arm64::Arm64>(image, start, end),
+        Machine::Arm => with::<crate::arm::Arm>(image, start, end),
     }
 }
 
@@ -136,6 +138,7 @@ pub fn cfg(image: &Image, analysis: &Analysis, body: &[(u64, u64)]) -> Cfg {
         Machine::Aarch64 => cfg_with::<crate::arm64::Arm64>(image, analysis, body),
         Machine::I8051 => cfg_with::<crate::i8051::I8051>(image, analysis, body),
         Machine::Thumb => cfg_with::<crate::thumb::Thumb>(image, analysis, body),
+        Machine::Arm => cfg_with::<crate::arm::Arm>(image, analysis, body),
     }
 }
 

@@ -488,7 +488,7 @@ pub fn decode_floor(binary: &Path, runs: usize) -> Result<()> {
                 }
                 if level >= 3 {
                     found += u64::from(A::memory_reference(&insn, &state).is_some());
-                    found += u64::from(A::address_taken(&insn, &state).is_some());
+                    found += u64::from(A::address_taken(&insn, &state, image).is_some());
                     found += u64::from(A::based_data_address(&insn, &state).is_some());
                 }
             }
@@ -507,6 +507,7 @@ pub fn decode_floor(binary: &Path, runs: usize) -> Result<()> {
                 Machine::Aarch64 => walk::<recore::arm64::Arm64>(image, &ranges, level),
                 Machine::I8051 => walk::<recore::i8051::I8051>(image, &ranges, level),
                 Machine::Thumb => walk::<recore::thumb::Thumb>(image, &ranges, level),
+                Machine::Arm => walk::<recore::arm::Arm>(image, &ranges, level),
             };
             times.push(ms(start));
         }

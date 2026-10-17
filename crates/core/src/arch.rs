@@ -176,8 +176,9 @@ pub trait Arch: 'static {
     fn flow(insn: &Self::Insn, state: &Self::State, image: &Image) -> Option<Flow>;
 
     /// The address `insn` materialises in a register, if it computes one: how code takes the
-    /// address of a function or of data.
-    fn address_taken(insn: &Self::Insn, state: &Self::State) -> Option<u64>;
+    /// address of a function or of data. The image says whether a number its code holds can be
+    /// an address at all.
+    fn address_taken(insn: &Self::Insn, state: &Self::State, image: &Image) -> Option<u64>;
 
     /// Where [`Arch::CALL_MAY_BE_FAR_JUMP`], whether `insn` is of an instruction set whose branches
     /// reach as far as its calls, so that code that has it never jumps with a call.

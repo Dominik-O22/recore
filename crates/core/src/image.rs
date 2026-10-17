@@ -50,6 +50,17 @@ pub enum Machine {
     /// An ARM Cortex-M, which runs Thumb code only.
     #[serde(rename = "cortex-m")]
     Thumb,
+    /// A 32-bit ARM application processor, which runs A32 and Thumb code side by side, as
+    /// Linux on ARMv5 to ARMv7 does.
+    #[serde(rename = "arm")]
+    Arm,
+}
+
+/// What 32-bit ARM code at an address is: A32, four bytes an instruction, or Thumb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionSet {
+    A32,
+    Thumb,
 }
 
 /// The compiler that built an image, where a layout file names it. It decides how functions
@@ -66,7 +77,7 @@ impl Machine {
     /// Bytes in a pointer, which is how wide a code or data address stored in the image is.
     pub fn pointer_size(self) -> u64 {
         match self {
-            Machine::X86 | Machine::Thumb => 4,
+            Machine::X86 | Machine::Thumb | Machine::Arm => 4,
             Machine::X86_64 | Machine::Aarch64 => 8,
             Machine::I8051 => 2,
         }
@@ -162,6 +173,10 @@ pub struct Image {
     pub banking: Banking,
     /// What a layout says built the image. Without it the machine and the format decide.
     pub compiler: Option<Compiler>,
+    /// Where the code of a 32-bit ARM image changes instruction set, as `(address, set)` sorted
+    /// by address: each holds up to the next. What comes before the first is in its set. Empty
+    /// for every other machine.
+    pub instruction_sets: Vec<(u64, InstructionSet)>,
 }
 
 impl Image {
@@ -185,6 +200,7 @@ impl Image {
             data_in_code: matches!(format, Format::Pe | Format::Raw),
             banking: Banking::default(),
             compiler: None,
+            instruction_sets: Vec::new(),
         }
     }
 
@@ -242,6 +258,7 @@ impl Image {
             object::Architecture::I386 => Machine::X86,
             object::Architecture::X86_64 => Machine::X86_64,
             object::Architecture::Aarch64 => Machine::Aarch64,
+            object::Architecture::Arm if file.is_little_endian() => Machine::Arm,
             other => anyhow::bail!("unsupported architecture {other:?}"),
         };
 
@@ -263,7 +280,7 @@ impl Image {
             })
             .unwrap_or_default();
 
-        Ok(Image {
+        let mut image = Image {
             zero_filled,
             format: if is_pe { Format::Pe } else { Format::Elf },
             base: if is_pe { file.relative_address_base() } else { 0 },
@@ -277,10 +294,16 @@ impl Image {
             exports,
             frames,
             relative_targets,
-            data_in_code: is_pe,
+            // ARM code reads its constants from pools among it.
+            data_in_code: is_pe || machine == Machine::Arm,
             banking: Banking::default(),
             compiler: None,
-        })
+            instruction_sets: Vec::new(),
+        };
+        if machine == Machine::Arm {
+            crate::arm::load(&file, &mut image);
+        }
+        Ok(image)
     }
 
     pub fn section_at(&self, addr: u64) -> Option<&Section> {
@@ -304,6 +327,16 @@ impl Image {
         Some(&section.data[(addr - section.addr) as usize..])
     }
 
+    /// The instruction set of the 32-bit ARM code at `addr`, and the addresses it holds over.
+    pub fn instruction_set(&self, addr: u64) -> (InstructionSet, std::ops::Range<u64>) {
+        let index = self.instruction_sets.partition_point(|&(start, _)| start <= addr);
+        let (from, set) = match index {
+            0 => (0, self.instruction_sets.first().map_or(InstructionSet::A32, |&(_, set)| set)),
+            _ => self.instruction_sets[index - 1],
+        };
+        (set, from..self.instruction_sets.get(index).map_or(u64::MAX, |&(start, _)| start))
+    }
+
     pub fn text(&self) -> Option<&Section> {
         self.sections.iter().find(|s| s.name == ".text" || s.name == "__TEXT,__text")
     }
@@ -324,6 +357,12 @@ fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, St
                         import_slots.insert(addr, name.to_string());
                     }
                 }
+                // A REL relocation keeps its addend in the word it relocates.
+                object::RelocationTarget::Absolute if reloc.has_implicit_addend() => {
+                    if let Some(word) = read_word(sections, addr, if file.is_64() { 8 } else { 4 }) {
+                        relative_targets.push((addr, word));
+                    }
+                }
                 object::RelocationTarget::Absolute => relative_targets.push((addr, reloc.addend() as u64)),
                 _ => {}
             }
@@ -332,12 +371,7 @@ fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, St
 
     // Packed relative relocations store the target in the relocated word itself.
     if let Some(relr) = file.section_by_name(".relr.dyn").and_then(|s| s.uncompressed_data().ok()) {
-        let read_word = |addr: u64| {
-            let section = sections.iter().find(|s| s.contains(addr))?;
-            let bytes = section.data.get((addr - section.addr) as usize..)?.get(..8)?;
-            Some(u64::from_le_bytes(bytes.try_into().unwrap()))
-        };
-        relative_targets.extend(relr_slots(&relr).into_iter().filter_map(|slot| Some((slot, read_word(slot)?))));
+        relative_targets.extend(relr_slots(&relr).into_iter().filter_map(|slot| Some((slot, read_word(sections, slot, 8)?))));
     }
 
     let exports = file
@@ -352,6 +386,13 @@ fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, St
         .unwrap_or_default();
 
     (import_slots, relative_targets, exports, frames)
+}
+
+/// The little-endian word of `size` bytes at `addr`.
+fn read_word(sections: &[Section], addr: u64, size: usize) -> Option<u64> {
+    let section = sections.iter().find(|s| s.contains(addr))?;
+    let bytes = section.data.get((addr - section.addr) as usize..)?.get(..size)?;
+    Some(bytes.iter().rev().fold(0, |word, &byte| word << 8 | u64::from(byte)))
 }
 
 /// Sections that are written only by the loader and protected afterwards (full RELRO).

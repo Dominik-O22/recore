@@ -105,7 +105,7 @@ impl Target {
             (Machine::Aarch64, _) => Target::Aarch64,
             (Machine::I8051, _) if image.compiler == Some(Compiler::Sdcc) => Target::I8051Sdcc,
             (Machine::I8051, _) => Target::I8051,
-            (Machine::Thumb, _) => Target::Thumb,
+            (Machine::Thumb | Machine::Arm, _) => Target::Thumb,
         }
     }
 

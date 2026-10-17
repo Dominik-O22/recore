@@ -61,6 +61,13 @@ enum Command {
         #[arg(long)]
         detail: bool,
     },
+    /// Scores the instruction set recore gives each function of a 32-bit ARM binary against its
+    /// symbol, which has the Thumb bit for Thumb code.
+    ScoreInstructionSets {
+        /// Print each function in the wrong set.
+        #[arg(long)]
+        detail: bool,
+    },
     /// Scores one or more analyzer output directories against the truth.
     Score {
         /// Directories of `<name>.json` analysis files, e.g. `corpus/ghidra`.
@@ -256,6 +263,11 @@ fn main() -> Result<()> {
         Command::ScoreReferences { misses } => references::score(&cli.corpus, misses),
         Command::ScoreClasses { detail } => classes::score(&cli.corpus, detail),
         Command::PeFacts { detail } => run_pe_facts(&cli.corpus, detail),
+        Command::ScoreInstructionSets { detail } => {
+            let (right, all) = truth::arm::score_instruction_sets(&cli.corpus, detail)?;
+            println!("{}: {right} of {all} functions in the right instruction set ({:.2}%)", cli.corpus.display(), 100.0 * right as f64 / all.max(1) as f64);
+            Ok(())
+        }
         Command::Score { dirs, detail } => dirs.iter().try_for_each(|dir| run_score(&cli.corpus, dir, detail)),
     }
 }

@@ -450,7 +450,7 @@ impl Arch for Arm64 {
         }
     }
 
-    fn address_taken(insn: &Insn, state: &State) -> Option<u64> {
+    fn address_taken(insn: &Insn, state: &State, _: &Image) -> Option<u64> {
         match insn.pc_relative() {
             Some((false, address)) => Some(address),
             Some((true, _)) => None,

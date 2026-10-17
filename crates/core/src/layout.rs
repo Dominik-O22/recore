@@ -454,6 +454,7 @@ impl Layout {
             data_in_code: matches!(self.machine, Machine::I8051 | Machine::Thumb),
             banking,
             compiler: self.compiler,
+            instruction_sets: Vec::new(),
         })
     }
 }

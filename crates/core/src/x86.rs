@@ -80,7 +80,7 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         classify(insn)
     }
 
-    fn address_taken(insn: &Instruction, _: &State) -> Option<u64> {
+    fn address_taken(insn: &Instruction, _: &State, _: &Image) -> Option<u64> {
         if BITS == 64 { lea_target(insn) } else { immediate_address(insn) }
     }
 

@@ -470,7 +470,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     if self.recording {
                         self.note_references(insn, &state, decoded.addr, speculative);
                     }
-                    let mut taken = A::address_taken(insn, &state).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
+                    let mut taken = A::address_taken(insn, &state, self.image).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
                     let in_code = taken.is_some_and(|target| self.region_index(target).is_some());
                     if in_code && !A::code_pointer(self.image, taken.unwrap_or_default()) {
                         taken = None;

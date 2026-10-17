@@ -270,6 +270,7 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
         data_in_code: false,
         banking: Default::default(),
         compiler: None,
+        instruction_sets: Vec::new(),
     };
     // A method list of 32-bit offsets is no pointer the loader rebases, so nothing else says
     // that its methods are code.

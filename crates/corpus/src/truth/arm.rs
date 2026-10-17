@@ -502,3 +502,31 @@ pub fn jump_tables(name: String, binary: &object::File, debug: &object::File) ->
     let listed = tables.len() + rejected.len();
     Ok(Some(Extracted { truth: JumpTables { name, tables }, listed, rejected }))
 }
+
+/// How many functions of the 32-bit ARM binaries of `corpus` recore puts in the instruction set
+/// that their symbol says, as `(right, all)`, with each wrong one printed when `detail`.
+pub fn score_instruction_sets(corpus: &Path, detail: bool) -> Result<(usize, usize)> {
+    use rayon::prelude::*;
+    let binaries = crate::binaries(corpus)?;
+    let counts: Vec<(usize, usize)> = binaries
+        .par_iter()
+        .filter_map(|binary| {
+            let image = recore::Image::load(binary).ok().filter(|image| image.machine == recore::image::Machine::Arm)?;
+            let data = std::fs::read(crate::debug_file(corpus, &crate::name_of(binary))).ok()?;
+            let debug = object::File::parse(&*data).ok()?;
+            let (mut right, mut all) = (0, 0);
+            for symbol in debug.symbols().filter(|symbol| symbol.kind() == SymbolKind::Text && symbol.size() > 0 && image.is_code(symbol.address() & !1)) {
+                let expected = if symbol.address() & 1 != 0 { recore::image::InstructionSet::Thumb } else { recore::image::InstructionSet::A32 };
+                let (found, _) = image.instruction_set(symbol.address() & !1);
+                all += 1;
+                if found == expected {
+                    right += 1;
+                } else if detail {
+                    println!("{} {:#x} {}: {expected:?}, recore says {found:?}", image.name, symbol.address() & !1, symbol.name().unwrap_or_default());
+                }
+            }
+            Some((right, all))
+        })
+        .collect();
+    Ok(counts.into_iter().fold((0, 0), |(right, all), (r, a)| (right + r, all + a)))
+}

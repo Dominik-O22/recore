@@ -366,7 +366,7 @@ impl Arch for I8051 {
     }
 
     /// Nothing: `MOV DPTR, #address` loads the address of data far more often than of code.
-    fn address_taken(_: &Insn, _: &State) -> Option<u64> {
+    fn address_taken(_: &Insn, _: &State, _: &Image) -> Option<u64> {
         None
     }
 
