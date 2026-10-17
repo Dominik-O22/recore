@@ -103,8 +103,8 @@ Scored against debug information, on the same binaries as Ghidra. Mach-O binarie
 | | Ghidra | 99.7% | 97.1% | 487 of 535 |
 | Linux AArch64 | recore | 100.0% | 99.9% | |
 | | Ghidra | 100.0% | 99.9% | |
-| Linux 32-bit ARM, armhf | recore | 99.1% | 99.6% | 5,090 of 5,161 |
-| | Ghidra | 64.3% | 99.8% | 4,123 of 5,161 |
+| Linux 32-bit ARM, armhf | recore | 99.1% | 99.6% | 5,090 of 5,158 |
+| | Ghidra | 64.3% | 99.8% | 4,123 of 5,158 |
 | Linux 32-bit ARM, armel | recore | 99.0% | 99.6% | 5,252 of 5,323 |
 | | Ghidra | 55.1% | 99.7% | 3,821 of 5,323 |
 | Windows x86 | recore | 99.3% | 98.8% | 6,244 of 6,277 |
@@ -186,16 +186,22 @@ The decompiler names the compiler's library routines by a hash of their code, so
 
 A `names` file gives the hardware's registers and bits their names, the standard 8051 ones are built in, and `recore-mcp unnamed` lists the addresses the code uses most that have none. Text is found where it is stored as ASCII. A firmware that stores its menu as indices into its own font, as the monitor's does, shows none of that text.
 
-A Cortex-M layout needs only `machine = "cortex-m"` and its flash region. recore reads the reset handler and every interrupt handler from the vector table, which it takes to start the lowest executable region unless the layout says `vectors = <address>`, or `vectors = "none"` with the entry points in `entry`. It is scored against the ELF each image was cut from, with Ghidra seeded from the same vector table. 27 programs are built by clang for Cortex-M0, M3 and M4 at `-O0`, `-Os` and `-O2`, each function in its own section. 12 more are laid out as a vendor build usually is, with no per-function sections, so unused library functions stay in the image between the used ones.
+A Cortex-M layout needs only `machine = "cortex-m"` and its flash region. recore reads the reset handler and every interrupt handler from the vector table, which it takes to start the lowest executable region unless the layout says `vectors = <address>`, or `vectors = "none"` with the entry points in `entry`. It is scored against the ELF each image was cut from, with Ghidra seeded from the same vector table. 27 programs are built for Cortex-M0, M3 and M4 at `-O0`, `-Os` and `-O2`, each function in its own section. 12 more are laid out as a vendor build usually is, with no per-function sections, so unused library functions stay in the image between the used ones. clang builds each of the 39 and so does GCC, and GNU ld links them all with libgcc and newlib-nano from the Arm GNU Toolchain.
 
 | Cortex-M | | Functions found | Precision | Jump tables exact |
 |---|---|---|---|---|
-| 27 programs | recore | 99.9% | 100.0% | 119 of 119 |
-| | Ghidra | 91.5% | 98.6% | 112 of 119 |
-| 12 vendor-style builds | recore | 99.3% | 99.9% | 57 of 59 |
-| | Ghidra | 66.8% | 98.6% | 49 of 59 |
+| 27 programs, clang | recore | 98.7% | 95.0% | 119 of 119 |
+| | Ghidra | 86.2% | 96.9% | 112 of 119 |
+| 27 programs, GCC | recore | 99.0% | 94.8% | 41 of 41 |
+| | Ghidra | 87.5% | 98.1% | 36 of 41 |
+| 12 vendor-style builds, clang | recore | 98.3% | 95.8% | 57 of 57 |
+| | Ghidra | 69.5% | 97.6% | 49 of 57 |
+| 12 vendor-style builds, GCC | recore | 99.2% | 95.2% | 27 of 28 |
+| | Ghidra | 64.0% | 98.0% | 15 of 28 |
 
-recore analyzes all 39 in 55 ms, none taking more than 3 ms. Most of the functions Ghidra misses are reached only by a tail call, by an address the code builds with `MOVW` and `MOVT`, or, in the vendor-style builds, by nothing at all. recore finds those by dividing the unreached code between functions into whole functions. Every function decompiles, in 3 ms on average, and against DWARF the number of parameters is right for 86.7% of the C functions. The System Control Space registers, such as `SYST_RVR` and the NVIC's, are named without a names file. The corpus has no GCC-built code, because no ARM GCC was at hand. GCC's Thumb-1 switch helpers are recognised, and tested only on hand-assembled code.
+recore analyzes all 78 in 128 ms, none taking more than 4 ms. Most of the functions Ghidra misses are reached only by a tail call, by an address the code builds with `MOVW` and `MOVT`, or, in the vendor-style builds, by nothing at all. recore finds those by dividing the unreached code between functions into whole functions. Its precision is lower than Ghidra's because of libgcc's hand-written assembly, which every program links. Of the 325 starts recore puts inside a function, 298 are in libgcc's floating point and division routines, where `__aeabi_ddiv` branches into the end of `__aeabi_dmul` and Thumb-1 division leaves a `BX LR` after its last branch. Ghidra splits these two routines as well, with two starts inside them per program to recore's five. GCC's Thumb-1 switches call libgcc's `__gnu_thumb1_case_*` helpers with the table after the call, and recore reads all 15 of those tables.
+
+All but 5 of the 7,757 functions recore finds decompile, in 3.7 ms on average, and those 5 are data it took for code. Against DWARF the number of parameters is right for 85.9% of the C functions clang built and 80.2% of those GCC built. GCC saves a spare register to keep the stack aligned, as in `PUSH {R3, R4, R5, LR}`, and the decompiler takes the saved `R3` for a fourth argument. The System Control Space registers, such as `SYST_RVR` and the NVIC's, are named without a names file.
 
 ## What Ghidra does that recore does not
 
@@ -235,7 +241,7 @@ For Claude Code, in `.mcp.json`:
 
 ## Reproducing the numbers
 
-The corpora are not in the repository. `corpus/fetch*.py` download them, except the monitor firmware, a vendor's image that is not ours to share, `corpus/build_8051.py` builds the 8051 programs with SDCC, `corpus/build_thumb.py` the Cortex-M ones with clang, and `MISE_ENV=corpus mise run corpus` runs both after `MISE_ENV=corpus mise install` has fetched the tools `mise.corpus.toml` names. `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. Ghidra refuses a project path that has a part starting with a dot. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. `recore-decompile structs <corpus>... --tuning bench/set.txt` scores recovered structs against DWARF, the binaries of the benchmark set apart from the rest. `recore-bench run analysis --save <name>` and `--compare <name>` hold a change against an earlier build. Next to the times they report the processor instructions executed, which stay the same to a few hundredths of a percent whatever else the machine is doing.
+The corpora are not in the repository. `corpus/fetch*.py` download them, except the monitor firmware, a vendor's image that is not ours to share, `corpus/build_8051.py` builds the 8051 programs with SDCC, `corpus/build_thumb.py` the Cortex-M ones with clang and GCC, and `MISE_ENV=corpus mise run corpus` runs both after `MISE_ENV=corpus mise install` has fetched the tools `mise.corpus.toml` names. `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. Ghidra refuses a project path that has a part starting with a dot. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. `recore-decompile structs <corpus>... --tuning bench/set.txt` scores recovered structs against DWARF, the binaries of the benchmark set apart from the rest. `recore-bench run analysis --save <name>` and `--compare <name>` hold a change against an earlier build. Next to the times they report the processor instructions executed, which stay the same to a few hundredths of a percent whatever else the machine is doing.
 
 The speed table compares Ghidra's `Total Time` per binary with the wall time of `recore-mcp summary`, fastest of three runs, and `ghidra/speed.py` measures it. Both ran on the same Ryzen 7 9850X3D. Ghidra analyzed several binaries at a time with 4 cores each, and recore one at a time, with all cores or pinned to one with `taskset`.
 
