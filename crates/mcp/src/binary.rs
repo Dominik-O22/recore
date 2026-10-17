@@ -87,6 +87,16 @@ impl Binary {
         self.worker.listing(start, end, pcode, QUICK).map_err(anyhow::Error::msg)
     }
 
+    /// `[start, end)` lifted to raw p-code for the emulator: see [`recore_decomp::Session::lift`].
+    pub fn lift(&mut self, start: u64, end: u64) -> Result<Vec<Instruction>> {
+        self.worker.lift(start, end, QUICK).map_err(anyhow::Error::msg)
+    }
+
+    /// The space, offset and size of a register: see [`recore_decomp::Session::register`].
+    pub fn register(&mut self, name: &str) -> Result<(String, u64, u32)> {
+        self.worker.register(name, QUICK).map_err(anyhow::Error::msg)
+    }
+
     /// The data flow of the function at `addr`, which costs one decompilation.
     pub fn flow(&mut self, addr: u64, timeout: Duration) -> Result<Flow> {
         self.worker.flow(addr, timeout).map_err(anyhow::Error::msg)

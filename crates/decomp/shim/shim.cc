@@ -732,14 +732,45 @@ class ListingAssembly : public AssemblyEmit {
   }
 };
 
+// One operand of raw p-code for a program to read: its space, offset and size.
+static void print_raw_operand(ostream &s, const VarnodeData &vn) {
+  s << vn.space->getName() << ":" << hex << vn.offset << dec << ":" << vn.size;
+}
+
+// Raw p-code, one operation a line: as Ghidra's listing shows it, or with `raw` as a program
+// reads it, `OPNAME out-or-'-' input ...` with each operand as `space:offset:size`. The first
+// input of a LOAD or STORE is the name of its space, and that of a CALLOTHER the name of the
+// processor operation.
 class ListingPcode : public PcodeEmit {
   const Translate *translate;
   ostream &out;
+  bool raw;
+  vector<string> userops;
 
  public:
-  ListingPcode(const Translate *t, ostream &o) : translate(t), out(o) {}
+  ListingPcode(const Translate *t, ostream &o, bool r) : translate(t), out(o), raw(r) {
+    if (raw) t->getUserOpNames(userops);
+  }
   void dump(const Address &, OpCode opc, VarnodeData *outvar, VarnodeData *vars, int4 isize) override {
     out << "\t";
+    if (raw) {
+      out << get_opname(opc) << " ";
+      if (outvar != nullptr)
+        print_raw_operand(out, *outvar);
+      else
+        out << "-";
+      for (int4 i = 0; i < isize; ++i) {
+        out << " ";
+        if (i == 0 && (opc == CPUI_LOAD || opc == CPUI_STORE))
+          out << ((AddrSpace *)(uintp)vars[i].offset)->getName();
+        else if (i == 0 && opc == CPUI_CALLOTHER && vars[i].offset < userops.size() && !userops[vars[i].offset].empty())
+          out << userops[vars[i].offset];
+        else
+          print_raw_operand(out, vars[i]);
+      }
+      out << "\n";
+      return;
+    }
     if (outvar != nullptr) {
       print_operand(out, translate, *outvar);
       out << " = ";
@@ -1621,7 +1652,8 @@ int rd_rename_function(RdSession *session, uint64_t addr, const char *name, cons
 // Disassembles `[start, end)` into `*out`, one line per instruction: its address and length in
 // hex and its text, tab-separated. Bytes that do not decode give a line with the text `(bad)`.
 // With `pcode`, each instruction is followed by its raw p-code, one operation per line, each
-// starting with a tab. The text stays valid until the next call on the session.
+// starting with a tab: as Ghidra's listing shows it for 1, and for a program to read for 2, as
+// ListingPcode writes it. The text stays valid until the next call on the session.
 int rd_listing(RdSession *session, uint64_t start, uint64_t end, int pcode, const char **out,
                char *err, size_t errlen) {
   return guarded(err, errlen, [&] {
@@ -1635,11 +1667,13 @@ int rd_listing(RdSession *session, uint64_t start, uint64_t end, int pcode, cons
       try {
         length = translate->printAssembly(line, session->address(addr));
         if (pcode) {
-          ListingPcode emit(translate, ops);
+          ListingPcode emit(translate, ops, pcode == 2);
           translate->oneInstruction(emit, session->address(addr));
         }
       } catch (const UnimplError &) {
-        // Decoded, but the processor spec gives it no semantics.
+        // Decoded, but the processor spec gives it no semantics. A program reading the raw
+        // p-code is told so, where it would take the empty listing for an instruction that does nothing.
+        if (pcode == 2) ops << "\tUNIMPLEMENTED\n";
       } catch (const LowlevelError &) {
         length = 0;
       }
@@ -1653,6 +1687,18 @@ int rd_listing(RdSession *session, uint64_t start, uint64_t end, int pcode, cons
     }
     session->text = text.str();
     *out = session->text.c_str();
+  });
+}
+
+// The place of the register `name`: the name of its space, its offset there and its size in
+// bytes. The name stays valid as long as the session.
+int rd_register(RdSession *session, const char *name, const char **space, uint64_t *offset, int32_t *size,
+                char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    const VarnodeData &reg = session->arch->translate->getRegister(name);
+    *space = reg.space->getName().c_str();
+    *offset = reg.offset;
+    *size = reg.size;
   });
 }
 
