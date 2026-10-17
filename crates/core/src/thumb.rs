@@ -1069,6 +1069,32 @@ impl Arch for Thumb {
         false
     }
 
+    /// A `POP`, `ADD SP` or `LDR Rt, [SP], #4` before a `PUSH`, `SUB SP` or `STR Rt, [SP, #-4]!`.
+    fn gives_back_frame(image: &Image, addr: u64) -> bool {
+        /// How many instructions it may take to come to either.
+        const LONGEST: usize = 32;
+        let decode = |at: u64| Some(Self::decode(image, image.bytes_from(at)?, at));
+        let Some(mut insns) = decode(addr) else { return false };
+        for _ in 0..LONGEST {
+            let Some(Decoded { insn: Some(insn), .. }) = insns.next() else { return false };
+            let (hw1, hw2) = (insn.hw1, insn.hw2);
+            let sets_up = if insn.wide() { hw1 == 0xE92D || hw1 == 0xF84D && hw2 & 0x0FFF == 0x0D04 } else { hw1 & 0xFE00 == 0xB400 || hw1 & 0xFF80 == 0xB080 };
+            let gives_back = if insn.wide() { hw1 == 0xE8BD || hw1 == 0xF85D && hw2 & 0x0FFF == 0x0B04 } else { hw1 & 0xFE00 == 0xBC00 || hw1 & 0xFF80 == 0xB000 };
+            if sets_up || gives_back {
+                return gives_back;
+            }
+            match Self::flow(&insn, &State::default(), image) {
+                None | Some(Flow::Branch(_)) => {}
+                Some(Flow::Jump(target)) => match decode(target) {
+                    Some(next) => insns = next,
+                    None => return false,
+                },
+                Some(_) => return false,
+            }
+        }
+        false
+    }
+
     /// The argument register the instruction writes, the lowest of R0 to R3 it writes, and the
     /// address it completes there.
     fn argument_write(insn: &Insn, state: &State) -> Option<(usize, Option<u64>)> {
@@ -1410,10 +1436,20 @@ mod tests {
     }
 
     #[test]
+    fn an_end_that_gives_back_the_frame_of_whoever_jumps_there_is_no_function() {
+        // 0x00: PUSH {R4, LR}; BL 0x0C; CMP R0, #0; BEQ 0x16; POP {R4, PC}. 0x0C: PUSH {R4, LR};
+        // CMP R0, #1; BEQ 0x16; MOVS R0, #0; POP {R4, PC}. 0x16: MOVS R0, #1; POP {R4, PC}, or
+        // with PUSH {R4, LR} first, which sets up a frame of its own.
+        let code = |first: &[u16]| [&[0xB510][..], &bl(0x02, 0x0C), &[0x2800, 0xD005, 0xBD10, 0xB510, 0x2801, 0xD001, 0x2000, 0xBD10], first, &[0x2001, 0xBD10]].concat();
+        assert_eq!(functions(&code(&[])), [0x00, 0x0C]);
+        assert_eq!(functions(&code(&[0xB510])), [0x00, 0x0C, 0x16]);
+    }
+
+    #[test]
     fn a_call_may_be_a_jump_only_in_thumb_1() {
-        // 0x00: PUSH {LR}; BL to; MOVS R0, #0 or MOVW R0, #0, then MOVS R0, #0 up to `to`: POP
-        // {PC}. Code that has Thumb-2 has `B.W` to jump as far as it calls.
-        let code = |to: usize, first: &[u16]| [&[0xB500][..], &bl(0x02, to as u64), first, &vec![0x2000; (to - 6 - 2 * first.len()) / 2], &[0xBD00]].concat();
+        // 0x00: PUSH {LR}; BL to; MOVS R0, #0 or MOVW R0, #0, then MOVS R0, #0 up to `to`: BX
+        // LR. Code that has Thumb-2 has `B.W` to jump as far as it calls.
+        let code = |to: usize, first: &[u16]| [&[0xB500][..], &bl(0x02, to as u64), first, &vec![0x2000; (to - 6 - 2 * first.len()) / 2], &[0x4770]].concat();
         assert_eq!(functions(&code(0x100, &[0x2000])), [0x00]);
         assert_eq!(functions(&code(0x100, &[0xF240, 0x0000])), [0x00, 0x100]);
         // A word after the code that points into the BL at 0x04, where its second halfword reads

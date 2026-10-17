@@ -820,6 +820,12 @@ impl Arch for Arm {
         thumb_only(insns).is_some_and(|insns| Thumb::borrows_frame(&insns))
     }
 
+    /// Thumb code that gives back a frame it did not set up.
+    fn gives_back_frame(image: &Image, addr: u64) -> bool {
+        let first = image.bytes_from(addr).and_then(|bytes| Self::decode(image, bytes, addr).next()?.insn);
+        matches!(first, Some(Insn::Thumb(_))) && Thumb::gives_back_frame(image, addr)
+    }
+
     /// Thumb code that saves R3 where `va_arg` looks for it, as on a Cortex-M.
     fn takes_variable_arguments(insns: &[Insn]) -> bool {
         thumb_only(insns).is_some_and(|insns| Thumb::takes_variable_arguments(&insns))

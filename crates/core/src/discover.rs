@@ -146,6 +146,9 @@ pub struct Discovery {
     /// Entry points taken away because the code before them comes back from a call and runs on
     /// into them, as `(entry, callee)`: entry points after all if the callee never returns.
     pub after_calls: Vec<(u64, u64)>,
+    /// Entry points taken away because the code there gives back a frame it did not set up,
+    /// sorted: see [`Arch::gives_back_frame`]. A call there jumps into the end of the caller.
+    pub frame_ends: Vec<u64>,
 }
 
 /// A set of addresses, for asking of very many ranges whether any member lies inside. Most
@@ -284,6 +287,8 @@ struct Explorer<'a, A: Arch> {
     branches_reach_far: bool,
     /// See [`Discovery::after_calls`].
     after_calls: Vec<(u64, u64)>,
+    /// See [`Discovery::frame_ends`].
+    frame_ends: Vec<u64>,
     /// Addresses taken that an earlier pass found inside other code, which are no entry points
     /// on that evidence: see [`Arch::TAKEN_IS_WEAK`].
     rejected: FxHashSet<u64>,
@@ -976,7 +981,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
 
     /// Removes entry points whose code runs in another function's stack frame. Windows scope
     /// tables point at exception filters and handlers, and functions call their own `finally`
-    /// blocks; all of these sit inside the function they belong to.
+    /// blocks; all of these sit inside the function they belong to. Hand-written routines jump
+    /// or call into an end that gives back the frame they set up, which may be another routine's.
     fn demote_frame_borrowers(&mut self) {
         /// How many instructions decide it. A function sets up its frame within the first few.
         const PROBE: usize = 4;
@@ -994,9 +1000,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 A::borrows_frame(&insns)
             })
             .collect();
-        for addr in borrowers {
+        let frame_ends: Vec<u64> = self.starts.iter().filter(|(_, origin)| !matches!(origin, Origin::Frame | Origin::Export | Origin::Thunk)).map(|(&addr, _)| addr).filter(|&addr| A::gives_back_frame(self.image, addr)).collect();
+        for &addr in borrowers.iter().chain(&frame_ends) {
             self.starts.remove(&addr);
         }
+        self.frame_ends = frame_ends;
     }
 
     /// Whether the unreached bytes at `addr` are a whole function nothing refers to: they decode
@@ -1466,7 +1474,8 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
         inline_tables = merge_touching(inline_tables);
     }
     let after_calls = std::mem::take(&mut explorer.after_calls);
-    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code, inline_tables, after_calls }
+    let frame_ends = std::mem::take(&mut explorer.frame_ends);
+    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code, inline_tables, after_calls, frame_ends }
 }
 
 /// Sorted ranges with those that overlap or touch joined, as literals back to back make one pool.
@@ -1545,6 +1554,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         calls: Vec::new(),
         branches_reach_far: false,
         after_calls: Vec::new(),
+        frame_ends: Vec::new(),
         rejected,
         weak_starts: Vec::new(),
         data_sections: {

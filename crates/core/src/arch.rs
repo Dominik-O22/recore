@@ -289,6 +289,13 @@ pub trait Arch: 'static {
         false
     }
 
+    /// Whether the code at `addr` gives back a stack frame before it sets one up, on its way
+    /// past conditional branches and through jumps: it is the end of a function that set the
+    /// frame up and jumped there, as hand-written code shares the end of one routine with others.
+    fn gives_back_frame(_image: &Image, _addr: u64) -> bool {
+        false
+    }
+
     /// Whether a short function beginning with `insns` is the compiler's stack-cookie check,
     /// which every protected function calls just before it returns.
     fn checks_stack_cookie(_insns: &[Self::Insn]) -> bool {
