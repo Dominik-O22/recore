@@ -822,9 +822,9 @@ impl Arch for Arm {
     }
 
     /// Thumb code that gives back a frame it did not set up.
-    fn gives_back_frame(image: &Image, addr: u64) -> bool {
+    fn gives_back_frame(image: &Image, addr: u64, past_calls: bool) -> bool {
         let first = image.bytes_from(addr).and_then(|bytes| Self::decode(image, bytes, addr).next()?.insn);
-        matches!(first, Some(Insn::Thumb(_))) && Thumb::gives_back_frame(image, addr)
+        matches!(first, Some(Insn::Thumb(_))) && Thumb::gives_back_frame(image, addr, past_calls)
     }
 
     /// Thumb code that saves R3 where `va_arg` looks for it, as on a Cortex-M.

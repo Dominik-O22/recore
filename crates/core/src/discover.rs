@@ -1006,7 +1006,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 A::borrows_frame(&insns)
             })
             .collect();
-        let frame_ends: Vec<u64> = self.starts.iter().filter(|(_, origin)| !matches!(origin, Origin::Frame | Origin::Export | Origin::Thunk)).map(|(&addr, _)| addr).filter(|&addr| A::gives_back_frame(self.image, addr)).collect();
+        let past_calls = A::CALL_MAY_BE_FAR_JUMP && !self.branches_reach_far;
+        let frame_ends: Vec<u64> = self.starts.iter().filter(|(_, origin)| !matches!(origin, Origin::Frame | Origin::Export | Origin::Thunk)).map(|(&addr, _)| addr).filter(|&addr| A::gives_back_frame(self.image, addr, past_calls)).collect();
         for &addr in borrowers.iter().chain(&frame_ends) {
             self.starts.remove(&addr);
         }

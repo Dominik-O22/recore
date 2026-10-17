@@ -1096,9 +1096,9 @@ impl Arch for Thumb {
     }
 
     /// A `POP`, `ADD SP` or `LDR Rt, [SP], #4` before a `PUSH`, `SUB SP` or `STR Rt, [SP, #-4]!`.
-    fn gives_back_frame(image: &Image, addr: u64) -> bool {
+    fn gives_back_frame(image: &Image, addr: u64, past_calls: bool) -> bool {
         /// How many instructions it may take to come to either.
-        const LONGEST: usize = 32;
+        const LONGEST: usize = 64;
         let decode = |at: u64| Some(Self::decode(image, image.bytes_from(at)?, at));
         let Some(mut insns) = decode(addr) else { return false };
         for _ in 0..LONGEST {
@@ -1111,6 +1111,7 @@ impl Arch for Thumb {
             }
             match Self::flow(&insn, &State::default(), image) {
                 None | Some(Flow::Branch(_)) => {}
+                Some(Flow::Call(_) | Flow::CallIndirect(_)) if past_calls => {}
                 Some(Flow::Jump(target)) => match decode(target) {
                     Some(next) => insns = next,
                     None => return false,
@@ -1488,6 +1489,15 @@ mod tests {
         let code = |literal: u16| [0x4801, 0x4770, 0xBF00, 0xBF00, literal, 0x0000, 0x0000, 0x0000, 0x2001, 0x4770, 0x2002, 0x4770];
         assert_eq!(functions(&code(0x10)), [0x00]);
         assert_eq!(functions(&code(0x00)), [0x00, 0x10, 0x14]);
+    }
+
+    #[test]
+    fn a_block_that_calls_before_it_gives_back_the_frame_is_no_function_in_thumb_1() {
+        // 0x00: PUSH {R4, LR}; BL 0x0C, a jump; MOVS R0, #1; POP {R4, PC}; NOP. 0x0C: MOVS R0,
+        // #2; BL 0x14; POP {R4, PC}, or PUSH {R4, LR} first. 0x14: BX LR.
+        let code = |first: &[u16]| [&[0xB510][..], &bl(0x02, 0x0C), &[0x2001, 0xBD10, 0xBF00], first, &[0x2002], &bl(0x0E + 2 * first.len() as u64, 0x14 + 2 * first.len() as u64), &[0xBD10, 0x4770]].concat();
+        assert_eq!(functions(&code(&[])), [0x00, 0x14]);
+        assert_eq!(functions(&code(&[0xB510])), [0x00, 0x0C, 0x16]);
     }
 
     #[test]

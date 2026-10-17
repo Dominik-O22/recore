@@ -297,9 +297,11 @@ pub trait Arch: 'static {
     }
 
     /// Whether the code at `addr` gives back a stack frame before it sets one up, on its way
-    /// past conditional branches and through jumps: it is the end of a function that set the
-    /// frame up and jumped there, as hand-written code shares the end of one routine with others.
-    fn gives_back_frame(_image: &Image, _addr: u64) -> bool {
+    /// past conditional branches and through jumps, and with `past_calls` past calls too: it is
+    /// the end of a function that set the frame up and jumped there, as hand-written code shares
+    /// the end of one routine with others. Code that calls before it saves its return address
+    /// returns nowhere, so where a call may be a jump the way goes on past one.
+    fn gives_back_frame(_image: &Image, _addr: u64, _past_calls: bool) -> bool {
         false
     }
 
