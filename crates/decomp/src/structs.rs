@@ -635,25 +635,35 @@ fn shape(object: &Object) -> Result<(Layout, bool), Refusal> {
             ends.chain([object.span.1 + 1]).max().unwrap_or(0)
         }
     };
-    // Accesses that start alike are one field, the widest; others print as a cast of it.
-    let mut fields: BTreeMap<u64, Field> = BTreeMap::new();
-    for access in &object.accesses {
-        let field = Field::new(access.size, access.ty.clone());
-        match fields.entry(reduced(access.offset, stride)) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(field);
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let known = entry.get_mut();
-                if field.size > known.size {
-                    *known = field;
-                } else if field.size == known.size && field.ty != known.ty {
-                    known.ty = FieldType::Unknown;
+    // Accesses that start alike are one field, the widest; others print as a cast of it. A
+    // vector access, 16 bytes or more, copies or clears several fields: it lays out none where
+    // narrower accesses lay out the fields, and prints as a cast.
+    let narrower = object.accesses.iter().any(|access| access.size < 16);
+    let fields = |vectors: bool| {
+        let mut fields: BTreeMap<u64, Field> = BTreeMap::new();
+        for access in object.accesses.iter().filter(|access| vectors || access.size < 16) {
+            let field = Field::new(access.size, access.ty.clone());
+            match fields.entry(reduced(access.offset, stride)) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(field);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let known = entry.get_mut();
+                    if field.size > known.size {
+                        *known = field;
+                    } else if field.size == known.size && field.ty != known.ty {
+                        known.ty = FieldType::Unknown;
+                    }
                 }
             }
         }
+        fields
+    };
+    // Whether accesses overlap is judged over all of them.
+    if let Err(Refusal::Overlap) = Layout::new(size as u64, fields(true)) {
+        return Err(Refusal::Overlap);
     }
-    Ok((Layout::new(size as u64, fields)?, stride.is_some()))
+    Ok((Layout::new(size as u64, fields(!narrower))?, stride.is_some()))
 }
 
 /// A register by name, or with a null name the stack at `stack`.
@@ -829,6 +839,17 @@ mod tests {
         assert_eq!(decisions, refusals.map(Err));
     }
 
+    /// A 16-byte store that clears the int at 0x10 and what follows it leaves the int as it is
+    /// read.
+    #[test]
+    fn a_vector_store_lays_out_no_field() {
+        let mut cleared = object(&[0x10]);
+        cleared.accesses.push(access(0x10, 16, FieldType::Unknown));
+        cleared.accesses.push(access(0, 8, FieldType::Uint));
+        let plan = plan(vec![cleared]);
+        assert_eq!(plan.structs[0].layout, layout(&[(0, 8, FieldType::Uint), (0x10, 4, FieldType::Int)], 0x20));
+    }
+
     #[test]
     fn an_array_of_structs_is_one_element() {
         let mut points = object(&[0, 8]);
@@ -900,7 +921,7 @@ mod tests {
         let mut registry = Registry::default();
         let mut list = object(&[0]);
         list.accesses.push(access(8, 8, FieldType::Unknown));
-        list.accesses.push(access(0x10, 16, FieldType::Unknown));
+        list.accesses.push(access(0x10, 10, FieldType::Unknown));
         list.points_to = vec![(8, 0)];
         let plan = registry.plan(&Evidence { function: 0x401000, pointer: 8, objects: vec![list] });
         let xml = registry.xml(8, &plan.structs);
@@ -909,11 +930,11 @@ mod tests {
             xml,
             format!(
                 r#"<debug>
-<type name="S_401000_RDI" id="{id}" metatype="struct" size="32" incomplete="true"/>
-<type name="S_401000_RDI" id="{id}" metatype="struct" size="32">
+<type name="S_401000_RDI" id="{id}" metatype="struct" size="26" incomplete="true"/>
+<type name="S_401000_RDI" id="{id}" metatype="struct" size="26">
 <field name="field_0x0" offset="0"><typeref name="int4"/></field>
 <field name="field_0x8" offset="8"><type metatype="ptr" size="8" wordsize="1"><typeref name="S_401000_RDI" id="{id}"/></type></field>
-<field name="field_0x10" offset="16"><type metatype="array" size="16" arraysize="16"><typeref name="undefined1"/></type></field>
+<field name="field_0x10" offset="16"><type metatype="array" size="10" arraysize="10"><typeref name="undefined1"/></type></field>
 </type>
 </debug>
 "#
