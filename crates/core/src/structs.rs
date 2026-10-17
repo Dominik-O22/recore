@@ -91,6 +91,9 @@ pub enum Refusal {
     Wrapped,
     /// Two different named structs reach it.
     NamedConflict,
+    /// Every read or write is one byte, within its first four: a string or a buffer of bytes
+    /// tested a byte at a time, as `s[0] == '-' && s[1] == '-'`.
+    Bytes,
 }
 
 impl Refusal {
@@ -108,6 +111,7 @@ impl Refusal {
             Refusal::NoRoot => "no parameter and no field of a recovered struct points to it",
             Refusal::Wrapped => "its struct came out too small once this session",
             Refusal::NamedConflict => "two different named structs reach it",
+            Refusal::Bytes => "every read is one byte near its start, as of a string",
         }
     }
 }

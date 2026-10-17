@@ -601,6 +601,9 @@ fn shape(object: &Object) -> Result<(Layout, bool), Refusal> {
     if object.number {
         return Err(Refusal::Number);
     }
+    if !object.accesses.is_empty() && object.accesses.iter().all(|access| access.size == 1 && (0..4).contains(&access.offset)) {
+        return Err(Refusal::Bytes);
+    }
     if object.roots.iter().any(|&(_, offset)| offset != 0) {
         return Err(Refusal::IntoMiddle);
     }
@@ -819,8 +822,10 @@ mod tests {
         number.number = true;
         let mut beyond = object(&[0, 4]);
         (beyond.strides, beyond.span) = (vec![12], (0, 0x20));
-        let decisions = plan(vec![object(&[0, 2]), object(&[0]), object(&[]), middle, second_root, strides, past_stride, locked, global, number, beyond]).decisions;
-        let refusals = [Refusal::Overlap, Refusal::Primitive, Refusal::Unused, Refusal::IntoMiddle, Refusal::IntoMiddle, Refusal::Stride, Refusal::Stride, Refusal::Locked, Refusal::Global, Refusal::Number, Refusal::Stride];
+        let mut string = object(&[]);
+        string.accesses = vec![access(0, 1, FieldType::Int), access(1, 1, FieldType::Int)];
+        let decisions = plan(vec![object(&[0, 2]), object(&[0]), object(&[]), middle, second_root, strides, past_stride, locked, global, number, beyond, string]).decisions;
+        let refusals = [Refusal::Overlap, Refusal::Primitive, Refusal::Unused, Refusal::IntoMiddle, Refusal::IntoMiddle, Refusal::Stride, Refusal::Stride, Refusal::Locked, Refusal::Global, Refusal::Number, Refusal::Stride, Refusal::Bytes];
         assert_eq!(decisions, refusals.map(Err));
     }
 
