@@ -678,8 +678,9 @@ impl Arch for Arm {
     type Insn = Insn;
     type State = State;
 
-    /// A32 functions sit at a word and Thumb ones at a halfword.
-    const FUNCTION_ALIGN: u64 = 2;
+    /// A32 functions sit at a word, and GCC aligns Thumb ones to a word too, with a `NOP` before
+    /// one where needed: 99.9% of armhf functions start at a word.
+    const FUNCTION_ALIGN: u64 = 4;
     const LONGEST_PADDING: u64 = 14;
     const ALIGNMENT_IS_EVIDENCE: bool = false;
     const LITERAL_POOLS: bool = true;
@@ -735,6 +736,29 @@ impl Arch for Arm {
             1 | 3 => Some(u64::from(address & !1)),
             _ => None,
         }
+    }
+
+    /// Whether the code at `target`, an address that code takes or the first instruction after
+    /// a gap, can be a function: it opens as one, or decodes, to a return, a jump elsewhere or
+    /// for a while, without running into anything that cannot be code, as a literal pool's zeros.
+    fn code_pointer(image: &Image, target: u64) -> bool {
+        const LONGEST: usize = 48;
+        let Some(bytes) = image.bytes_from(target) else { return false };
+        let mut insns = Self::decode(image, bytes, target).map(|decoded| decoded.insn);
+        let (Some(Some(first)), second) = (insns.next(), insns.next().flatten()) else { return false };
+        if Self::opens_function(&first, second.as_ref()) {
+            return true;
+        }
+        let state = State::default();
+        for insn in [Some(first)].into_iter().chain([second]).chain(insns).take(LONGEST) {
+            let Some(insn) = insn.filter(|insn| !Self::ends_code(insn) && !Self::is_padding(insn)) else { return false };
+            match Self::flow(&insn, &state, image) {
+                Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(_)) => return true,
+                Some(Flow::Halt) => return false,
+                _ => {}
+            }
+        }
+        true
     }
 
     fn memory_reference(insn: &Insn, state: &State) -> Option<u64> {
