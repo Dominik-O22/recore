@@ -53,3 +53,5 @@ id	base	replaces	url	sha256
 22.03.7-x86_64-full	22.03.7-x86_64		https://downloads.openwrt.org/releases/22.03.7/targets/x86/64/packages/kmod-nf-ipt_5.10.221-1_x86_64.ipk	a20ec8744ab6b455abcec28892907f16b17a1c229e83bd87556dc9dd961e3101
 22.03.7-x86_64-full	22.03.7-x86_64		https://downloads.openwrt.org/releases/22.03.7/packages/x86_64/base/libnettle8_3.7.3-2_x86_64.ipk	0d64d026e0aa073031b78bd59f7e6cd96cb9f540a1490a5f1ee58ae44384ad9e
 22.03.7-x86_64-full	22.03.7-x86_64		https://downloads.openwrt.org/releases/22.03.7/packages/x86_64/base/libgmp10_6.2.1-1_x86_64.ipk	e4edab4b26223a59d16ea0b0f9edb8af4d1b9154e62a14d7efd8f3e260c376ca
+25.12.5-aarch64-stale	25.12.5-aarch64	usr/sbin/dnsmasq	image:24.10.6-aarch64	062f84818f1b2335fd01a8d633cc1a62fd1fbf8df87c982f4017efae88aa3403
+24.10.8-armv7-stale	24.10.8-armv7	usr/sbin/dropbear	image:23.05.2-armv7	df743c64a40da93ca8ca34da7a8bb4f2979fbae79f6a3335fc3f11b7c4c62200

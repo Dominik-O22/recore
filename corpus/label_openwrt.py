@@ -132,22 +132,35 @@ def main() -> None:
     advisories = tomllib.loads(ADVISORIES.read_text())["advisory"]
     # Each image and the release image it is, or that a variant was built from.
     images = {line.split("\t")[0]: line.split("\t")[0] for line in IMAGES.read_text().splitlines()[1:]}
-    images |= {line.split("\t")[0]: line.split("\t")[1] for line in VARIANTS.read_text().splitlines()[1:]}
+    variants = [line.split("\t") for line in VARIANTS.read_text().splitlines()[1:]]
+    images |= {row[0]: row[1] for row in variants}
+    # The programs a stale variant took from an older image: its id, the path, that image.
+    stale = {(row[0], row[2]): row[3].removeprefix("image:") for row in variants if row[3].startswith("image:")}
     rows, cache = [], {}
+
+    def built(tag: str, path: str) -> Package:
+        if (tag, path) not in cache:
+            cache[(tag, path)] = package(tag, path)
+        return cache[(tag, path)]
+
     for id, base in images.items():
         tag = "v" + base.rsplit("-", 1)[0]
         rootfs = FLEET / "images" / id / "rootfs"
         packages = installed(rootfs)
         for advisory in advisories:
-            key = (tag, advisory["package"])
-            if key not in cache:
-                cache[key] = package(*key)
-            pkg = cache[key]
+            pkg = built(tag, advisory["package"])
             status, evidence, claimed = label(advisory, tag, rootfs, packages, pkg)
+            # A stale program is labelled from the release it was built in. The claim stays the
+            # one the image's own database makes.
+            source = stale.get((id, advisory["files"][0]))
+            if source:
+                older = "v" + source.rsplit("-", 1)[0]
+                status, evidence, _ = label(advisory, older, rootfs, installed(FLEET / "images" / source / "rootfs"), built(older, advisory["package"]))
+                evidence = f"program from {source}: {evidence}"
             name = advisory["package"].rsplit("/", 1)[1]
             reported = next((v for n, v in packages.items() if n == name or n.startswith(name + "-")), "")
             # The image's own package database has to agree with the tree it was labelled from.
-            if reported and pkg.upstream and not reported.startswith(pkg.upstream + "-"):
+            if not source and reported and pkg.upstream and not reported.startswith(pkg.upstream + "-"):
                 raise SystemExit(f"{id}: the image reports {name} {reported}, the tree at {tag} builds {pkg.upstream}")
             rows.append(f"{id}\t{advisory['id']}\t{status}\t{claimed}\t{reported}\t{evidence}")
     LABELS.write_text("image\tadvisory\tstatus\tby_version\treported\tevidence\n" + "\n".join(rows) + "\n")

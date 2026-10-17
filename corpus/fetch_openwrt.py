@@ -9,7 +9,8 @@ Usage: python3 -I corpus/fetch_openwrt.py [pin]
         <corpora>/corpus-openwrt/images/<id>/rootfs, where corpus/store.py names <corpora>.
         A download lands in its own new directory, dl/<id>/. An image already unpacked is skipped.
         Then it builds each variant: a copy of a release image with packages from that release's
-        own feed installed over it, as opkg would, with the package database updated to match.
+        own feed installed over it, as opkg would, with the package database updated to match, or
+        with one program copied from an older release image and the database left as it was.
 
 Each release ships its root filesystem as a tarball beside the disk images, so nothing here needs
 a firmware unpacker. Nothing downloaded is executed: the tarballs are only read, through Python's
@@ -48,6 +49,14 @@ SWAPS = {
     "21.02.7-armv7-full": ("21.02.7-armv7", "dnsmasq", "dnsmasq-full"),
     "22.03.2-aarch64-full": ("22.03.2-aarch64", "dnsmasq", "dnsmasq-full"),
     "22.03.7-x86_64-full": ("22.03.7-x86_64", "dnsmasq", "dnsmasq-full"),
+}
+
+# Each stale variant: its release image, a program, and the older release image whose build of
+# that program replaces it. The package database still names the newer version, so the version
+# claims a fix the code does not have, as when a vendor ships a stale binary.
+STALE = {
+    "25.12.5-aarch64-stale": ("25.12.5-aarch64", "usr/sbin/dnsmasq", "24.10.6-aarch64"),
+    "24.10.8-armv7-stale": ("24.10.8-armv7", "usr/sbin/dropbear", "23.05.2-armv7"),
 }
 
 
@@ -118,8 +127,12 @@ def pin_variants() -> None:
         for name in chosen:
             fields = index[name]
             rows.append(f"{id}\t{base}\t{old if name == new else ''}\t{fields['feed']}/{fields['Filename']}\t{fields['SHA256sum']}")
+    # A stale program comes from another image, named in the url as image:<id>.
+    for id, (base, path, source) in STALE.items():
+        digest = hashlib.sha256((OUT / "images" / source / "rootfs" / path).read_bytes()).hexdigest()
+        rows.append(f"{id}\t{base}\t{path}\timage:{source}\t{digest}")
     VARIANTS.write_text("id\tbase\treplaces\turl\tsha256\n" + "\n".join(rows) + "\n")
-    print(f"{len(SWAPS)} variants, {len(rows)} packages pinned in {VARIANTS}")
+    print(f"{len(SWAPS) + len(STALE)} variants, {len(rows)} packages and programs pinned in {VARIANTS}")
 
 
 def ipk(path: Path) -> dict[str, bytes]:
@@ -171,7 +184,14 @@ def variant(id: str, rows: list[tuple[str, ...]]) -> str:
     image.mkdir(parents=True, exist_ok=True)
     shutil.copytree(OUT / "images" / rows[0][1] / "rootfs", partial, symlinks=True)
     for _, _, replaces, url, digest in rows:
-        install(partial, download(OUT / "dl" / id, url, digest), replaces)
+        if url.startswith("image:"):
+            program = OUT / "images" / url.removeprefix("image:") / "rootfs" / replaces
+            if hashlib.sha256(program.read_bytes()).hexdigest() != digest:
+                raise SystemExit(f"{program}: sha256 is not the pinned {digest}")
+            (partial / replaces).unlink()
+            shutil.copy2(program, partial / replaces)
+        else:
+            install(partial, download(OUT / "dl" / id, url, digest), replaces)
     partial.rename(image / "rootfs")
     return f"{id}: built from {rows[0][1]}"
 
