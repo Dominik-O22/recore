@@ -3246,3 +3246,105 @@ image	advisory	status	by_version	reported	evidence
 25.12.5-armv7	CVE-2019-19945	fixed	fixed	2026.06.16~7b1bec45-r1	snapshot 7b1bec45826b contains 5f9ae5738372
 25.12.5-armv7	UHTTPD-2026-CHUNKED	fixed	fixed	2026.06.16~7b1bec45-r1	snapshot 7b1bec45826b contains d255187
 25.12.5-armv7	CVE-2026-53922	fixed	fixed	2026.06.29~5d7be43f-r1	snapshot 5d7be43f8b9d has d08dbcc, a cherry-pick of c6792ba
+18.06.9-armv7-full	CVE-2017-14491	fixed	fixed	2.80-1.4	upstream 2.80 has the fix from 2.78
+18.06.9-armv7-full	CVE-2020-25681	vulnerable	vulnerable	2.80-1.4	2.80, no fix and no patch with it
+18.06.9-armv7-full	CVE-2020-25684	vulnerable	vulnerable	2.80-1.4	2.80, no fix and no patch with it
+18.06.9-armv7-full	CVE-2020-25685	vulnerable	vulnerable	2.80-1.4	2.80, no fix and no patch with it
+18.06.9-armv7-full	CVE-2020-25686	vulnerable	vulnerable	2.80-1.4	2.80, no fix and no patch with it
+18.06.9-armv7-full	CVE-2022-0934	vulnerable	vulnerable	2.80-1.4	2.80, no fix and no patch with it
+18.06.9-armv7-full	CVE-2023-28450	vulnerable	vulnerable	2.80-1.4	2.80, no fix and no patch with it
+18.06.9-armv7-full	CVE-2026-2291	vulnerable	vulnerable	2.80-1.4	2.80, no fix and no patch with it
+18.06.9-armv7-full	CVE-2026-5172	vulnerable	vulnerable	2.80-1.4	2.80, no fix and no patch with it
+18.06.9-armv7-full	CVE-2026-12969	vulnerable	vulnerable	2.80-1.4	2.80, no fix and no patch with it
+18.06.9-armv7-full	CVE-2018-15599	fixed	vulnerable	2017.75-7.1	patch 020-Wait-to-fail-invalid-usernames.patch
+18.06.9-armv7-full	CVE-2023-48795	vulnerable	vulnerable	2017.75-7.1	2017.75, no fix and no patch with it
+18.06.9-armv7-full	CVE-2023-36328	vulnerable	vulnerable	2017.75-7.1	2017.75, no fix and no patch with it
+18.06.9-armv7-full	CVE-2022-30065	vulnerable	vulnerable	1.28.4-3	1.28.4, no fix and no patch with it
+18.06.9-armv7-full	CVE-2019-19945	fixed	fixed	2020-02-12-2ee323c0-1	snapshot 2ee323c01079 contains 5f9ae5738372
+18.06.9-armv7-full	UHTTPD-2026-CHUNKED	vulnerable	vulnerable	2020-02-12-2ee323c0-1	snapshot 2020-02-12, no fix and no patch with it
+18.06.9-armv7-full	CVE-2026-53922	vulnerable	vulnerable	1.15-3	1.15, no fix and no patch with it
+19.07.10-aarch64-full	CVE-2017-14491	fixed	fixed	2.80-16.3	upstream 2.80 has the fix from 2.78
+19.07.10-aarch64-full	CVE-2020-25681	fixed	vulnerable	2.80-16.3	patch 0102-Fix-remote-buffer-overflow-CERT-VU-434904.patch
+19.07.10-aarch64-full	CVE-2020-25684	fixed	vulnerable	2.80-16.3	patch 0103-Check-destination-of-DNS-UDP-query-replies.patch
+19.07.10-aarch64-full	CVE-2020-25685	fixed	vulnerable	2.80-16.3	patch 0104-Use-SHA-256-to-provide-security-against-DNS-cache-po.patch
+19.07.10-aarch64-full	CVE-2020-25686	fixed	vulnerable	2.80-16.3	patch 0108-Handle-multiple-identical-near-simultaneous-DNS-quer.patch
+19.07.10-aarch64-full	CVE-2022-0934	vulnerable	vulnerable	2.80-16.3	2.80, no fix and no patch with it
+19.07.10-aarch64-full	CVE-2023-28450	vulnerable	vulnerable	2.80-16.3	2.80, no fix and no patch with it
+19.07.10-aarch64-full	CVE-2026-2291	vulnerable	vulnerable	2.80-16.3	2.80, no fix and no patch with it
+19.07.10-aarch64-full	CVE-2026-5172	vulnerable	vulnerable	2.80-16.3	2.80, no fix and no patch with it
+19.07.10-aarch64-full	CVE-2026-12969	vulnerable	vulnerable	2.80-16.3	2.80, no fix and no patch with it
+19.07.10-aarch64-full	CVE-2018-15599	fixed	fixed	2019.78-2	upstream 2019.78 has the fix from 2019.77
+19.07.10-aarch64-full	CVE-2023-48795	vulnerable	vulnerable	2019.78-2	2019.78, no fix and no patch with it
+19.07.10-aarch64-full	CVE-2023-36328	vulnerable	vulnerable	2019.78-2	2019.78, no fix and no patch with it
+19.07.10-aarch64-full	CVE-2022-30065	vulnerable	vulnerable	1.30.1-6	1.30.1, no fix and no patch with it
+19.07.10-aarch64-full	CVE-2019-19945	fixed	fixed	2020-10-01-3abcc891-1	snapshot 3abcc8910379 contains 5f9ae5738372
+19.07.10-aarch64-full	UHTTPD-2026-CHUNKED	vulnerable	vulnerable	2020-10-01-3abcc891-1	snapshot 2020-10-01, no fix and no patch with it
+19.07.10-aarch64-full	CVE-2026-53922	vulnerable	vulnerable	2020-05-03-49e4949c-3	snapshot 2020-05-03, no fix and no patch with it
+21.02.0-x86_64-full	CVE-2017-14491	fixed	fixed	2.85-9	upstream 2.85 has the fix from 2.78
+21.02.0-x86_64-full	CVE-2020-25681	fixed	fixed	2.85-9	upstream 2.85 has the fix from 2.83
+21.02.0-x86_64-full	CVE-2020-25684	fixed	fixed	2.85-9	upstream 2.85 has the fix from 2.83
+21.02.0-x86_64-full	CVE-2020-25685	fixed	fixed	2.85-9	upstream 2.85 has the fix from 2.83
+21.02.0-x86_64-full	CVE-2020-25686	fixed	fixed	2.85-9	upstream 2.85 has the fix from 2.83
+21.02.0-x86_64-full	CVE-2022-0934	vulnerable	vulnerable	2.85-9	2.85, no fix and no patch with it
+21.02.0-x86_64-full	CVE-2023-28450	vulnerable	vulnerable	2.85-9	2.85, no fix and no patch with it
+21.02.0-x86_64-full	CVE-2026-2291	vulnerable	vulnerable	2.85-9	2.85, no fix and no patch with it
+21.02.0-x86_64-full	CVE-2026-5172	vulnerable	vulnerable	2.85-9	2.85, no fix and no patch with it
+21.02.0-x86_64-full	CVE-2026-12969	vulnerable	vulnerable	2.85-9	2.85, no fix and no patch with it
+21.02.0-x86_64-full	CVE-2018-15599	fixed	fixed	2020.81-2	upstream 2020.81 has the fix from 2019.77
+21.02.0-x86_64-full	CVE-2023-48795	vulnerable	vulnerable	2020.81-2	2020.81, no fix and no patch with it
+21.02.0-x86_64-full	CVE-2023-36328	vulnerable	vulnerable	2020.81-2	2020.81, no fix and no patch with it
+21.02.0-x86_64-full	CVE-2022-30065	vulnerable	vulnerable	1.33.1-6	1.33.1, no fix and no patch with it
+21.02.0-x86_64-full	CVE-2019-19945	fixed	fixed	2021-03-21-15346de8-1	snapshot 15346de8d3ba contains 5f9ae5738372
+21.02.0-x86_64-full	UHTTPD-2026-CHUNKED	vulnerable	vulnerable	2021-03-21-15346de8-1	snapshot 2021-03-21, no fix and no patch with it
+21.02.0-x86_64-full	CVE-2026-53922	vulnerable	vulnerable	2021-07-18-bc9d317f-3	snapshot 2021-07-18, no fix and no patch with it
+21.02.7-armv7-full	CVE-2017-14491	fixed	fixed	2.85-9	upstream 2.85 has the fix from 2.78
+21.02.7-armv7-full	CVE-2020-25681	fixed	fixed	2.85-9	upstream 2.85 has the fix from 2.83
+21.02.7-armv7-full	CVE-2020-25684	fixed	fixed	2.85-9	upstream 2.85 has the fix from 2.83
+21.02.7-armv7-full	CVE-2020-25685	fixed	fixed	2.85-9	upstream 2.85 has the fix from 2.83
+21.02.7-armv7-full	CVE-2020-25686	fixed	fixed	2.85-9	upstream 2.85 has the fix from 2.83
+21.02.7-armv7-full	CVE-2022-0934	fixed	vulnerable	2.85-9	patch 001-CVE-2022-0934-Fix-write-after-free-error-in-DHCPv6-code.patch
+21.02.7-armv7-full	CVE-2023-28450	vulnerable	vulnerable	2.85-9	2.85, no fix and no patch with it
+21.02.7-armv7-full	CVE-2026-2291	vulnerable	vulnerable	2.85-9	2.85, no fix and no patch with it
+21.02.7-armv7-full	CVE-2026-5172	vulnerable	vulnerable	2.85-9	2.85, no fix and no patch with it
+21.02.7-armv7-full	CVE-2026-12969	vulnerable	vulnerable	2.85-9	2.85, no fix and no patch with it
+21.02.7-armv7-full	CVE-2018-15599	fixed	fixed	2020.81-2	upstream 2020.81 has the fix from 2019.77
+21.02.7-armv7-full	CVE-2023-48795	vulnerable	vulnerable	2020.81-2	2020.81, no fix and no patch with it
+21.02.7-armv7-full	CVE-2023-36328	vulnerable	vulnerable	2020.81-2	2020.81, no fix and no patch with it
+21.02.7-armv7-full	CVE-2022-30065	vulnerable	vulnerable	1.33.2-2	1.33.2, no fix and no patch with it
+21.02.7-armv7-full	CVE-2019-19945	fixed	fixed	2021-03-21-15346de8-2	snapshot 15346de8d3ba contains 5f9ae5738372
+21.02.7-armv7-full	UHTTPD-2026-CHUNKED	vulnerable	vulnerable	2021-03-21-15346de8-2	snapshot 2021-03-21, no fix and no patch with it
+21.02.7-armv7-full	CVE-2026-53922	vulnerable	vulnerable	2021-07-18-bc9d317f-3	snapshot 2021-07-18, no fix and no patch with it
+22.03.2-aarch64-full	CVE-2017-14491	fixed	fixed	2.86-16	upstream 2.86 has the fix from 2.78
+22.03.2-aarch64-full	CVE-2020-25681	fixed	fixed	2.86-16	upstream 2.86 has the fix from 2.83
+22.03.2-aarch64-full	CVE-2020-25684	fixed	fixed	2.86-16	upstream 2.86 has the fix from 2.83
+22.03.2-aarch64-full	CVE-2020-25685	fixed	fixed	2.86-16	upstream 2.86 has the fix from 2.83
+22.03.2-aarch64-full	CVE-2020-25686	fixed	fixed	2.86-16	upstream 2.86 has the fix from 2.83
+22.03.2-aarch64-full	CVE-2022-0934	vulnerable	vulnerable	2.86-16	2.86, no fix and no patch with it
+22.03.2-aarch64-full	CVE-2023-28450	vulnerable	vulnerable	2.86-16	2.86, no fix and no patch with it
+22.03.2-aarch64-full	CVE-2026-2291	vulnerable	vulnerable	2.86-16	2.86, no fix and no patch with it
+22.03.2-aarch64-full	CVE-2026-5172	vulnerable	vulnerable	2.86-16	2.86, no fix and no patch with it
+22.03.2-aarch64-full	CVE-2026-12969	vulnerable	vulnerable	2.86-16	2.86, no fix and no patch with it
+22.03.2-aarch64-full	CVE-2018-15599	fixed	fixed	2022.82-2	upstream 2022.82 has the fix from 2019.77
+22.03.2-aarch64-full	CVE-2023-48795	vulnerable	vulnerable	2022.82-2	2022.82, no fix and no patch with it
+22.03.2-aarch64-full	CVE-2023-36328	vulnerable	vulnerable	2022.82-2	2022.82, no fix and no patch with it
+22.03.2-aarch64-full	CVE-2022-30065	vulnerable	vulnerable	1.35.0-4	1.35.0, no fix and no patch with it
+22.03.2-aarch64-full	CVE-2019-19945	fixed	fixed	2022-08-12-e3395cd9-1	snapshot e3395cd90bed contains 5f9ae5738372
+22.03.2-aarch64-full	UHTTPD-2026-CHUNKED	vulnerable	vulnerable	2022-08-12-e3395cd9-1	snapshot 2022-08-12, no fix and no patch with it
+22.03.2-aarch64-full	CVE-2026-53922	vulnerable	vulnerable	2022-03-22-860ca900-1	snapshot 2022-03-22, no fix and no patch with it
+22.03.7-x86_64-full	CVE-2017-14491	fixed	fixed	2.86-16	upstream 2.86 has the fix from 2.78
+22.03.7-x86_64-full	CVE-2020-25681	fixed	fixed	2.86-16	upstream 2.86 has the fix from 2.83
+22.03.7-x86_64-full	CVE-2020-25684	fixed	fixed	2.86-16	upstream 2.86 has the fix from 2.83
+22.03.7-x86_64-full	CVE-2020-25685	fixed	fixed	2.86-16	upstream 2.86 has the fix from 2.83
+22.03.7-x86_64-full	CVE-2020-25686	fixed	fixed	2.86-16	upstream 2.86 has the fix from 2.83
+22.03.7-x86_64-full	CVE-2022-0934	fixed	vulnerable	2.86-16	patch 001-CVE-2022-0934-Fix-write-after-free-error-in-DHCPv6-code.patch
+22.03.7-x86_64-full	CVE-2023-28450	vulnerable	vulnerable	2.86-16	2.86, no fix and no patch with it
+22.03.7-x86_64-full	CVE-2026-2291	vulnerable	vulnerable	2.86-16	2.86, no fix and no patch with it
+22.03.7-x86_64-full	CVE-2026-5172	vulnerable	vulnerable	2.86-16	2.86, no fix and no patch with it
+22.03.7-x86_64-full	CVE-2026-12969	vulnerable	vulnerable	2.86-16	2.86, no fix and no patch with it
+22.03.7-x86_64-full	CVE-2018-15599	fixed	fixed	2022.82-4	upstream 2022.82 has the fix from 2019.77
+22.03.7-x86_64-full	CVE-2023-48795	fixed	vulnerable	2022.82-4	patch 021-Implement-Strict-KEX-mode.patch
+22.03.7-x86_64-full	CVE-2023-36328	fixed	vulnerable	2022.82-4	patch 015-libtommath-fix-possible-integer-overflow.patch
+22.03.7-x86_64-full	CVE-2022-30065	fixed	vulnerable	1.35.0-5	patch 001-CVE-2022-30065-awk-fix-use-after-free.patch
+22.03.7-x86_64-full	CVE-2019-19945	fixed	fixed	2023-06-25-34a8a74d-1	snapshot 34a8a74dbdec contains 5f9ae5738372
+22.03.7-x86_64-full	UHTTPD-2026-CHUNKED	vulnerable	vulnerable	2023-06-25-34a8a74d-1	snapshot 2023-06-25, no fix and no patch with it
+22.03.7-x86_64-full	CVE-2026-53922	vulnerable	vulnerable	2023-01-02-4a673e1c-2	snapshot 2023-01-02, no fix and no patch with it

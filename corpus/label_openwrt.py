@@ -3,7 +3,7 @@
 image's release tag and never from the version string the image reports.
 
 Usage: python3 -I corpus/label_openwrt.py
-Reads corpus/openwrt-images.tsv, bench/firmware/advisories.toml and the unpacked images that
+Reads corpus/openwrt-images.tsv, corpus/openwrt-variants.tsv, bench/firmware/advisories.toml and the unpacked images that
 corpus/fetch_openwrt.py wrote, and writes bench/firmware/labels.tsv. It clones the OpenWrt tree
 and the upstream trees of the packages it builds from git snapshots into
 <corpora>/corpus-openwrt/src, without their file contents, which git fetches as it reads them.
@@ -25,6 +25,7 @@ from store import CORPORA  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 IMAGES = ROOT / "corpus" / "openwrt-images.tsv"
+VARIANTS = ROOT / "corpus" / "openwrt-variants.tsv"
 ADVISORIES = ROOT / "bench" / "firmware" / "advisories.toml"
 LABELS = ROOT / "bench" / "firmware" / "labels.tsv"
 FLEET = CORPORA / "corpus-openwrt"
@@ -125,11 +126,12 @@ def main() -> None:
     for repo in REPOS:
         clone(repo)
     advisories = tomllib.loads(ADVISORIES.read_text())["advisory"]
-    images = [line.split("\t")[0] for line in IMAGES.read_text().splitlines()[1:]]
+    # Each image and the release image it is, or that a variant was built from.
+    images = {line.split("\t")[0]: line.split("\t")[0] for line in IMAGES.read_text().splitlines()[1:]}
+    images |= {line.split("\t")[0]: line.split("\t")[1] for line in VARIANTS.read_text().splitlines()[1:]}
     rows, cache = [], {}
-    for id in images:
-        release = id.rsplit("-", 1)[0]
-        tag = f"v{release}"
+    for id, base in images.items():
+        tag = "v" + base.rsplit("-", 1)[0]
         rootfs = FLEET / "images" / id / "rootfs"
         packages = installed(rootfs)
         for advisory in advisories:
