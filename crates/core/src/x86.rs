@@ -46,7 +46,7 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
     /// An operand names the slot outright or not at all.
     const FLOW_READS_STATE: bool = false;
 
-    fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Instruction>> {
+    fn decode<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> impl Iterator<Item = Decoded<Instruction>> + 'a {
         let mut decoder = Decoder::with_ip(BITS, bytes, addr, DecoderOptions::NONE);
         let mut instr = Instruction::default();
         std::iter::from_fn(move || {
@@ -60,7 +60,7 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
     /// The decoder, the address its bytes are loaded at, and the instruction decoded last.
     type Decoder<'a> = (Decoder<'a>, u64, Instruction);
 
-    fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_> {
+    fn decoder<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> Self::Decoder<'a> {
         (Decoder::with_ip(BITS, bytes, addr, DecoderOptions::NONE), addr, Instruction::default())
     }
 
@@ -247,7 +247,7 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         let mut stubs = FxHashMap::default();
         for section in image.sections.iter().filter(|s| s.is_stubs()) {
             let mut stub_start = section.addr;
-            for decoded in Self::decode(&section.data, section.addr) {
+            for decoded in Self::decode(image, &section.data, section.addr) {
                 let flow = decoded.insn.as_ref().and_then(classify);
                 if let Some(Flow::JumpIndirect(Some(slot))) = flow {
                     if image.import_slots.contains_key(&slot) {

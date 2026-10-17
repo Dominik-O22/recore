@@ -152,16 +152,17 @@ pub trait Arch: 'static {
     /// track registers where it cannot.
     const FLOW_READS_STATE: bool = true;
 
-    /// Decodes consecutive instructions from `bytes`, which are loaded at `addr`.
-    fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Self::Insn>>;
+    /// Decodes consecutive instructions from `bytes` of `image`, which are loaded at `addr`.
+    /// The image says what the bytes are where a machine has more than one instruction set.
+    fn decode<'a>(image: &'a Image, bytes: &'a [u8], addr: u64) -> impl Iterator<Item = Decoded<Self::Insn>> + 'a;
 
     /// A decoder over a whole section, for decoding from many places in it: moving one is
     /// cheaper than making one. It holds the instruction it decoded last and lends it out, so
     /// that no instruction is copied on its way to whoever reads it.
     type Decoder<'a>;
 
-    /// A decoder over `bytes`, which are loaded at `addr`.
-    fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_>;
+    /// A decoder over `bytes` of `image`, which are loaded at `addr`.
+    fn decoder<'a>(image: &'a Image, bytes: &'a [u8], addr: u64) -> Self::Decoder<'a>;
 
     /// Moves the decoder to `offset` into its bytes.
     fn seek(decoder: &mut Self::Decoder<'_>, offset: usize);

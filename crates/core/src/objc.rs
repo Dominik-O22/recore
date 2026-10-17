@@ -202,7 +202,7 @@ fn stub_selectors<'a, A: Arch>(image: &Image, metadata: &'a Metadata) -> FxHashM
     for section in image.sections.iter().filter(|section| section.name == "__TEXT,__objc_stubs") {
         let mut state = A::State::default();
         let mut start = None;
-        for decoded in A::decode(&section.data, section.addr) {
+        for decoded in A::decode(image, &section.data, section.addr) {
             let Some(insn) = decoded.insn else { continue };
             match A::flow(&insn, &state, image) {
                 // Traps pad the space between stubs.
@@ -381,7 +381,7 @@ pub fn sends<A: Arch>(image: &Image, metadata: &Metadata, swift_methods: &[(u64,
             let bytes = &bytes[..bytes.len().min((end - start) as usize)];
             // Where paths meet: every address a branch in the piece goes to.
             let fresh = A::State::default();
-            let joins: FxHashSet<u64> = A::decode(bytes, start)
+            let joins: FxHashSet<u64> = A::decode(image, bytes, start)
                 .filter_map(|decoded| match A::flow(&decoded.insn?, &fresh, image)? {
                     Flow::Branch(target) | Flow::Jump(target) => Some(target),
                     _ => None,
@@ -395,7 +395,7 @@ pub fn sends<A: Arch>(image: &Image, metadata: &Metadata, swift_methods: &[(u64,
             if let Some(receiver) = swift_receivers.get(&start) {
                 A::set_self_object(&mut state, receiver.0);
             }
-            for decoded in A::decode(bytes, start) {
+            for decoded in A::decode(image, bytes, start) {
                 let Some(insn) = decoded.insn else { continue };
                 if joins.contains(&decoded.addr) || join_points.contains(&decoded.addr) {
                     state = A::State::default();

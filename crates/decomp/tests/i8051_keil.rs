@@ -29,24 +29,8 @@ fn a_switch_through_a_list_of_cases_after_a_call_has_each_case_by_its_value() {
 
 /// `code` as C51 compiled it, loaded at address 0 with the function at 0 as the entry.
 fn image(code: &[u8]) -> recore::Image {
-    recore::Image {
-        name: String::new(),
-        format: recore::image::Format::Raw,
-        machine: recore::image::Machine::I8051,
-        base: 0,
-        branch_targets_marked: false,
-        entry: 0,
-        sections: vec![recore::image::Section { name: String::new(), addr: 0, data: code.to_vec(), file_offset: None, executable: true, writable: false }],
-        zero_filled: recore::i8051::memory(),
-        import_slots: Default::default(),
-        exports: Vec::new(),
-        symbol_names: Default::default(),
-        frames: Vec::new(),
-        relative_targets: Vec::new(),
-        data_in_code: true,
-        banking: Default::default(),
-        compiler: None,
-    }
+    let section = recore::image::Section { name: String::new(), addr: 0, data: code.to_vec(), file_offset: None, executable: true, writable: false };
+    recore::Image { zero_filled: recore::i8051::memory(), ..recore::Image::bare(String::new(), recore::image::Format::Raw, recore::image::Machine::I8051, 0, vec![section]) }
 }
 
 /// A session for `code`, told everything the analysis of it says.

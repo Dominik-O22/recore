@@ -402,7 +402,7 @@ impl Arch for Arm64 {
     const FUNCTION_ALIGN: u64 = 4;
     const ALIGNMENT_IS_EVIDENCE: bool = false;
 
-    fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> {
+    fn decode<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> + 'a {
         bytes.chunks_exact(4).zip((addr..).step_by(4)).map(|(chunk, addr)| {
             let word = u32::from_le_bytes(chunk.try_into().unwrap());
             Decoded { addr, len: 4, insn: Some(Insn { word, addr }) }
@@ -413,7 +413,7 @@ impl Arch for Arm64 {
     /// instruction decoded last.
     type Decoder<'a> = (&'a [u8], u64, usize, Insn);
 
-    fn decoder(bytes: &[u8], addr: u64) -> Self::Decoder<'_> {
+    fn decoder<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> Self::Decoder<'a> {
         (bytes, addr, 0, Insn { word: 0, addr })
     }
 
@@ -644,7 +644,7 @@ impl Arch for Arm64 {
         for section in image.sections.iter().filter(|s| s.is_stubs()) {
             let mut state = State::default();
             let mut stub_start = None;
-            for decoded in Self::decode(&section.data, section.addr) {
+            for decoded in Self::decode(image, &section.data, section.addr) {
                 let Some(insn) = decoded.insn else { continue };
                 // Padding and traps separate stubs.
                 if insn.word == NOP || Self::flow(&insn, &state, image) == Some(Flow::Halt) {
@@ -677,7 +677,8 @@ mod tests {
         let code: Vec<u8> = [0xB000_0000u32, 0xB940_1001].iter().flat_map(|word| word.to_le_bytes()).collect();
         let mut state = State::default();
         let mut referred = Vec::new();
-        for decoded in Arm64::decode(&code, 0x4000) {
+        let image = Image::bare(String::new(), crate::image::Format::Elf, crate::image::Machine::Aarch64, 0x4000, Vec::new());
+        for decoded in Arm64::decode(&image, &code, 0x4000) {
             let insn = decoded.insn.unwrap();
             referred.push(Arm64::memory_reference(&insn, &state));
             Arm64::step(&mut state, &insn);

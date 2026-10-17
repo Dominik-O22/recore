@@ -5,24 +5,8 @@ use recore_decomp::facts::Facts;
 
 /// The C of the function at `addr` of `code`, loaded at 0, with everything the analysis says.
 fn decompiled(code: &[u8], exports: &[u64], addr: u64) -> String {
-    let image = recore::Image {
-        name: String::new(),
-        format: recore::image::Format::Raw,
-        machine: recore::image::Machine::Thumb,
-        base: 0,
-        branch_targets_marked: false,
-        entry: 0,
-        sections: vec![recore::image::Section { name: String::new(), addr: 0, data: code.to_vec(), file_offset: None, executable: true, writable: false }],
-        zero_filled: Vec::new(),
-        import_slots: Default::default(),
-        exports: exports.to_vec(),
-        symbol_names: Default::default(),
-        frames: Vec::new(),
-        relative_targets: Vec::new(),
-        data_in_code: true,
-        banking: Default::default(),
-        compiler: None,
-    };
+    let section = recore::image::Section { name: String::new(), addr: 0, data: code.to_vec(), file_offset: None, executable: true, writable: false };
+    let image = recore::Image { exports: exports.to_vec(), ..recore::Image::bare(String::new(), recore::image::Format::Raw, recore::image::Machine::Thumb, 0, vec![section]) };
     let analysis = recore::analyze(&image);
     let facts = Facts::derive(&image, &analysis);
     let mut session = Session::from_image(&image, &analysis).unwrap();

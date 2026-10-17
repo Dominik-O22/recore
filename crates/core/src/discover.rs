@@ -308,7 +308,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
 
     /// Whether the instruction at `addr` is filler.
     fn is_padding_at(&self, addr: u64) -> bool {
-        self.image.bytes_from(addr).and_then(|bytes| A::decode(bytes, addr).next()?.insn).is_some_and(|insn| A::is_padding(&insn))
+        self.image.bytes_from(addr).and_then(|bytes| A::decode(self.image, bytes, addr).next()?.insn).is_some_and(|insn| A::is_padding(&insn))
     }
 
     fn is_data(&self, addr: u64) -> bool {
@@ -424,7 +424,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 continue;
             }
             let mut after_call = false;
-            let decoder = decoders[index].get_or_insert_with(|| A::decoder(&section.data, section.addr));
+            let decoder = decoders[index].get_or_insert_with(|| A::decoder(self.image, &section.data, section.addr));
             A::seek(decoder, (start - section.addr) as usize);
             while let Some(decoded) = A::decode_next(decoder) {
                 let offset = (decoded.addr - section.addr) as usize;
@@ -690,7 +690,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
     fn retry_jump_ahead(&mut self, index: usize, addr: u64, mut state: A::State) {
         let Some(&jump) = self.unresolved.range(addr..addr + RETRY_REACH).next() else { return };
         let section = self.regions[index].section;
-        for decoded in A::decode(&section.data[(addr - section.addr) as usize..], addr) {
+        for decoded in A::decode(self.image, &section.data[(addr - section.addr) as usize..], addr) {
             let Some(insn) = decoded.insn else { return };
             match A::flow(&insn, &state, self.image) {
                 None => A::step(&mut state, &insn),
@@ -750,7 +750,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let Some(break_at) = (earliest..=offset).rev().find(|&o| region.follows_break(o) || after_table(o)) else {
             return false;
         };
-        A::decode(&region.section.data[break_at..offset], 0).all(|decoded| decoded.insn.is_some_and(|insn| A::is_padding(&insn)))
+        A::decode(self.image, &region.section.data[break_at..offset], region.section.addr + break_at as u64).all(|decoded| decoded.insn.is_some_and(|insn| A::is_padding(&insn)))
     }
 
     /// Marks a jump target as an entry point when the jump is a tail call: it leaves the function
@@ -871,7 +871,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let earliest = offset.saturating_sub(A::LONGEST_PADDING as usize);
         loop {
             let before = (1..=offset.min(LONGEST_INSN)).map(|len| offset - len).find(|&at| usize::from(region.insn_len[at]) == offset - at)?;
-            let insn = A::decode(&region.section.data[before..], region.section.addr + before as u64).next()?.insn?;
+            let insn = A::decode(self.image, &region.section.data[before..], region.section.addr + before as u64).next()?.insn?;
             if !A::is_padding(&insn) {
                 let Some(Flow::Call(callee)) = A::flow(&insn, &A::State::default(), self.image) else { return None };
                 return Some(callee);
@@ -975,7 +975,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
             .map(|(&addr, _)| addr)
             .filter(|&addr| {
                 let Some(bytes) = self.image.bytes_from(addr) else { return false };
-                let insns: Vec<A::Insn> = A::decode(bytes, addr).take(PROBE).map_while(|d| d.insn).collect();
+                let insns: Vec<A::Insn> = A::decode(self.image, bytes, addr).take(PROBE).map_while(|d| d.insn).collect();
                 A::borrows_frame(&insns)
             })
             .collect();
@@ -995,7 +995,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let section = region.section;
         let known = |at: u64| ((at - section.addr) as usize) < section.data.len() && region.insn_len[(at - section.addr) as usize] != 0;
         let state = A::State::default();
-        let mut decoder = A::decode(&section.data[(addr - section.addr) as usize..], addr);
+        let mut decoder = A::decode(self.image, &section.data[(addr - section.addr) as usize..], addr);
         let literal = |at: u64| A::LITERAL_POOLS && region.flags.get((at - section.addr) as usize).is_some_and(|flags| flags & IN_TABLE != 0);
         for decoded in decoder.by_ref().take(LONGEST) {
             let Some(insn) = decoded.insn else { return false };
@@ -1054,7 +1054,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         // Where decoding starts again past a literal pool, and where the gap's instructions end.
         let (mut resume, mut end) = (Some(addr), addr);
         'gap: while let Some(from) = resume.take() {
-            for decoded in A::decode(&section.data[(from - section.addr) as usize..], from) {
+            for decoded in A::decode(self.image, &section.data[(from - section.addr) as usize..], from) {
                 if known(decoded.addr) {
                     break 'gap;
                 }
@@ -1219,7 +1219,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     let mut candidate = None;
                     let mut scanned_to = addr;
                     let mut next = None;
-                    let decoder = decoders[index].get_or_insert_with(|| A::decoder(&section.data, section.addr));
+                    let decoder = decoders[index].get_or_insert_with(|| A::decoder(self.image, &section.data, section.addr));
                     A::seek(decoder, offset);
                     while let Some(decoded) = A::decode_next(decoder) {
                         let at = (decoded.addr - section.addr) as usize;

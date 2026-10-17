@@ -477,7 +477,7 @@ pub fn decode_floor(binary: &Path, runs: usize) -> Result<()> {
             let Some(bytes) = image.bytes_from(start) else { continue };
             let bytes = &bytes[..((end - start) as usize).min(bytes.len())];
             let mut state = A::State::default();
-            for decoded in A::decode(bytes, start) {
+            for decoded in A::decode(image, bytes, start) {
                 let Some(insn) = std::hint::black_box(decoded).insn else { continue };
                 instructions += 1;
                 if level >= 1 {

@@ -184,11 +184,10 @@ fn an_8051_jump_stays_in_the_bank_of_its_instruction() {
 
 #[test]
 fn every_8051_opcode_is_as_long_as_recore_decodes_it() {
-    use recore::arch::Arch;
     for opcode in 0..=255u8 {
         let code = [opcode, 0x00, 0x00];
         let listed = &session_8051(&code, 0).listing(0, 1, false).unwrap()[0];
-        let decoded = recore::i8051::I8051::decode(&code, 0).next().unwrap();
+        let decoded = recore::i8051::decode(&code, 0).next().unwrap();
         let expected = if decoded.insn.is_some() { u64::from(decoded.len) } else { 1 };
         assert_eq!((listed.len, listed.text == "(bad)"), (expected, decoded.insn.is_none()), "opcode {opcode:#04x}: {}", listed.text);
     }

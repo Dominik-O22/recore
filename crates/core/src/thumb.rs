@@ -738,7 +738,7 @@ pub fn returns_through_register(image: &Image, start: u64, end: u64) -> Vec<u64>
 fn scan(image: &Image, start: u64, end: u64, mut visit: impl FnMut(&Insn, &State, Option<Flow>)) {
     let Some(bytes) = image.bytes_from(start) else { return };
     let mut state = State::default();
-    for insn in Thumb::decode(bytes, start).take_while(|decoded| decoded.addr < end).filter_map(|decoded| decoded.insn) {
+    for insn in Thumb::decode(image, bytes, start).take_while(|decoded| decoded.addr < end).filter_map(|decoded| decoded.insn) {
         let flow = Thumb::flow(&insn, &state, image);
         visit(&insn, &state, flow);
         match flow {
@@ -830,7 +830,7 @@ impl Arch for Thumb {
     const SHORTEST_TILE: u64 = 2;
     const MARKED_CODE_POINTERS: bool = true;
 
-    fn decode(bytes: &[u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> {
+    fn decode<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> + 'a {
         let (mut offset, mut it) = (0, 0);
         std::iter::from_fn(move || {
             let decoded = decode_at(bytes, addr, offset, &mut it)?;
@@ -841,7 +841,7 @@ impl Arch for Thumb {
 
     type Decoder<'a> = Decoder<'a>;
 
-    fn decoder(bytes: &[u8], addr: u64) -> Decoder<'_> {
+    fn decoder<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> Decoder<'a> {
         Decoder { bytes, base: addr, offset: 0, it: 0, insn: Insn { addr, hw1: 0, hw2: 0, conditional: false, literal: None } }
     }
 
@@ -951,7 +951,7 @@ impl Arch for Thumb {
         /// How many instructions a function that saves nothing may run to its end.
         const LONGEST_LEAF: usize = 24;
         let Some(bytes) = image.bytes_from(target) else { return false };
-        let mut insns = Self::decode(bytes, target).map(|decoded| decoded.insn);
+        let mut insns = Self::decode(image, bytes, target).map(|decoded| decoded.insn);
         let Some(Some(first)) = insns.next() else { return false };
         // PUSH, PUSH.W, SUB SP, #imm.
         if Self::opens_function(&first, None) || !first.wide() && first.hw1 & 0xFF80 == 0xB080 {
@@ -1233,24 +1233,8 @@ mod tests {
 
     /// An image with `code` at `addr`.
     fn image(code: &[u8], addr: u64) -> Image {
-        Image {
-            name: String::new(),
-            format: crate::image::Format::Raw,
-            machine: crate::image::Machine::Thumb,
-            base: 0,
-            branch_targets_marked: false,
-            entry: addr,
-            sections: vec![Section { name: String::new(), addr, data: code.to_vec(), file_offset: None, executable: true, writable: false }],
-            zero_filled: Vec::new(),
-            import_slots: FxHashMap::default(),
-            exports: Vec::new(),
-            symbol_names: FxHashMap::default(),
-            frames: Vec::new(),
-            relative_targets: Vec::new(),
-            data_in_code: true,
-            banking: Default::default(),
-            compiler: None,
-        }
+        let section = Section { name: String::new(), addr, data: code.to_vec(), file_offset: None, executable: true, writable: false };
+        Image::bare(String::new(), crate::image::Format::Raw, crate::image::Machine::Thumb, addr, vec![section])
     }
 
     /// The length and the control flow of each instruction of `halfwords` at `addr`.
@@ -1258,7 +1242,7 @@ mod tests {
         let bytes: Vec<u8> = halfwords.iter().flat_map(|half| half.to_le_bytes()).collect();
         let image = image(&bytes, addr);
         let mut state = State::default();
-        Thumb::decode(&bytes, addr)
+        Thumb::decode(&image, &bytes, addr)
             .map(|decoded| {
                 let insn = decoded.insn.unwrap();
                 let flow = Thumb::flow(&insn, &state, &image);
@@ -1327,7 +1311,7 @@ mod tests {
     fn a_literal_load_reads_the_word_of_its_pool() {
         // At 0x1002, LDR R0, [PC, #4] reads the word at 0x1008: (0x1002 + 4) & !3 is 0x1004.
         let bytes = [0x00, 0xBF, 0x01, 0x48, 0x70, 0x47, 0x00, 0xBF, 0x35, 0x12, 0x00, 0x08];
-        let insn = Thumb::decode(&bytes, 0x1000).nth(1).unwrap().insn.unwrap();
+        let insn = Thumb::decode(&image(&bytes, 0x1000), &bytes, 0x1000).nth(1).unwrap().insn.unwrap();
         assert_eq!((Thumb::literal(&insn), insn.literal), (Some((0x1008, 0x100C)), Some(0x0800_1235)));
         assert_eq!(Thumb::address_taken(&insn, &State::default()), Some(0x0800_1234));
     }
@@ -1346,7 +1330,7 @@ mod tests {
     fn registers_after(halfwords: &[u16], addr: u64) -> [Value; 4] {
         let bytes: Vec<u8> = halfwords.iter().flat_map(|half| half.to_le_bytes()).collect();
         let mut state = State::default();
-        Thumb::decode(&bytes, addr).for_each(|decoded| state.step(decoded.insn.unwrap()));
+        Thumb::decode(&image(&bytes, addr), &bytes, addr).for_each(|decoded| state.step(decoded.insn.unwrap()));
         state.registers[..4].try_into().unwrap()
     }
 
@@ -1384,7 +1368,7 @@ mod tests {
         ];
         for (halfwords, expected) in cases {
             let bytes: Vec<u8> = halfwords.iter().flat_map(|half| half.to_le_bytes()).collect();
-            let insns: Vec<Insn> = Thumb::decode(&bytes, 0).filter_map(|decoded| decoded.insn).collect();
+            let insns: Vec<Insn> = Thumb::decode(&image(&bytes, 0), &bytes, 0).filter_map(|decoded| decoded.insn).collect();
             assert_eq!(Thumb::takes_variable_arguments(&insns), expected, "{halfwords:04x?}");
         }
     }
@@ -1475,7 +1459,7 @@ mod tests {
         // where the branch is taken.
         let bounds = |halfwords: &[u16]| {
             let bytes: Vec<u8> = halfwords.iter().flat_map(|half| half.to_le_bytes()).collect();
-            let insns: Vec<Insn> = Thumb::decode(&bytes, 0).filter_map(|decoded| decoded.insn).collect();
+            let insns: Vec<Insn> = Thumb::decode(&image(&bytes, 0), &bytes, 0).filter_map(|decoded| decoded.insn).collect();
             let (branch, before) = insns.split_last().unwrap();
             let mut state = State::default();
             before.iter().for_each(|insn| state.step(*insn));

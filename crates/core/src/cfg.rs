@@ -49,7 +49,7 @@ pub fn field_uses(image: &Image, body: &[(u64, u64)], offset: u64) -> Vec<(u64, 
         for &(start, end) in body {
             let Some(bytes) = image.bytes_from(start) else { continue };
             let bytes = &bytes[..bytes.len().min((end - start) as usize)];
-            found.extend(A::decode(bytes, start).filter_map(|decoded| Some((decoded.addr, A::field_use(&decoded.insn?).filter(|used| used.0 == offset)?.1))));
+            found.extend(A::decode(image, bytes, start).filter_map(|decoded| Some((decoded.addr, A::field_use(&decoded.insn?).filter(|used| used.0 == offset)?.1))));
         }
         found
     }
@@ -74,7 +74,7 @@ pub fn text_arguments(image: &Image, body: &[(u64, u64)], calls: &[u64], is_text
         // the literal it loads from after the code.
         let decoded = |&(start, end): &(u64, u64)| {
             let bytes = image.bytes_from(start).unwrap_or(&[]);
-            A::decode(bytes, start).take_while(move |decoded| decoded.addr < end).filter_map(|decoded| Some((decoded.addr, decoded.insn?)))
+            A::decode(image, bytes, start).take_while(move |decoded| decoded.addr < end).filter_map(|decoded| Some((decoded.addr, decoded.insn?)))
         };
         // Where a jump lands, what the registers hold depends on where it came from.
         let landings: BTreeSet<u64> = body.iter().flat_map(decoded).filter_map(|(_, insn)| match A::flow(&insn, &state, image)? {
@@ -117,7 +117,7 @@ pub fn takes_variable_arguments(image: &Image, start: u64, end: u64) -> bool {
     fn with<A: Arch>(image: &Image, start: u64, end: u64) -> bool {
         let Some(bytes) = image.bytes_from(start) else { return false };
         let bytes = &bytes[..bytes.len().min((end - start) as usize)];
-        let insns: Vec<A::Insn> = A::decode(bytes, start).take(OPENING).map_while(|decoded| decoded.insn).collect();
+        let insns: Vec<A::Insn> = A::decode(image, bytes, start).take(OPENING).map_while(|decoded| decoded.insn).collect();
         A::takes_variable_arguments(&insns)
     }
     match image.machine {
@@ -147,7 +147,7 @@ fn cfg_with<A: Arch>(image: &Image, analysis: &Analysis, body: &[(u64, u64)]) ->
     for &(start, end) in body {
         let Some(bytes) = image.bytes_from(start) else { continue };
         let bytes = &bytes[..bytes.len().min((end - start) as usize)];
-        instructions.extend(A::decode(bytes, start).map(|decoded| (decoded.addr, decoded.next_addr(), decoded.insn.and_then(|insn| A::flow(&insn, &state, image)))));
+        instructions.extend(A::decode(image, bytes, start).map(|decoded| (decoded.addr, decoded.next_addr(), decoded.insn.and_then(|insn| A::flow(&insn, &state, image)))));
     }
     let table = |jump: u64| analysis.jump_tables.iter().find(|table| table.jump == jump).map(|table| &table.targets);
     let call = |at: u64| analysis.calls.binary_search_by_key(&at, |call| call.at).ok().map(|index| &analysis.calls[index]);
@@ -214,24 +214,8 @@ mod tests {
     use crate::image::{Format, Section};
 
     fn image(code: &[u8]) -> Image {
-        Image {
-            name: "test".into(),
-            format: Format::Elf,
-            machine: Machine::X86_64,
-            base: 0,
-            branch_targets_marked: false,
-            entry: 0x1000,
-            sections: vec![Section { name: ".text".into(), addr: 0x1000, data: code.to_vec(), file_offset: None, executable: true, writable: false }],
-            zero_filled: Vec::new(),
-            import_slots: Default::default(),
-            exports: Vec::new(),
-            symbol_names: Default::default(),
-            frames: Vec::new(),
-            relative_targets: Vec::new(),
-            data_in_code: false,
-            banking: Default::default(),
-            compiler: None,
-        }
+        let section = Section { name: ".text".into(), addr: 0x1000, data: code.to_vec(), file_offset: None, executable: true, writable: false };
+        Image::bare("test".into(), Format::Elf, Machine::X86_64, 0x1000, vec![section])
     }
 
     #[test]

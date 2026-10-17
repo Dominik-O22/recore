@@ -165,6 +165,29 @@ pub struct Image {
 }
 
 impl Image {
+    /// An image of `sections` alone, entered at `entry`: no imports, exports, relocations,
+    /// unwind information or names. Data sits among the code of a PE or raw image.
+    pub fn bare(name: String, format: Format, machine: Machine, entry: u64, sections: Vec<Section>) -> Image {
+        Image {
+            name,
+            format,
+            machine,
+            base: 0,
+            branch_targets_marked: false,
+            entry,
+            sections,
+            zero_filled: Vec::new(),
+            import_slots: FxHashMap::default(),
+            exports: Vec::new(),
+            symbol_names: FxHashMap::default(),
+            frames: Vec::new(),
+            relative_targets: Vec::new(),
+            data_in_code: matches!(format, Format::Pe | Format::Raw),
+            banking: Banking::default(),
+            compiler: None,
+        }
+    }
+
     /// Loads the executable at `path`, or the raw image the layout file at `path` describes.
     pub fn load(path: &Path) -> Result<Image> {
         if crate::layout::is_layout(path) {

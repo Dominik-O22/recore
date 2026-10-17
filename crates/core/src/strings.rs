@@ -127,24 +127,8 @@ mod tests {
     #[test]
     fn finds_strings_nothing_refers_to_between_the_known_ones() {
         let data = b"known one\0left over text\0\x01\x02abcdefgh\0tiny\0";
-        let image = Image {
-            name: "test".into(),
-            format: Format::Elf,
-            machine: Machine::X86_64,
-            base: 0,
-            branch_targets_marked: false,
-            entry: 0,
-            sections: vec![Section { name: ".rodata".into(), addr: 0x2000, data: data.to_vec(), file_offset: None, executable: false, writable: false }],
-            zero_filled: Vec::new(),
-            import_slots: Default::default(),
-            exports: Vec::new(),
-            symbol_names: Default::default(),
-            frames: Vec::new(),
-            relative_targets: Vec::new(),
-            data_in_code: false,
-            banking: Default::default(),
-            compiler: None,
-        };
+        let section = Section { name: ".rodata".into(), addr: 0x2000, data: data.to_vec(), file_offset: None, executable: false, writable: false };
+        let image = Image::bare("test".into(), Format::Elf, Machine::X86_64, 0, vec![section]);
         let known = [StringLiteral { addr: 0x2000, text: "known one".into(), wide: false }];
         let found: Vec<(u64, String)> = unreferenced(&image, &known).into_iter().map(|string| (string.addr, string.text)).collect();
         // Not the known string, not text that starts in the middle of other bytes, not a short run.

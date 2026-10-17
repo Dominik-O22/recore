@@ -140,24 +140,7 @@ fn shapes() -> Image {
         Words::at(0x3180).to(0x2140).section("__TEXT,__swift5_protos"),
         names.section("__TEXT,__swift5_typeref"),
     ];
-    Image {
-        name: "shapes".into(),
-        format: Format::MachO,
-        machine: Machine::Aarch64,
-        base: 0,
-        branch_targets_marked: false,
-        entry: 0x1000,
-        sections,
-        zero_filled: Vec::new(),
-        import_slots: Default::default(),
-        exports: Vec::new(),
-        symbol_names: Default::default(),
-        frames: Vec::new(),
-        relative_targets: Vec::new(),
-        data_in_code: false,
-        banking: Default::default(),
-        compiler: None,
-    }
+    Image::bare("shapes".into(), Format::MachO, Machine::Aarch64, 0x1000, sections)
 }
 
 #[test]
