@@ -3348,3 +3348,37 @@ image	advisory	status	by_version	reported	evidence
 22.03.7-x86_64-full	CVE-2019-19945	fixed	fixed	2023-06-25-34a8a74d-1	snapshot 34a8a74dbdec contains 5f9ae5738372
 22.03.7-x86_64-full	UHTTPD-2026-CHUNKED	vulnerable	vulnerable	2023-06-25-34a8a74d-1	snapshot 2023-06-25, no fix and no patch with it
 22.03.7-x86_64-full	CVE-2026-53922	vulnerable	vulnerable	2023-01-02-4a673e1c-2	snapshot 2023-01-02, no fix and no patch with it
+25.12.5-aarch64-stale	CVE-2017-14491	fixed	fixed	2.93-r1	program from 24.10.6-aarch64: upstream 2.90 has the fix from 2.78
+25.12.5-aarch64-stale	CVE-2020-25681	absent	fixed	2.93-r1	program from 24.10.6-aarch64: built without the code: the image has dnsmasq
+25.12.5-aarch64-stale	CVE-2020-25684	fixed	fixed	2.93-r1	program from 24.10.6-aarch64: upstream 2.90 has the fix from 2.83
+25.12.5-aarch64-stale	CVE-2020-25685	fixed	fixed	2.93-r1	program from 24.10.6-aarch64: upstream 2.90 has the fix from 2.83
+25.12.5-aarch64-stale	CVE-2020-25686	fixed	fixed	2.93-r1	program from 24.10.6-aarch64: upstream 2.90 has the fix from 2.83
+25.12.5-aarch64-stale	CVE-2022-0934	absent	fixed	2.93-r1	program from 24.10.6-aarch64: built without the code: the image has dnsmasq
+25.12.5-aarch64-stale	CVE-2023-28450	fixed	fixed	2.93-r1	program from 24.10.6-aarch64: upstream 2.90 has the fix from 2.90
+25.12.5-aarch64-stale	CVE-2026-2291	vulnerable	fixed	2.93-r1	program from 24.10.6-aarch64: 2.90, no fix and no patch with it
+25.12.5-aarch64-stale	CVE-2026-5172	vulnerable	fixed	2.93-r1	program from 24.10.6-aarch64: 2.90, no fix and no patch with it
+25.12.5-aarch64-stale	CVE-2026-12969	vulnerable	fixed	2.93-r1	program from 24.10.6-aarch64: 2.90, no fix and no patch with it
+25.12.5-aarch64-stale	CVE-2018-15599	fixed	fixed	2025.89-r3	upstream 2025.89 has the fix from 2019.77
+25.12.5-aarch64-stale	CVE-2023-48795	fixed	fixed	2025.89-r3	upstream 2025.89 has the fix from 2024.84
+25.12.5-aarch64-stale	CVE-2023-36328	fixed	fixed	2025.89-r3	upstream 2025.89 has the fix from 2024.84
+25.12.5-aarch64-stale	CVE-2022-30065	fixed	fixed	1.37.0-r6	upstream 1.37.0 has the fix from 1.36.0
+25.12.5-aarch64-stale	CVE-2019-19945	fixed	fixed	2026.06.16~7b1bec45-r1	snapshot 7b1bec45826b contains 5f9ae5738372
+25.12.5-aarch64-stale	UHTTPD-2026-CHUNKED	fixed	fixed	2026.06.16~7b1bec45-r1	snapshot 7b1bec45826b contains d255187
+25.12.5-aarch64-stale	CVE-2026-53922	fixed	fixed	2026.06.29~5d7be43f-r1	snapshot 5d7be43f8b9d has d08dbcc, a cherry-pick of c6792ba
+24.10.8-armv7-stale	CVE-2017-14491	fixed	fixed	2.93-r1	upstream 2.93 has the fix from 2.78
+24.10.8-armv7-stale	CVE-2020-25681	absent	fixed	2.93-r1	built without the code: the image has dnsmasq
+24.10.8-armv7-stale	CVE-2020-25684	fixed	fixed	2.93-r1	upstream 2.93 has the fix from 2.83
+24.10.8-armv7-stale	CVE-2020-25685	fixed	fixed	2.93-r1	upstream 2.93 has the fix from 2.83
+24.10.8-armv7-stale	CVE-2020-25686	fixed	fixed	2.93-r1	upstream 2.93 has the fix from 2.83
+24.10.8-armv7-stale	CVE-2022-0934	absent	fixed	2.93-r1	built without the code: the image has dnsmasq
+24.10.8-armv7-stale	CVE-2023-28450	fixed	fixed	2.93-r1	upstream 2.93 has the fix from 2.90
+24.10.8-armv7-stale	CVE-2026-2291	fixed	fixed	2.93-r1	upstream 2.93 has the fix from 2.93
+24.10.8-armv7-stale	CVE-2026-5172	fixed	fixed	2.93-r1	upstream 2.93 has the fix from 2.93
+24.10.8-armv7-stale	CVE-2026-12969	fixed	fixed	2.93-r1	upstream 2.93 has the fix from 2.93
+24.10.8-armv7-stale	CVE-2018-15599	fixed	fixed	2024.86-r3	program from 23.05.2-armv7: upstream 2022.82 has the fix from 2019.77
+24.10.8-armv7-stale	CVE-2023-48795	vulnerable	fixed	2024.86-r3	program from 23.05.2-armv7: 2022.82, no fix and no patch with it
+24.10.8-armv7-stale	CVE-2023-36328	vulnerable	fixed	2024.86-r3	program from 23.05.2-armv7: 2022.82, no fix and no patch with it
+24.10.8-armv7-stale	CVE-2022-30065	fixed	fixed	1.36.1-r3	upstream 1.36.1 has the fix from 1.36.0
+24.10.8-armv7-stale	CVE-2019-19945	fixed	fixed	2025.07.06~7e64e8ba-r5	snapshot 7e64e8bad241 contains 5f9ae5738372
+24.10.8-armv7-stale	UHTTPD-2026-CHUNKED	fixed	vulnerable	2025.07.06~7e64e8ba-r5	patch 0003-client-prevent-transfer_chunked-counter-overflow.patch
+24.10.8-armv7-stale	CVE-2026-53922	fixed	vulnerable	2025.10.02~b14cf98c-r3	patch 0029-odhcpd-fix-integer-underflow-in-dhcpv6_ia_handle_IAs.patch
