@@ -11,8 +11,12 @@ public class ExportRef extends GhidraScript {
 	@Override
 	public void run() throws Exception {
 		long base = currentProgram.getImageBase().getOffset();
-		// Non-PIE executables are loaded at their link address, so nothing is subtracted.
-		long shift = currentProgram.getMinAddress().getOffset() >= base && base == 0x100000 ? base : 0;
+		// Non-PIE executables are loaded at their link address, so nothing is subtracted. Ghidra
+		// loads a position-independent ELF at 0x100000, or at 0x10000 for a 32-bit one, where
+		// 32-bit ARM executables are also linked: its ELF type, ET_DYN, tells which.
+		byte[] header = java.nio.file.Files.readAllBytes(java.nio.file.Path.of(currentProgram.getExecutablePath()));
+		boolean dynamic = header.length > 17 && header[0] == 0x7f && header[1] == 'E' && header[16] == 3 && header[17] == 0;
+		long shift = currentProgram.getMinAddress().getOffset() >= base && (base == 0x100000 || base == 0x10000 && dynamic) ? base : 0;
 		Address min = currentProgram.getMinAddress();
 
 		StringBuilder functions = new StringBuilder();
