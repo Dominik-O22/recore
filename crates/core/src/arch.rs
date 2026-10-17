@@ -180,6 +180,12 @@ pub trait Arch: 'static {
     /// an address at all.
     fn address_taken(insn: &Self::Insn, state: &Self::State, image: &Image) -> Option<u64>;
 
+    /// The address `insn` completes in a register that cannot be one of code, where pointers to
+    /// code carry a mark: see [`Arch::MARKED_CODE_POINTERS`].
+    fn data_address(_insn: &Self::Insn, _state: &Self::State) -> Option<u64> {
+        None
+    }
+
     /// Where [`Arch::CALL_MAY_BE_FAR_JUMP`], whether `insn` is of an instruction set whose branches
     /// reach as far as its calls, so that code that has it never jumps with a call.
     fn branches_reach_far(_insn: &Self::Insn) -> bool {

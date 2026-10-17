@@ -289,6 +289,9 @@ struct Explorer<'a, A: Arch> {
     after_calls: Vec<(u64, u64)>,
     /// See [`Discovery::frame_ends`].
     frame_ends: Vec<u64>,
+    /// The addresses that code reached from an entry point completes and that cannot be of code:
+    /// see [`Arch::data_address`].
+    data_addresses: Vec<u64>,
     /// Addresses taken that an earlier pass found inside other code, which are no entry points
     /// on that evidence: see [`Arch::TAKEN_IS_WEAK`].
     rejected: FxHashSet<u64>,
@@ -488,6 +491,9 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     }
                     if self.recording {
                         self.note_references(insn, &state, decoded.addr, speculative);
+                    }
+                    if let Some(data) = A::data_address(insn, &state).filter(|_| trusted && !speculative) {
+                        self.data_addresses.push(data);
                     }
                     let mut taken = A::address_taken(insn, &state, self.image).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
                     let in_code = taken.is_some_and(|target| self.region_index(target).is_some());
@@ -1230,6 +1236,38 @@ impl<'a, A: Arch> Explorer<'a, A> {
         tiles
     }
 
+    /// Marks as data, in each region, everything from the first address that the code reached
+    /// forms of data past the end of that code and of its tables and pools: the constants and
+    /// the initial values of variables that a firmware image keeps after its code. Nothing
+    /// there is a function, however its bytes decode, and the entry points there that only an
+    /// address taken speaks for go, as does the code decoded from them, which ends nothing.
+    fn mark_trailing_data(&mut self) {
+        self.data_addresses.sort_unstable();
+        self.weak_starts.sort_unstable();
+        for index in 0..self.regions.len() {
+            let region = &self.regions[index];
+            let section = region.section;
+            let weak: Vec<(usize, usize)> = self
+                .weak_starts
+                .iter()
+                .filter(|&&addr| section.contains(addr))
+                .map(|&addr| (addr - section.addr) as usize)
+                .map(|offset| (offset, region.end_of_run(offset)))
+                .collect();
+            let from_weak = |at: usize| weak.iter().any(|&(start, end)| (start..end).contains(&at));
+            let known = |at: usize| (region.insn_len[at] != 0 || region.flags[at] & IN_TABLE != 0) && !from_weak(at);
+            let Some(last) = (0..section.data.len()).rev().find(|&at| known(at)) else { continue };
+            let known_end = section.addr + last as u64 + u64::from(region.insn_len[last].max(1));
+            let Some(&start) = self.data_addresses.iter().find(|&&addr| addr >= known_end && addr < section.end()) else { continue };
+            let (from, clock) = ((start - section.addr) as usize, self.clock);
+            let region = &mut self.regions[index];
+            region.flags[from..].iter_mut().for_each(|flags| *flags |= IN_TABLE);
+            region.touch(from, clock);
+            region.touch(section.data.len() - 1, clock);
+            self.starts.retain(|&addr, origin| !(section.contains(addr) && addr >= start && matches!(origin, Origin::AddressTaken | Origin::DataPointer)));
+        }
+    }
+
     fn in_table(&self, addr: u64) -> bool {
         self.tables.iter().any(|(_, table)| addr >= table.address && addr < table.address + table.entry_size * table.entries.len() as u64)
     }
@@ -1555,6 +1593,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         branches_reach_far: false,
         after_calls: Vec::new(),
         frame_ends: Vec::new(),
+        data_addresses: Vec::new(),
         rejected,
         weak_starts: Vec::new(),
         data_sections: {
@@ -1591,6 +1630,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         let _phase = phase::scope("discover/drain");
         explorer.drain(&mut decoders);
     }
+    explorer.mark_trailing_data();
     loop {
         let promoted = {
             let _phase = phase::scope("discover/promote tail calls");

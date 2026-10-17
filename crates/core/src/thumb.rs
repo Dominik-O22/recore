@@ -965,6 +965,11 @@ impl Arch for Thumb {
         Self::completed_address(insn, state).filter(|address| address & 1 != 0).map(|address| u64::from(address & !1))
     }
 
+    /// An address without the Thumb bit.
+    fn data_address(insn: &Insn, state: &State) -> Option<u64> {
+        Self::completed_address(insn, state).filter(|address| address & 1 == 0).map(u64::from)
+    }
+
     fn memory_reference(insn: &Insn, state: &State) -> Option<u64> {
         let base = |register: usize| match state.registers[register] {
             Value::Const(base) => Some(u64::from(base)),
@@ -1468,11 +1473,21 @@ mod tests {
 
     #[test]
     fn a_doubleword_loaded_through_an_adr_is_data() {
-        // 0x00: ADR R3, 0x08; LDRD R2, R3, [R3], or MOVS R2, #0; NOP; BX LR. At 0x08 the
-        // constant, whose words read as MOVS R0, #1; BX LR and MOVS R0, #2; BX LR.
-        let code = |load: [u16; 2]| [&[0xA301][..], &load, &[0x4770, 0x2001, 0x4770, 0x2002, 0x4770]].concat();
-        assert_eq!(functions(&code([0xE9D3, 0x2300])), [0x00]);
-        assert_eq!(functions(&code([0x2200, 0xBF00])), [0x00, 0x08, 0x0C]);
+        // 0x00: PUSH {LR}; ADR R3, 0x10; LDRD R2, R3, [R3], or MOVS R3, #0; MOVS R2, #0; NOP;
+        // BL 0x18; POP {PC}; NOP. At 0x10 the constant, whose words read as MOVS R0, #1; BX LR
+        // and MOVS R0, #2; BX LR. At 0x18 BX LR.
+        let code = |load: [u16; 3]| [&[0xB500][..], &load, &bl(0x08, 0x18), &[0xBD00, 0xBF00, 0x2001, 0x4770, 0x2002, 0x4770, 0x4770]].concat();
+        assert_eq!(functions(&code([0xA303, 0xE9D3, 0x2300])), [0x00, 0x18]);
+        assert_eq!(functions(&code([0x2300, 0x2200, 0xBF00])), [0x00, 0x10, 0x14, 0x18]);
+    }
+
+    #[test]
+    fn what_follows_the_code_from_an_address_it_loads_of_data_is_data() {
+        // 0x00: LDR R0, =0x10 or =0; BX LR; padding; the literal. At 0x10 MOVS R0, #1; BX LR;
+        // MOVS R0, #2; BX LR, which follow the code as constants do.
+        let code = |literal: u16| [0x4801, 0x4770, 0xBF00, 0xBF00, literal, 0x0000, 0x0000, 0x0000, 0x2001, 0x4770, 0x2002, 0x4770];
+        assert_eq!(functions(&code(0x10)), [0x00]);
+        assert_eq!(functions(&code(0x00)), [0x00, 0x10, 0x14]);
     }
 
     #[test]
