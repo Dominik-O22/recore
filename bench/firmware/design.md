@@ -23,7 +23,7 @@ recore reads x86-64, AArch64, 32-bit ARM Linux (A32 and Thumb-2, since PR #17), 
 
 These are the virtual-machine targets. They build the same packages from the same tree as the routers of their architecture, and they exist for every release, which no single router target does. MIPS is still out. When recore reads it, ath79 and ramips images bring the same packages and the task sets carry over.
 
-Cortex-M is tier C's. The Debian builds in `corpus-armhf-holdout` and `corpus-armel-holdout` score recore's own analysis and stay out of this benchmark, so nothing here is tuned on them.
+Cortex-M is part 2's. The Debian builds in `corpus-armhf-holdout` and `corpus-armel-holdout` score recore's own analysis and stay out of this benchmark, so nothing here is tuned on them.
 
 ## Corpus
 
@@ -57,58 +57,55 @@ Labels were checked against the binaries where a string settles it. The strict-K
 Variants put the cells the natural fleet lacks into real images. Each is a release image with one package replaced, recorded in the manifest with what was changed, so its label stays exact.
 
 - **Package swap.** `dnsmasq-full` from the release's own package feed, pinned by the SHA-256 in its `Packages` index, replaces `dnsmasq`. Many vendor images ship it. This turns CVE-2022-0934 and CVE-2020-25681 from absent into present cells, with the 21.02.7 and 22.03.7 backports as the trap. No build is needed.
-- **Patch dropped.** The release's SDK rebuilds the package without its CVE patch. The version still claims fixed, and the code is vulnerable.
-- **Patch added.** The SDK rebuilds an older release's package with a later backport. The version says vulnerable, and the code is fixed.
+- **Stale program.** One program comes from an older release image of the same architecture, and the package database stays as it was, as when a vendor ships a stale binary. The version claims a fix the code lacks. No build is needed. Two are built: 25.12.5's database names dnsmasq 2.93 over 24.10.6's 2.90, and 24.10.8's names dropbear 2024.86 over 23.05.2's 2022.82.
+- **Patch dropped.** The release's SDK rebuilds the package without its CVE patch. The version still claims fixed, and the code is vulnerable. Not built yet: it runs the SDK's downloaded toolchain.
+- **Patch added.** The SDK rebuilds an older release's package with a later backport. The version says vulnerable, and the code is fixed. Not built yet, for the same reason.
 
 The SDK builds use the release's own toolchain and flags, so the rebuilt binary differs from the shipped one only by the patch. The agent never sees both (see the pitfalls).
 
-## Three task tiers
+## Two parts
 
-### A. Fleet triage (the core; speed matters)
+A version scanner and a binary analysis tool do different jobs, so the benchmark scores them apart. The scanner matches versions against a database of advisories, which is fast and covers a fleet, and it cannot tell a backport from a vulnerable build or code that is built out from code that is there. Binary analysis can. Part 1 scores what analysis adds to the scanner. Part 2 scores analysis with no advisory at all.
 
-The agent gets 40 to 60 unpacked images and 5 to 8 advisories, with the advisory text as published and no fix commit. It fills a matrix: for each image and advisory, vulnerable, fixed or absent, with the binary and the function that decide it as evidence. Images are named `img01` and so on, in random order. The rootfs keeps `/etc/openwrt_release` and the package database, as a defender's images would.
+### Part 1. Check the scanner's claims (a fleet; speed matters)
 
-The session has a wall-clock budget, 45 minutes for the full tier. The budget only makes the fleet size count when the agent has to look at many binaries. Ghidra took 6 s of analysis and 9.4 s of wall time per OpenWrt binary in the first measurements, so an advisory that names one daemon costs it 50 binaries and about 8 minutes per tier, well inside the budget. Speed shows where the advisory does not say which binary carries the code:
+The agent gets unpacked images, the advisories as published, and the scanner's claim for each image and advisory: `affected` or `not affected`, with the program and version it read. It checks the claims against the binaries and refutes the wrong ones, with the binary and the function that decide each verdict as evidence. A claim it does not check stands. Images are named `img01` and so on, in random order, and keep `/etc/openwrt_release` and the package database, as a defender's images would.
 
-- **Library advisories.** A flaw in libubox, musl or another shared library: the agent has to find which programs call the vulnerable function, not only whether the library has the fix.
-- **Bundled copies.** Code that programs carry inside them, such as dropbear's libtommath or BusyBox's DHCP client, which also exists as standalone code elsewhere.
+The scanner is wrong in both directions, and a task holds both:
+
+- **Claimed affected, not affected.** A backport (dropbear 2022.82 in 22.03.7), code built out (DHCPv6 in stock dnsmasq), or a mixed-status binary (24.10.7's dnsmasq, fixed for two 2026 advisories and not a third).
+- **Claimed not affected, affected.** A stale program, and once they are built, a dropped patch.
+
+A full task has 40 to 60 images and 5 to 8 advisories and a 45-minute budget. The budget only makes the fleet count when the agent has to look at many binaries. Ghidra took 6 s of analysis and 9.4 s of wall time per OpenWrt binary in the first measurements, so an advisory that names one daemon costs it 50 binaries and about 8 minutes, well inside the budget. Speed shows where the advisory does not say which binary carries the code:
+
+- **Library advisories.** A flaw in libubox, musl or another shared library: the agent has to find which programs use the vulnerable function, not only whether the library has the fix.
+- **Bundled copies.** Code that programs carry inside them, such as dropbear's libtommath or BusyBox's DHCP client.
 - **Component unknown.** An advisory that names the bug and the protocol but not the program, as vendor advisories often do.
 
-Each full tier carries at least two such advisories. An image has 85 to 96 programs and libraries, so a fleet of 50 has about 4,500, roughly 12 hours of Ghidra wall time on one 4-core job (inferred from the per-binary average), so a Ghidra agent has to choose which to analyze. recore analyzed all 3,228 distinct ones in the 197 images in 8.5 s on one core.
+Each full task carries at least two such advisories. An image has 85 to 96 programs and libraries, so a fleet of 50 has about 4,500, roughly 12 hours of Ghidra wall time on one 4-core job (inferred from the per-binary average), and a Ghidra agent has to choose which to analyze. recore analyzed all 3,228 distinct ones in the 197 images in 8.5 s on one core.
 
-Each advisory in a task is picked so the version alone misjudges some of its cells. A full tier mixes one advisory a string decides (Terrapin), one compiled-out case (CVE-2022-0934 with some `dnsmasq-full` images), one mixed-status binary (24.10.7's dnsmasq) and at least two advisories published after the models' training data (the 2026 dnsmasq, uhttpd and odhcpd fixes).
+### Part 2. Find security bugs with no prior knowledge (depth)
 
-### B. Locate and prove (depth on one advisory)
+The agent gets programs and a scope, such as "the web server and the DHCPv6 server of this router image", and no advisory. It reports each security bug it finds: the binary, the function, the class of bug and the input that reaches it.
 
-The agent gets one advisory and three to five binaries of one package from different releases and architectures, for example dropbear from 19.07.10 x86_64, 22.03.6 armv7 and 23.05.6 aarch64. For each binary it reports the address of the function that the fix changes, whether the fix is there, and the instructions that show it. Examples are the comparison CVE-2026-5172 adds after `extract_name`, or the cap UHTTPD-2026-CHUNKED puts on the chunk counter.
+Truth comes from security fixes OpenWrt shipped as patches between two releases built from the same source snapshot. The earlier release's program carries every one of those bugs, and the later one exists to check the truth against: a diff of the two builds shows each fixed function. 24.10.7 and 24.10.8 are such a pair for uhttpd and odhcpd, with dozens of fixes from 2026, most without a CVE, so a model cannot recall them. Cortex-M firmware joins the same way, from the Zephyr and Contiki-NG fix commits and their parents.
 
-Truth comes from SDK builds of the same package and release, which keep their symbols until the strip step. The unstripped build gives the function's address, and the stripped release binary has it at the same address when the build reproduces. That holds when the rebuilt and the shipped binary have the same code bytes, and the benchmark checks it before it uses a binary. A cell scores when the address is the function's start and the stated status is right. The evidence is judged against the fix's diff by a model, three times with the majority taken, as `bench/agent/judge.py` does.
-
-The binaries are never one build with and without the patch. Each pair differs by release, compiler version and architecture, so diffing two binaries turns up hundreds of changed functions, and the agent has to find the one the advisory describes.
-
-### C. Firmware without a name (Cortex-M, and bugs nobody published)
-
-Two sources, both with exact truth and neither in training data as an answer.
-
-- **Cortex-M.** The Zephyr and Contiki-NG CVE samples from fuzzware-experiments, 15 with ELF truth, and our own builds of each fix commit and its parent across two boards and two compilers. Raw `.bin` images with a layout file, as recore's Cortex-M corpus already has.
-- **Reverted fixes that never got a CVE.** OpenWrt's patch lists carry security fixes with no CVE, such as libubox's `blobmsg-fix-heap-buffer-overflow-in-blobmsg_parse` in 18.06.9 and uhttpd's `fix-off-by-one-out-of-bounds-read-in-uh_b64decode` in 24.10.8. The SDK builds each release with and without one. The advisory is written as a defender would get it from a vendor, with the component and the bug class but no function name.
-
-The task is tier B's: name the function, say fixed or vulnerable per build. Tier C has the fewest images and the hardest cells, and is where headroom lives once tiers A and B saturate.
+The agent never sees the fixed build, so diffing is not available to it. The truth list itself is not in this repository yet.
 
 ## Scoring
 
-- **Cells.** Each cell is right or wrong on its status. The headline is the F1 score of "vulnerable", because a defender acts on that call. Accuracy over all three statuses comes second. A cell with no answer counts as wrong.
-- **Evidence.** A status counts only with evidence. In tier A that is the binary that carries the code and a function address in it. The scorer checks that the binary exists in the image and is the package's, and that the address is a function start in recore's and Ghidra's analysis of it. A right status with wrong or no evidence scores half.
-- **Cost.** Wall time, the analysis time each tool spent before and during the session, tokens read and dollars. They come from `bench/agent/stats.py`.
-- **Baselines, published with every result.** The version scanner (the `by_version` column), "everything vulnerable", and the model with no tool at all, which measures what it recalls. A tool's score is worth what it adds over the best of these.
+- **Part 1.** The scanner's claims are the starting point. A session is scored on the wrong claims it refutes and the right claims it breaks, and on how many claims end up right. A refutation counts only with evidence that holds, the advisory's binary and an address in its code, at the file's addresses or at Ghidra's default image base. Results are reported separately for claims a string decides (an advisory's `tell`) and for claims only the code decides.
+- **Part 2.** A finding matches a known bug when it names the right program and an address inside the fixed function, and a judge model agrees, three times with the majority taken as `bench/agent/judge.py` does, that it describes that bug. A finding that matches no known bug is not counted as wrong, since the program may hold bugs nobody has fixed. It goes to review by a person.
+- **Cost.** Wall time, the analysis time each tool spent before and during the session, tokens read and dollars, from `bench/agent/stats.py`.
+- **Baselines.** Part 1 has the scanner alone. Part 2 has the model with no tool, which measures what it recalls.
 
 ## Pitfalls, and what the design does about each
 
 The research's section 4 names seven, and the brief that asked for this design names five. Each has an answer here.
 
-1. **A diff where only one function changed.** No task contains a variant beside the release it came from, on the same architecture. Tier B pairs differ by release, compiler and architecture. A patch-dropped variant replaces its release in a task; its twin is not in the fleet.
+1. **A diff where only one function changed.** No task contains a variant beside the release it came from, on the same architecture, and part 2 never gives the agent the fixed build. A patch-dropped variant replaces its release in a task; its twin is not in the fleet.
 2. **Strings that give the answer away.** Some fixes add a string. Terrapin's strict-KEX name is one. An advisory records the string in `tell` where one decides it, and results are reported separately for those cells and for cells only the code decides. CVE-2023-28450 is a constant (an EDNS size of 4096 or 1232), CVE-2026-5172 one comparison, and UHTTPD-2026-CHUNKED a cap on a counter: no string tells. Version banners stay in, because they are the trap. Images are numbered, so a file name says nothing.
-3. **CVEs a model may remember.** Five advisories are 2026 fixes. CVE-2026-53922's text was published on 2026-10-12, and the uhttpd fix has no CVE, so its text is the fix commit's own description. OpenWrt's backports are the part a model might recall ("22.03.7 has the Terrapin patch"), and the patch-dropped variants make that recall wrong. The no-tool baseline measures how much recall is worth.
+3. **CVEs a model may remember.** Five advisories are 2026 fixes. CVE-2026-53922's text was published on 2026-10-12, and the uhttpd fix has no CVE, so its text is the fix commit's own description. OpenWrt's backports are the part a model might recall ("22.03.7 has the Terrapin patch"), and the stale and patch-dropped variants make that recall wrong. Part 2's bugs are mostly fixes with no CVE, and its no-tool baseline measures how much recall is worth.
 4. **Version-only labels.** Labels come from the tree and the patch list at the tag, never from the version string. The labeller refuses an image whose package database disagrees with the tree.
 5. **Build variance.** Variants are built with the release's own SDK, pinned by URL and SHA-256 with its toolchain version. A variant whose untouched rebuild does not match the shipped binary's code is not used. The release images are the release's own builds, so the natural fleet has no build variance of ours.
 6. **Canaries and logging calls.** Nothing is instrumented. Variants are plain builds with a real patch dropped or added.
@@ -118,15 +115,15 @@ The research's section 4 names seven, and the brief that asked for this design n
 
 Several things keep a strong model with the best tool short of full marks:
 
-- **The budget.** Fleet triage is a time-bound sweep, and the cells it misses count as wrong.
+- **The budget.** Part 1 is a time-bound sweep, and a claim the agent does not reach stands, right or wrong.
 - **Architectures.** Two thirds of the binaries are ARM, a third of them 32-bit, stripped, built with musl.
-- **Code-only cells.** Advisories with no telling string have to be settled in the code, in a function the advisory describes but does not always name.
+- **Code-only claims.** Advisories with no telling string have to be settled in the code, in a function the advisory describes but does not always name.
 - **Mixed-status binaries.** The model has to judge each advisory on its own, even when it shares one dnsmasq binary with others.
-- **Compiled-out cells.** The model has to show the code is missing, not just that the version is old.
-- **Tier C.** Bugs with no public name, in images with no file system.
+- **Compiled-out code.** The model has to show the code is missing, not just that the version is old.
+- **Part 2.** Bugs with no advisory, in programs with no symbols.
 
-The pilot below has to show that the harder cells separate the tools and that neither arm saturates them.
+The pilots have to show that the harder claims separate the tools and that neither arm saturates them.
 
-## Pilot
+## Pilots
 
-Tier A, small: 10 images and 3 advisories, run with Haiku on both arms. `bench/firmware/pilot/` holds the task, its scorer and the prompts. The results and an audit of the sessions are in [results.md](results.md).
+Part 1, small: 10 images and 3 advisories, 30 claims, run with Haiku and Sonnet on both arms. `bench/firmware/verify/` holds the task, its scorer and the scanner's claims, and `bench/firmware/run.sh` runs a session. A first pilot asked the agent to fill the matrix with no claims. The results of both and an audit of the sessions are in [results.md](results.md).
