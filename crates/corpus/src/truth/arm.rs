@@ -69,7 +69,7 @@ impl<'a> Code<'a> {
                 Some((symbol.address(), run))
             })
             .collect();
-        marks.sort_unstable_by_key(|&(addr, _)| addr);
+        marks.sort_by_key(|&(addr, _)| addr);
         marks.dedup_by_key(|&mut (addr, _)| addr);
         // GCC marks the byte that pads a table of an odd length as data of its own.
         marks.dedup_by_key(|&mut (_, run)| run);
