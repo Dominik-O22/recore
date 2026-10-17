@@ -264,7 +264,7 @@ impl Image {
             object::Architecture::I386 => Machine::X86,
             object::Architecture::X86_64 => Machine::X86_64,
             object::Architecture::Aarch64 => Machine::Aarch64,
-            object::Architecture::Arm if file.is_little_endian() => Machine::Arm,
+            object::Architecture::Arm if file.is_little_endian() && !file.is_64() => Machine::Arm,
             other => anyhow::bail!("unsupported architecture {other:?}"),
         };
 
@@ -378,7 +378,8 @@ fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, St
 
     // Packed relative relocations store the target in the relocated word itself.
     if let Some(relr) = file.section_by_name(".relr.dyn").and_then(|s| s.uncompressed_data().ok()) {
-        relative_targets.extend(relr_slots(&relr).into_iter().filter_map(|slot| Some((slot, read_word(sections, slot, 8)?))));
+        let word = if file.is_64() { 8 } else { 4 };
+        relative_targets.extend(relr_slots(&relr, word).into_iter().filter_map(|slot| Some((slot, read_word(sections, slot, word)?))));
     }
 
     let exports = file
@@ -441,18 +442,20 @@ pub(crate) fn parse_frames(data: &[u8], addr: u64) -> Vec<(u64, u64)> {
     frames
 }
 
-/// Decodes a `.relr.dyn` section into the addresses it relocates. An even entry is an address;
-/// an odd entry is a bitmap covering the 63 words after the previous one.
-fn relr_slots(data: &[u8]) -> Vec<u64> {
+/// Decodes a `.relr.dyn` section of `word`-byte entries into the addresses it relocates. An even
+/// entry is an address; an odd entry is a bitmap covering the words after the previous one, as
+/// many as it has bits but one.
+fn relr_slots(data: &[u8], word: usize) -> Vec<u64> {
+    let (step, bits) = (word as u64, 8 * word as u64 - 1);
     let mut slots = Vec::new();
     let mut next = 0u64;
-    for entry in data.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())) {
+    for entry in data.chunks_exact(word).map(|c| c.iter().rev().fold(0u64, |entry, &byte| entry << 8 | u64::from(byte))) {
         if entry & 1 == 0 {
             slots.push(entry);
-            next = entry + 8;
+            next = entry + step;
         } else {
-            slots.extend((0..63).filter(|bit| entry >> (bit + 1) & 1 == 1).map(|bit| next + 8 * bit));
-            next += 8 * 63;
+            slots.extend((0..bits).filter(|bit| entry >> (bit + 1) & 1 == 1).map(|bit| next + step * bit));
+            next += step * bits;
         }
     }
     slots
@@ -476,4 +479,18 @@ fn has_bti(note: &[u8]) -> bool {
         at += 8 + (size as usize).next_multiple_of(8);
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_relocations_count_words_of_the_image_s_own_size() {
+        // An address, then a bitmap whose bits 1 and 3 after the marker name the first and the
+        // third word past it.
+        let entries = |words: &[u64], size: usize| words.iter().flat_map(|word| word.to_le_bytes()[..size].to_vec()).collect::<Vec<u8>>();
+        assert_eq!(relr_slots(&entries(&[0x1000, 0b1011], 4), 4), [0x1000, 0x1004, 0x100C]);
+        assert_eq!(relr_slots(&entries(&[0x1000, 0b1011], 8), 8), [0x1000, 0x1008, 0x1018]);
+    }
 }
