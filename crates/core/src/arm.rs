@@ -771,10 +771,11 @@ impl Arch for Arm {
         Some(if transfer.up { u64::from(base) + u64::from(offset) } else { u64::from(base).wrapping_sub(u64::from(offset)) })
     }
 
-    fn literal(insn: &Insn) -> Option<(u64, u64)> {
+    #[inline]
+    fn literal(insn: &Insn, state: &State) -> Option<(u64, u64)> {
         match insn {
             Insn::A32(insn) => insn.literal_range(),
-            Insn::Thumb(insn) => insn.literal_range(),
+            Insn::Thumb(insn) => Thumb::literal(insn, state),
         }
     }
 
@@ -818,6 +819,12 @@ impl Arch for Arm {
     /// A Thumb block that reads its function's variables before setting up a frame.
     fn borrows_frame(insns: &[Insn]) -> bool {
         thumb_only(insns).is_some_and(|insns| Thumb::borrows_frame(&insns))
+    }
+
+    /// Thumb code that gives back a frame it did not set up.
+    fn gives_back_frame(image: &Image, addr: u64, past_calls: bool) -> bool {
+        let first = image.bytes_from(addr).and_then(|bytes| Self::decode(image, bytes, addr).next()?.insn);
+        matches!(first, Some(Insn::Thumb(_))) && Thumb::gives_back_frame(image, addr, past_calls)
     }
 
     /// Thumb code that saves R3 where `va_arg` looks for it, as on a Cortex-M.
@@ -1061,7 +1068,7 @@ fn instruction_sets(image: &Image, seeds: &[(u64, InstructionSet)]) -> Vec<(u64,
             seen[index][offset..offset + usize::from(decoded.len)].fill(Some(set));
             // The code does not run on into its constants, nor does a guess at what follows a
             // call that never returns.
-            if let Some((from, to)) = Arm::literal(&insn).filter(|&(from, to)| from >= section.addr && to <= section.end()) {
+            if let Some((from, to)) = Arm::literal(&insn, &state).filter(|&(from, to)| from >= section.addr && to <= section.end()) {
                 let (from, to) = ((from - section.addr) as usize, (to - section.addr) as usize);
                 if seen[index][from..to].iter().all(Option::is_none) {
                     seen[index][from..to].fill(Some(set));

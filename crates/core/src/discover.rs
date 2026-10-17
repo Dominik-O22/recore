@@ -146,6 +146,9 @@ pub struct Discovery {
     /// Entry points taken away because the code before them comes back from a call and runs on
     /// into them, as `(entry, callee)`: entry points after all if the callee never returns.
     pub after_calls: Vec<(u64, u64)>,
+    /// Entry points taken away because the code there gives back a frame it did not set up,
+    /// sorted: see [`Arch::gives_back_frame`]. A call there jumps into the end of the caller.
+    pub frame_ends: Vec<u64>,
 }
 
 /// A set of addresses, for asking of very many ranges whether any member lies inside. Most
@@ -284,6 +287,11 @@ struct Explorer<'a, A: Arch> {
     branches_reach_far: bool,
     /// See [`Discovery::after_calls`].
     after_calls: Vec<(u64, u64)>,
+    /// See [`Discovery::frame_ends`].
+    frame_ends: Vec<u64>,
+    /// The addresses that code reached from an entry point reads or writes through a register:
+    /// see [`Arch::data_address`].
+    data_addresses: Vec<u64>,
     /// Addresses taken that an earlier pass found inside other code, which are no entry points
     /// on that evidence: see [`Arch::TAKEN_IS_WEAK`].
     rejected: FxHashSet<u64>,
@@ -463,7 +471,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 };
                 after_call = false;
                 self.regions[index].cover(offset, usize::from(decoded.len.max(1)));
-                if let Some((start, end)) = A::literal(insn).filter(|_| !speculative) {
+                if let Some((start, end)) = A::literal(insn, &state).filter(|_| !speculative) {
                     self.mark_literal(start, end);
                 }
                 if A::CALL_MAY_BE_FAR_JUMP && !speculative && trusted && A::branches_reach_far(insn) {
@@ -483,6 +491,9 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     }
                     if self.recording {
                         self.note_references(insn, &state, decoded.addr, speculative);
+                    }
+                    if let Some(data) = A::data_address(insn, &state).filter(|_| trusted && !speculative) {
+                        self.data_addresses.push(data);
                     }
                     let mut taken = A::address_taken(insn, &state, self.image).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
                     let in_code = taken.is_some_and(|target| self.region_index(target).is_some());
@@ -976,27 +987,30 @@ impl<'a, A: Arch> Explorer<'a, A> {
 
     /// Removes entry points whose code runs in another function's stack frame. Windows scope
     /// tables point at exception filters and handlers, and functions call their own `finally`
-    /// blocks; all of these sit inside the function they belong to.
+    /// blocks; all of these sit inside the function they belong to. Hand-written routines jump
+    /// or call into an end that gives back the frame they set up, which may be another routine's.
     fn demote_frame_borrowers(&mut self) {
         /// How many instructions decide it. A function sets up its frame within the first few.
         const PROBE: usize = 4;
         if !self.image.data_in_code {
             return;
         }
-        let borrowers: Vec<u64> = self
-            .starts
+        let candidates: Vec<u64> = self.starts.iter().filter(|(_, origin)| !matches!(origin, Origin::Frame | Origin::Export | Origin::Thunk)).map(|(&addr, _)| addr).collect();
+        let borrowers: Vec<u64> = candidates
             .iter()
-            .filter(|(_, origin)| !matches!(origin, Origin::Frame | Origin::Export | Origin::Thunk))
-            .map(|(&addr, _)| addr)
+            .copied()
             .filter(|&addr| {
                 let Some(bytes) = self.image.bytes_from(addr) else { return false };
                 let insns: Vec<A::Insn> = A::decode(self.image, bytes, addr).take(PROBE).map_while(|d| d.insn).collect();
                 A::borrows_frame(&insns)
             })
             .collect();
-        for addr in borrowers {
+        let past_calls = A::CALL_MAY_BE_FAR_JUMP && !self.branches_reach_far;
+        let frame_ends: Vec<u64> = candidates.into_iter().filter(|&addr| A::gives_back_frame(self.image, addr, past_calls)).collect();
+        for &addr in borrowers.iter().chain(&frame_ends) {
             self.starts.remove(&addr);
         }
+        self.frame_ends = frame_ends;
     }
 
     /// Whether the unreached bytes at `addr` are a whole function nothing refers to: they decode
@@ -1060,7 +1074,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 if inside || own_pool || A::is_padding(&insn) || self.frame_of(decoded.addr).is_some() {
                     return false;
                 }
-                if let Some(pool) = A::literal(&insn).filter(|_| extended) {
+                if let Some(pool) = A::literal(&insn, &state).filter(|_| extended) {
                     pools.push(pool);
                 }
                 let flow = A::flow(&insn, &state, self.image);
@@ -1165,7 +1179,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 }
                 instructions.push(decoded.addr);
                 end = decoded.next_addr();
-                if let Some(literal) = A::literal(&insn) {
+                if let Some(literal) = A::literal(&insn, &state) {
                     pools.push(literal);
                 }
                 ended = match A::flow(&insn, &state, self.image) {
@@ -1220,6 +1234,39 @@ impl<'a, A: Arch> Explorer<'a, A> {
             self.tiled = stretches;
         }
         tiles
+    }
+
+    /// Marks as data, in each region, everything from the first address that the code reached
+    /// reads or writes through a register past the end of that code and of its tables and
+    /// pools: the constants and the initial values of variables that a firmware image keeps
+    /// after its code. Nothing there is a function, however its bytes decode. The entry points
+    /// there that only an address the code takes speaks for go, and the code decoded from them
+    /// ends nothing, where a pointer to text reads as one to code.
+    fn mark_trailing_data(&mut self) {
+        self.data_addresses.sort_unstable();
+        self.weak_starts.sort_unstable();
+        for index in 0..self.regions.len() {
+            let region = &self.regions[index];
+            let section = region.section;
+            let weak: Vec<(usize, usize)> = self
+                .weak_starts
+                .iter()
+                .filter(|&&addr| section.contains(addr) && self.starts.get(&addr) == Some(&Origin::AddressTaken))
+                .map(|&addr| (addr - section.addr) as usize)
+                .map(|offset| (offset, region.end_of_run(offset)))
+                .collect();
+            let from_weak = |at: usize| weak.iter().any(|&(start, end)| (start..end).contains(&at));
+            let known = |at: usize| (region.insn_len[at] != 0 || region.flags[at] & IN_TABLE != 0) && !from_weak(at);
+            let Some(last) = (0..section.data.len()).rev().find(|&at| known(at)) else { continue };
+            let known_end = section.addr + last as u64 + u64::from(region.insn_len[last].max(1));
+            let Some(&start) = self.data_addresses.iter().find(|&&addr| addr >= known_end && addr < section.end()) else { continue };
+            let (from, clock) = ((start - section.addr) as usize, self.clock);
+            let region = &mut self.regions[index];
+            region.flags[from..].iter_mut().for_each(|flags| *flags |= IN_TABLE);
+            region.touch(from, clock);
+            region.touch(section.data.len() - 1, clock);
+            self.starts.retain(|&addr, origin| !(section.contains(addr) && addr >= start && *origin == Origin::AddressTaken));
+        }
     }
 
     fn in_table(&self, addr: u64) -> bool {
@@ -1466,7 +1513,8 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
         inline_tables = merge_touching(inline_tables);
     }
     let after_calls = std::mem::take(&mut explorer.after_calls);
-    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code, inline_tables, after_calls }
+    let frame_ends = std::mem::take(&mut explorer.frame_ends);
+    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code, inline_tables, after_calls, frame_ends }
 }
 
 /// Sorted ranges with those that overlap or touch joined, as literals back to back make one pool.
@@ -1545,6 +1593,8 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         calls: Vec::new(),
         branches_reach_far: false,
         after_calls: Vec::new(),
+        frame_ends: Vec::new(),
+        data_addresses: Vec::new(),
         rejected,
         weak_starts: Vec::new(),
         data_sections: {
@@ -1581,6 +1631,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         let _phase = phase::scope("discover/drain");
         explorer.drain(&mut decoders);
     }
+    explorer.mark_trailing_data();
     loop {
         let promoted = {
             let _phase = phase::scope("discover/promote tail calls");

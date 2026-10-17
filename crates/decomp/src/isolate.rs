@@ -302,6 +302,9 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     };
     for function in analysis.functions.iter().filter(|function| function.fragment_of.is_none()) {
         let variadic = function.ranges.first().is_some_and(|&(start, end)| recore::cfg::takes_variable_arguments(&image, start, end));
+        if variadic {
+            session.saves_argument_registers(function.addr);
+        }
         if variadic && hands_on_formats(function.addr) {
             session.takes_variable_arguments(function.addr);
         }

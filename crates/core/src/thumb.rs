@@ -15,6 +15,7 @@ use crate::arch::{Arch, Decoded, Flow, Limit, Table, TextPointer};
 use crate::image::{Image, Section};
 
 const PC: usize = 15;
+const SP: usize = 13;
 const LR: usize = 14;
 
 /// One instruction and where it sits, which PC-relative forms need.
@@ -142,6 +143,44 @@ impl Insn {
         };
         let at = if up { pc + offset } else { pc.wrapping_sub(offset) };
         Some((at, at + size))
+    }
+
+    /// `[start, end)` of the doubleword an `LDRD` or `VLDR` reads at an offset from a register
+    /// that holds an address past it, as near as `ADR.W` reaches: a literal pool, whose address
+    /// GCC forms with `ADR` to load a 64-bit constant.
+    #[inline]
+    pub(crate) fn pool_load(self, state: &State) -> Option<(u64, u64)> {
+        /// How far `ADR.W` reaches.
+        const REACH: u64 = 4095;
+        let (hw1, hw2) = (self.hw1, self.hw2);
+        // LDRD Rt, Rt2, [Rn, #imm] without writeback, and VLDR of a double register: both are
+        // 32-bit instructions.
+        let loads = hw1 & 0xFF70 == 0xE950 || hw1 & 0xFF30 == 0xED10 && hw2 & 0x0F00 == 0x0B00;
+        if !loads || usize::from(hw1 & 0xF) == PC {
+            return None;
+        }
+        let (offset, size) = (u64::from(hw2 & 0xFF) * 4, 8);
+        let Value::Const(base) = state.registers[usize::from(hw1 & 0xF)] else { return None };
+        let at = if hw1 & 0x0080 != 0 { u64::from(base) + offset } else { u64::from(base).wrapping_sub(offset) };
+        (at > self.addr && at - self.addr <= REACH && at % 4 == 0).then_some((at, at + size))
+    }
+
+    /// The base register of a load or a store, other than SP or PC: of one register at an
+    /// immediate or a register offset, of several, or of two.
+    pub(crate) fn memory_base(self) -> Option<usize> {
+        let hw1 = self.hw1;
+        let base = if !self.wide() {
+            match hw1 >> 12 {
+                0b0101..=0b1000 => self.low_register(3),
+                0b1100 => self.low_register(8),
+                _ => return None,
+            }
+        } else if hw1 & 0xFE00 == 0xF800 || hw1 & 0xFE00 == 0xE800 {
+            usize::from(hw1 & 0xF)
+        } else {
+            return None;
+        };
+        (base != SP && base != PC).then_some(base)
     }
 
     /// The register a literal `LDR` of a word loads.
@@ -945,6 +984,15 @@ impl Arch for Thumb {
         Self::completed_address(insn, state).filter(|address| address & 1 != 0).map(|address| u64::from(address & !1))
     }
 
+    /// The address in the base register of a load or a store. A number the code forms is as
+    /// often no address at all, and with flash at 0 a size or a count falls inside the image.
+    fn data_address(insn: &Insn, state: &State) -> Option<u64> {
+        match state.registers[insn.memory_base()?] {
+            Value::Const(base) => Some(u64::from(base)),
+            _ => None,
+        }
+    }
+
     fn memory_reference(insn: &Insn, state: &State) -> Option<u64> {
         let base = |register: usize| match state.registers[register] {
             Value::Const(base) => Some(u64::from(base)),
@@ -965,8 +1013,9 @@ impl Arch for Thumb {
         (insn.hw1 & 0xFE80 == 0xF880 && insn.rn() != PC).then(|| base(insn.rn()).map(|base| base + u64::from(insn.hw2 & 0xFFF))).flatten()
     }
 
-    fn literal(insn: &Insn) -> Option<(u64, u64)> {
-        insn.literal_range()
+    #[inline]
+    fn literal(insn: &Insn, state: &State) -> Option<(u64, u64)> {
+        insn.literal_range().or_else(|| insn.pool_load(state))
     }
 
     /// Whether the code at `target`, whose address with the Thumb bit the code forms or which
@@ -1069,6 +1118,37 @@ impl Arch for Thumb {
         false
     }
 
+    /// A `POP` or `LDR` into PC from the stack before a `PUSH`, `SUB SP` or `STR Rt, [SP, #-4]!`.
+    /// Code that pops other words first may be switching to a stack of its own, as an RTOS starts
+    /// its first task by popping the task's registers and branching to the word it popped.
+    fn gives_back_frame(image: &Image, addr: u64, past_calls: bool) -> bool {
+        /// How many instructions it may take to come to either.
+        const LONGEST: usize = 64;
+        let decode = |at: u64| Some(Self::decode(image, image.bytes_from(at)?, at));
+        let Some(mut insns) = decode(addr) else { return false };
+        for _ in 0..LONGEST {
+            let Some(Decoded { insn: Some(insn), .. }) = insns.next() else { return false };
+            let (hw1, hw2) = (insn.hw1, insn.hw2);
+            if insn.pops_pc() {
+                return true;
+            }
+            let sets_up = if insn.wide() { hw1 == 0xE92D || hw1 == 0xF84D && hw2 & 0x0FFF == 0x0D04 } else { hw1 & 0xFE00 == 0xB400 || hw1 & 0xFF80 == 0xB080 };
+            if sets_up {
+                return false;
+            }
+            match Self::flow(&insn, &State::default(), image) {
+                None | Some(Flow::Branch(_)) => {}
+                Some(Flow::Call(_) | Flow::CallIndirect(_)) if past_calls => {}
+                Some(Flow::Jump(target)) => match decode(target) {
+                    Some(next) => insns = next,
+                    None => return false,
+                },
+                Some(_) => return false,
+            }
+        }
+        false
+    }
+
     /// The argument register the instruction writes, the lowest of R0 to R3 it writes, and the
     /// address it completes there.
     fn argument_write(insn: &Insn, state: &State) -> Option<(usize, Option<u64>)> {
@@ -1083,7 +1163,6 @@ impl Arch for Thumb {
     /// below the arguments the caller left on the stack, so that all lie in a row for `va_arg`.
     /// A function of four arguments that keeps them on the stack stores R3 lower down.
     fn takes_variable_arguments(insns: &[Insn]) -> bool {
-        const SP: usize = 13;
         // Where each register points, as an offset from the stack pointer at entry, if it does.
         let mut points: [Option<i64>; 16] = [None; 16];
         points[SP] = Some(0);
@@ -1323,7 +1402,7 @@ mod tests {
         // At 0x1002, LDR R0, [PC, #4] reads the word at 0x1008: (0x1002 + 4) & !3 is 0x1004.
         let bytes = [0x00, 0xBF, 0x01, 0x48, 0x70, 0x47, 0x00, 0xBF, 0x35, 0x12, 0x00, 0x08];
         let insn = Thumb::decode(&image(&bytes, 0x1000), &bytes, 0x1000).nth(1).unwrap().insn.unwrap();
-        assert_eq!((Thumb::literal(&insn), insn.literal), (Some((0x1008, 0x100C)), Some(0x0800_1235)));
+        assert_eq!((Thumb::literal(&insn, &State::default()), insn.literal), (Some((0x1008, 0x100C)), Some(0x0800_1235)));
         assert_eq!(Thumb::address_taken(&insn, &State::default(), &image(&bytes, 0x1000)), Some(0x0800_1234));
     }
 
@@ -1410,10 +1489,53 @@ mod tests {
     }
 
     #[test]
+    fn an_end_that_gives_back_the_frame_of_whoever_jumps_there_is_no_function() {
+        // 0x00: PUSH {R4, LR}; BL 0x0C; CMP R0, #0; BEQ 0x16; POP {R4, PC}. 0x0C: PUSH {R4, LR};
+        // CMP R0, #1; BEQ 0x16; MOVS R0, #0; POP {R4, PC}. 0x16: MOVS R0, #1; POP {R4, PC}, or
+        // with PUSH {R4, LR} first, which sets up a frame of its own.
+        let code = |first: &[u16]| [&[0xB510][..], &bl(0x02, 0x0C), &[0x2800, 0xD005, 0xBD10, 0xB510, 0x2801, 0xD001, 0x2000, 0xBD10], first, &[0x2001, 0xBD10]].concat();
+        assert_eq!(functions(&code(&[])), [0x00, 0x0C]);
+        assert_eq!(functions(&code(&[0xB510])), [0x00, 0x0C, 0x16]);
+        // 0x00: PUSH {R4, LR}; BL 0x0A; MOVS R0, #0; POP {R4, PC}. 0x0A: POP {R0, R1}; BX R1, as an
+        // RTOS starts its first task from a stack of the task's own.
+        assert_eq!(functions(&[&[0xB510][..], &bl(0x02, 0x0A), &[0x2000, 0xBD10, 0xBC03, 0x4708]].concat()), [0x00, 0x0A]);
+    }
+
+    #[test]
+    fn a_doubleword_loaded_through_an_adr_is_data() {
+        // 0x00: PUSH {LR}; ADR R3, 0x10; LDRD R2, R3, [R3], or MOVS R3, #0; MOVS R2, #0; NOP;
+        // BL 0x18; POP {PC}; NOP. At 0x10 the constant, whose words read as MOVS R0, #1; BX LR
+        // and MOVS R0, #2; BX LR. At 0x18 BX LR.
+        let code = |load: [u16; 3]| [&[0xB500][..], &load, &bl(0x08, 0x18), &[0xBD00, 0xBF00, 0x2001, 0x4770, 0x2002, 0x4770, 0x4770]].concat();
+        assert_eq!(functions(&code([0xA303, 0xE9D3, 0x2300])), [0x00, 0x18]);
+        assert_eq!(functions(&code([0x2300, 0x2200, 0xBF00])), [0x00, 0x10, 0x14, 0x18]);
+    }
+
+    #[test]
+    fn what_follows_the_code_from_an_address_it_reads_is_data() {
+        // 0x00: LDR R0, =0x10; LDR R0, [R0] or NOP; BX LR; padding; the literal. At 0x10
+        // MOVS R0, #1; BX LR; MOVS R0, #2; BX LR, which follow the code as constants do. A number
+        // the code only forms, such as a size, may be no address at all.
+        let code = |read: u16| [0x4801, read, 0x4770, 0xBF00, 0x0010, 0x0000, 0x0000, 0x0000, 0x2001, 0x4770, 0x2002, 0x4770];
+        assert_eq!(functions(&code(0x6800)), [0x00]);
+        assert_eq!(functions(&code(0xBF00)), [0x00, 0x10, 0x14]);
+    }
+
+    #[test]
+    fn a_block_that_calls_before_it_gives_back_the_frame_is_no_function_in_thumb_1() {
+        // 0x00: PUSH {R4, LR}; BL 0x0C, a jump; MOVS R0, #1; POP {R4, PC}; NOP. 0x0C: MOVS R0,
+        // #2; BL 0x14; POP {R4, PC}, or PUSH {R4, LR} first. 0x14: BX LR.
+        let code = |first: &[u16]| [&[0xB510][..], &bl(0x02, 0x0C), &[0x2001, 0xBD10, 0xBF00], first, &[0x2002], &bl(0x0E + 2 * first.len() as u64, 0x14 + 2 * first.len() as u64), &[0xBD10, 0x4770]].concat();
+        assert_eq!(functions(&code(&[])), [0x00, 0x14]);
+        assert_eq!(functions(&code(&[0xB510])), [0x00, 0x0C, 0x16]);
+    }
+
+    #[test]
     fn a_call_may_be_a_jump_only_in_thumb_1() {
-        // 0x00: PUSH {LR}; BL to; MOVS R0, #0 or MOVW R0, #0, then MOVS R0, #0 up to `to`: POP
-        // {PC}. Code that has Thumb-2 has `B.W` to jump as far as it calls.
-        let code = |to: usize, first: &[u16]| [&[0xB500][..], &bl(0x02, to as u64), first, &vec![0x2000; (to - 6 - 2 * first.len()) / 2], &[0xBD00]].concat();
+        // 0x00: PUSH {LR}; BL to; MOVS R0, #0 or MOVW R0, #0, then MOVS R0, #0 up to `to`: BX
+        // LR, which a call may reach as a function, where a POP {PC} would return through the
+        // caller's frame. Code that has Thumb-2 has `B.W` to jump as far as it calls.
+        let code = |to: usize, first: &[u16]| [&[0xB500][..], &bl(0x02, to as u64), first, &vec![0x2000; (to - 6 - 2 * first.len()) / 2], &[0x4770]].concat();
         assert_eq!(functions(&code(0x100, &[0x2000])), [0x00]);
         assert_eq!(functions(&code(0x100, &[0xF240, 0x0000])), [0x00, 0x100]);
         // A word after the code that points into the BL at 0x04, where its second halfword reads

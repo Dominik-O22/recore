@@ -482,7 +482,7 @@ pub fn jump_tables(name: String, binary: &object::File, debug: &object::File) ->
         // Thumb: a run of data inside the function that a TBB, TBH or ADD PC before it reads.
         let thumb: Vec<(u64, u8, Option<Instruction>)> = instructions.iter().filter(|(_, _, run, _)| *run == Run::Thumb).map(|(at, len, _, instruction)| (*at, *len, *instruction)).collect();
         for &(table, table_end) in data.iter().filter(|&&(table, _)| table > start && table < end) {
-            match super::thumb::table_at(&|start, end| code.bytes(start, end), &thumb, table, table_end, start, end) {
+            match super::thumb::table_at(&|start, end| code.bytes(start, end), &Default::default(), &thumb, table, table_end, start, end) {
                 None => {}
                 Some(Ok(found)) => tables.push(found),
                 Some(Err(reason)) => rejected.push(Rejected { table, reason }),

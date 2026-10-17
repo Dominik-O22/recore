@@ -410,6 +410,9 @@ struct RdSession {
   // Functions rd_takes_variable_arguments named: those of the program that take a format and
   // the arguments it asks for.
   set<uint64_t> saves_arguments;
+  // Functions rd_saves_argument_registers named: those that save their argument registers
+  // where va_arg reads them, whose prototypes are kept as the least a call passes.
+  set<uint64_t> variadic;
   // Calls whose arguments rd_format_call settled before their function was decompiled.
   set<pair<uint64_t, uint64_t>> format_calls;
   // Names given to variables, per function: the variable's place and its name.
@@ -1547,6 +1550,8 @@ void rd_forget_comments(RdSession *session, uint64_t function) {
 // a call that passes it a printf format then gets the arguments the format asks for.
 void rd_takes_variable_arguments(RdSession *session, uint64_t addr) { session->saves_arguments.insert(addr); }
 
+void rd_saves_argument_registers(RdSession *session, uint64_t addr) { session->variadic.insert(addr); }
+
 // Settles what the call at `call` in `function` passes, from the printf or scanf format at
 // `format` that it passes as argument `position`, counted from zero: the parameters before the
 // format, the format, and an argument for each conversion in it. Done before the function is
@@ -2473,7 +2478,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
         proto.setParam(i, param->getName(), piece);
       }
       fd->getFuncProto().setInputLock(true);
-      fd->getFuncProto().setDotdotdot(session->kept_are_lower_bounds);
+      fd->getFuncProto().setDotdotdot(session->kept_are_lower_bounds || session->variadic.count(addr) != 0);
       session->kept.insert(addr);
     }
   }

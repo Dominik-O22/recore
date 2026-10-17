@@ -180,6 +180,12 @@ pub trait Arch: 'static {
     /// an address at all.
     fn address_taken(insn: &Self::Insn, state: &Self::State, image: &Image) -> Option<u64>;
 
+    /// The address of the data that `insn` reads or writes through a register whose value the
+    /// state knows, counted from the register alone.
+    fn data_address(_insn: &Self::Insn, _state: &Self::State) -> Option<u64> {
+        None
+    }
+
     /// Where [`Arch::CALL_MAY_BE_FAR_JUMP`], whether `insn` is of an instruction set whose branches
     /// reach as far as its calls, so that code that has it never jumps with a call.
     fn branches_reach_far(_insn: &Self::Insn) -> bool {
@@ -212,8 +218,9 @@ pub trait Arch: 'static {
     const LITERAL_POOLS: bool = false;
 
     /// `[start, end)` of the data among the code that `insn` reads at an address relative to
-    /// its own, as a load from a literal pool does. Nothing there is an instruction.
-    fn literal(_insn: &Self::Insn) -> Option<(u64, u64)> {
+    /// its own, as a load from a literal pool does, or through a register that `state` says
+    /// holds such an address. Nothing there is an instruction.
+    fn literal(_insn: &Self::Insn, _state: &Self::State) -> Option<(u64, u64)> {
         None
     }
 
@@ -286,6 +293,15 @@ pub trait Arch: 'static {
     /// Whether code beginning with `insns` uses a stack frame it did not set up, which marks a
     /// block inside a function, such as an exception filter or handler, and not a function.
     fn borrows_frame(_insns: &[Self::Insn]) -> bool {
+        false
+    }
+
+    /// Whether the code at `addr` returns through a stack frame before it sets one up, on its way
+    /// past conditional branches and through jumps, and with `past_calls` past calls too: it is
+    /// the end of a function that set the frame up and jumped there, as hand-written code shares
+    /// the end of one routine with others. Code that calls before it saves its return address
+    /// returns nowhere, so where a call may be a jump the way goes on past one.
+    fn gives_back_frame(_image: &Image, _addr: u64, _past_calls: bool) -> bool {
         false
     }
 

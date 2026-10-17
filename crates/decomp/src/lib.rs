@@ -161,12 +161,22 @@ impl Target {
     /// Whether a call passes just the parameters its callee was found to read, and not also
     /// whatever else the call site has put in argument registers. GCC and clang keep a caller's
     /// own values in those registers across a call to a function known to leave them alone,
-    /// so there the callee is the better witness, on 32-bit ARM as well. MSVC does not, and
-    /// 32-bit x86 code passes on the stack, where a function may be passed more than it reads:
-    /// against PDB signatures, taking the callee's word alone gets 87.5% of 64-bit parameter
-    /// lists right and taking it as the least gets 89.8%.
+    /// so there the callee is the better witness, on 32-bit ARM and Cortex-M as well. MSVC does
+    /// not, and 32-bit x86 code passes on the stack, where a function may be passed more than it
+    /// reads: against PDB signatures, taking the callee's word alone gets 87.5% of 64-bit
+    /// parameter lists right and taking it as the least gets 89.8%. On a Cortex-M, taken as the
+    /// least, it lets a call pass the word GCC pushes to keep the stack aligned, as in
+    /// `PUSH {R3, R4, R5, LR}`, which makes R3 a parameter of the caller.
+    /// Where prototypes are kept exact, whether one of a function that saves its argument
+    /// registers where `va_arg` reads them is kept as the least a call passes instead, so that
+    /// a call to it passes what the call site put in them. On six armhf programs this got
+    /// 0.4 points fewer parameter counts right, and on Cortex-M none fewer.
+    fn keeps_variadic_open(self) -> bool {
+        matches!(self, Target::Thumb)
+    }
+
     fn callers_pass_what_is_read(self) -> bool {
-        matches!(self, Target::X86_64Gcc | Target::Aarch64 | Target::Arm)
+        matches!(self, Target::X86_64Gcc | Target::Aarch64 | Target::Thumb | Target::Arm)
     }
 
     /// The address spaces the target has besides the one its code is in: the address recore
@@ -653,6 +663,14 @@ impl Session {
     /// it. A call that passes it a printf format is then given the arguments the format asks for.
     pub fn takes_variable_arguments(&mut self, addr: u64) {
         unsafe { ffi::rd_takes_variable_arguments(self.raw.as_ptr(), addr) }
+    }
+
+    /// Says that the function at `addr` saves its argument registers where `va_arg` reads them:
+    /// see [`Target::keeps_variadic_open`].
+    pub fn saves_argument_registers(&mut self, addr: u64) {
+        if self.target.keeps_variadic_open() {
+            unsafe { ffi::rd_saves_argument_registers(self.raw.as_ptr(), addr) }
+        }
     }
 
     /// Settles what the call at `call` in `function` passes, from the format at `format` that
