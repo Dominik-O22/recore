@@ -20,8 +20,9 @@ use recore::report::{Analysis, CallTarget};
 use serde::{Deserialize, Serialize};
 
 use recore::edits::Edits;
+use recore::structs::{Recovered, auto_function};
 
-use crate::{Facts, Flow, Instruction, Local, Session, Style};
+use crate::{Converged, Facts, Flow, Instruction, Local, Session, StructReport, Style};
 
 /// Where switch targets come from.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -110,6 +111,8 @@ enum Event {
     Text(Result<String, String>),
     /// Whether the session took [`Request::Edit`] in place.
     Edited(bool),
+    Recovered(Result<Recovered, String>),
+    Structs(Result<StructReport, String>),
 }
 
 /// One line of a worker's stdin.
@@ -134,6 +137,11 @@ enum Request {
     Type(String),
     /// Take the binary's edits as they are now, in place if the session can.
     Edit(Edits),
+    /// The recovered struct of this name and those it points to, decompiling the function its
+    /// name says if the session has not.
+    Recovered(String),
+    /// Decompile the function for what struct recovery made of its objects.
+    Structs(u64),
 }
 
 /// Callees with more code than this, in bytes, are not decompiled ahead of their callers. The few
@@ -201,6 +209,8 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
     }
 
+    // Named structs go in before declarations, which may mention them.
+    session.set_structs(&edits.structs, &edits.holders)?;
     // Each edit was accepted by a session when it was made. One that no longer is, after a
     // change to an earlier declaration, is reported and costs only itself.
     for declaration in &edits.declarations {
@@ -399,6 +409,33 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 send(&Event::Locals(session.decompile(addr).map(|function| function.locals).map_err(|error| error.to_string())))?;
                 continue;
             }
+            Request::Recovered(ref name) => {
+                let found = match session.recovered(name) {
+                    Some(found) => Some(found),
+                    None => match auto_function(name) {
+                        Some(function) => {
+                            if let Some(importer) = &mut importer {
+                                importer.functions(&mut session, std::iter::once(function).chain(called.get(&function).into_iter().flatten().copied()));
+                            }
+                            settle_formats(&mut session, function);
+                            let _ = session.decompile(function);
+                            session.recovered(name)
+                        }
+                        None => None,
+                    },
+                };
+                send(&Event::Recovered(found.ok_or_else(|| format!("no struct `{name}` was recovered; decompile the function it comes from to see the names its structs have now"))))?;
+                continue;
+            }
+            Request::Structs(addr) => {
+                if let Some(importer) = &mut importer {
+                    importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
+                }
+                settle_formats(&mut session, addr);
+                let report = session.decompile(addr).map_err(|error| error.to_string()).map(|_| session.structs_of(addr).unwrap_or_default());
+                send(&Event::Structs(report))?;
+                continue;
+            }
             Request::Declare(ref declaration) => {
                 if let Some(importer) = &mut importer {
                     importer.mentioned(&mut session, declaration);
@@ -500,6 +537,9 @@ fn comment_owner(analysis: &Analysis, addr: u64) -> Option<u64> {
 /// by name as the session starts. Having said no, it may have made part of the change.
 fn edit_in_place(session: &mut Session, analysis: &Analysis, aliases: &HashSet<u64>, before: &Edits, after: &Edits) -> Result<bool> {
     if before.declarations != after.declarations || before.types != after.types || before.names.keys().any(|addr| !after.names.contains_key(addr)) {
+        return Ok(false);
+    }
+    if (before.structs != after.structs || before.holders != after.holders) && session.set_structs(&after.structs, &after.holders)? == Converged::Restart {
         return Ok(false);
     }
     let declared: HashSet<&str> = after.declarations.iter().flat_map(|text| text.split(|c: char| !(c.is_alphanumeric() || c == '_'))).collect();
@@ -794,6 +834,28 @@ impl Worker {
         }
     }
 
+    /// The recovered struct `name` and those it points to: see [`Session::recovered`]. Its
+    /// function is decompiled first if the child has not.
+    pub fn recovered(&mut self, name: &str, timeout: Duration) -> Result<Recovered, String> {
+        if let Some(function) = auto_function(name) {
+            self.callees_first(function, timeout);
+        }
+        match self.ask(Request::Recovered(name.to_string()), timeout) {
+            Ok(Event::Recovered(found)) => found,
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// What struct recovery made of the objects of the function at `addr`, which costs one
+    /// decompilation: see [`Session::structs_of`].
+    pub fn structs(&mut self, addr: u64, timeout: Duration) -> Result<StructReport, String> {
+        self.callees_first(addr, timeout);
+        match self.ask(Request::Structs(addr), timeout) {
+            Ok(Event::Structs(report)) => report,
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Checks that the engine takes a C declaration. The child's session keeps it, but only a
     /// declaration among the binary's edits is there again after [`Worker::update`].
     pub fn declare(&mut self, declaration: &str, timeout: Duration) -> Result<(), String> {
@@ -811,15 +873,18 @@ impl Worker {
         }
     }
 
-    /// Brings the child up to `edits`, the binary's edits as just saved. The child takes names,
-    /// comments and variable names in place and keeps the parameters it has found. Any other
-    /// change replaces it with a new child, which reads the edits from their file and sets up
-    /// before the next request.
-    pub fn update(&mut self, edits: &Edits, timeout: Duration) {
+    /// Brings the child up to `edits`, the binary's edits as just saved, and says whether it
+    /// took them in place. The child takes names, comments, variable names, new structs and
+    /// names of fields in place and keeps the parameters it has found. Any other change
+    /// replaces it with a new child, which reads the edits from their file and sets up before
+    /// the next request.
+    pub fn update(&mut self, edits: &Edits, timeout: Duration) -> bool {
         // With no child, the next one reads the file.
-        if self.process.is_some() && !matches!(self.ask(Request::Edit(edits.clone()), timeout), Ok(Event::Edited(true))) {
+        let in_place = self.process.is_some() && matches!(self.ask(Request::Edit(edits.clone()), timeout), Ok(Event::Edited(true)));
+        if self.process.is_some() && !in_place {
             self.process = Process::start((self.command)()).ok();
         }
+        in_place
     }
 
     /// Waits until a child is set up, so that what is timed next is the decompiler alone.

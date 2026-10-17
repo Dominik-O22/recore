@@ -30,9 +30,12 @@ use anyhow::{Context, Result, bail};
 use recore::Image;
 use recore::image::{Compiler, Format, Machine};
 use recore::report::Analysis;
+use recore::structs::{Layout, Recovered, Slot};
+use std::collections::BTreeMap;
 
 pub use facts::Facts;
 pub use flow::Flow;
+pub use structs::{ObjectReport, StructReport};
 
 /// The allocator the engine's C++ side is built to use. A program that decompiles a lot does
 /// well to make it the Rust side's too.
@@ -278,6 +281,16 @@ impl Decompiled {
     pub fn param_count(&self) -> usize {
         self.params.len()
     }
+}
+
+/// What [`Session::set_structs`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Converged {
+    /// New structs, holders and names of fields took effect in this session.
+    InPlace,
+    /// A struct the session holds has another layout now. The engine cannot redefine a type,
+    /// so only a new session shows it; this one is as it was.
+    Restart,
 }
 
 /// A program loaded into the decompiler.
@@ -671,6 +684,53 @@ impl Session {
         let mut old = std::ptr::null();
         check(|err, len| unsafe { ffi::rd_rename_function(self.raw.as_ptr(), addr, name.as_ptr(), &mut old, err, len) != 0 })?;
         Ok(unsafe { CStr::from_ptr(old) }.to_string_lossy().into_owned())
+    }
+
+    /// The machine and compiler the session decompiles for.
+    pub fn target(&self) -> Target {
+        self.target
+    }
+
+    /// Brings the named structs and the slots that hold them to those of the edits. Called
+    /// again with the same edits it does nothing. Renames the structs the session holds that
+    /// the edits renamed, defines those new to it, gives the fields of those it holds the
+    /// names they have now, and has decompilations put each on the objects its holders reach,
+    /// where it fits.
+    pub fn set_structs(&mut self, structs: &BTreeMap<String, Layout>, holders: &BTreeMap<u64, BTreeMap<Slot, String>>) -> Result<Converged> {
+        // SAFETY: the session owns the registry, and the shim reads it only inside `rd_decompile`.
+        let converge = unsafe { self.structs.as_mut() }.converge(self.target.pointer_bytes() as u32, structs, holders);
+        if converge.restart {
+            return Ok(Converged::Restart);
+        }
+        // Renamed first: new structs refer to the ones the engine holds by their names now.
+        for (old, name) in converge.renamed {
+            let (old, name) = (CString::new(old)?, CString::new(name)?);
+            check(|err, len| unsafe { ffi::rd_rename_type(self.raw.as_ptr(), old.as_ptr(), name.as_ptr(), err, len) != 0 })?;
+        }
+        if let Some(xml) = converge.xml {
+            let rejected = self.add_types(&xml)?;
+            anyhow::ensure!(rejected.is_empty(), "the decompiler did not take the structs: {}", rejected.join("; "));
+        }
+        for (name, offset, field) in converge.renames {
+            let (name, field) = (CString::new(name)?, CString::new(field)?);
+            check(|err, len| unsafe { ffi::rd_name_field(self.raw.as_ptr(), name.as_ptr(), offset, field.as_ptr(), err, len) != 0 })?;
+        }
+        Ok(Converged::InPlace)
+    }
+
+    /// The recovered struct `name` stands for and those it points to, as the last
+    /// decompilation of its function in this session left them; none if no decompilation
+    /// recovered it.
+    pub fn recovered(&self, name: &str) -> Option<Recovered> {
+        // SAFETY: as in `set_structs`.
+        unsafe { self.structs.as_ref() }.recovered(name)
+    }
+
+    /// What the last decompilation of the function at `function` made of the objects its
+    /// pointers reach; none if this session has not decompiled it.
+    pub fn structs_of(&self, function: u64) -> Option<StructReport> {
+        // SAFETY: as in `set_structs`.
+        unsafe { self.structs.as_ref() }.report(function)
     }
 
     /// Disassembles `[start, end)` linearly, with each instruction's raw p-code if `pcode`.

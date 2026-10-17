@@ -47,3 +47,34 @@ fn a_dying_child_is_reported_as_a_crash() {
     assert_eq!(record.status, Status::Crash);
     assert!(record.message.unwrap().contains("signal 11"));
 }
+
+/// A child set up for the struct fixture, keeping its edits in a directory of its own.
+fn structs_worker() -> Worker {
+    let edits = std::env::temp_dir().join(format!("recore-isolate-structs-{}", std::process::id()));
+    let command = move || {
+        let mut command = Command::new(RUNNER);
+        command.arg("worker").env(recore::edits::DIR_VAR, &edits);
+        command
+    };
+    Worker::new(command, &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/structs.elf"), &Options::default())
+}
+
+/// Naming a recovered struct and its fields reaches the running child; a struct that grows
+/// needs a new one, since the engine cannot redefine a type.
+#[test]
+fn named_structs_and_fields_reach_the_running_child() {
+    let mut worker = structs_worker();
+    let timeout = Duration::from_secs(60);
+    let mut edits = recore::edits::Edits::default();
+    edits.adopt(&worker.recovered("S_401000_RDI", timeout).unwrap());
+    edits.name_struct("S_401000_RDI", "Connection").unwrap();
+    assert!(worker.update(&edits, timeout));
+    edits.name_field("Connection", "field_0x8", "session").unwrap();
+    assert!(worker.update(&edits, timeout));
+    let (_, c_text) = worker.decompile(0x401000, timeout);
+    assert!(c_text.as_deref().unwrap().contains("param_1->session->field_0x4 = param_2;"), "{c_text:?}");
+
+    let grown = recore::structs::Layout::new(0x40, edits.structs["Connection"].fields().clone()).unwrap();
+    edits.structs.insert("Connection".into(), grown);
+    assert!(!worker.update(&edits, timeout));
+}

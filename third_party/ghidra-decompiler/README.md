@@ -63,6 +63,11 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   pointers it is passed structs before any unlocked varnode is typed. Marked with `recore:`
   comments.
 
+- `cpp/type.hh` and `cpp/type.cc`, `TypeFactory::setFieldName`: names a field of a struct the
+  session already holds. Upstream builds a struct whole and never changes it; `crates/decomp`
+  names a field of a struct an agent named while the session runs, without a new process.
+  Marked with `recore:` comments.
+
 - `languages/cip-51.sla`: built from `slaspec/`, upstream's `cip-51.slaspec` and
   `8051_main.sinc` with six changes, each marked with a `recore:` comment. To rebuild, run
   `support/sleigh cip-51.slaspec cip-51.sla` of the distribution in a copy of `slaspec/`.

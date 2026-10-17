@@ -12,6 +12,8 @@ use recore::FxHashMap;
 use recore::arch::FieldUse;
 use recore::diff::{Change, Evidence, Pair};
 use recore::report::CallTarget;
+use recore::structs::Refusal;
+use recore_decomp::ObjectReport;
 use recore_decomp::isolate::Status;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -150,6 +152,16 @@ pub fn list() -> Value {
             &["function"],
         ),
         tool(
+            "structs",
+            "The structs a function's pointers got: each parameter that points to one, and each struct field that points to another, with the struct's name and how much the code reads and writes through it. With `refused`, also each pointer the code reads fields through that got no struct, and why: so `*(int8 *)(param_1 + 0x28)` can be told from a struct that was never tried. Costs one decompilation.",
+            json!({
+                "function": function,
+                "refused": { "type": "boolean", "description": "Also list the pointers that got no struct, with the reason." },
+                "timeout": timeout,
+            }),
+            &["function"],
+        ),
+        tool(
             "symbols",
             "Every address that has a name: functions, import slots, vtables, exported data, and the names given with `rename`.",
             json!({ "pattern": pattern("name"), "limit": limit }),
@@ -168,9 +180,9 @@ pub fn list() -> Value {
         ),
         tool(
             "rename",
-            "Names a function (at its entry address), a data address, or with `var` a variable inside a function. The name is saved for this binary and used everywhere from then on, the decompiler's C included. An empty name removes it. Give `addr` and `name`, or several in `names`.",
+            "Names a function (at its entry address), a data address, with `var` a variable inside a function, or a struct or one of its fields. The name is saved for this binary and used everywhere from then on, the decompiler's C included. An empty name removes it. Give `addr` and `name`, or several in `names`. A struct the decompiler recovered, such as `S_401a20_RDI`, is kept under the name given, with the structs it points to, and callers that pass the pointer on show it too. Giving a second struct a name already taken says the two are one type: their fields merge, or the rename is refused with the offsets that clash. `S_401a20_RDI.field_0x10` names a field.",
             json!({
-                "addr": addr("A function entry or a data address; with `var`, the function, by address or name"),
+                "addr": addr("A function entry or a data address; with `var`, the function, by address or name. Or a struct, `Struct.field` for one of its fields"),
                 "var": { "type": "string", "description": "A parameter or local variable of the function, as `decompile` spells it now: `param_1`, `local_18`, `uVar3`." },
                 "name": { "type": "string", "description": "The new name; empty to remove." },
                 "names": { "type": "array", "items": { "type": "object", "properties": { "addr": { "type": "string" }, "var": { "type": "string" }, "name": { "type": "string" } }, "required": ["addr", "name"] }, "description": "Several renames at once." },
@@ -195,8 +207,8 @@ pub fn list() -> Value {
         ),
         tool(
             "type",
-            "The layout of a data type: size, alignment, and each field of a struct or union with its offset, or the values of an enum. Without `name`, lists what `declare` has recorded.",
-            json!({ "name": { "type": "string", "description": "A type name, declared or built in." } }),
+            "The layout of a data type: size, alignment, and each field of a struct or union with its offset, or the values of an enum. A struct kept with `rename` also lists the functions passed a pointer to it. Without `name`, lists what `declare` and `rename` have recorded.",
+            json!({ "name": { "type": "string", "description": "A type name: declared, built in, a struct the decompiler recovered such as `S_401a20_RDI`, or one kept with `rename`." } }),
             &[],
         ),
     ])
@@ -231,6 +243,7 @@ pub fn call(cache: &mut Cache, name: &str, arguments: Value) -> Option<Result<St
         "comment" => run(cache, name, arguments, edit::comment),
         "declare" => run(cache, name, arguments, edit::declare),
         "type" => run(cache, name, arguments, edit::type_),
+        "structs" => run(cache, name, arguments, structs),
         _ => return None,
     })
 }
@@ -1059,6 +1072,45 @@ fn around(c_text: &str, addr: u64) -> String {
     }
     out += &lines[start..end].join("\n");
     out + &format!("\n  ...{}", cut(end - start, lines.len(), "lines ", "`decompile` without `around` shows all"))
+}
+
+#[derive(Deserialize)]
+struct Structs {
+    function: String,
+    #[serde(default)]
+    refused: bool,
+    timeout: Option<f64>,
+}
+
+fn structs(binary: &mut Binary, args: Structs) -> Result<String> {
+    let function = resolve_function(binary, &args.function)?;
+    let timeout = Duration::try_from_secs_f64(args.timeout.unwrap_or(30.0)).map_err(|_| anyhow!("`timeout` must be a positive number of seconds"))?;
+    let report = binary.structs(function, timeout)?;
+    // Nothing read or written through a pointer is no struct to miss.
+    let shown: Vec<&ObjectReport> = report.objects.iter().filter(|object| object.decision.is_ok() || args.refused && object.decision != Err(Refusal::Unused)).collect();
+    let given = report.objects.iter().filter(|object| object.decision.is_ok()).count();
+    let refused = report.objects.iter().filter(|object| object.decision.is_err() && object.decision != Err(Refusal::Unused)).count();
+    let pointers = if given == 1 { "pointer" } else { "pointers" };
+    let mut out = format!("{}: {given} {pointers} with a struct, {refused} read through without one{}\n", binary.program.label(function), if args.refused || refused == 0 { "" } else { " (`refused` lists them)" });
+    for object in shown {
+        let place = match (object.slots.as_slice(), &object.field) {
+            ([], Some((owner, offset))) => format!("{owner} +{offset:#x}"),
+            ([], None) => "a pointer no parameter reaches".to_string(),
+            (slots, _) => slots.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+        };
+        let low = object.accesses.iter().map(|&(offset, _)| offset).min().unwrap_or(0);
+        let high = object.accesses.iter().map(|&(offset, size)| offset + i64::from(size)).max().unwrap_or(0);
+        let count = object.accesses.len();
+        let reach = format!("{count} {}, +{low:#x} to +{high:#x}", if count == 1 { "access" } else { "accesses" });
+        match &object.decision {
+            Ok(name) => writeln!(out, "{place}: {name}{}, {reach}", if object.named { " (named)" } else { "" })?,
+            Err(refusal) => writeln!(out, "{place}: no struct, {}; {reach}", refusal.reason())?,
+        }
+    }
+    for warning in &report.warnings {
+        writeln!(out, "warning: {warning}")?;
+    }
+    Ok(out)
 }
 
 fn decompile(binary: &mut Binary, args: Decompile) -> Result<String> {

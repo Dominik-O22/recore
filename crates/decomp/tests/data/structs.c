@@ -57,6 +57,12 @@ __attribute__((noinline)) int relay(struct conn *conn) {
     return touch(conn, 7) + 1;
 }
 
+// The high half of the stamp alone: 4 bytes inside the 8 that `touch` writes, so the struct
+// recovered here and `touch`'s cannot be one.
+__attribute__((noinline)) int late(struct conn *conn) {
+    return ((volatile int *)&conn->stamp)[1] + conn->flags;
+}
+
 volatile int sink;
 
 void start(void) {
@@ -64,5 +70,5 @@ void start(void) {
     struct conn conn = {1, 2, &session, 3, 0, 4};
     struct node second = {2, 0}, first = {1, &second};
     struct point points[2] = {{1, 2, 3}, {4, 5, 6}};
-    sink = touch(&conn, 5) + sum(&first) + spread(points, 2) + relay(&conn);
+    sink = touch(&conn, 5) + sum(&first) + spread(points, 2) + relay(&conn) + late(&conn);
 }
