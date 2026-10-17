@@ -12,6 +12,8 @@
 //! the distance from the instruction after the dispatch to the case; on Thumb-1, `ADD PC, Rm`
 //! after a load of a byte or a halfword entry, which is half the distance from the `ADD`'s own
 //! PC; and `MOV PC, Rm` after a load of a word, which is the case's address with the Thumb bit.
+//! GCC's Thumb-1 code calls one of libgcc's switch helpers instead, with its table right after the
+//! `BL`, and the helper returns to twice the entry past the table.
 //! A table of an odd number of bytes is padded with a zero, whose target would be the table.
 //! A literal pool may follow a table in the same run of data: the table ends at the first
 //! literal that a load reads.
@@ -52,6 +54,8 @@ impl<'a> Code<'a> {
             .collect();
         marks.extend(sections.iter().map(|&(addr, bytes)| (addr + bytes.len() as u64, false)));
         marks.sort_unstable();
+        // A `$d` after a `$d` continues its run, as GCC marks the byte that pads a `TBB` table.
+        marks.dedup_by_key(|&mut (_, is_data)| is_data);
         let data = marks.windows(2).filter(|pair| pair[0].1 && pair[0].0 < pair[1].0).map(|pair| (pair[0].0, pair[1].0)).collect();
         Code { sections, data }
     }
@@ -197,11 +201,24 @@ fn register(instruction: &Instruction, index: usize) -> Option<u8> {
     }
 }
 
+/// GCC's Thumb-1 switch helpers: the name, the size of an entry, and whether the entry is signed.
+const CASE_HELPERS: [(&str, u64, bool); 4] =
+    [("__gnu_thumb1_case_uqi", 1, false), ("__gnu_thumb1_case_sqi", 1, true), ("__gnu_thumb1_case_uhi", 2, false), ("__gnu_thumb1_case_shi", 2, true)];
+
+/// The switch helpers among the ELF's functions, by address, as the size of an entry and whether
+/// it is signed.
+fn case_helpers(functions: &BTreeMap<u64, (String, u64)>) -> BTreeMap<u64, (u64, bool)> {
+    functions
+        .iter()
+        .filter_map(|(&addr, (name, _))| CASE_HELPERS.iter().find(|&&(helper, ..)| helper == name).map(|&(_, size, signed)| (addr, (size, signed))))
+        .collect()
+}
+
 /// How a dispatch finds the case in an entry of its table: the size of an entry, and the case's
 /// address from the entry's value.
 enum Dispatch {
-    /// `TBB`, `TBH`, or `ADD PC, Rm`: twice the entry from this address.
-    Relative { size: u64, base: u64 },
+    /// `TBB`, `TBH`, `ADD PC, Rm` or a `BL` to a switch helper: twice the entry from this address.
+    Relative { size: u64, signed: bool, base: u64 },
     /// `MOV PC, Rm`: the entry, Thumb bit and all, in the table an `ADR` before it names.
     Absolute { table: u64 },
 }
@@ -228,23 +245,28 @@ fn literals(instructions: &[(u64, u8, Option<Instruction>)]) -> Vec<(u64, u64)> 
 }
 
 /// What the instructions before a run of data say about it: the dispatch that reads it as a
-/// table, if one does, or why it is no table that can be read.
-fn dispatch(before: &[(u64, u8, Option<Instruction>)]) -> Option<Result<(u64, Dispatch), String>> {
+/// table, if one does, or why it is no table that can be read. `helpers` are the switch helpers
+/// by address.
+fn dispatch(before: &[(u64, u8, Option<Instruction>)], helpers: &BTreeMap<u64, (u64, bool)>) -> Option<Result<(u64, Dispatch), String>> {
     // An instruction may pad the table to its alignment.
     let real: Vec<&(u64, u8, Option<Instruction>)> = before.iter().rev().filter(|(_, _, instruction)| !instruction.as_ref().is_some_and(is_nop)).take(4).collect();
     let &&(at, _, Some(ref jump)) = real.first()? else { return None };
     let writes_pc = register(jump, 0) == Some(15);
     let loaded = |opcodes: &[Opcode]| real[1..].iter().find_map(|(_, _, instruction)| instruction.as_ref().filter(|instruction| opcodes.contains(&instruction.opcode)));
     Some(Ok(match jump.opcode {
-        Opcode::TBB => (at, Dispatch::Relative { size: 1, base: at + 4 }),
-        Opcode::TBH => (at, Dispatch::Relative { size: 2, base: at + 4 }),
+        Opcode::TBB => (at, Dispatch::Relative { size: 1, signed: false, base: at + 4 }),
+        Opcode::TBH => (at, Dispatch::Relative { size: 2, signed: false, base: at + 4 }),
+        Opcode::BL => {
+            let &(size, signed) = helpers.get(&branch_target(jump, at)?)?;
+            (at, Dispatch::Relative { size, signed, base: at + 4 })
+        }
         Opcode::ADD if writes_pc => {
             let size = match loaded(&[Opcode::LDRB, Opcode::LDRH]).map(|load| load.opcode) {
                 Some(Opcode::LDRB) => 1,
                 Some(_) => 2,
                 None => return Some(Err("ADD PC with no load of an entry before it".into())),
             };
-            (at, Dispatch::Relative { size, base: at + 4 })
+            (at, Dispatch::Relative { size, signed: false, base: at + 4 })
         }
         Opcode::MOV if writes_pc => {
             let adr = real[1..].iter().find_map(|(at, _, instruction)| match instruction.as_ref()?.operands {
@@ -266,11 +288,13 @@ pub fn jump_tables(layout: &Path, debug_path: &Path) -> Result<Option<Extracted>
     let elf = object::File::parse(&*data)?;
     let code = Code::read(&elf);
     let (mut tables, mut rejected) = (Vec::new(), Vec::new());
-    for (&start, (_, size)) in &functions(&elf, &code) {
+    let functions = functions(&elf, &code);
+    let helpers = case_helpers(&functions);
+    for (&start, (_, size)) in &functions {
         let end = start + size;
         let instructions = code.instructions(start, end);
         for &(table, table_end) in code.data.iter().filter(|&&(table, _)| table > start && table < end) {
-            match table_at(&|start, end| code.bytes(start, end), &instructions, table, table_end, start, end) {
+            match table_at(&|start, end| code.bytes(start, end), &helpers, &instructions, table, table_end, start, end) {
                 None => {}
                 Some(Ok(found)) => tables.push(found),
                 Some(Err(reason)) => rejected.push(Rejected { table, reason }),
@@ -284,9 +308,10 @@ pub fn jump_tables(layout: &Path, debug_path: &Path) -> Result<Option<Extracted>
 
 /// The table that the data run `[table, table_end)` of the function `[start, end)` holds, if the
 /// Thumb `instructions` of the function before it end in a dispatch that reads it, or why it
-/// cannot be read.
+/// cannot be read. `helpers` are the switch helpers by address.
 pub(super) fn table_at<'a>(
     bytes: &dyn Fn(u64, u64) -> Option<&'a [u8]>,
+    helpers: &BTreeMap<u64, (u64, bool)>,
     instructions: &[(u64, u8, Option<Instruction>)],
     table: u64,
     table_end: u64,
@@ -294,7 +319,7 @@ pub(super) fn table_at<'a>(
     end: u64,
 ) -> Option<Result<JumpTable, String>> {
     let before = &instructions[..instructions.partition_point(|&(at, _, _)| at < table)];
-    let (jump, kind) = match dispatch(before)? {
+    let (jump, kind) = match dispatch(before, helpers)? {
         Err(reason) => return Some(Err(reason)),
         Ok(found) => found,
     };
@@ -306,9 +331,20 @@ pub(super) fn table_at<'a>(
         Dispatch::Relative { .. } => table,
     };
     let table_end = literals(instructions).iter().map(|&(literal, _)| literal).filter(|&literal| literal >= table && literal < table_end).min().unwrap_or(table_end);
+    // A pool of literals after the table and the instruction that pads it, as GCC puts one.
+    if table_end == table {
+        return None;
+    }
     let Some(bytes) = bytes(table, table_end) else { return Some(Err("a table outside the code".into())) };
     let mut targets: Vec<u64> = match kind {
-        Dispatch::Relative { size, base } => bytes.chunks_exact(size as usize).map(|entry| base + 2 * entry.iter().rev().fold(0u64, |value, &byte| value << 8 | u64::from(byte))).collect(),
+        Dispatch::Relative { size, signed, base } => bytes
+            .chunks_exact(size as usize)
+            .map(|entry| {
+                let value = entry.iter().rev().fold(0i64, |value, &byte| value << 8 | i64::from(byte));
+                let bits = 64 - 8 * size as u32;
+                base.wrapping_add_signed(2 * if signed { value << bits >> bits } else { value })
+            })
+            .collect(),
         Dispatch::Absolute { .. } => bytes.chunks_exact(4).map(|entry| u64::from(u32::from_le_bytes(entry.try_into().unwrap())) & !1).collect(),
     };
     // Padding: an entry whose case would be the table itself.
@@ -319,4 +355,20 @@ pub(super) fn table_at<'a>(
         return Some(Err(format!("a case at {outside:#x} outside the function")));
     }
     Some(Ok(JumpTable { jump, table, targets, unreachable: None }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_signed_table_after_a_call_to_a_switch_helper() {
+        // `BL 0x200`, to `__gnu_thumb1_case_shi`, then entries of 4 and -4.
+        let code = [0x00, 0xf0, 0x7e, 0xf8, 0x04, 0x00, 0xfc, 0xff];
+        let bytes = |start: u64, end: u64| code.get((start - 0x100) as usize..(end - 0x100) as usize);
+        let bl = InstDecoder::default_thumb().decode(&mut U8Reader::new(&code)).unwrap();
+        let helpers = BTreeMap::from([(0x200, (2, true))]);
+        let table = table_at(&bytes, &helpers, &[(0x100, 4, Some(bl))], 0x104, 0x108, 0xf0, 0x120).unwrap().unwrap();
+        assert_eq!((table.jump, table.table, table.targets), (0x100, 0x104, vec![0xfc, 0x10c]));
+    }
 }
