@@ -2,7 +2,7 @@
 //! comparisons are scored against, and the data types the decompiler is given.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use object::{Object, ObjectSection, ObjectSymbol};
@@ -117,8 +117,17 @@ struct Scope {
 /// every unit again, and most are never used by anything that has an address.
 struct Reader<'a> {
     dwarf: gimli::Dwarf<Slice<'a>>,
+    /// The supplementary file's, whose units are those from `sup_from` on.
+    sup: Option<gimli::Dwarf<Slice<'a>>>,
+    sup_from: usize,
+    /// Whether a struct takes the members of the variants of its variant part too, which
+    /// overlap, as [`located`] has them. The engine takes no overlapping members.
+    variants: bool,
+    /// Classes with a virtual base, which their members leave out.
+    virtual_bases: HashSet<TypeId>,
     units: Vec<gimli::Unit<Slice<'a>>>,
-    /// Per unit, where it starts in `.debug_info`, for references from one unit into another.
+    /// Per unit, where it starts in the `.debug_info` of its file, for references from one
+    /// unit into another.
     starts: Vec<usize>,
     /// Per unit, its namespaces and classes in the order they start.
     scopes: Vec<Vec<Scope>>,
@@ -134,16 +143,91 @@ struct Reader<'a> {
     types: Types,
 }
 
+/// Where a parameter is as its function is entered, as its DWARF location says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry {
+    /// In the register of this DWARF number.
+    Register(u16),
+    /// In memory, this many bytes above the canonical frame address.
+    Frame(i64),
+    /// In memory at the address the register of this DWARF number holds: a value the source
+    /// passes by value and the caller by pointer.
+    Address(u16),
+}
+
+/// One parameter of a function's definition: its name, the type the source gives it, and where
+/// the function finds it when it is entered, if the location says.
+#[derive(Debug, Clone)]
+pub struct Parameter {
+    pub name: String,
+    pub kind: TypeId,
+    pub entry: Option<Entry>,
+}
+
+/// What the definition of a function says it returns and takes, in the source's order.
+#[derive(Debug, Clone)]
+pub struct Defined {
+    pub returns: TypeId,
+    pub params: Vec<Parameter>,
+}
+
+/// The types of a debug file, and the definition of every function it has, by address.
+/// Compiler clones (`.isra`, `.constprop`) are among them: the locations say what they take.
+pub struct Located {
+    pub types: Types,
+    pub functions: BTreeMap<u64, Defined>,
+    /// The classes with a virtual base, whose bytes the members do not all account for.
+    pub virtual_bases: HashSet<TypeId>,
+}
+
 /// The types, function prototypes and globals in the DWARF of the file at `path`, which is a
 /// binary or a separate debug file, for code of `machine`.
 pub fn types(path: &Path, machine: Machine) -> Result<Types> {
+    read(path, machine, false, &[]).map(|located| located.types)
+}
+
+/// [`types`], and where each parameter of each function is as it is entered. Reads the
+/// location lists, which loading types for a session leaves packed, and gives a Rust enum the
+/// members of all its variants. A supplementary file that
+/// is not where the debug file says is looked for under each of `roots`, as a package unpacked
+/// there would have it.
+pub fn located(path: &Path, machine: Machine, roots: &[PathBuf]) -> Result<Located> {
+    read(path, machine, true, roots)
+}
+
+/// The supplementary file that `dwz` moved the entries several debug files share to, as the
+/// `.gnu_debugaltlink` section of `file` names it: at that path, or under one of `roots`.
+fn supplementary(file: &object::File, roots: &[PathBuf]) -> Option<PathBuf> {
+    let link = file.section_by_name(".gnu_debugaltlink")?.data().ok()?;
+    let path = PathBuf::from(String::from_utf8_lossy(&link[..link.iter().position(|&byte| byte == 0)?]).into_owned());
+    let relative = path.strip_prefix("/").unwrap_or(&path).to_path_buf();
+    std::iter::once(path).chain(roots.iter().map(|root| root.join(&relative))).find(|candidate| candidate.is_file())
+}
+
+/// The DWARF sections of `file` among `needed`, unpacked, each on a thread of its own.
+fn unpack_sections<'d>(file: &object::File<'d>, needed: &[gimli::SectionId]) -> Result<gimli::DwarfSections<std::borrow::Cow<'d, [u8]>>> {
+    let unpack = |id: gimli::SectionId| {
+        // Mach-O spells `.debug_info` as `__debug_info`.
+        let section = file.section_by_name(id.name()).or_else(|| file.section_by_name(&id.name().replacen('.', "__", 1)));
+        section.and_then(|section| section.uncompressed_data().ok()).unwrap_or_default()
+    };
+    let mut unpacked: Vec<std::borrow::Cow<[u8]>> = std::thread::scope(|scope| {
+        let threads: Vec<_> = needed.iter().map(|&id| scope.spawn(move || unpack(id))).collect();
+        threads.into_iter().map(|thread| thread.join().expect("unpacking does not panic")).collect()
+    });
+    gimli::DwarfSections::load(|id| -> Result<std::borrow::Cow<[u8]>> {
+        Ok(needed.iter().position(|&needed| needed == id).map(|index| std::mem::take(&mut unpacked[index])).unwrap_or_default())
+    })
+}
+
+fn read(path: &Path, machine: Machine, locations: bool, roots: &[PathBuf]) -> Result<Located> {
     let pointer = machine.pointer_size();
     let data = std::fs::read(path).with_context(|| format!("reading {path:?}"))?;
     let file = object::File::parse(&*data)?;
     // Debian compresses these sections, and unpacking them is then most of the work: only the
     // ones that describe types are unpacked, not variable locations or macros, and each on a
     // thread of its own. The line table is among them because a unit cannot be opened without.
-    const NEEDED: [gimli::SectionId; 9] = [
+    let mut needed = vec![
         gimli::SectionId::DebugLine,
         gimli::SectionId::DebugInfo,
         gimli::SectionId::DebugAbbrev,
@@ -154,58 +238,76 @@ pub fn types(path: &Path, machine: Machine) -> Result<Types> {
         gimli::SectionId::DebugRanges,
         gimli::SectionId::DebugRngLists,
     ];
-    let unpack = |id: gimli::SectionId| {
-        // Mach-O spells `.debug_info` as `__debug_info`.
-        let section = file.section_by_name(id.name()).or_else(|| file.section_by_name(&id.name().replacen('.', "__", 1)));
-        section.and_then(|section| section.uncompressed_data().ok()).unwrap_or_default()
+    if locations {
+        needed.extend([gimli::SectionId::DebugLoc, gimli::SectionId::DebugLocLists]);
+    }
+    let sections = unpack_sections(&file, &needed)?;
+    let mut dwarf = sections.borrow(|section| gimli::EndianSlice::new(section, gimli::LittleEndian));
+    // Debian's packages share what several debug files describe alike in a file of its own,
+    // which their entries refer to.
+    let sup_data = match supplementary(&file, roots) {
+        Some(sup) => std::fs::read(&sup).with_context(|| format!("reading {sup:?}"))?,
+        None => Vec::new(),
     };
-    let mut unpacked: Vec<std::borrow::Cow<[u8]>> = std::thread::scope(|scope| {
-        let threads: Vec<_> = NEEDED.iter().map(|&id| scope.spawn(move || unpack(id))).collect();
-        threads.into_iter().map(|thread| thread.join().expect("unpacking does not panic")).collect()
-    });
-    let sections = gimli::DwarfSections::load(|id| -> Result<std::borrow::Cow<[u8]>> {
-        Ok(NEEDED.iter().position(|&needed| needed == id).map(|index| std::mem::take(&mut unpacked[index])).unwrap_or_default())
-    })?;
-    let dwarf = sections.borrow(|section| gimli::EndianSlice::new(section, gimli::LittleEndian));
+    let sup_file = (!sup_data.is_empty()).then(|| object::File::parse(&*sup_data)).transpose()?;
+    let sup_sections = sup_file.as_ref().map(|sup| unpack_sections(sup, &needed)).transpose()?;
+    let sup = sup_sections.as_ref().map(|sections| sections.borrow(|section| gimli::EndianSlice::new(section, gimli::LittleEndian)));
+    if let Some(sections) = &sup_sections {
+        dwarf.set_sup(sections.borrow(|section| gimli::EndianSlice::new(section, gimli::LittleEndian)));
+    }
     // The compiler's copies of a function that take other parameters than the source says.
     let clones: HashSet<u64> = file.symbols().filter(|symbol| symbol.name().is_ok_and(|name| [".isra.", ".constprop.", ".part."].iter().any(|mark| name.contains(mark)))).map(|symbol| symbol.address()).collect();
 
     // Walking every entry is most of the work, and each unit can be walked on its own.
+    // The units of the supplementary file come after the file's own, flagged.
     let mut headers = Vec::new();
-    let mut walk = dwarf.units();
-    while let Some(header) = walk.next()? {
-        headers.push(header);
+    for (from_sup, dwarf) in [(false, Some(&dwarf)), (true, sup.as_ref())] {
+        let Some(dwarf) = dwarf else { continue };
+        let mut walk = dwarf.units();
+        while let Some(header) = walk.next()? {
+            headers.push((from_sup, header));
+        }
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = std::thread::available_parallelism().map_or(1, usize::from).min(8);
-    let mut surveyed: Vec<(usize, gimli::Unit<Slice>, Survey)> = std::thread::scope(|scope| {
+    let mut surveyed: Vec<(bool, usize, gimli::Unit<Slice>, Survey)> = std::thread::scope(|scope| {
         let work = || {
             let mut done = Vec::new();
-            while let Some(header) = headers.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+            while let Some(&(from_sup, header)) = headers.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                 let Some(start) = header.debug_info_offset() else { continue };
-                let Ok(unit) = dwarf.unit(*header) else { continue };
+                let dwarf = if from_sup { sup.as_ref().expect("a header of the supplementary file") } else { &dwarf };
+                let Ok(unit) = dwarf.unit(header) else { continue };
                 let mut survey = Survey::default();
                 // A unit that cannot be read to its end still gave what came before.
-                let _ = survey.walk(&dwarf, &unit);
-                done.push((start.0, unit, survey));
+                let _ = survey.walk(dwarf, &unit);
+                done.push((from_sup, start.0, unit, survey));
             }
             done
         };
         let threads: Vec<_> = (0..workers).map(|_| scope.spawn(work)).collect();
         threads.into_iter().flat_map(|thread| thread.join().expect("the survey does not panic")).collect()
     });
-    surveyed.sort_by_key(|unit| unit.0);
+    surveyed.sort_by_key(|unit| (unit.0, unit.1));
 
-    let mut reader = Reader { dwarf, units: Vec::new(), starts: Vec::new(), scopes: Vec::new(), seen: HashMap::new(), pending: Vec::new(), by_reference: HashSet::new(), types: Types::new(pointer) };
+    let sup_from = surveyed.iter().position(|unit| unit.0).unwrap_or(surveyed.len());
+    let mut reader = Reader { dwarf, sup, sup_from, variants: locations, virtual_bases: HashSet::new(), units: Vec::new(), starts: Vec::new(), scopes: Vec::new(), seen: HashMap::new(), pending: Vec::new(), by_reference: HashSet::new(), types: Types::new(pointer) };
     let (mut functions, mut globals) = (Vec::new(), Vec::new());
-    for (index, (start, unit, survey)) in surveyed.into_iter().enumerate() {
+    for (index, (from_sup, start, unit, survey)) in surveyed.into_iter().enumerate() {
         reader.starts.push(start);
         reader.units.push(unit);
         reader.scopes.push(survey.scopes);
-        functions.extend(survey.functions.into_iter().map(|(offset, addr)| ((index, offset), addr)));
-        globals.extend(survey.globals.into_iter().map(|(offset, addr)| ((index, offset), addr)));
+        // The supplementary file holds what units share, which has no address of its own.
+        if !from_sup {
+            functions.extend(survey.functions.into_iter().map(|(offset, addr)| ((index, offset), addr)));
+            globals.extend(survey.globals.into_iter().map(|(offset, addr)| ((index, offset), addr)));
+        }
     }
+    let mut parameters = BTreeMap::new();
     for (die, addr) in functions {
+        if locations && !parameters.contains_key(&addr) {
+            let found = reader.parameters(die, addr);
+            parameters.insert(addr, found);
+        }
         if !clones.contains(&addr) {
             reader.function(die, addr);
         }
@@ -218,7 +320,7 @@ pub fn types(path: &Path, machine: Machine) -> Result<Types> {
     }
     reader.as_passed(machine);
     reader.types.finish();
-    Ok(reader.types)
+    Ok(Located { types: reader.types, functions: parameters, virtual_bases: reader.virtual_bases })
 }
 
 /// What one unit holds that the reader starts from: its scopes in the order they start, and
@@ -304,16 +406,27 @@ impl<'a> Reader<'a> {
         self.units[die.0].entry(die.1).ok()
     }
 
+    /// The debug information the unit at `unit` is part of: the file's, or the supplementary
+    /// file's.
+    fn dwarf_of(&self, unit: usize) -> &gimli::Dwarf<Slice<'a>> {
+        match &self.sup {
+            Some(sup) if unit >= self.sup_from => sup,
+            _ => &self.dwarf,
+        }
+    }
+
     /// The entry an attribute of an entry in unit `unit` refers to.
     fn reference(&self, unit: usize, value: gimli::AttributeValue<Slice<'a>>) -> Option<Die> {
-        match value {
-            gimli::AttributeValue::UnitRef(offset) => Some((unit, offset)),
-            gimli::AttributeValue::DebugInfoRef(offset) => {
-                let unit = self.starts.partition_point(|&start| start <= offset.0).checked_sub(1)?;
-                Some((unit, offset.to_unit_offset(&self.units[unit].header)?))
-            }
-            _ => None,
-        }
+        // A reference into `.debug_info` of the file the unit is in, or of the other one.
+        let (offset, sup) = match value {
+            gimli::AttributeValue::UnitRef(offset) => return Some((unit, offset)),
+            gimli::AttributeValue::DebugInfoRef(offset) => (offset, unit >= self.sup_from),
+            gimli::AttributeValue::DebugInfoRefSup(offset) => (offset, true),
+            _ => return None,
+        };
+        let (first, starts) = if sup { (self.sup_from, &self.starts[self.sup_from..]) } else { (0, &self.starts[..self.sup_from]) };
+        let unit = first + starts.partition_point(|&start| start <= offset.0).checked_sub(1)?;
+        Some((unit, offset.to_unit_offset(&self.units[unit].header)?))
     }
 
     /// An attribute of the entry at `die`, or failing that of the entry it is an instance or
@@ -346,7 +459,7 @@ impl<'a> Reader<'a> {
     /// the empty string if it has no name.
     fn qualified(&self, die: Die) -> String {
         let die = self.declaration(die);
-        let Some(name) = self.entry(die).and_then(|entry| entry.attr_value(gimli::DW_AT_name)).and_then(|name| self.dwarf.attr_string(&self.units[die.0], name).ok()) else {
+        let Some(name) = self.entry(die).and_then(|entry| entry.attr_value(gimli::DW_AT_name)).and_then(|name| self.dwarf_of(die.0).attr_string(&self.units[die.0], name).ok()) else {
             return String::new();
         };
         let scopes = &self.scopes[die.0];
@@ -453,7 +566,7 @@ impl<'a> Reader<'a> {
             if fill {
                 let values = self.children(die, |_, child| {
                     let value = child.attr(gimli::DW_AT_const_value)?;
-                    let name = self.dwarf.attr_string(&self.units[die.0], child.attr_value(gimli::DW_AT_name)?).ok()?;
+                    let name = self.dwarf_of(die.0).attr_string(&self.units[die.0], child.attr_value(gimli::DW_AT_name)?).ok()?;
                     Some((name.to_string_lossy().into_owned(), value.sdata_value().or_else(|| value.udata_value().map(|value| value as i64))?))
                 });
                 self.types.set_values(id, values);
@@ -502,13 +615,23 @@ impl<'a> Reader<'a> {
 
     /// Reads the members and base classes of the struct or union at `die` into the type `id`.
     fn members(&mut self, id: TypeId, die: Die) {
-        let members: Vec<(Die, gimli::DebuggingInformationEntry<Slice<'a>>)> =
+        let mut members: Vec<(Die, gimli::DebuggingInformationEntry<Slice<'a>>)> =
             self.children(die, |child, entry| matches!(entry.tag(), gimli::DW_TAG_member | gimli::DW_TAG_inheritance | gimli::DW_TAG_subprogram).then(|| (child, entry.clone())));
+        // A Rust enum keeps its tag and the members of each variant in a variant part, at
+        // offsets from the start of the enum. The variants overlap as a union's members do.
+        if self.variants {
+            for part in self.children(die, |child, entry| (entry.tag() == gimli::DW_TAG_variant_part).then_some(child)) {
+                members.extend(self.children(part, |child, entry| (entry.tag() == gimli::DW_TAG_member).then(|| (child, entry.clone()))));
+                for variant in self.children(part, |child, entry| (entry.tag() == gimli::DW_TAG_variant).then_some(child)) {
+                    members.extend(self.children(variant, |child, entry| (entry.tag() == gimli::DW_TAG_member).then(|| (child, entry.clone()))));
+                }
+            }
+        }
         let mut fields = Vec::new();
         for (member, entry) in members {
             if entry.tag() == gimli::DW_TAG_subprogram {
                 // A destructor: copying or dropping a value of this class runs code.
-                let name = entry.attr_value(gimli::DW_AT_name).and_then(|name| self.dwarf.attr_string(&self.units[die.0], name).ok());
+                let name = entry.attr_value(gimli::DW_AT_name).and_then(|name| self.dwarf_of(die.0).attr_string(&self.units[die.0], name).ok());
                 if name.is_some_and(|name| name.slice().starts_with(b"~")) {
                     self.by_reference.insert(id);
                 }
@@ -526,12 +649,15 @@ impl<'a> Reader<'a> {
                     Ok(Some(gimli::Operation::PlusConstant { value })) => value,
                     Ok(Some(gimli::Operation::UnsignedConstant { value })) => value,
                     // Where a virtual base lies is only known at run time.
-                    _ => continue,
+                    _ => {
+                        self.virtual_bases.insert(id);
+                        continue;
+                    }
                 },
                 Some(_) => number(gimli::DW_AT_data_member_location).unwrap_or(0),
             };
             let kind = self.type_of(member);
-            let name = entry.attr_value(gimli::DW_AT_name).and_then(|name| self.dwarf.attr_string(&self.units[die.0], name).ok()).map(|name| name.to_string_lossy().into_owned());
+            let name = entry.attr_value(gimli::DW_AT_name).and_then(|name| self.dwarf_of(die.0).attr_string(&self.units[die.0], name).ok()).map(|name| name.to_string_lossy().into_owned());
             let name = match (name, entry.tag()) {
                 (Some(name), gimli::DW_TAG_inheritance) | (Some(name), _) if entry.tag() != gimli::DW_TAG_inheritance => name,
                 (_, gimli::DW_TAG_inheritance) => match self.types.get(kind) {
@@ -568,7 +694,7 @@ impl<'a> Reader<'a> {
         for (child, tag) in children {
             match tag {
                 gimli::DW_TAG_formal_parameter => {
-                    let name = self.attr(child, gimli::DW_AT_name).and_then(|(unit, name)| self.dwarf.attr_string(&self.units[unit], name).ok());
+                    let name = self.attr(child, gimli::DW_AT_name).and_then(|(unit, name)| self.dwarf_of(unit).attr_string(&self.units[unit], name).ok());
                     let kind = self.type_of(child);
                     prototype.params.push((name.map_or_else(String::new, |name| name.to_string_lossy().into_owned()), kind));
                 }
@@ -646,6 +772,81 @@ impl<'a> Reader<'a> {
         let prototype = self.prototype(die);
         let prototype = self.types.add(Type::Function(prototype));
         self.types.functions.push(crate::types::Function { addr, name, prototype });
+    }
+
+    /// The parameters of the function at `addr`, whose definition is at `die`, with where each
+    /// is when the function is entered: the location that covers its first instruction, or
+    /// failing that the register a later location says the value came in.
+    fn parameters(&mut self, die: Die, addr: u64) -> Defined {
+        let encoding = self.units[die.0].encoding();
+        let frame_base = self.entry(die).and_then(|entry| entry.attr_value(gimli::DW_AT_frame_base));
+        let cfa = matches!(frame_base, Some(gimli::AttributeValue::Exprloc(base)) if matches!(base.operations(encoding).next(), Ok(Some(gimli::Operation::CallFrameCFA))));
+        // One operation and nothing more.
+        let alone = |expression: gimli::Expression<Slice<'a>>| {
+            let mut operations = expression.operations(encoding);
+            match (operations.next(), operations.next()) {
+                (Ok(Some(operation)), Ok(None)) => Some(operation),
+                _ => None,
+            }
+        };
+        let at_entry = |expression: gimli::Expression<Slice<'a>>| match alone(expression)? {
+            gimli::Operation::Register { register } => Some(Entry::Register(register.0)),
+            gimli::Operation::FrameOffset { offset } if cfa => Some(Entry::Frame(offset)),
+            gimli::Operation::RegisterOffset { register, offset: 0, .. } => Some(Entry::Address(register.0)),
+            _ => None,
+        };
+        // `DW_OP_entry_value(DW_OP_regN) DW_OP_stack_value`: what the register held on entry.
+        let came_in = |expression: gimli::Expression<Slice<'a>>| {
+            let mut operations = expression.operations(encoding);
+            match (operations.next(), operations.next()) {
+                (Ok(Some(gimli::Operation::EntryValue { expression })), Ok(Some(gimli::Operation::StackValue))) => match alone(gimli::Expression(expression))? {
+                    gimli::Operation::Register { register } => Some(Entry::Register(register.0)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let parameter = |child: Die, entry: &gimli::DebuggingInformationEntry<Slice<'a>>| (entry.tag() == gimli::DW_TAG_formal_parameter).then_some(child);
+        let mut children: Vec<(Die, Option<gimli::AttributeValue<Slice<'a>>>)> = self.children(die, |child, entry| parameter(child, entry).map(|child| (child, entry.attr_value(gimli::DW_AT_location))));
+        // An out-of-line copy of an inlined function may leave out a parameter it does not
+        // track, which only the inlined function lists. It is there, with no location.
+        if let Some(origin) = self.entry(die).and_then(|entry| entry.attr_value(gimli::DW_AT_abstract_origin)).and_then(|origin| self.reference(die.0, origin)) {
+            let instances: Vec<Option<Die>> = children.iter().map(|(child, _)| self.entry(*child).and_then(|entry| entry.attr_value(gimli::DW_AT_abstract_origin)).and_then(|origin| self.reference(child.0, origin))).collect();
+            let declared = self.children(origin, parameter);
+            if instances.iter().all(Option::is_some) && !declared.is_empty() {
+                let mut ordered = Vec::with_capacity(declared.len());
+                for declared in declared {
+                    match instances.iter().position(|instance| *instance == Some(declared)) {
+                        Some(at) => ordered.push(children[at]),
+                        None => ordered.push((declared, None)),
+                    }
+                }
+                children = ordered;
+            }
+        }
+        let mut parameters = Vec::with_capacity(children.len());
+        for (child, location) in children {
+            let entry = match location {
+                None => None,
+                Some(gimli::AttributeValue::Exprloc(expression)) => at_entry(expression),
+                Some(list) => {
+                    let mut list = self.dwarf.attr_locations(&self.units[die.0], list).ok().flatten();
+                    let (mut first, mut later) = (None, None);
+                    while let Some(Ok(Some(item))) = list.as_mut().map(|list| list.next()) {
+                        if (item.range.begin..item.range.end).contains(&addr) {
+                            first = at_entry(item.data);
+                            break;
+                        }
+                        later = later.or_else(|| came_in(item.data));
+                    }
+                    first.or(later)
+                }
+            };
+            let name = self.attr(child, gimli::DW_AT_name).and_then(|(unit, name)| self.dwarf_of(unit).attr_string(&self.units[unit], name).ok());
+            let kind = self.type_of(child);
+            parameters.push(Parameter { name: name.map_or_else(String::new, |name| name.to_string_lossy().into_owned()), kind, entry });
+        }
+        Defined { returns: self.type_of(die), params: parameters }
     }
 
     fn global(&mut self, die: Die, addr: u64) {

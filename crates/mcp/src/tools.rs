@@ -12,6 +12,8 @@ use recore::FxHashMap;
 use recore::arch::FieldUse;
 use recore::diff::{Change, Evidence, Pair};
 use recore::report::CallTarget;
+use recore::structs::Refusal;
+use recore_decomp::ObjectReport;
 use recore_decomp::isolate::Status;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -150,6 +152,16 @@ pub fn list() -> Value {
             &["function"],
         ),
         tool(
+            "structs",
+            "The structs a function's pointers got: each parameter that points to one, and each struct field that points to another, with the struct's name and how much the code reads and writes through it. With `refused`, also each pointer the code reads fields through that got no struct, and why: so `*(int8 *)(param_1 + 0x28)` can be told from a struct that was never tried. Costs one decompilation.",
+            json!({
+                "function": function,
+                "refused": { "type": "boolean", "description": "Also list the pointers that got no struct, with the reason." },
+                "timeout": timeout,
+            }),
+            &["function"],
+        ),
+        tool(
             "run",
             "Runs a function of the binary as its processor would and answers what it did: the value it returned, the buffers it was given as it left them, and the memory it wrote. This is what the original does on inputs you choose, to check a rewrite against or to show a finding. It runs the function and everything it calls, not the program: imports such as memcpy and malloc run as stand-ins, a call to any other import stops the run, and memory that nothing wrote and the file does not hold reads as zero, which the answer counts because on a chip that memory is the peripherals.",
             json!({
@@ -182,12 +194,12 @@ pub fn list() -> Value {
         ),
         tool(
             "rename",
-            "Names a function (at its entry address), a data address, or with `var` a variable inside a function. The name is saved for this binary and used everywhere from then on, the decompiler's C included. An empty name removes it. Give `addr` and `name`, or several in `names`.",
+            "Names a function (at its entry address), a data address, with `var` a variable inside a function, or a struct or one of its fields. The name is saved for this binary and used everywhere from then on, the decompiler's C included. An empty name removes it. Give `addr` and `name`, or several in `names`. A struct the decompiler recovered, such as `S_401a20_RDI`, is kept under the name given, with the structs it points to, and callers that pass the pointer on show it too. Giving a second struct a name already taken says the two are one type: their fields merge, or the rename is refused with the offsets that clash. `S_401a20_RDI.field_0x10` names a field.",
             json!({
-                "addr": addr("A function entry or a data address; with `var`, the function, by address or name"),
+                "addr": addr("A function entry or a data address; with `var`, the function, by address or name. Or a struct, `Struct.field` for one of its fields"),
                 "var": { "type": "string", "description": "A parameter or local variable of the function, as `decompile` spells it now: `param_1`, `local_18`, `uVar3`." },
                 "name": { "type": "string", "description": "The new name; empty to remove." },
-                "names": { "type": "array", "items": { "type": "object", "properties": { "addr": { "type": "string" }, "var": { "type": "string" }, "name": { "type": "string" } }, "required": ["addr", "name"] }, "description": "Several renames at once, which restarts the decompiler only once." },
+                "names": { "type": "array", "items": { "type": "object", "properties": { "addr": { "type": "string" }, "var": { "type": "string" }, "name": { "type": "string" } }, "required": ["addr", "name"] }, "description": "Several renames at once." },
             }),
             &[],
         ),
@@ -209,8 +221,8 @@ pub fn list() -> Value {
         ),
         tool(
             "type",
-            "The layout of a data type: size, alignment, and each field of a struct or union with its offset, or the values of an enum. Without `name`, lists what `declare` has recorded.",
-            json!({ "name": { "type": "string", "description": "A type name, declared or built in." } }),
+            "The layout of a data type: size, alignment, and each field of a struct or union with its offset, or the values of an enum. A struct kept with `rename` also lists the functions passed a pointer to it. Without `name`, lists what `declare` and `rename` have recorded.",
+            json!({ "name": { "type": "string", "description": "A type name: declared, built in, a struct the decompiler recovered such as `S_401a20_RDI`, or one kept with `rename`." } }),
             &[],
         ),
     ])
@@ -246,6 +258,7 @@ pub fn call(cache: &mut Cache, name: &str, arguments: Value) -> Option<Result<St
         "comment" => run(cache, name, arguments, edit::comment),
         "declare" => run(cache, name, arguments, edit::declare),
         "type" => run(cache, name, arguments, edit::type_),
+        "structs" => run(cache, name, arguments, structs),
         _ => return None,
     })
 }
@@ -263,15 +276,22 @@ struct Diff {
 /// function's own taken out, so that equal lines compare equal: the numbers the decompiler
 /// gives its variables, and addresses. An address of a function becomes the function's entry in
 /// the later build, which `in_new` gives, and any other address in the image only says it is one.
+/// So does the function a recovered struct is named after, as in `S_88f0_RDI`.
 fn comparable(c_text: &str, program: &Program, in_new: &dyn Fn(u64) -> Option<u64>) -> Vec<String> {
     let numbered = regex::Regex::new(r"\b(?:[a-z]{1,3}Var\d+|local_[0-9a-f]+|[a-z]+Stack_[0-9a-f]+|extraout_\w+|in_\w+|unaff_\w+)\b").expect("a valid expression");
     let address = regex::Regex::new(r"(0x|_)(?:r0x)?([0-9a-f]{4,16})\b").expect("a valid expression");
+    // The form of `recore::structs::auto_name`.
+    let recovered = regex::Regex::new(r"\bS_([0-9a-f]+)_").expect("a valid expression");
     // A bare number is an address only if the code refers to what is there: in an image
     // loaded at zero, a line number or a size is inside some section too.
     let referred_to = |addr: u64| program.refs_to(addr).next().is_some() || program.string_at(addr).is_some();
     let line_key = |line: &str| {
         // `iVar3` and `iVar5` are both an `iVar`: which number a variable got says nothing.
         let line = numbered.replace_all(line.trim(), |found: &regex::Captures| found[0].trim_end_matches(|c: char| c.is_ascii_hexdigit() || c == '_').to_string());
+        let line = recovered.replace_all(&line, |found: &regex::Captures| match u64::from_str_radix(&found[1], 16) {
+            Ok(addr) if program.function(addr).is_some() => in_new(addr).map_or_else(|| "S_<function>_".to_string(), |entry| format!("S_{entry:x}_")),
+            _ => found[0].to_string(),
+        });
         address
             .replace_all(&line, |found: &regex::Captures| match u64::from_str_radix(&found[2], 16) {
                 Ok(addr) if program.function(addr).is_some() => in_new(addr).map_or_else(|| "<function>".to_string(), |entry| format!("<function {entry:#x}>")),
@@ -1076,6 +1096,45 @@ fn around(c_text: &str, addr: u64) -> String {
     out + &format!("\n  ...{}", cut(end - start, lines.len(), "lines ", "`decompile` without `around` shows all"))
 }
 
+#[derive(Deserialize)]
+struct Structs {
+    function: String,
+    #[serde(default)]
+    refused: bool,
+    timeout: Option<f64>,
+}
+
+fn structs(binary: &mut Binary, args: Structs) -> Result<String> {
+    let function = resolve_function(binary, &args.function)?;
+    let timeout = Duration::try_from_secs_f64(args.timeout.unwrap_or(30.0)).map_err(|_| anyhow!("`timeout` must be a positive number of seconds"))?;
+    let report = binary.structs(function, timeout)?;
+    // Nothing read or written through a pointer is no struct to miss.
+    let shown: Vec<&ObjectReport> = report.objects.iter().filter(|object| object.decision.is_ok() || args.refused && object.decision != Err(Refusal::Unused)).collect();
+    let given = report.objects.iter().filter(|object| object.decision.is_ok()).count();
+    let refused = report.objects.iter().filter(|object| object.decision.is_err() && object.decision != Err(Refusal::Unused)).count();
+    let pointers = if given == 1 { "pointer" } else { "pointers" };
+    let mut out = format!("{}: {given} {pointers} with a struct, {refused} read through without one{}\n", binary.program.label(function), if args.refused || refused == 0 { "" } else { " (`refused` lists them)" });
+    for object in shown {
+        let place = match (object.slots.as_slice(), &object.field) {
+            ([], Some((owner, offset))) => format!("{owner} +{offset:#x}"),
+            ([], None) => "a pointer no parameter reaches".to_string(),
+            (slots, _) => slots.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+        };
+        let low = object.accesses.iter().map(|&(offset, _)| offset).min().unwrap_or(0);
+        let high = object.accesses.iter().map(|&(offset, size)| offset + i64::from(size)).max().unwrap_or(0);
+        let count = object.accesses.len();
+        let reach = format!("{count} {}, +{low:#x} to +{high:#x}", if count == 1 { "access" } else { "accesses" });
+        match &object.decision {
+            Ok(name) => writeln!(out, "{place}: {name}{}, {reach}", if object.named { " (named)" } else { "" })?,
+            Err(refusal) => writeln!(out, "{place}: no struct, {}; {reach}", refusal.reason())?,
+        }
+    }
+    for warning in &report.warnings {
+        writeln!(out, "warning: {warning}")?;
+    }
+    Ok(out)
+}
+
 fn decompile(binary: &mut Binary, args: Decompile) -> Result<String> {
     let near = args.around.as_deref().map(addr_arg).transpose()?;
     // The function an address is in need not be named as well.
@@ -1191,7 +1250,13 @@ fn addr(binary: &mut Binary, args: Addr) -> Result<String> {
     let (section, addr) = match (&args.addr, &args.offset) {
         (Some(addr), None) => {
             let addr = addr_arg(addr)?;
-            (image.section_at(addr).with_context(|| format!("{addr:#x} is not in any section stored in the file"))?, addr)
+            match image.section_at(addr) {
+                Some(section) => (section, addr),
+                // Memory the loader zero-fills, as `.bss` is, has no bytes in the file but is
+                // data all the same.
+                None if image.is_zero_filled(addr) => return Ok(format!("address {addr:#x}, not stored in the file: {}\n", describe(binary, addr))),
+                None => bail!("{addr:#x} is in no section of the file, nor in memory the loader fills with zeros"),
+            }
         }
         (None, Some(offset)) => {
             let offset = addr_arg(offset)?;
@@ -1248,4 +1313,26 @@ fn classes(binary: &mut Binary, args: Classes) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A recovered struct is named after the function it was recovered in. In a later build
+    /// where that function moved, the line that names it is the same line.
+    #[test]
+    fn a_recovered_struct_named_after_a_function_that_moved_compares_equal() {
+        // `total` is at 0x40100b in this build; say it was at 0x401000 in the earlier one.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/types-patched.elf");
+        let image = recore::Image::load(std::path::Path::new(path)).unwrap();
+        let analysis = recore::analyze(&image);
+        let program = Program::new(image, analysis);
+        let before = comparable("// header\nif (param_1 == (S_401000_RDI_8 *)0x0) {", &program, &|entry| (entry == 0x401000).then_some(0x40100b));
+        let after = comparable("// header\nif (param_1 == (S_40100b_RDI_8 *)0x0) {", &program, &Some);
+        assert_eq!(before, ["if (param_1 == (S_40100b_RDI_8 *)0x0) {"]);
+        assert_eq!(after, before);
+        // A name that leads to no function is left as it is.
+        assert_eq!(comparable("// header\nS_dead_RDI *p;", &program, &Some), ["S_dead_RDI *p;"]);
+    }
 }

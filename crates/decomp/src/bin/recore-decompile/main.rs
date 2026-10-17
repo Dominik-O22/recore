@@ -5,6 +5,7 @@ mod noise;
 mod params;
 mod report;
 mod run;
+mod structs;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -122,6 +123,30 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         list: usize,
     },
+    /// Scores the structs recovered for pointer parameters against the DWARF of each binary in
+    /// `<corpus>/bin` that has `<corpus>/debug/<name>.debug`, decompiling a sample of its
+    /// functions as the census does: every so many, the same each run, without debug
+    /// information or edits.
+    Structs {
+        /// Corpus directories, each with `bin/` and `debug/`.
+        corpora: Vec<PathBuf>,
+        /// The binaries struct recovery was tuned on, one `<corpus>/bin/<name>` a line, as
+        /// `bench/set.txt` lists them. Scored apart from the others.
+        #[arg(long)]
+        tuning: Option<PathBuf>,
+        /// Functions per binary.
+        #[arg(long, default_value_t = 200)]
+        sample: usize,
+        /// Binaries scored at once, each with its own decompiler process.
+        #[arg(long, default_value_t = 6)]
+        jobs: usize,
+        /// Wall-clock seconds one function may take.
+        #[arg(long, default_value_t = 20.0)]
+        timeout: f64,
+        /// Write each scored struct, and each parameter refused one, as a JSON line here.
+        #[arg(long)]
+        cases: Option<PathBuf>,
+    },
     /// Prints how much of the C of a `corpus` run with `--emit-c` is hard to read: flags kept as
     /// bits of a status register, values seen only as their bytes, registers no convention
     /// accounts for.
@@ -160,6 +185,18 @@ fn main() -> Result<()> {
             run::functions(&binary, &functions, all, jobs, Duration::from_secs_f64(timeout), &(&worker).into())
         }
         Command::Params { out_dir, debug_dir, jobs, list } => params::compare(&out_dir, &debug_dir, jobs, list),
+        Command::Structs { corpora, tuning, sample, jobs, timeout, cases } => {
+            let tuning = match tuning {
+                Some(list) => std::fs::read_to_string(list)?.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')).map(String::from).collect(),
+                None => Default::default(),
+            };
+            // Each package unpacked as `<corpus>/pkgs/<source>/x/<package>`.
+            let mut roots = Vec::new();
+            for sources in corpora.iter().filter_map(|corpus| std::fs::read_dir(corpus.join("pkgs")).ok()).flatten().flatten() {
+                roots.extend(std::fs::read_dir(sources.path().join("x")).into_iter().flatten().flatten().map(|package| package.path()));
+            }
+            structs::score(&structs::Config { corpora, roots, tuning, sample, jobs, timeout: Duration::from_secs_f64(timeout), cases })
+        }
         Command::Noise { out_dir, list } => noise::report(&out_dir, list.as_deref()),
         Command::Imports { bin_dir, list } => imports::coverage(&bin_dir, list),
         Command::DebugInfo { binary } => imports::debug_info(&binary),

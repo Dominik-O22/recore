@@ -22,7 +22,7 @@ fn speaks_the_protocol() {
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        ["summary", "strings", "imports", "functions", "function", "xrefs", "decompile", "unnamed", "bytes", "classes", "addr", "disassemble", "pcode", "trace", "run", "symbols", "diff", "rename", "comment", "declare", "type"]
+        ["summary", "strings", "imports", "functions", "function", "xrefs", "decompile", "unnamed", "bytes", "classes", "addr", "disassemble", "pcode", "trace", "structs", "run", "symbols", "diff", "rename", "comment", "declare", "type"]
     );
 
     assert_eq!(client.request("resources/list", json!({}))["error"]["code"], -32601);
@@ -116,6 +116,31 @@ fn a_variable_keeps_the_name_it_is_given() {
 }
 
 #[test]
+fn edits_made_while_the_decompiler_runs_read_as_in_a_new_server() {
+    // `start` of the decompiler's fixture calls `draw` and `total`, which it decompiles first.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/types.elf");
+    let edits = edits_dir();
+    let decompile = |client: &mut Client| {
+        let c_text = client.tool("decompile", json!({ "path": path, "functions": ["0x40104c", "0x401000"] })).unwrap();
+        // Without the times, which the header of each function gives.
+        c_text.lines().filter(|line| !line.starts_with("// 0x")).collect::<Vec<_>>().join("\n")
+    };
+    let mut client = Client::start_in(&edits);
+    decompile(&mut client);
+    client.tool("rename", json!({ "path": path, "addr": "0x401000", "name": "sum_list" })).unwrap();
+    client.tool("rename", json!({ "path": path, "addr": "0x401000", "var": "iVar1", "name": "sum" })).unwrap();
+    client.tool("comment", json!({ "path": path, "addr": "0x401000", "text": "walks the list once" })).unwrap();
+    let live = decompile(&mut client);
+    assert!(live.contains("  sum_list(head,2);"), "{live}");
+    assert!(live.contains("int4 sum_list(node *list,int4 scale)"), "{live}");
+    assert!(live.contains("sum = sum + scale * list->value;"), "{live}");
+    assert!(live.contains("walks the list once"), "{live}");
+
+    drop(client);
+    assert_eq!(live, decompile(&mut Client::start_in(&edits)));
+}
+
+#[test]
 fn a_patch_shows_as_the_functions_it_touched() {
     // Two builds of the decompiler's fixture: the later one has a check in `total`, which
     // calls a new function, and neither has a name to go by.
@@ -184,6 +209,44 @@ fn a_pointer_in_a_table_is_paired_with_the_name_of_its_own_record() {
 }
 
 #[test]
+fn a_named_struct_reaches_a_caller_and_outlives_the_server() {
+    // The decompiler's struct fixture: `touch` (0x401000) reads a struct and one it points to,
+    // `relay` (0x40107b) hands its parameter to `touch`, and `late` (0x401089) reads 4 bytes
+    // inside the 8 that `touch` writes at 0x18.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/structs.elf");
+    let edits = edits_dir();
+    let decompile = |client: &mut Client| {
+        let c_text = client.tool("decompile", json!({ "path": path, "functions": ["0x401000", "0x40107b"] })).unwrap();
+        c_text.lines().filter(|line| !line.starts_with("// 0x")).collect::<Vec<_>>().join("\n")
+    };
+    let mut client = Client::start_in(&edits);
+    assert!(decompile(&mut client).contains("(S_401000_RDI *param_1,int4 param_2)"));
+    let renamed = client.tool("rename", json!({ "path": path, "addr": "S_401000_RDI", "name": "Connection" })).unwrap();
+    assert_eq!(renamed, "S_401000_RDI is now Connection, the struct 0x401000 is passed in RDI; kept with it under the names they have: S_401000_RDI_8\nsaved; later answers use the new names\n");
+    client.tool("rename", json!({ "path": path, "addr": "Connection.field_0x8", "name": "session" })).unwrap();
+    let live = decompile(&mut client);
+    assert!(live.contains("func_0x00401000(Connection *param_1,int4 param_2)"), "{live}");
+    assert!(live.contains("param_1->session->field_0x4 = param_2;"), "{live}");
+    assert!(live.contains("func_0x0040107b(Connection *param_1)"), "{live}");
+    let layout = client.tool("type", json!({ "path": path, "name": "Connection" })).unwrap();
+    assert!(layout.contains("+0x8 S_401000_RDI_8 * session (8 bytes)") && layout.ends_with("0x401000 is passed it in RDI\n"), "{layout}");
+
+    let refused = client.tool("rename", json!({ "path": path, "addr": "S_401089_RDI", "name": "Connection" })).unwrap_err();
+    assert_eq!(refused, "cannot join Connection: S_401089_RDI has 4 bytes at +0x1c, across Connection.field_0x18 (+0x18, 8 bytes)");
+    let structs = client.tool("structs", json!({ "path": path, "function": "0x401089", "refused": true })).unwrap();
+    assert_eq!(structs, "0x401089: 1 pointer with a struct, 0 read through without one\nRDI: S_401089_RDI, 2 accesses, +0x4 to +0x20\n");
+
+    // Holders go by address and slot, so naming the function and its parameter leaves them be.
+    client.tool("rename", json!({ "path": path, "names": [{ "addr": "0x401000", "name": "touch" }, { "addr": "0x401000", "var": "param_1", "name": "conn" }] })).unwrap();
+    let live = decompile(&mut client);
+    assert!(live.contains("touch(Connection *conn,int4 param_2)"), "{live}");
+    assert!(live.contains("conn->session->field_0x4 = param_2;"), "{live}");
+
+    drop(client);
+    assert_eq!(live, decompile(&mut Client::start_in(&edits)));
+}
+
+#[test]
 fn data_is_told_by_what_its_pointers_reach() {
     // The fixture's first method record: its name, its function, a number and its documentation.
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/tables.elf");
@@ -222,6 +285,26 @@ fn the_command_line_takes_counts_in_hex_and_says_how_it_read_an_address() {
     assert!(dump.starts_with("16 bytes at 0x2008 in .rodata"), "{dump}");
     let error = run(&["bytes", path, "29760"]);
     assert!(error.contains("0x29760 (`29760` is read as hex, 0x29760; decimal 29760 is 0x7440) has no bytes in the file"), "{error}");
+}
+
+#[test]
+fn imported_data_reads_by_name_and_zero_filled_data_has_an_address() {
+    // `report` passes `stderr`, which a shared library reads through its slot in the GOT, and
+    // counts in a variable the loader zero-fills.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/imported.so");
+    let mut client = Client::start();
+    let c_text = client.tool("decompile", json!({ "path": path, "functions": ["report"] })).unwrap();
+    assert!(c_text.contains("((void *)*__imp_stderr,\"%s %ld\\n\",param_1,"), "{c_text}");
+    let counter = client.tool("addr", json!({ "path": path, "addr": "0x4018" })).unwrap();
+    assert_eq!(counter, "address 0x4018, not stored in the file: uninitialized data\n");
+}
+
+#[test]
+fn a_jump_to_an_import_reads_as_a_call_to_it() {
+    // `say` ends by calling `puts`, which the compiler makes a jump to its PLT stub.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/tail.so");
+    let c_text = Client::start().tool("decompile", json!({ "path": path, "functions": ["say"] })).unwrap();
+    assert!(c_text.contains("iVar1 = puts(param_1);"), "{c_text}");
 }
 
 #[test]

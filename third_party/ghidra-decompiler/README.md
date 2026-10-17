@@ -43,6 +43,11 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   print each line of C with the address of the instruction it came from. Marked with a
   `recore:` comment.
 
+- `cpp/funcdata.hh`, `Funcdata::setName`: renames a function after it was made. Upstream sets
+  the name only on construction. `crates/decomp` renames the function's symbol and the function
+  together, so a rename keeps the prototype the session found for it. Marked with a `recore:`
+  comment.
+
 - `cpp/funcdata_varnode.cc`, `Funcdata::calcNZMask`: the low byte of the incoming stack
   pointer is taken as zero only if the pointer is wider than a byte. Upstream clears it for
   any, so the 8051's stack pointer was the constant 0 wherever code kept it in memory, as
@@ -51,6 +56,17 @@ SLEIGH compiler. The `.sla` format version must match the engine.
 - `cpp/fspec.hh`, `ProtoModel::addEffect`: adds a side-effect of a call to the ones the
   compiler spec lists. `crates/decomp` uses it for the byte of memory SDCC keeps its frame
   pointer in, which differs from program to program. Marked with a `recore:` comment.
+
+- `cpp/architecture.hh` and `cpp/coreaction.hh`, `Architecture::startTypes`: a virtual method,
+  empty in the engine, that `ActionStartTypes` calls once per run of the pipeline, when type
+  recovery starts. `crates/decomp` reads the function's settled SSA there and gives the
+  pointers it is passed structs before any unlocked varnode is typed. Marked with `recore:`
+  comments.
+
+- `cpp/type.hh` and `cpp/type.cc`, `TypeFactory::setFieldName`: names a field of a struct the
+  session already holds. Upstream builds a struct whole and never changes it; `crates/decomp`
+  names a field of a struct an agent named while the session runs, without a new process.
+  Marked with `recore:` comments.
 
 - `languages/cip-51.sla`: built from `slaspec/`, upstream's `cip-51.slaspec` and
   `8051_main.sinc` with six changes, each marked with a `recore:` comment. To rebuild, run
