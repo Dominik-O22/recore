@@ -99,7 +99,11 @@ def label(advisory: dict, tag: str, rootfs: Path, packages: dict[str, str], pkg:
         fix_date = git(advisory["repo"], "log", "-1", "--format=%cs", advisory["commit"]).stdout.strip()
         claimed = "fixed" if pkg.vars["PKG_SOURCE_DATE"] >= fix_date else "vulnerable"
     kind, _, names = advisory.get("needs", ":").partition(":")
-    if kind == "variant" and not any(name in packages for name in names.split(",")):
+    left_out = kind == "variant" and not any(name in packages for name in names.split(","))
+    # The binary's own list of compile options has to agree with what its variant's build leaves out.
+    if "built" in advisory and left_out != (b"no-" + advisory["built"].encode() in (rootfs / file).read_bytes()):
+        raise SystemExit(f"{rootfs}: the variant says {advisory['built']} is {'out' if left_out else 'in'}, the compile options of {file} disagree")
+    if left_out:
         return "absent", f"built without the code: the image has {', '.join(n for n in packages if n.startswith('dnsmasq'))}", claimed
     if kind == "busybox" and not busybox_default(tag, names):
         return "absent", f"{names} is off", claimed
@@ -143,7 +147,7 @@ def main() -> None:
             name = advisory["package"].rsplit("/", 1)[1]
             reported = next((v for n, v in packages.items() if n == name or n.startswith(name + "-")), "")
             # The image's own package database has to agree with the tree it was labelled from.
-            if reported and pkg.upstream and not reported.startswith(pkg.upstream):
+            if reported and pkg.upstream and not reported.startswith(pkg.upstream + "-"):
                 raise SystemExit(f"{id}: the image reports {name} {reported}, the tree at {tag} builds {pkg.upstream}")
             rows.append(f"{id}\t{advisory['id']}\t{status}\t{claimed}\t{reported}\t{evidence}")
     LABELS.write_text("image\tadvisory\tstatus\tby_version\treported\tevidence\n" + "\n".join(rows) + "\n")
