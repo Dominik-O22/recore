@@ -16,6 +16,7 @@ const ELF_TOUCH: u64 = 0x401000;
 const ELF_SUM: u64 = 0x401018;
 const ELF_SPREAD: u64 = 0x401042;
 const ELF_RELAY: u64 = 0x40107b;
+const ELF_LOWER: u64 = 0x401090;
 const PE_TOUCH: u64 = 0x401000;
 const PE_SUM: u64 = 0x401030;
 const PE_RELAY: u64 = 0x4010f0;
@@ -66,6 +67,22 @@ fn a_pointer_stepped_through_an_array_points_to_one_element() {
     assert!(c_text.contains("param_1->field_0x0 * param_1->field_0x8"), "{c_text}");
     assert!(c_text.contains("param_1 = param_1 + 1;"), "{c_text}");
     assert!(session.type_layout("S_401042_RDI").unwrap().starts_with("struct S_401042_RDI, 12 bytes"));
+}
+
+/// The tree's nodes and its header link to the header, 8 bytes into the tree: those fields
+/// point into the middle of the tree's struct and not to it.
+#[test]
+fn a_link_into_the_middle_of_a_struct_does_not_point_to_it() {
+    let mut session = session("structs.elf");
+    session.decompile(ELF_LOWER).unwrap();
+    assert_eq!(
+        session.type_layout("S_401090_RDI").unwrap(),
+        "struct S_401090_RDI, 28 bytes, alignment 8
+  +0x8 undefined8 field_0x8 (8 bytes)
+  +0x10 undefined8 field_0x10 (8 bytes)
+  +0x18 int4 field_0x18 (4 bytes)
+"
+    );
 }
 
 #[test]

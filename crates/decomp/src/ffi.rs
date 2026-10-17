@@ -72,7 +72,7 @@ pub struct RdAccess {
     pub kind: u8,
 }
 
-/// The field at `offset` of `object` holds pointers to `child`.
+/// The field at `offset` of `object` holds pointers to the base of `child`.
 #[repr(C)]
 pub struct RdLink {
     pub object: u32,

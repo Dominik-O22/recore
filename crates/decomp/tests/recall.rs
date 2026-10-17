@@ -158,7 +158,7 @@ fn gather_sees_what_the_data_flow_reads_through_parameters() {
     let binaries = ["structs.elf", "types.elf", "classes.elf", "tables.elf", "aggregate.elf", "format.elf", "types.exe", "structs.exe"].map(|name| data.join(name));
     let found = by_target(binaries.into_iter().chain(["classes-x86-static", "classes-x86_64-static", "shapes-arm64"].map(|name| fixtures.join(name))), None);
     let counts: Vec<(&str, usize, usize)> = found.iter().map(|(target, recall)| (target.as_str(), recall.gathered, recall.flow)).collect();
-    assert_eq!(counts, [("Aarch64", 2, 2), ("X86Gcc", 17, 17), ("X86Windows", 7, 7), ("X86_64Gcc", 30, 30), ("X86_64Windows", 4, 4)]);
+    assert_eq!(counts, [("Aarch64", 2, 2), ("X86Gcc", 17, 17), ("X86Windows", 8, 8), ("X86_64Gcc", 31, 31), ("X86_64Windows", 4, 4)]);
 }
 
 /// The same over binaries of a corpus, 200 functions each: `RECORE_RECALL` names a file that

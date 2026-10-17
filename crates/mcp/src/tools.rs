@@ -261,15 +261,22 @@ struct Diff {
 /// function's own taken out, so that equal lines compare equal: the numbers the decompiler
 /// gives its variables, and addresses. An address of a function becomes the function's entry in
 /// the later build, which `in_new` gives, and any other address in the image only says it is one.
+/// So does the function a recovered struct is named after, as in `S_88f0_RDI`.
 fn comparable(c_text: &str, program: &Program, in_new: &dyn Fn(u64) -> Option<u64>) -> Vec<String> {
     let numbered = regex::Regex::new(r"\b(?:[a-z]{1,3}Var\d+|local_[0-9a-f]+|[a-z]+Stack_[0-9a-f]+|extraout_\w+|in_\w+|unaff_\w+)\b").expect("a valid expression");
     let address = regex::Regex::new(r"(0x|_)(?:r0x)?([0-9a-f]{4,16})\b").expect("a valid expression");
+    // The form of `recore::structs::auto_name`.
+    let recovered = regex::Regex::new(r"\bS_([0-9a-f]+)_").expect("a valid expression");
     // A bare number is an address only if the code refers to what is there: in an image
     // loaded at zero, a line number or a size is inside some section too.
     let referred_to = |addr: u64| program.refs_to(addr).next().is_some() || program.string_at(addr).is_some();
     let line_key = |line: &str| {
         // `iVar3` and `iVar5` are both an `iVar`: which number a variable got says nothing.
         let line = numbered.replace_all(line.trim(), |found: &regex::Captures| found[0].trim_end_matches(|c: char| c.is_ascii_hexdigit() || c == '_').to_string());
+        let line = recovered.replace_all(&line, |found: &regex::Captures| match u64::from_str_radix(&found[1], 16) {
+            Ok(addr) if program.function(addr).is_some() => in_new(addr).map_or_else(|| "S_<function>_".to_string(), |entry| format!("S_{entry:x}_")),
+            _ => found[0].to_string(),
+        });
         address
             .replace_all(&line, |found: &regex::Captures| match u64::from_str_radix(&found[2], 16) {
                 Ok(addr) if program.function(addr).is_some() => in_new(addr).map_or_else(|| "<function>".to_string(), |entry| format!("<function {entry:#x}>")),
@@ -1291,4 +1298,26 @@ fn classes(binary: &mut Binary, args: Classes) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A recovered struct is named after the function it was recovered in. In a later build
+    /// where that function moved, the line that names it is the same line.
+    #[test]
+    fn a_recovered_struct_named_after_a_function_that_moved_compares_equal() {
+        // `total` is at 0x40100b in this build; say it was at 0x401000 in the earlier one.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/types-patched.elf");
+        let image = recore::Image::load(std::path::Path::new(path)).unwrap();
+        let analysis = recore::analyze(&image);
+        let program = Program::new(image, analysis);
+        let before = comparable("// header\nif (param_1 == (S_401000_RDI_8 *)0x0) {", &program, &|entry| (entry == 0x401000).then_some(0x40100b));
+        let after = comparable("// header\nif (param_1 == (S_40100b_RDI_8 *)0x0) {", &program, &Some);
+        assert_eq!(before, ["if (param_1 == (S_40100b_RDI_8 *)0x0) {"]);
+        assert_eq!(after, before);
+        // A name that leads to no function is left as it is.
+        assert_eq!(comparable("// header\nS_dead_RDI *p;", &program, &Some), ["S_dead_RDI *p;"]);
+    }
 }
