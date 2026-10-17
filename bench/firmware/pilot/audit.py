@@ -29,7 +29,9 @@ def flags(dir: Path) -> list[tuple[str, str]]:
             if block.get("type") != "tool_use":
                 continue
             given = block["input"]
-            text = given.get("command") or given.get("file_path") or given.get("path") or given.get("pattern") or ""
+            # A shell command or a file path when there is one, and otherwise every argument, as
+            # an MCP tool such as `import_binary` takes a path under its own name.
+            text = given.get("command") or given.get("file_path") or given.get("path") or given.get("pattern") or json.dumps(given)
             if not isinstance(text, str):
                 continue
             if block["name"] in ("WebFetch", "WebSearch") or NETWORK.search(text):
