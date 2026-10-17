@@ -183,6 +183,7 @@ unsafe extern "C" {
     pub fn rd_keep_prototypes_exact(session: *mut RdSession, exact: i32);
     pub fn rd_result_in_first_argument(session: *mut RdSession, shared: i32);
     pub fn rd_takes_variable_arguments(session: *mut RdSession, addr: u64);
+    pub fn rd_saves_argument_registers(session: *mut RdSession, addr: u64);
     #[allow(clippy::too_many_arguments)]
     pub fn rd_format_call(session: *mut RdSession, function: u64, call: u64, callee: u64, import: i32, position: usize, format: u64, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_add_comment(session: *mut RdSession, function: u64, addr: u64, text: *const c_char, err: *mut c_char, errlen: usize) -> i32;

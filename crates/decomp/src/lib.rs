@@ -167,6 +167,14 @@ impl Target {
     /// parameter lists right and taking it as the least gets 89.8%. On a Cortex-M, taken as the
     /// least, it lets a call pass the word GCC pushes to keep the stack aligned, as in
     /// `PUSH {R3, R4, R5, LR}`, which makes R3 a parameter of the caller.
+    /// Where prototypes are kept exact, whether one of a function that saves its argument
+    /// registers where `va_arg` reads them is kept as the least a call passes instead, so that
+    /// a call to it passes what the call site put in them. On six armhf programs this got
+    /// 0.4 points fewer parameter counts right, and on Cortex-M none fewer.
+    fn keeps_variadic_open(self) -> bool {
+        matches!(self, Target::Thumb)
+    }
+
     fn callers_pass_what_is_read(self) -> bool {
         matches!(self, Target::X86_64Gcc | Target::Aarch64 | Target::Thumb | Target::Arm)
     }
@@ -655,6 +663,14 @@ impl Session {
     /// it. A call that passes it a printf format is then given the arguments the format asks for.
     pub fn takes_variable_arguments(&mut self, addr: u64) {
         unsafe { ffi::rd_takes_variable_arguments(self.raw.as_ptr(), addr) }
+    }
+
+    /// Says that the function at `addr` saves its argument registers where `va_arg` reads them:
+    /// see [`Target::keeps_variadic_open`].
+    pub fn saves_argument_registers(&mut self, addr: u64) {
+        if self.target.keeps_variadic_open() {
+            unsafe { ffi::rd_saves_argument_registers(self.raw.as_ptr(), addr) }
+        }
     }
 
     /// Settles what the call at `call` in `function` passes, from the format at `format` that

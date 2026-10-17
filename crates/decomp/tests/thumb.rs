@@ -58,9 +58,8 @@ fn decompiled_firmware(addrs: &[u64]) -> Vec<String> {
 #[test]
 fn only_a_function_passed_a_format_has_its_calls_take_what_the_format_asks_for() {
     // `words` passes `total` a list of words ended by a null; `greet` passes `say` a format with
-    // two conversions, and text with none. A call passes what its callee reads, which of a
-    // function that takes a variable number of arguments is only the first.
+    // two conversions, and text with none.
     let c = decompiled_firmware(&[0x13c, 0x15c]);
-    assert!(c[0].contains(r#"func_0x000000c4("alpha");"#), "{}", c[0]);
+    assert!(c[0].contains(r#"func_0x000000c4("alpha",0x1ab,0x1a5,0)"#), "{}", c[0]);
     assert!(c[1].contains("func_0x00000040(0x1b0);") && c[1].contains("func_0x00000040(0x19a,3,4);"), "{}", c[1]);
 }
