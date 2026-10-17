@@ -203,6 +203,10 @@ impl AddrSet {
     }
 }
 
+/// How many functions after a whole one, none of them reached, are decoded to show that it ends
+/// where the next begins, where nothing else between functions does.
+const WHOLE_CHAIN: u8 = 8;
+
 /// How far ahead of a path that runs into decoded code an unresolved indirect jump is looked
 /// for: about as far as a dispatch sequence can reasonably end.
 const RETRY_REACH: u64 = 96;
@@ -990,16 +994,16 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// `may_call` says whether calls are allowed in it; a function without an unwind entry, where
     /// others have one, is a leaf and makes none. Where code keeps literal pools, the function
     /// goes on past a return to where a branch before it goes, its own literals follow its end,
-    /// and so may another function, which opens as one.
-    fn is_whole_function(&self, index: usize, addr: u64, may_call: bool) -> bool {
+    /// and so may another function: one that opens as one, or up to `chain` more whole ones.
+    fn is_whole_function(&self, index: usize, addr: u64, may_call: bool, chain: u8) -> bool {
         const LONGEST: usize = 48;
         let region = &self.regions[index];
         let section = region.section;
         let known = |at: u64| ((at - section.addr) as usize) < section.data.len() && region.insn_len[(at - section.addr) as usize] != 0;
         let state = A::State::default();
         let literal = |at: u64| A::LITERAL_POOLS && region.flags.get((at - section.addr) as usize).is_some_and(|flags| flags & IN_TABLE != 0);
-        // The furthest a branch so far goes, and the literals the code so far reads.
-        let (mut furthest, mut pools) = (addr, Vec::new());
+        // Where the branches so far go past the code decoded, and the literals it reads.
+        let (mut ahead, mut pools): (BTreeSet<u64>, Vec<(u64, u64)>) = (BTreeSet::new(), Vec::new());
         let (mut from, mut decoded_count) = (addr, 0);
         loop {
             let mut decoder = A::decode(self.image, &section.data[(from - section.addr) as usize..], from);
@@ -1019,16 +1023,18 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     pools.push(pool);
                 }
                 match A::flow(&insn, &state, self.image) {
-                    Some(Flow::Call(target)) if !may_call || self.region_index(target).is_none() => return false,
+                    Some(Flow::Call(target)) if !may_call || !self.image.is_code(target) => return false,
                     Some(Flow::CallIndirect(_)) if !may_call => return false,
                     Some(Flow::Halt | Flow::JumpIndirect(None)) => return false,
                     Some(Flow::Branch(target)) if target < addr || self.region_index(target).is_none() => return false,
-                    Some(Flow::Branch(target)) => furthest = furthest.max(target),
+                    Some(Flow::Branch(target)) => {
+                        ahead.insert(target);
+                    }
                     Some(Flow::Jump(target)) if self.region_index(target).is_none() => return false,
                     Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) => {
                         let mut end = decoded.next_addr();
-                        if A::LITERAL_POOLS && furthest >= end {
-                            resume = Some(furthest);
+                        if let Some(&next) = ahead.range(end..).next().filter(|_| A::LITERAL_POOLS) {
+                            resume = Some(next);
                             break;
                         }
                         // A lone `ret` is more often the tail of the function before it.
@@ -1043,7 +1049,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         let (next, second) = (after.next().flatten(), after.next().flatten());
                         let padded = next.as_ref().is_some_and(A::is_padding);
                         let opens = A::LITERAL_POOLS && next.as_ref().is_some_and(|next| A::opens_function(next, second.as_ref()));
-                        return padded || opens || known(end) || literal(end) || end == section.end() || self.frame_of(end).is_some();
+                        let whole = || A::LITERAL_POOLS && chain > 0 && self.is_whole_function(index, end, may_call, chain - 1);
+                        return padded || opens || known(end) || literal(end) || end == section.end() || self.frame_of(end).is_some() || whole();
                     }
                     _ => {}
                 }
@@ -1310,8 +1317,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         // alignment boundary straight after a terminator may call.
                         let unwound_elsewhere = !self.frames.is_empty() && self.frame_of(addr).is_none();
                         let whole = after_break
-                            && (unwound_elsewhere && self.is_whole_function(index, addr, false)
-                                || aligned && self.is_whole_function(index, addr, true)
+                            && (unwound_elsewhere && self.is_whole_function(index, addr, false, WHOLE_CHAIN)
+                                || aligned && self.is_whole_function(index, addr, true, WHOLE_CHAIN)
                                 || A::TILES_GAPS && self.tiles_gap(index, addr));
                         // A whole function, or a gap that divides into functions, is code
                         // whatever its first instructions look like.

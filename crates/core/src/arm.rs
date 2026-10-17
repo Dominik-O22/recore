@@ -776,7 +776,12 @@ impl Arch for Arm {
 
     fn opens_function(first: &Insn, second: Option<&Insn>) -> bool {
         match (first, second) {
-            (Insn::A32(insn), Some(Insn::A32(second))) if insn.probes_stack() => second.saves_return(),
+            // GCC may put an instruction of the body first, as the compare of an argument, or
+            // the probe of a stack that must not clash.
+            (Insn::A32(insn), Some(Insn::A32(second))) if !insn.saves_return() => {
+                let body = insn.data_processing().is_some_and(|(.., rd, _)| rd != PC);
+                (insn.probes_stack() || body) && second.saves_return()
+            }
             (Insn::A32(insn), _) => insn.saves_return(),
             (Insn::Thumb(insn), Some(Insn::Thumb(second))) => Thumb::opens_function(insn, Some(second)),
             (Insn::Thumb(insn), _) => Thumb::opens_function(insn, None),
