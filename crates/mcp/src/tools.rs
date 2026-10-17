@@ -20,7 +20,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::binary::{Binary, Cache};
-use crate::{code, edit};
+use crate::{code, edit, emulate};
 
 /// Rows a listing shows unless the caller sets `limit`.
 pub(crate) const DEFAULT_LIMIT: usize = 100;
@@ -162,6 +162,20 @@ pub fn list() -> Value {
             &["function"],
         ),
         tool(
+            "run",
+            "Runs a function of the binary as its processor would and answers what it did: the value it returned, the buffers it was given as it left them, and the memory it wrote. This is what the original does on inputs you choose, to check a rewrite against or to show a finding. It runs the function and everything it calls, not the program: imports such as memcpy and malloc run as stand-ins, a call to any other import stops the run, and memory that nothing wrote and the file does not hold reads as zero, which the answer counts because on a chip that memory is the peripherals.",
+            json!({
+                "function": function,
+                "args": { "type": "array", "items": { "type": ["integer", "string"] }, "description": "The arguments in order, as the platform's calling convention passes integers and pointers. A number, decimal or hex as 0x1f; `hex:4142` for bytes put in memory and passed by their address; `str:text` for a string with its end; `buf:16` for 16 zero bytes. Buffers are shown as the function left them." },
+                "set": { "type": "array", "items": { "type": "string" }, "description": "Registers and memory to set after the arguments are placed: `RDX=5`, `0x20000000=hex:0011` for bytes at an address, or `EXTMEM:0x100=hex:09` for bytes in a memory of the processor other than the one the code is in (an 8051 has CODE, INTMEM, EXTMEM, SFR and BITS)." },
+                "read": { "type": "array", "items": { "type": "string" }, "description": "Registers to show after the run, besides the one that holds the result." },
+                "dump": { "type": "array", "items": { "type": "string" }, "description": "Memory to show after the run, as ADDRESS:LENGTH or SPACE:ADDRESS:LENGTH, for what a returned pointer reaches." },
+                "bits": { "type": "integer", "minimum": 1, "description": "Width of the result in bits, for a function that returns fewer than its register holds (32 for an int)." },
+                "steps": { "type": "integer", "minimum": 1, "description": "Most instructions to run (default 10,000,000)." },
+            }),
+            &["function"],
+        ),
+        tool(
             "symbols",
             "Every address that has a name: functions, import slots, vtables, exported data, and the names given with `rename`.",
             json!({ "pattern": pattern("name"), "limit": limit }),
@@ -237,6 +251,7 @@ pub fn call(cache: &mut Cache, name: &str, arguments: Value) -> Option<Result<St
         "disassemble" => run(cache, name, arguments, code::disassemble),
         "pcode" => run(cache, name, arguments, code::pcode),
         "trace" => run(cache, name, arguments, code::trace),
+        "run" => run(cache, name, arguments, emulate::run),
         "symbols" => run(cache, name, arguments, edit::symbols),
         "diff" => diff(cache, arguments),
         "rename" => run(cache, name, arguments, edit::rename),
