@@ -906,6 +906,11 @@ pub(crate) fn load(file: &object::File, image: &mut Image) {
     );
     seeds.extend(dynamic_code_pointers(file).into_iter().map(marked));
     seeds.extend(image.sections.iter().filter(|section| section.is_stubs()).map(|section| (section.addr, InstructionSet::A32)));
+    // Last, and so only where nothing above reaches: the functions .ARM.exidx lists whose code
+    // reads as A32, as the Rust code of an armhf program, which calls among itself, does.
+    let frames = exception_index(file);
+    let reads = |start: u64| image.bytes_from(start).is_some_and(|bytes| start % 4 == 0 && reads_as_a32(&bytes[..bytes.len().min(48)]));
+    seeds.extend(frames.iter().filter(|&&(start, _)| reads(start)).map(|&(start, _)| (start, InstructionSet::A32)));
 
     image.entry &= !1;
     for export in &mut image.exports {
@@ -917,7 +922,7 @@ pub(crate) fn load(file: &object::File, image: &mut Image) {
         image.relative_targets[index].1 &= !1;
     }
 
-    image.frames = exception_index(file);
+    image.frames = frames;
     image.frames_merge = true;
 
     // An unstripped file says where the sets change itself.
