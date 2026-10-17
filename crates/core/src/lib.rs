@@ -28,6 +28,7 @@ pub mod program;
 pub mod report;
 pub mod rtti;
 pub mod score;
+pub mod sectionless;
 pub mod signature;
 pub mod strings;
 pub mod structs;
