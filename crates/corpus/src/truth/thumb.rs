@@ -2,7 +2,9 @@
 //!
 //! The raw image is cut from an ELF, which is kept as the program's debug file. Its symbol table
 //! gives each function's start and size: bit 0 of a Thumb function's value is the mark of Thumb
-//! code, not part of its address. Its mapping symbols say where code (`$t`) and data (`$d`)
+//! code, not part of its address. Code that a `$t` mapping symbol marks and no function symbol
+//! covers, as an object of libgcc linked whole but without its symbols, is a function too, up to
+//! the next. Its mapping symbols say where code (`$t`) and data (`$d`)
 //! alternate inside the code, as a literal pool or a jump table does, and its DWARF which
 //! functions never return. Instructions are decoded with yaxpeax-arm, so that truth shares no
 //! decoder with recore.
@@ -99,7 +101,8 @@ impl<'a> Code<'a> {
 }
 
 /// The functions of the ELF, by address, without the Thumb bit. Of several names at one address,
-/// as the weak names of one default handler are, the first in the symbol table stays.
+/// as the weak names of one default handler are, the first in the symbol table stays. Code that
+/// only a `$t` marks has no name, and ends where the next function or its section does.
 fn functions(elf: &object::File, code: &Code) -> BTreeMap<u64, (String, u64)> {
     let mut by_addr = BTreeMap::new();
     for symbol in elf.symbols().filter(|symbol| symbol.kind() == SymbolKind::Text) {
@@ -109,6 +112,16 @@ fn functions(elf: &object::File, code: &Code) -> BTreeMap<u64, (String, u64)> {
             continue;
         }
         by_addr.entry(addr).or_insert((name.to_string(), symbol.size()));
+    }
+    let unnamed: Vec<u64> = elf.symbols().filter(|symbol| symbol.name().is_ok_and(|name| name == "$t" || name.starts_with("$t."))).map(|symbol| symbol.address()).collect();
+    for addr in unnamed {
+        let covered = by_addr.range(..=addr).next_back().is_some_and(|(&start, (_, size))| start == addr || addr < start + size);
+        if covered {
+            continue;
+        }
+        let Some(&(section, bytes)) = code.sections.iter().find(|&&(start, bytes)| (start..start + bytes.len() as u64).contains(&addr)) else { continue };
+        let end = by_addr.range(addr..).next().map_or(section + bytes.len() as u64, |(&next, _)| next).min(section + bytes.len() as u64);
+        by_addr.insert(addr, (String::new(), end - addr));
     }
     by_addr
 }
