@@ -3,7 +3,7 @@
 //! The debug file's symbol table gives every function's start and size, DWARF marks functions
 //! that never return, and a linear decode inside each known function range gives the true
 //! instruction boundaries and call sites. Symbols, DWARF and the classification of calls are
-//! shared; only that decode is per architecture (x86-64 and AArch64).
+//! shared; only that decode is per architecture (x86-64, AArch64 and 32-bit ARM, see [`arm`]).
 //!
 //! PE images take their functions from a PDB instead (see [`pe`]), and Mach-O images from an
 //! unstripped copy (see [`macho`]); both share the classification. Raw images take theirs from
@@ -11,6 +11,7 @@
 //! from the ELF they were cut from (see [`thumb`]).
 
 mod aarch64;
+pub mod arm;
 mod macho;
 pub mod pe;
 pub mod pe_facts;
@@ -316,6 +317,9 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     let debug_data = std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?;
     let debug = object::File::parse(&*debug_data)?;
     let architecture = binary.architecture();
+    if architecture == Architecture::Arm {
+        return arm::extract(binary_path, &binary, &debug);
+    }
     if !matches!(architecture, Architecture::X86_64 | Architecture::Aarch64) {
         bail!("unsupported architecture {architecture:?}");
     }

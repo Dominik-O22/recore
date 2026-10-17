@@ -69,3 +69,17 @@ corpus-thumb/jumptables/
 corpus-thumb/signatures/
 corpus-thumb/recore*/
 corpus-thumb/ghidra*/
+corpus-armhf/pkgs/
+corpus-armhf/bin/
+corpus-armhf/debug/
+corpus-armhf/truth/
+corpus-armhf/jumptables/
+corpus-armhf/recore*/
+corpus-armhf/ghidra*/
+corpus-armel/pkgs/
+corpus-armel/bin/
+corpus-armel/debug/
+corpus-armel/truth/
+corpus-armel/jumptables/
+corpus-armel/recore*/
+corpus-armel/ghidra*/
