@@ -1065,7 +1065,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 }
                 let flow = A::flow(&insn, &state, self.image);
                 after_call = extended && matches!(flow, Some(Flow::Call(_)));
-                // Where code is not tiled, a call may go to the PLT, which holds no functions.
+                // Where code is not tiled, a call or tail call may go to the PLT, which holds no
+                // functions.
                 let callable = |target: u64| if extended { self.image.is_code(target) } else { self.region_index(target).is_some() };
                 match flow {
                     Some(Flow::Call(target)) if !may_call || !callable(target) => return false,
@@ -1085,7 +1086,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                             ahead.insert(target);
                         }
                     }
-                    Some(Flow::Jump(target)) if self.region_index(target).is_none() => return false,
+                    Some(Flow::Jump(target)) if !callable(target) => return false,
                     Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) if extended => break finish(decoded.next_addr(), &ahead, &pools),
                     Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) => {
                         let end = decoded.next_addr();
