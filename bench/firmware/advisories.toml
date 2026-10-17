@@ -1,0 +1,157 @@
+# The advisories the fleet is labelled against. corpus/label_openwrt.py reads this file and the
+# OpenWrt source tree at each release tag, and writes labels.tsv.
+#
+# Each advisory names its package (the directory under the OpenWrt tree's package/), the files in
+# the image that carry the code, and how to tell a fixed build from a vulnerable one:
+#   fixed     the first upstream release with the fix, for a package OpenWrt builds from a tarball;
+#   commit    the upstream fix commit, for a package OpenWrt builds from a git snapshot, checked
+#             against the snapshot with `git merge-base --is-ancestor` in the clone named by `repo`;
+#   backport  a regular expression over the names of the patches OpenWrt applies at the tag.
+# needs names what has to be compiled in for the code to be there at all:
+#   variant:<names>  the installed package is one of these build variants (dnsmasq, dnsmasq-full, ...);
+#   busybox:<SYMBOL> the BusyBox option is on in the tree's Config-defaults.in.
+# text is what an agent is given: the published description, without the fix commit.
+# tell is a string the fix adds, where one decides the cell, so results can leave those cells out.
+# Fix versions were read from each project's CHANGELOG or from `git tag --contains <fix>`.
+
+[[advisory]]
+id = "CVE-2017-14491"
+package = "network/services/dnsmasq"
+files = ["usr/sbin/dnsmasq"]
+fixed = "2.78"
+text = "Heap-based buffer overflow in dnsmasq before 2.78 allows remote attackers to cause a denial of service (crash) or execute arbitrary code via a crafted DNS response."
+
+[[advisory]]
+id = "CVE-2020-25681"
+package = "network/services/dnsmasq"
+files = ["usr/sbin/dnsmasq"]
+fixed = "2.83"
+backport = "Fix-remote-buffer-overflow-CERT-VU-434904"
+needs = "variant:dnsmasq-full"
+text = "A flaw was found in dnsmasq before version 2.83. A heap-based buffer overflow was discovered in the way RRSets are sorted before validating with DNSSEC data. An attacker on the network, who can forge DNS replies such as that they are accepted as valid, could use this flaw to cause a buffer overflow with arbitrary data in a heap memory segment, possibly executing code on the machine."
+
+[[advisory]]
+id = "CVE-2020-25684"
+package = "network/services/dnsmasq"
+files = ["usr/sbin/dnsmasq"]
+fixed = "2.83"
+backport = "Check-destination-of-DNS-UDP-query-replies"
+text = "A flaw was found in dnsmasq before version 2.83. When getting a reply from a forwarded query, dnsmasq checks in the forward.c:reply_query() if the reply destination address/port is used by the pending forwarded queries. However, it does not use the address/port to retrieve the exact forwarded query, substantially reducing the number of attempts an attacker on the network would have to perform to forge a reply and get it accepted by dnsmasq. This flaw allows an attacker to perform a DNS Cache Poisoning attack."
+
+[[advisory]]
+id = "CVE-2020-25685"
+package = "network/services/dnsmasq"
+files = ["usr/sbin/dnsmasq"]
+fixed = "2.83"
+backport = "Use-SHA-256-to-provide-security-against-DNS-cache-po"
+text = "A flaw was found in dnsmasq before version 2.83. When getting a reply from a forwarded query, dnsmasq checks in forward.c:reply_query(), which is the forwarded query that matches the reply, by only using a weak hash of the query name. Due to the weak hash (CRC32 when dnsmasq is compiled without DNSSEC, SHA-1 when it is) this flaw allows an off-path attacker to find several different domains all having the same hash, substantially reducing the number of attempts they would have to perform to forge a reply and get it accepted by dnsmasq."
+
+[[advisory]]
+id = "CVE-2020-25686"
+package = "network/services/dnsmasq"
+files = ["usr/sbin/dnsmasq"]
+fixed = "2.83"
+backport = "Handle-multiple-identical-near-simultaneous-DNS-quer"
+text = "A flaw was found in dnsmasq before version 2.83. When receiving a query, dnsmasq does not check for an existing pending request for the same name and forwards a new request. By default, a maximum of 150 pending queries can be sent to upstream servers, so there can be at most 150 queries for the same name. This flaw allows an off-path attacker on the network to substantially reduce the number of attempts that it would have to perform to forge a reply and have it accepted by dnsmasq."
+
+[[advisory]]
+id = "CVE-2022-0934"
+package = "network/services/dnsmasq"
+files = ["usr/sbin/dnsmasq"]
+fixed = "2.87"
+backport = "CVE-2022-0934"
+needs = "variant:dnsmasq-dhcpv6,dnsmasq-full"
+text = "A single-byte, non-arbitrary write/use-after-free flaw was found in dnsmasq. This flaw allows an attacker who sends a crafted packet processed by dnsmasq, potentially causing a denial of service."
+
+[[advisory]]
+id = "CVE-2023-28450"
+package = "network/services/dnsmasq"
+files = ["usr/sbin/dnsmasq"]
+fixed = "2.90"
+text = "An issue was discovered in Dnsmasq before 2.90. The default maximum EDNS.0 UDP packet size was set to 4096 but should be 1232 because of DNS Flag Day 2020."
+
+[[advisory]]
+id = "CVE-2026-2291"
+package = "network/services/dnsmasq"
+files = ["usr/sbin/dnsmasq"]
+fixed = "2.93"
+backport = "CVE-2026-2291"
+text = "dnsmasq's extract_name() function can be abused to cause a heap buffer overflow, allowing an attacker to inject false DNS cache entries, which could result in DNS lookups to redirect to an attacker-controlled IP address, or to cause a DoS."
+
+[[advisory]]
+id = "CVE-2026-5172"
+package = "network/services/dnsmasq"
+files = ["usr/sbin/dnsmasq"]
+fixed = "2.93"
+backport = "CVE-2026-5172"
+text = "A buffer overflow in dnsmasq's extract_addresses() function allows an attacker to trigger a heap out-of-bounds read and crash by exploiting a malformed DNS response, enabling extract_name() to advance the pointer past the record's end."
+
+[[advisory]]
+id = "CVE-2026-12969"
+package = "network/services/dnsmasq"
+files = ["usr/sbin/dnsmasq"]
+fixed = "2.93"
+backport = "CVE-2026-12969"
+text = "An out-of-bounds read vulnerability exists in dnsmasq's find_soa() function in src/rfc1035.c. When parsing NS section records, extract_name() is called with extrabytes=0, failing to validate that 10 additional bytes exist for fixed-length DNS record fields. A remote attacker controlling a DNS zone can exploit this via a crafted NXDOMAIN response to cause a 10-byte heap out-of-bounds read, potentially accessing stale data from prior transactions."
+
+[[advisory]]
+id = "CVE-2018-15599"
+package = "network/services/dropbear"
+files = ["usr/sbin/dropbear"]
+fixed = "2019.77"
+backport = "Wait-to-fail-invalid-usernames"
+text = "The recv_msg_userauth_request function in svr-auth.c in Dropbear through 2018.76 is prone to a user enumeration vulnerability because username validity affects how fields in SSH_MSG_USERAUTH messages are handled."
+
+[[advisory]]
+id = "CVE-2023-48795"
+package = "network/services/dropbear"
+files = ["usr/sbin/dropbear"]
+fixed = "2024.84"
+backport = "Implement-Strict-KEX-mode"
+tell = "kex-strict-s-v00@openssh.com"
+text = "The SSH transport protocol with certain OpenSSH extensions, found in OpenSSH before 9.6 and other products (among them Dropbear through 2022.83), allows remote attackers to bypass integrity checks such that some packets are omitted (from the extension negotiation message), and a client and server may consequently end up with a connection for which some security features have been downgraded or disabled, aka a Terrapin attack. This occurs because the SSH Binary Packet Protocol (BPP), implemented by these extensions, mishandles the handshake phase and mishandles use of sequence numbers."
+
+[[advisory]]
+id = "CVE-2023-36328"
+package = "network/services/dropbear"
+files = ["usr/sbin/dropbear"]
+fixed = "2024.84"
+backport = "libtommath-fix-possible-integer-overflow"
+text = "Integer Overflow vulnerability in mp_grow in libtom libtommath before commit beba892bc0d4e4ded4d667ab1d2a94f4d75109a9, allows attackers to execute arbitrary code and cause a denial of service (DoS). Dropbear bundles libtommath."
+
+[[advisory]]
+id = "CVE-2022-30065"
+package = "utils/busybox"
+files = ["bin/busybox"]
+fixed = "1.36.0"
+backport = "CVE-2022-30065"
+needs = "busybox:BUSYBOX_DEFAULT_AWK"
+text = "A use-after-free in Busybox 1.35-x's awk applet leads to denial of service and possibly code execution when processing a crafted awk pattern in the copyvar function."
+
+[[advisory]]
+id = "CVE-2019-19945"
+package = "network/services/uhttpd"
+files = ["usr/sbin/uhttpd"]
+repo = "uhttpd"
+commit = "5f9ae5738372aaa3a6be2f0a278933563d3f191a"
+backport = "invalid-content-length"
+text = "uhttpd in OpenWrt through 18.06.5 and 19.x through 19.07.0-rc2 has an integer signedness error. This leads to out-of-bounds access to a heap buffer and a subsequent crash. It can be triggered with an HTTP POST request to a CGI script, specifying both \"Transfer-Encoding: chunked\" and a large negative Content-Length value."
+
+[[advisory]]
+# The fix commit names no CVE. The text is the commit's own description, without its diff.
+id = "UHTTPD-2026-CHUNKED"
+package = "network/services/uhttpd"
+files = ["usr/sbin/uhttpd"]
+repo = "uhttpd"
+commit = "d255187"
+backport = "prevent-transfer_chunked-counter-overflow"
+text = "uhttpd, OpenWrt's web server, counts the chunks of a request body sent with Transfer-Encoding: chunked in an 8-bit field. After 255 chunks the count wraps to zero, the server takes the body as finished, and the bytes that follow on a keep-alive connection are parsed as the next request. An attacker can smuggle HTTP requests by splitting a body into 256 or more small chunks."
+
+[[advisory]]
+id = "CVE-2026-53922"
+package = "network/services/odhcpd"
+files = ["usr/sbin/odhcpd"]
+repo = "odhcpd"
+commit = "c6792ba"
+backport = "fix-integer-underflow-in-dhcpv6_ia_handle_IAs"
+text = "odhcpd is the DHCPv6, DHCPv4, and router-advertisement server used by OpenWrt. In commit cfddd56 and earlier, an unauthenticated host on the same link can first obtain two bindings through normal DHCPv6 SOLICIT and REQUEST exchanges and then send a crafted RENEW containing multiple IA_NA options. An earlier matched IA consumes most of the response buffer, an unmatched IA causes the build_ia() status branch to write and return a NOBINDING response larger than the remaining space, and a subsequent matched IA is processed after dhcpv6_ia_handle_IAs() subtracts that over-return from an unsigned size_t. The resulting underflow disables subsequent length checks and permits attacker-controlled IA_ADDR serialization beyond the 512-byte stack buffer pdbuf in handle_client_request(). The stack canary terminates odhcpd, and sustained packets can repeatedly disrupt DHCPv6 service while procd respawns the process. The observed configuration does not establish code execution."
