@@ -209,9 +209,11 @@ SETTINGS = {
 # Some of them again laid out as a vendor's build is, for Thumb-1 and Thumb-2, with the settings of
 # the program named first.
 VENDOR = [("freertos_m0_Os", "m0", "Os"), ("freertos_m3_O2", "m3", "O2"), ("coremark_m0_O2", "m0", "O2"),
-                ("coremark_m3_O0", "m3", "Os"), ("fatfs_m0_O2", "m0", "O2"), ("fatfs_m4_Os", "m3", "Os"),
-                ("littlefs_m0_O2", "m0", "O2"), ("littlefs_m3_Os", "m3", "Os"), ("uip_m3_Os", "m0", "Os"),
-                ("uip_m3_Os", "m3", "O2"), ("printf_m0_Os", "m0", "Os"), ("minmea_m3_O2", "m3", "O2")]
+          ("coremark_m3_O0", "m3", "Os"), ("fatfs_m0_O2", "m0", "O2"), ("fatfs_m4_Os", "m3", "Os"),
+          ("littlefs_m0_O2", "m0", "O2"), ("littlefs_m3_Os", "m3", "Os"), ("uip_m3_Os", "m0", "Os"),
+          ("uip_m3_Os", "m3", "O2"), ("printf_m0_Os", "m0", "Os"), ("minmea_m3_O2", "m3", "O2")]
+
+
 def program_name(like, core, opt, compiler, vendor):
     return f"{like.split('_')[0]}_{core}_{opt}_{compiler}" + ("_vendor" if vendor else "")
 

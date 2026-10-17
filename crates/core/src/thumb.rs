@@ -1533,7 +1533,8 @@ mod tests {
     #[test]
     fn a_call_may_be_a_jump_only_in_thumb_1() {
         // 0x00: PUSH {LR}; BL to; MOVS R0, #0 or MOVW R0, #0, then MOVS R0, #0 up to `to`: BX
-        // LR. Code that has Thumb-2 has `B.W` to jump as far as it calls.
+        // LR, which a call may reach as a function, where a POP {PC} would return through the
+        // caller's frame. Code that has Thumb-2 has `B.W` to jump as far as it calls.
         let code = |to: usize, first: &[u16]| [&[0xB500][..], &bl(0x02, to as u64), first, &vec![0x2000; (to - 6 - 2 * first.len()) / 2], &[0x4770]].concat();
         assert_eq!(functions(&code(0x100, &[0x2000])), [0x00]);
         assert_eq!(functions(&code(0x100, &[0xF240, 0x0000])), [0x00, 0x100]);
