@@ -45,38 +45,56 @@ The ratios compare Ghidra's reported analysis time, without JVM start, import or
 - **Why 257x and not the README's 1,000x and more.** These binaries are small, 37 KB to 590 KB, and Ghidra spends most of its time on large ones with many jump tables: the README's corpus averages 61 s a binary, this one 6 s. The research's 43 to 84 s a binary was for BusyBox builds of 3.8 to 6.3 MB.
 - **The fleet.** At 9.4 s of wall time a binary, Ghidra needs about 15 minutes for one image's 85 to 96 programs and libraries, and about 8.4 hours for the 3,228 distinct ones of all 197 images, on one 4-core job (inferred from the per-binary average). The research's 70 hours for 5,000 binaries becomes about 13 hours. recore analyzed the 3,228 in 8.5 s on one core (measured).
 
-## Pilot: fleet triage with Haiku
+## Part 1: checking a version scanner's claims
 
-Ten images, three architectures, three advisories, 30 cells: `bench/firmware/pilot/`. The advisories were picked for one pitfall each:
+`bench/firmware/verify/`. Ten images over three architectures and three advisories, 30 claims. The agent gets the scanner's claim for each image and advisory, `affected` or `not affected` from the package version, and checks it against the binary. A claim it does not check stands. A refutation counts only with evidence that holds, the advisory's binary and an address in its code. The advisories each test one way a version misleads:
 
-- **CVE-2023-48795 (Terrapin, dropbear).** A string decides it: the fix adds `kex-strict-s-v00@openssh.com`. dropbear 2022.82 is fixed in two of the images and vulnerable in three.
-- **CVE-2022-0934 (dnsmasq, DHCPv6).** Stock images leave the code out: dnsmasq's compile options in the binary say `no-DHCPv6`. Four images ship `dnsmasq-full`, two of them with the backport.
-- **CVE-2026-5172 (dnsmasq, `extract_addresses`).** Only the code decides it, one comparison after `extract_name`, and 24.10.7 and 25.12.4 carry it as a backport on 2.90 and 2.91.
+- **CVE-2023-48795 (Terrapin, dropbear).** A string decides it: the fix adds `kex-strict-s-v00@openssh.com`. dropbear 2022.82 is fixed in two images and vulnerable in three.
+- **CVE-2022-0934 (dnsmasq, DHCPv6).** Stock images leave the code out, and dnsmasq's compile options in the binary say `no-DHCPv6`. Four images ship `dnsmasq-full`, two of them with the backport.
+- **CVE-2026-5172 (dnsmasq, `extract_addresses`).** Only the code decides it: one comparison after `extract_name`, backported in 24.10.7 and 25.12.4.
 
-A version scanner misjudges 7 of the 30 cells (the "traps"). Two Haiku 5.5 sessions ran per arm. The Ghidra arm had every image's dnsmasq and dropbear analyzed before the session; the recore arm analyzed on demand. `score.py` gives a cell 1 for the right status with evidence that holds (the right binary, an address in its code) and half for the right status without it.
+Two images are stale variants (`corpus/fetch_openwrt.py`), so 2 of the scanner's 9 wrong claims say `not affected` for a vulnerable binary. The other 7 say `affected` for code that is fixed or absent. Ghidra's arm had the images' dnsmasq and dropbear analyzed before the session, and recore's analyzed on demand.
 
-| Run | Points | Right status | F1 of vulnerable | Traps | Terrapin | CVE-2022-0934 | CVE-2026-5172 | Session | Analysis first | Cost |
-|---|---|---|---|---|---|---|---|---|---|---|
-| version scanner | 18 | 18 | 0.81 | 0 of 7 | 8 | 2 | 8 | | | |
-| everything vulnerable | 15 | 15 | 0.67 | 0 of 7 | 5 | 2 | 8 | | | |
-| recore 1 | 10 | 10 | 0.50 | 2 | 10 | 0 | 0 | 323 s | none | $0.14 |
-| recore 2 | 10 | 10 | 0.50 | 2 | 10 | 0 | 0 | 375 s | none | $0.26 |
-| Ghidra 1 | 2.5 | 5 | 0.48 | 0 | 2.5 | 0 | 0 | 225 s | 445 s | $0.22 |
-| Ghidra 2 | 7 | 12 | 0.50 | 2.5 | 6 | 0 | 1 | 438 s | 385 s | $0.61 |
+| Session | Right after checking | Wrong claims caught | Right claims broken | Claims checked | Session | Analysis first | Cost |
+|---|---|---|---|---|---|---|---|
+| version scanner alone | 21 of 30 | 0 of 9 | 0 of 21 | | | | |
+| Haiku 5.5, recore, 1 | 27 | 6 | 0 | 18 | 388 s | none | $0.32 |
+| Haiku 5.5, recore, 2 | 24 | 3 | 0 | 10 | 349 s | none | $0.21 |
+| Haiku 5.5, Ghidra, 1 | 22 | 1 | 0 | 7 | 302 s | 390 s | $0.44 |
+| Haiku 5.5, Ghidra, 2 | 24 | 3 | 0 | 10 | 671 s | 385 s | $0.42 |
+| Sonnet 5.5, recore | 26 | 6 | 1 | 26 | 483 s | none | $1.95 |
+| Sonnet 5.5, Ghidra | 28 | 7 | 0 | 26 | 291 s | 380 s | $2.01 |
 
 What it shows:
 
-- **Every session scores below the version scanner.** The best scores 10 of 30 against the scanner's 18, and every F1 of vulnerable (0.48 to 0.50) is below even calling everything vulnerable (0.67). That is headroom, and it is also a warning: with Haiku the benchmark measures abstention as much as analysis. No session got a CVE-2022-0934 cell, though the binary's own compile-options string settles the 6 where the code is left out. Nobody decided CVE-2026-5172 from code: the recore sessions left it undecided, and Ghidra's second session called all ten fixed, so two came out right by chance.
-- **The string cell is easy, as the design expected.** Both recore sessions and Ghidra's second got all ten Terrapin statuses right from the strict-KEX strings. Results without such cells are the ones to watch.
-- **The tools separate on evidence and cost, not yet on the hard cells.** recore's sessions cited an address in the right binary for every cell they decided. Ghidra's cited `unknown` or an address outside the code for most, and took 6.4 to 7.4 minutes of analysis before starting. Haiku with either tool stopped after 4 to 7 minutes of a 30-minute budget, so the cells that need code reading never got a real attempt. Two sessions per arm is an illustration, not a result.
-- **Calibration.** Every session wrote its own word for an undecided cell (`undecided`, `unresolved`, `undetermined`). The prompt should say that an undecided cell scores as wrong, as the design's scoring does, and the next pilot should run a stronger model than Haiku.
+- **Every session adds to the scanner, and none saturates it.** The best, Sonnet with Ghidra, ends at 28 of 30. Across all six, only one right claim was broken.
+- **The cells only code decides get solved.** Haiku with recore refuted both CVE-2026-5172 backports and the stale dnsmasq in its first session, and Sonnet with Ghidra did the same. Sonnet with recore broke the one right claim, refuting img01's 5172 claim on code it misread.
+- **No session caught the two `dnsmasq-full` backports of CVE-2022-0934.** That is the headroom cell: it needs the agent to find the DHCPv6 code and tell the patched copy from the unpatched one.
+- **No clear winner between the tools yet.** With Haiku, recore's sessions caught 6 and 3, Ghidra's 1 and 3. With Sonnet, Ghidra's caught 7 and recore's 6. One or two sessions per cell is an illustration. recore's sessions started at once, while Ghidra's waited about 6.5 minutes for its analysis.
+- **Framing mattered more than the tool.** In the first pilot, below, the same Haiku with the same tools ended below the scanner, because it had to fill the matrix from nothing and abstained. Handed the scanner's claims, it checked them.
+
+### A scorer bug that cost Ghidra points
+
+Ghidra loads a position-independent program at 0x100000 on 64-bit and 0x10000 on 32-bit ARM, so its addresses are the file's plus that base: Sonnet's `0x131850` is recore's `0x31850`. The first scorer accepted only the file's own addresses and rejected four of Sonnet with Ghidra's right refutations, which made it look like the weakest session. Both scorers now accept either convention. Every number in this file is from the fixed scorer.
+
+### The first pilot: filling the matrix from nothing
+
+Before part 1, the same ten images (with 24.10.6-armv7 and 23.05.2-aarch64 where the stale variants are now) were given to Haiku with no claims: decide every cell. Its prompt and scorer are in the history of `bench/firmware/pilot/`.
+
+| Session | Points of 30 | Right status | Cost |
+|---|---|---|---|
+| version scanner | 18 | 18 | |
+| Haiku, recore, 1 and 2 | 10 and 10 | 10 and 10 | $0.14 and $0.26 |
+| Haiku, Ghidra, 1 and 2 | 2.5 and 11 | 5 and 12 | $0.22 and $0.61 |
+
+Every session stopped after 4 to 7 minutes of a 30-minute budget and left most dnsmasq cells undecided. The second Ghidra session called all ten CVE-2026-5172 cells fixed, so two came out right by chance.
 
 ### Audit of the sessions
 
-`audit.py` lists shell tools run on binaries, paths outside the session's folder and any mention of the labels, and every non-recore command of the recore sessions was read by hand as well.
+`bench/firmware/audit.py` lists shell tools run on binaries, paths outside the session's folder, the network and any mention of the labels, over every tool call's arguments. Every flag was then read by hand.
 
-- Neither recore session broke a rule. Their `grep` and `sed` ran over the package database and over decompiled C they had saved.
-- Ghidra's second session read a file outside its folder: Claude Code had saved an oversized `decompile_function` result under `~/.claude/projects/.../tool-results/`, and the agent parsed it with `python3`. That file is its own tool's output, not the labels or the answers, but it breaks the folder rule. Ghidra's first session saw the same file path and left it alone.
+- **Part 1.** No session broke a rule. The flags are `grep` and `awk` over the agents' own saved output, Python that writes the verdicts file, and Ghidra's second Haiku session running `analyzeHeadless` from the installation the prompt names. The prompts now tell agents not to read the files Claude Code saves an oversized answer to; Sonnet with Ghidra saw such a path and did not read it.
+- **First pilot.** Ghidra's second session read an oversized `decompile_function` result that Claude Code had saved outside its folder. That is its own tool's output, not the labels, but it broke the folder rule.
 - No session read the labels, the corpora directory or the repository, ran `strings` or another binary tool, or used the network.
 
 ### What the sessions found about recore

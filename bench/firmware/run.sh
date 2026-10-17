@@ -1,32 +1,29 @@
 #!/usr/bin/env bash
-# One agent session on the fleet triage pilot with one tool: ten OpenWrt images from the corpora
-# directory, three advisories, and the session recorded as bench/agent/run.sh records one. The
-# agent's answers go to <dir>/work/answer.tsv, its report to <dir>/report.md and its cost to
-# <dir>/stats.json. score.py scores the answers.
-# Usage: bench/firmware/pilot/run.sh <recore|ghidra> <model> <dir>, with <dir> outside any git
-# repository and with no part of its path starting with a dot, which Ghidra refuses.
+# One agent session on one part of the firmware benchmark with one tool, recorded as
+# bench/agent/run.sh records one: the transcript in <dir>/work/run.jsonl, the report in
+# <dir>/report.md and the cost in <dir>/stats.json. Each part's score.py scores the session.
+# Usage: bench/firmware/run.sh <part> <recore|ghidra> <model> <dir>, where <part> is a folder of
+# bench/firmware (verify, find) and <dir> is outside any git repository, with no part of its
+# path starting with a dot, which Ghidra refuses.
+#   The part names its images in images.tsv, the programs Ghidra analyzes first in programs.txt,
+#   and its task in task.md; its prepare.py writes what else the task folder holds.
 #   recore: RECORE_MCP names the binary, target/release/recore-mcp unless set.
 #   ghidra: GHIDRA_INSTALL_DIR names Ghidra, and pyghidra-mcp must be on the path. Ghidra analyzes
-#   every image's dnsmasq and dropbear before the session starts, in <dir>/work/analysis.seconds.
+#   the part's programs of every image before the session starts, in <dir>/work/analysis.seconds.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-root=$(cd "$here/../../.." && pwd)
-tool=$1 model=$2 dir=$(realpath -m "$3")
+root=$(cd "$here/../.." && pwd)
+part=$here/$1 tool=$2 model=$3 dir=$(realpath -m "$4")
 images="${RECORE_CORPORA:-$HOME/recore-corpora}/corpus-openwrt/images"
 mkdir -p "$dir/task" "$dir/work"
 if git -C "$dir" rev-parse --git-dir > /dev/null 2>&1; then
   echo "$dir is inside a git repository, whose status the session would see; choose another directory" >&2
   exit 2
 fi
-tail -n +2 "$here/images.tsv" | while IFS=$'\t' read -r img image; do
+tail -n +2 "$part/images.tsv" | while IFS=$'\t' read -r img image; do
   [ -d "$dir/task/$img" ] || cp -a "$images/$image/rootfs" "$dir/task/$img"
 done
-python3 -I - "$root/bench/firmware/advisories.toml" "$here/advisories.txt" > "$dir/task/advisories.md" <<'EOF'
-import sys, tomllib
-advisories = {a["id"]: a for a in tomllib.load(open(sys.argv[1], "rb"))["advisory"]}
-for id in open(sys.argv[2]).read().split():
-    print(f"## {id}\n\n{advisories[id]['text']}\n")
-EOF
+python3 -I "$part/prepare.py" "$dir/task"
 mcp=(--strict-mcp-config)
 case $tool in
   recore)
@@ -35,14 +32,17 @@ case $tool in
     cp "${RECORE_MCP:-$root/target/release/recore-mcp}" "$dir/bin/.recore-mcp"
     printf '#!/bin/sh\necho "$1" >> "%s/work/calls.log"\nexec "%s/bin/.recore-mcp" "$@"\n' "$dir" "$dir" > "$dir/bin/recore-mcp"
     chmod +x "$dir/bin/recore-mcp"
-    sed "s#{DIR}#$dir#g" "$here/prompts/recore.md" "$here/prompts/task.md" > "$dir/prompt.md" ;;
+    sed "s#{DIR}#$dir#g" "$here/prompts/recore.md" "$part/task.md" > "$dir/prompt.md" ;;
   ghidra)
     command -v pyghidra-mcp > /dev/null || { echo "the Ghidra side needs pyghidra-mcp on the path" >&2; exit 2; }
-    # pyghidra-mcp names a program after its file, so each image's copy carries the image's name.
+    # pyghidra-mcp names a program after its file, so each copy carries its image's name.
     mkdir -p "$dir/work/imported"
-    for img in $(tail -n +2 "$here/images.tsv" | cut -f1); do
-      for program in dnsmasq dropbear; do cp "$dir/task/$img/usr/sbin/$program" "$dir/work/imported/$img-$program"; done
+    for img in $(tail -n +2 "$part/images.tsv" | cut -f1); do
+      for program in $(cat "$part/programs.txt"); do
+        [ -f "$dir/task/$img/$program" ] && cp "$dir/task/$img/$program" "$dir/work/imported/$img-$(basename "$program")"
+      done
     done
+    imported="The programs $(sed 's/.*/`&`/' "$part/programs.txt" | paste -sd, | sed 's/,/, /g') of every image are imported into its project and fully analyzed."
     port=${PORT:-8766}
     start=$(date +%s)
     pyghidra-mcp -t streamable-http -p "$port" --project-path "$dir/work/proj" --project-name triage --max-workers 2 --wait-for-analysis "$dir"/work/imported/* > "$dir/work/server.log" 2>&1 &
@@ -56,7 +56,7 @@ case $tool in
     echo $(($(date +%s) - start)) > "$dir/work/analysis.seconds"
     printf '{"mcpServers":{"ghidra":{"type":"http","url":"http://127.0.0.1:%s/mcp"}}}\n' "$port" > "$dir/mcp.json"
     mcp+=(--mcp-config "$dir/mcp.json")
-    sed "s#{DIR}#$dir#g; s#{GHIDRA}#$GHIDRA_INSTALL_DIR#g" "$here/prompts/ghidra.md" "$here/prompts/task.md" > "$dir/prompt.md" ;;
+    sed "s#{DIR}#$dir#g; s#{GHIDRA}#$GHIDRA_INSTALL_DIR#g; s#{IMPORTED}#$imported#g" "$here/prompts/ghidra.md" "$part/task.md" > "$dir/prompt.md" ;;
   *)
     echo "the tool is recore or ghidra" >&2
     exit 2 ;;
