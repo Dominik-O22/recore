@@ -279,7 +279,7 @@ fn register(instruction: &Instruction, index: usize) -> Option<u8> {
     }
 }
 
-/// `Rm` of an operand `Rm, LSL #2`.
+/// `Rm` of an operand `Rm, LSL #2` or `[PC, Rm, LSL #2]`.
 fn times_four(operand: Operand) -> Option<u8> {
     let shift = match operand {
         Operand::RegShift(shift) => shift,
@@ -299,7 +299,7 @@ fn definition(instructions: &[Decoded], index: usize, register: u8) -> Option<us
     const CALLER_SAVED: u16 = 0b0101_0000_0000_1111;
     for at in (0..index).rev() {
         // yaxpeax-arm does not know every instruction, `UXTB` among them, and those write
-        // registers too. A wrong guess here is caught as the comment above says.
+        // registers too.
         let Some(instruction) = instructions[at].3.as_ref() else { continue };
         if matches!(instruction.opcode, Opcode::BL | Opcode::BLX) && CALLER_SAVED >> register & 1 != 0 {
             return None;
@@ -327,9 +327,10 @@ fn register_pair(operand: Operand) -> Option<(u8, u8)> {
     }
 }
 
-/// The highest value of `compared` that the compare and branch before `index` let through:
-/// `CMP Rn, #bound` then a branch away when it is higher, or a dispatch that runs only when it
-/// is lower or the same.
+/// The immediate of the last `CMP` of `compared` before `index`, if nothing between writes it,
+/// taken as the highest value let through. The branch after the compare is not checked: it is
+/// assumed to leave when the index is higher, or to be a dispatch that runs only when it is
+/// lower or the same.
 fn bound(instructions: &[Decoded], index: usize, compared: u8) -> Option<u64> {
     for at in (0..index).rev() {
         let instruction = instructions[at].3.as_ref()?;

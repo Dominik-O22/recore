@@ -185,7 +185,7 @@ impl A32 {
                     (false, 2) => (8, false, true),
                     (false, _) => (8, false, false),
                 };
-                // With the doubleword forms the bits after a halfword are not checked further.
+                // LDRD and STRD take an even Rt; nothing else of their encoding is checked.
                 (size != 8 || rt % 2 == 0).then_some(Access { load, size, signed, rn, rt, offset, pre, up, writeback })
             }
             _ => None,
@@ -227,7 +227,7 @@ impl A32 {
     }
 
     /// `ADD Rd, PC, Rm` or `ADD Rd, Rm, PC`: how position-independent code adds the PC to an
-    /// offset a literal holds. The register `Rm`.
+    /// offset a literal holds. `(Rd, Rm)`.
     fn adds_pc(self) -> Option<(usize, usize)> {
         let (opcode, _, rn, rd, operand) = self.data_processing()?;
         let Operand::Shifted { rm, left: 0 } = operand else { return None };
@@ -584,8 +584,9 @@ fn flow_a32(insn: A32, state: &State) -> Option<Flow> {
     (!insn.conditional() || dispatches).then_some(leaves)
 }
 
-/// The index register of `dispatch` and what it holds where the jump is taken: a jump that runs
-/// only when the index is at most the bound of the compare before it knows that bound.
+/// What the index register of `dispatch` holds where the jump is taken: a jump that runs only
+/// when the index is at most the bound of the compare before it knows that bound. None for
+/// `ADD PC, Rt, Re`, whose index is not one register.
 fn index_a32(insn: A32, state: &State, dispatch: Dispatch) -> Option<Value> {
     let rm = match dispatch {
         Dispatch::AddPc { rm } | Dispatch::LoadPc { rm } => rm,
@@ -922,7 +923,6 @@ pub(crate) fn load(file: &object::File, image: &mut Image) {
     use object::{Object, ObjectSection, ObjectSymbol};
     let code: Vec<(u64, u64)> = image.sections.iter().filter(|section| section.executable).map(|section| (section.addr, section.end())).collect();
     let is_code = |addr: u64| code.iter().any(|&(start, end)| (start..end).contains(&addr));
-    // A32 where the code at `start` reads as A32, see `reads_as_a32`.
     let reads = |start: u64| start % 4 == 0 && image.bytes_from(start).is_some_and(|bytes| reads_as_a32(&bytes[..bytes.len().min(48)]));
     // Where the set is known for sure: the entry point, the exports and the pointers that the
     // loader relocates into code, each with the Thumb bit or without it, and the PLT, which
@@ -1030,7 +1030,9 @@ fn dynamic_code_pointers(file: &object::File) -> Vec<u64> {
 /// Each seed is code in a known set. From there the code is followed, call by call and branch
 /// by branch, as long as it goes on in a straight line, and a `BLX` to a label leads to the
 /// other set. A stretch of code that nothing reaches is in the set of the code before it, as
-/// the functions of one source file are; one before any is in the set of the first seed.
+/// the functions of one source file are. One at the start of a section is in the set of the
+/// code after it, and a section nothing reaches in the set of the section before, or of the
+/// first seed.
 fn instruction_sets(image: &Image, seeds: &[(u64, InstructionSet)]) -> Vec<(u64, InstructionSet)> {
     let code: Vec<&Section> = image.sections.iter().filter(|section| section.executable).collect();
     // Per byte of each section, the set of the instruction that covers it, if one does.
@@ -1140,7 +1142,7 @@ mod tests {
     fn every_kind_of_a32_transfer_goes_where_its_bits_say() {
         use Flow::*;
         let cases: &[(u32, Option<Flow>)] = &[
-            // BL back by 0x23F8 from 0x4520, as objdump shows `bl 0x2130`; B; BHI; BLX to Thumb.
+            // BL back by 0x23F8 from PC 0x4528, as objdump shows `bl 0x2130`; B; BHI; BLX to Thumb.
             (0xEBFF_F702, Some(Call(0x2130))),
             (0xEA00_0001, Some(Jump(0x452C))),
             (0x8A00_07CD, Some(Branch(0x645C))),
@@ -1176,7 +1178,7 @@ mod tests {
 
     #[test]
     fn a_thumb_blx_goes_to_a32_code_at_a_word() {
-        // At 0x1002, BLX 0x1008: the offset counts from 0x1004, down to a word.
+        // At 0x1002, BLX with an offset of 0: it counts from PC 0x1006 down to a word, 0x1004.
         let image = image(&[], &[0xBF00, 0xF000, 0xE800], 0x1000);
         let image = Image { instruction_sets: vec![(0x1000, InstructionSet::Thumb)], ..image };
         assert_eq!(flows(&image)[1], (0x1002, 4, Some(Flow::Call(0x1004))));
@@ -1212,8 +1214,8 @@ mod tests {
     fn gcc_adds_four_times_an_entry_of_a_table_in_read_only_data_to_pc() {
         // LDR R3, [PC, #0x24] reads 0x0FF4 at 0x102C; ADD R3, PC, R3: the table at 0x2000.
         // CMP R0, #2; BHI 0x1028; ADD R0, R0, R0; LDRH R0, [R3, R0]; ADD PC, PC, R0, LSL #2; NOP;
-        // then the cases at 0x1020, 0x1024 and the default at 0x1028, each BX LR.
-        let mut words = vec![0xE59F_3024, 0xE08F_3003, 0xE350_0002, 0x8A00_0004, 0xE080_0000, 0xE193_00B0, 0xE08F_F100, 0xE1A0_0000];
+        // then the cases at 0x1020 and 0x1024 and the default at 0x1028, each BX LR.
+        let mut words = vec![0xE59F_3024, 0xE08F_3003, 0xE350_0002, 0x8A00_0005, 0xE080_0000, 0xE193_00B0, 0xE08F_F100, 0xE1A0_0000];
         words.extend([0xE12F_FF1E, 0xE12F_FF1E, 0xE12F_FF1E, 0x0000_0FF4]);
         let mut image = image(&words, &[], 0x1000);
         // The table: halfwords 0, 1 and 0, cases at 0x1020 + 4 * entry.
@@ -1240,8 +1242,8 @@ mod tests {
 
     #[test]
     fn the_sets_follow_calls_from_the_seeds_and_runs_keep_the_set_of_the_code_before_them() {
-        // A32 at 0x1000: BLX 0x100C; BX LR. Thumb at 0x1008: BX LR, which nothing reaches, then
-        // at 0x100A MOVS R0, #0, then BX LR at 0x100C... reached by the BLX.
+        // A32 at 0x1000: BLX 0x100C; BX LR. Thumb at 0x1008: BX LR and MOVS R0, #0, which
+        // nothing reaches, then BX LR at 0x100C, which the BLX reaches.
         let image = image(&[0xFA00_0001, 0xE12F_FF1E], &[0x4770, 0x2000, 0x4770, 0x4770], 0x1000);
         let sets = instruction_sets(&image, &[(0x1000, InstructionSet::A32)]);
         assert_eq!(sets, [(0x1000, InstructionSet::A32), (0x100C, InstructionSet::Thumb)]);
