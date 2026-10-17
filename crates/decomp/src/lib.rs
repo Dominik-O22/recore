@@ -161,12 +161,12 @@ impl Target {
     /// Whether a call passes just the parameters its callee was found to read, and not also
     /// whatever else the call site has put in argument registers. GCC and clang keep a caller's
     /// own values in those registers across a call to a function known to leave them alone,
-    /// so there the callee is the better witness. MSVC does not, and 32-bit code passes on
-    /// the stack, where a function may be passed more than it reads: against PDB signatures,
-    /// taking the callee's word alone gets 87.5% of 64-bit parameter lists right and taking
-    /// it as the least gets 89.8%.
+    /// so there the callee is the better witness, on 32-bit ARM as well. MSVC does not, and
+    /// 32-bit x86 code passes on the stack, where a function may be passed more than it reads:
+    /// against PDB signatures, taking the callee's word alone gets 87.5% of 64-bit parameter
+    /// lists right and taking it as the least gets 89.8%.
     fn callers_pass_what_is_read(self) -> bool {
-        matches!(self, Target::X86_64Gcc | Target::Aarch64)
+        matches!(self, Target::X86_64Gcc | Target::Aarch64 | Target::Arm)
     }
 
     /// The address spaces the target has besides the one its code is in: the address recore
