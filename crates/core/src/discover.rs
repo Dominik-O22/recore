@@ -995,13 +995,13 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// `may_call` says whether calls are allowed in it; a function without an unwind entry, where
     /// others have one, is a leaf and makes none. Where code keeps literal pools, the function
     /// goes on past a return to where a branch before it goes, its own literals follow its end,
-    /// and so may another function: one that opens as one, or up to `chain` more whole ones.
+    /// and so may another function: one that opens as one, or up to `chain` more whole ones. A
+    /// jump through a table of known length goes on to its cases there.
     fn is_whole_function(&self, index: usize, addr: u64, may_call: bool, chain: u8) -> bool {
         const LONGEST: usize = 48;
         let region = &self.regions[index];
         let section = region.section;
         let known = |at: u64| ((at - section.addr) as usize) < section.data.len() && region.insn_len[(at - section.addr) as usize] != 0;
-        let state = A::State::default();
         let literal = |at: u64| A::LITERAL_POOLS && region.flags.get((at - section.addr) as usize).is_some_and(|flags| flags & IN_TABLE != 0);
         // Where the branches so far go past the code decoded, and the literals it reads.
         let (mut ahead, mut pools): (BTreeSet<u64>, Vec<(u64, u64)>) = (BTreeSet::new(), Vec::new());
@@ -1030,7 +1030,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let (mut from, mut decoded_count) = (addr, 0);
         loop {
             let mut decoder = A::decode(self.image, &section.data[(from - section.addr) as usize..], from);
-            let mut after_call = false;
+            let (mut after_call, mut state) = (false, A::State::default());
             let ended = loop {
                 let Some(decoded) = decoder.next() else { return false };
                 decoded_count += 1;
@@ -1055,14 +1055,23 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 match flow {
                     Some(Flow::Call(target)) if !may_call || !self.image.is_code(target) => return false,
                     Some(Flow::CallIndirect(_)) if !may_call => return false,
+                    Some(Flow::JumpIndirect(None)) if A::LITERAL_POOLS => {
+                        let in_reach = |target: u64| target >= addr && self.region_index(target) == Some(index);
+                        let Some(table) = A::resolve_table(&state, self.image, self.pointer_slots, &insn, &in_reach, &in_reach).filter(|table| table.bounded) else { return false };
+                        ahead.extend(table.entries.iter().copied());
+                        pools.extend(table.inline_end.map(|end| (table.address, end)));
+                        break finish(table.inline_end.unwrap_or(decoded.next_addr()).max(decoded.next_addr()), &ahead, &pools);
+                    }
                     Some(Flow::Halt | Flow::JumpIndirect(None)) => return false,
                     Some(Flow::Branch(target)) if target < addr || self.region_index(target).is_none() => return false,
                     Some(Flow::Branch(target)) => {
+                        A::branch(&mut state, &insn);
                         ahead.insert(target);
                     }
                     Some(Flow::Jump(target)) if self.region_index(target).is_none() => return false,
                     Some(Flow::Return | Flow::Jump(_) | Flow::JumpIndirect(Some(_))) => break finish(decoded.next_addr(), &ahead, &pools),
-                    _ => {}
+                    Some(_) => A::step(&mut state, &insn),
+                    None => A::step(&mut state, &insn),
                 }
             };
             match ended {
