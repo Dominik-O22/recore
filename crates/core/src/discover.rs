@@ -742,8 +742,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
         tables
     }
 
-    /// Whether execution cannot fall into `addr`: it sits right after a terminator or a jump
-    /// table, or after one of those followed only by padding.
+    /// Whether execution cannot fall into `addr`: it sits right after a terminator, a jump
+    /// table or a literal pool, or after one of those followed only by padding.
     fn starts_after_break(&self, addr: u64) -> bool {
         let Some(index) = self.region_index(addr) else { return false };
         let region = &self.regions[index];
@@ -752,6 +752,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let pointer_size = self.image.machine.pointer_size() as usize;
         let after_table = |o: usize| {
             self.image.data_in_code && o >= pointer_size && self.pointer_slots.contains_key(&(region.section.addr + (o - pointer_size) as u64))
+                || A::LITERAL_POOLS && o > 0 && region.flags[o - 1] & IN_TABLE != 0
         };
         let Some(break_at) = (earliest..=offset).rev().find(|&o| region.follows_break(o) || after_table(o)) else {
             return false;
