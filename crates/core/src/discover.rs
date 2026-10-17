@@ -995,11 +995,10 @@ impl<'a, A: Arch> Explorer<'a, A> {
         if !self.image.data_in_code {
             return;
         }
-        let borrowers: Vec<u64> = self
-            .starts
+        let candidates: Vec<u64> = self.starts.iter().filter(|(_, origin)| !matches!(origin, Origin::Frame | Origin::Export | Origin::Thunk)).map(|(&addr, _)| addr).collect();
+        let borrowers: Vec<u64> = candidates
             .iter()
-            .filter(|(_, origin)| !matches!(origin, Origin::Frame | Origin::Export | Origin::Thunk))
-            .map(|(&addr, _)| addr)
+            .copied()
             .filter(|&addr| {
                 let Some(bytes) = self.image.bytes_from(addr) else { return false };
                 let insns: Vec<A::Insn> = A::decode(self.image, bytes, addr).take(PROBE).map_while(|d| d.insn).collect();
@@ -1007,7 +1006,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
             })
             .collect();
         let past_calls = A::CALL_MAY_BE_FAR_JUMP && !self.branches_reach_far;
-        let frame_ends: Vec<u64> = self.starts.iter().filter(|(_, origin)| !matches!(origin, Origin::Frame | Origin::Export | Origin::Thunk)).map(|(&addr, _)| addr).filter(|&addr| A::gives_back_frame(self.image, addr, past_calls)).collect();
+        let frame_ends: Vec<u64> = candidates.into_iter().filter(|&addr| A::gives_back_frame(self.image, addr, past_calls)).collect();
         for &addr in borrowers.iter().chain(&frame_ends) {
             self.starts.remove(&addr);
         }

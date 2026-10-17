@@ -296,7 +296,7 @@ pub trait Arch: 'static {
         false
     }
 
-    /// Whether the code at `addr` gives back a stack frame before it sets one up, on its way
+    /// Whether the code at `addr` returns through a stack frame before it sets one up, on its way
     /// past conditional branches and through jumps, and with `past_calls` past calls too: it is
     /// the end of a function that set the frame up and jumped there, as hand-written code shares
     /// the end of one routine with others. Code that calls before it saves its return address

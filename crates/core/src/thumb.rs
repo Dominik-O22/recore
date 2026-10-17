@@ -1095,7 +1095,9 @@ impl Arch for Thumb {
         false
     }
 
-    /// A `POP`, `ADD SP` or `LDR Rt, [SP], #4` before a `PUSH`, `SUB SP` or `STR Rt, [SP, #-4]!`.
+    /// A `POP` or `LDR` into PC from the stack before a `PUSH`, `SUB SP` or `STR Rt, [SP, #-4]!`.
+    /// Code that pops other words first may be switching to a stack of its own, as an RTOS starts
+    /// its first task by popping the task's registers and branching to the word it popped.
     fn gives_back_frame(image: &Image, addr: u64, past_calls: bool) -> bool {
         /// How many instructions it may take to come to either.
         const LONGEST: usize = 64;
@@ -1104,10 +1106,12 @@ impl Arch for Thumb {
         for _ in 0..LONGEST {
             let Some(Decoded { insn: Some(insn), .. }) = insns.next() else { return false };
             let (hw1, hw2) = (insn.hw1, insn.hw2);
+            if insn.pops_pc() {
+                return true;
+            }
             let sets_up = if insn.wide() { hw1 == 0xE92D || hw1 == 0xF84D && hw2 & 0x0FFF == 0x0D04 } else { hw1 & 0xFE00 == 0xB400 || hw1 & 0xFF80 == 0xB080 };
-            let gives_back = if insn.wide() { hw1 == 0xE8BD || hw1 == 0xF85D && hw2 & 0x0FFF == 0x0B04 } else { hw1 & 0xFE00 == 0xBC00 || hw1 & 0xFF80 == 0xB000 };
-            if sets_up || gives_back {
-                return gives_back;
+            if sets_up {
+                return false;
             }
             match Self::flow(&insn, &State::default(), image) {
                 None | Some(Flow::Branch(_)) => {}
@@ -1470,6 +1474,9 @@ mod tests {
         let code = |first: &[u16]| [&[0xB510][..], &bl(0x02, 0x0C), &[0x2800, 0xD005, 0xBD10, 0xB510, 0x2801, 0xD001, 0x2000, 0xBD10], first, &[0x2001, 0xBD10]].concat();
         assert_eq!(functions(&code(&[])), [0x00, 0x0C]);
         assert_eq!(functions(&code(&[0xB510])), [0x00, 0x0C, 0x16]);
+        // 0x00: PUSH {R4, LR}; BL 0x0A; MOVS R0, #0; POP {R4, PC}. 0x0A: POP {R0, R1}; BX R1, as an
+        // RTOS starts its first task from a stack of the task's own.
+        assert_eq!(functions(&[&[0xB510][..], &bl(0x02, 0x0A), &[0x2000, 0xBD10, 0xBC03, 0x4708]].concat()), [0x00, 0x0A]);
     }
 
     #[test]
