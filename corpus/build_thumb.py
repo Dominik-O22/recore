@@ -29,6 +29,7 @@ import functools, hashlib, os, shutil, subprocess, sys, tarfile, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Literal
 
 ROOT = Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "corpus-thumb"
@@ -131,7 +132,7 @@ class Program:
     # translation units; their roots are on the include path after `extra_include`.
     extra: dict[str, list[str]] = field(default_factory=dict)
     extra_include: list[str] = field(default_factory=list)
-    compiler: str = "clang"
+    compiler: Literal["clang", "gcc"] = "clang"
     # Laid out as a vendor's build is: one section of code per translation unit, none removed.
     vendor: bool = False
 
@@ -147,8 +148,8 @@ UIP = {"sources": ["uip/psock.c", "uip/timer.c", "uip/uip.c", "uip/uip_arp.c", "
        "exclude": ["apps/webserver/httpd-fsdata.c"], "include": ["uip", "lib", "apps/webserver", "unix"],
        "glue": ["thumb/uip"]}
 
-# The programs clang builds, each function in its own section.
-CLANG = {
+# The programs each compiler builds, each function in its own section.
+SETTINGS = {
     "aes_m0_Os": Program("tiny-AES-c", "m0", "Os", ["aes.c", "test.c"]),
     "aes_m4_O2": Program("tiny-AES-c", "m4", "O2", ["aes.c", "test.c"]),
     "crypto_m3_O2": Program("crypto-algorithms", "m3", "O2", ["*.c"], exclude=["base64_test.c", "aes*.c"],
@@ -206,8 +207,8 @@ CLANG = {
     "minmea_m3_O2": Program("minmea", "m3", "O2", ["minmea.c", "example.c"], glue=["thumb/minmea"]),
 }
 # Some of them again laid out as a vendor's build is, for Thumb-1 and Thumb-2, with the settings of
-# the clang program named first.
-CLANG_VENDOR = [("freertos_m0_Os", "m0", "Os"), ("freertos_m3_O2", "m3", "O2"), ("coremark_m0_O2", "m0", "O2"),
+# the program named first.
+VENDOR = [("freertos_m0_Os", "m0", "Os"), ("freertos_m3_O2", "m3", "O2"), ("coremark_m0_O2", "m0", "O2"),
                 ("coremark_m3_O0", "m3", "Os"), ("fatfs_m0_O2", "m0", "O2"), ("fatfs_m4_Os", "m3", "Os"),
                 ("littlefs_m0_O2", "m0", "O2"), ("littlefs_m3_Os", "m3", "Os"), ("uip_m3_Os", "m0", "Os"),
                 ("uip_m3_Os", "m3", "O2"), ("printf_m0_Os", "m0", "Os"), ("minmea_m3_O2", "m3", "O2")]
@@ -215,9 +216,12 @@ def program_name(like, core, opt, compiler, vendor):
     return f"{like.split('_')[0]}_{core}_{opt}_{compiler}" + ("_vendor" if vendor else "")
 
 
-PROGRAMS = {program_name(like, p.core, p.opt, "clang", False): p for like, p in CLANG.items()}
-PROGRAMS |= {program_name(like, core, opt, "clang", True): replace(CLANG[like], core=core, opt=opt, vendor=True)
-             for like, core, opt in CLANG_VENDOR}
+PROGRAMS = {}
+for compiler in ("clang", "gcc"):
+    PROGRAMS |= {program_name(like, p.core, p.opt, compiler, False): replace(p, compiler=compiler)
+                 for like, p in SETTINGS.items()}
+    PROGRAMS |= {program_name(like, core, opt, compiler, True): replace(SETTINGS[like], core=core, opt=opt, compiler=compiler, vendor=True)
+                 for like, core, opt in VENDOR}
 
 
 def run(argv, **kwargs):
