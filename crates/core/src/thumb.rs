@@ -15,6 +15,7 @@ use crate::arch::{Arch, Decoded, Flow, Limit, Table, TextPointer};
 use crate::image::{Image, Section};
 
 const PC: usize = 15;
+const SP: usize = 13;
 const LR: usize = 14;
 
 /// One instruction and where it sits, which PC-relative forms need.
@@ -162,6 +163,24 @@ impl Insn {
         let Value::Const(base) = state.registers[usize::from(hw1 & 0xF)] else { return None };
         let at = if hw1 & 0x0080 != 0 { u64::from(base) + offset } else { u64::from(base).wrapping_sub(offset) };
         (at > self.addr && at - self.addr <= REACH && at % 4 == 0).then_some((at, at + size))
+    }
+
+    /// The base register of a load or a store, other than SP or PC: of one register at an
+    /// immediate or a register offset, of several, or of two.
+    pub(crate) fn memory_base(self) -> Option<usize> {
+        let hw1 = self.hw1;
+        let base = if !self.wide() {
+            match hw1 >> 12 {
+                0b0101..=0b1000 => self.low_register(3),
+                0b1100 => self.low_register(8),
+                _ => return None,
+            }
+        } else if hw1 & 0xFE00 == 0xF800 || hw1 & 0xFE00 == 0xE800 {
+            usize::from(hw1 & 0xF)
+        } else {
+            return None;
+        };
+        (base != SP && base != PC).then_some(base)
     }
 
     /// The register a literal `LDR` of a word loads.
@@ -965,9 +984,13 @@ impl Arch for Thumb {
         Self::completed_address(insn, state).filter(|address| address & 1 != 0).map(|address| u64::from(address & !1))
     }
 
-    /// An address without the Thumb bit.
+    /// The address in the base register of a load or a store. A number the code forms is as
+    /// often no address at all, and with flash at 0 a size or a count falls inside the image.
     fn data_address(insn: &Insn, state: &State) -> Option<u64> {
-        Self::completed_address(insn, state).filter(|address| address & 1 == 0).map(u64::from)
+        match state.registers[insn.memory_base()?] {
+            Value::Const(base) => Some(u64::from(base)),
+            _ => None,
+        }
     }
 
     fn memory_reference(insn: &Insn, state: &State) -> Option<u64> {
@@ -1140,7 +1163,6 @@ impl Arch for Thumb {
     /// below the arguments the caller left on the stack, so that all lie in a row for `va_arg`.
     /// A function of four arguments that keeps them on the stack stores R3 lower down.
     fn takes_variable_arguments(insns: &[Insn]) -> bool {
-        const SP: usize = 13;
         // Where each register points, as an offset from the stack pointer at entry, if it does.
         let mut points: [Option<i64>; 16] = [None; 16];
         points[SP] = Some(0);
@@ -1490,12 +1512,13 @@ mod tests {
     }
 
     #[test]
-    fn what_follows_the_code_from_an_address_it_loads_of_data_is_data() {
-        // 0x00: LDR R0, =0x10 or =0; BX LR; padding; the literal. At 0x10 MOVS R0, #1; BX LR;
-        // MOVS R0, #2; BX LR, which follow the code as constants do.
-        let code = |literal: u16| [0x4801, 0x4770, 0xBF00, 0xBF00, literal, 0x0000, 0x0000, 0x0000, 0x2001, 0x4770, 0x2002, 0x4770];
-        assert_eq!(functions(&code(0x10)), [0x00]);
-        assert_eq!(functions(&code(0x00)), [0x00, 0x10, 0x14]);
+    fn what_follows_the_code_from_an_address_it_reads_is_data() {
+        // 0x00: LDR R0, =0x10; LDR R0, [R0] or NOP; BX LR; padding; the literal. At 0x10
+        // MOVS R0, #1; BX LR; MOVS R0, #2; BX LR, which follow the code as constants do. A number
+        // the code only forms, such as a size, may be no address at all.
+        let code = |read: u16| [0x4801, read, 0x4770, 0xBF00, 0x0010, 0x0000, 0x0000, 0x0000, 0x2001, 0x4770, 0x2002, 0x4770];
+        assert_eq!(functions(&code(0x6800)), [0x00]);
+        assert_eq!(functions(&code(0xBF00)), [0x00, 0x10, 0x14]);
     }
 
     #[test]

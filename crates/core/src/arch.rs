@@ -180,8 +180,8 @@ pub trait Arch: 'static {
     /// an address at all.
     fn address_taken(insn: &Self::Insn, state: &Self::State, image: &Image) -> Option<u64>;
 
-    /// The address `insn` completes in a register that cannot be one of code, where pointers to
-    /// code carry a mark: see [`Arch::MARKED_CODE_POINTERS`].
+    /// The address of the data that `insn` reads or writes through a register whose value the
+    /// state knows, counted from the register alone.
     fn data_address(_insn: &Self::Insn, _state: &Self::State) -> Option<u64> {
         None
     }

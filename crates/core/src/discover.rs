@@ -289,7 +289,7 @@ struct Explorer<'a, A: Arch> {
     after_calls: Vec<(u64, u64)>,
     /// See [`Discovery::frame_ends`].
     frame_ends: Vec<u64>,
-    /// The addresses that code reached from an entry point completes and that cannot be of code:
+    /// The addresses that code reached from an entry point reads or writes through a register:
     /// see [`Arch::data_address`].
     data_addresses: Vec<u64>,
     /// Addresses taken that an earlier pass found inside other code, which are no entry points
@@ -1237,10 +1237,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
     }
 
     /// Marks as data, in each region, everything from the first address that the code reached
-    /// forms of data past the end of that code and of its tables and pools: the constants and
-    /// the initial values of variables that a firmware image keeps after its code. Nothing
-    /// there is a function, however its bytes decode, and the entry points there that only an
-    /// address taken speaks for go, as does the code decoded from them, which ends nothing.
+    /// reads or writes through a register past the end of that code and of its tables and
+    /// pools: the constants and the initial values of variables that a firmware image keeps
+    /// after its code. Nothing there is a function, however its bytes decode. The entry points
+    /// there that only an address the code takes speaks for go, and the code decoded from them
+    /// ends nothing, where a pointer to text reads as one to code.
     fn mark_trailing_data(&mut self) {
         self.data_addresses.sort_unstable();
         self.weak_starts.sort_unstable();
@@ -1250,7 +1251,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
             let weak: Vec<(usize, usize)> = self
                 .weak_starts
                 .iter()
-                .filter(|&&addr| section.contains(addr))
+                .filter(|&&addr| section.contains(addr) && self.starts.get(&addr) == Some(&Origin::AddressTaken))
                 .map(|&addr| (addr - section.addr) as usize)
                 .map(|offset| (offset, region.end_of_run(offset)))
                 .collect();
@@ -1264,7 +1265,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
             region.flags[from..].iter_mut().for_each(|flags| *flags |= IN_TABLE);
             region.touch(from, clock);
             region.touch(section.data.len() - 1, clock);
-            self.starts.retain(|&addr, origin| !(section.contains(addr) && addr >= start && matches!(origin, Origin::AddressTaken | Origin::DataPointer)));
+            self.starts.retain(|&addr, origin| !(section.contains(addr) && addr >= start && *origin == Origin::AddressTaken));
         }
     }
 
