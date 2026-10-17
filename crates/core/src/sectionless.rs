@@ -8,8 +8,8 @@
 //! - the tables the dynamic table points to, under their usual names: `.dynsym`, `.dynstr`, the
 //!   relocations, `.dynamic`, and the unwind tables of `PT_GNU_EH_FRAME` and `PT_ARM_EXIDX`;
 //! - in an executable segment, `.text` from the end of the tables before the first code to the
-//!   end of `DT_FINI`, the last code the linker places, and `.rodata` for what follows; the
-//!   PLT, which GNU ld places after `.init`, as `.plt`;
+//!   end of `DT_FINI`, which GNU ld places last, or of the last function the image exports, and
+//!   `.rodata` for what follows; the PLT, which GNU ld places after `.init`, as `.plt`;
 //! - in a read-only segment, `.rodata` for what no table covers, after the last of them;
 //! - in a writable one, `.data.rel.ro` for the part `PT_GNU_RELRO` protects, `.data` for the
 //!   rest, and `.bss` for the memory beyond the file's bytes.
@@ -223,6 +223,22 @@ impl<'a> Elf<'a> {
         Some((addr & !1) + found as u64)
     }
 
+    /// The end of each function the dynamic symbol table at `symbols` defines, from its address
+    /// and size, without the Thumb bit.
+    fn function_ends(&self, symbols: Option<u64>, count: Option<u64>, size: u64) -> impl Iterator<Item = u64> + '_ {
+        const STT_FUNC: u8 = 2;
+        let at = symbols.and_then(|symbols| self.offset(symbols));
+        (0..count.unwrap_or(0)).filter_map(move |index| {
+            let entry = at? + index * size;
+            let (info, section, value, length) = if self.wide {
+                (*self.data.get(entry as usize + 4)?, u16_at(self.data, entry + 6)?, u64_at(self.data, entry + 8)?, u64_at(self.data, entry + 16)?)
+            } else {
+                (*self.data.get(entry as usize + 12)?, u16_at(self.data, entry + 14)?, u32_at(self.data, entry + 4)?.into(), u32_at(self.data, entry + 8)?.into())
+            };
+            (info & 0xF == STT_FUNC && section != 0 && value != 0).then_some((value & !1) + length)
+        })
+    }
+
     /// Where the PLT is, with `count` stubs: GNU ld places it right after `.init`, and its first
     /// entry, which every stub jumps to, is the same few instructions in every program.
     fn plt(&self, init: u64, count: u64) -> Option<(u64, u64)> {
@@ -281,7 +297,8 @@ impl<'a> Elf<'a> {
             }
         };
         let symbol_size = if self.wide { 24 } else { 16 };
-        table(".dynsym", SHT_DYNSYM, tag(6), self.symbol_count(tag, symbol_size).map(|count| count * symbol_size), Some(".dynstr"), symbol_size);
+        let symbol_count = self.symbol_count(tag, symbol_size);
+        table(".dynsym", SHT_DYNSYM, tag(6), symbol_count.map(|count| count * symbol_size), Some(".dynstr"), symbol_size);
         table(".dynstr", SHT_STRTAB, tag(5), tag(10), None, 0);
         let rela = if self.wide { 24 } else { 12 };
         table(".rela.dyn", SHT_RELA, tag(7), tag(8), Some(".dynsym"), rela);
@@ -344,9 +361,15 @@ impl<'a> Elf<'a> {
                 // puts `.init` there, and lld puts it after `.text`, before the entry point.
                 let first = tag(12).map(|init| init & !1).into_iter().chain(self.word(0x18)).filter(|&at| at >= start && at < end).min().unwrap_or(start);
                 let code = inside.iter().filter(|t| t.addr + t.size <= first).map(|t| t.addr + t.size).max().unwrap_or(start);
-                // `.fini` is the last code the linker places, and read-only data may follow it.
-                let code_end = fini
-                    .and_then(|fini| self.end_of_short_function(fini))
+                // Code runs to the end of `.fini`, which GNU ld places last, and of every function
+                // the image exports, the entry point included. Read-only data may follow.
+                let fini_end = fini.and_then(|fini| self.end_of_short_function(fini));
+                let exported = self.function_ends(tag(6), symbol_count, symbol_size).filter(|&at| at > code && at <= end).max();
+                let entry = self.word(0x18).filter(|&at| at >= code && at < end).map(|at| at + 1);
+                let code_end = [fini_end, exported, entry]
+                    .into_iter()
+                    .flatten()
+                    .max()
                     .unwrap_or_else(|| inside.iter().filter(|t| t.addr >= code).map(|t| t.addr).min().unwrap_or(end));
                 fill(&mut out, ".text", SHF_ALLOC | SHF_EXECINSTR, code, code_end);
                 fill(&mut out, ".rodata", SHF_ALLOC, code_end, end);
