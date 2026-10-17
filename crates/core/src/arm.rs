@@ -195,19 +195,19 @@ impl A32 {
     /// `[start, end)` of the data a PC-relative load reads: `LDR`, `LDRB`, the halfword and
     /// doubleword forms, and `VLDR`.
     fn literal_range(self) -> Option<(u64, u64)> {
-        let address = |offset: u32, up: bool| if up { self.pc() + u64::from(offset) } else { self.pc().wrapping_sub(u64::from(offset)) };
+        let address = |offset: u32, up: bool| if up { self.pc().wrapping_add(u64::from(offset)) } else { self.pc().wrapping_sub(u64::from(offset)) };
         if let Some(transfer) = self.transfer() {
             let Offset::Immediate(offset) = transfer.offset else { return None };
             if !transfer.load || transfer.rn != PC || !transfer.pre || transfer.writeback || transfer.rt == PC {
                 return None;
             }
             let at = address(offset, transfer.up);
-            return Some((at, at + u64::from(transfer.size)));
+            return Some((at, at.wrapping_add(u64::from(transfer.size))));
         }
         // VLDR of a single or a double register.
         (self.word & 0x0F3F_0E00 == 0x0D1F_0A00 && self.condition() != 15).then(|| {
             let at = address((self.word & 0xFF) * 4, self.word >> 23 & 1 != 0);
-            (at, at + if self.word & 0x100 != 0 { 8 } else { 4 })
+            (at, at.wrapping_add(if self.word & 0x100 != 0 { 8 } else { 4 }))
         })
     }
 
@@ -346,7 +346,7 @@ impl Decoder<'_> {
 /// The address the instruction completes in a register, whatever it is: a literal, the top
 /// half of a `MOVW` and `MOVT` pair, or the sum of PC and an offset. Not an `ADR`, which only
 /// names tables and literals among the code. Code that the loader relocates holds no address
-/// in a literal: it holds the offset from the PC it is added to.
+/// in a literal or a `MOVW` and `MOVT` pair: it holds the offset from the PC it is added to.
 fn completed_address(insn: &Insn, state: &State, image: &Image) -> Option<u32> {
     let constant = |register: usize| match state.registers[register] {
         Value::Const(value) => Some(value),
@@ -356,7 +356,7 @@ fn completed_address(insn: &Insn, state: &State, image: &Image) -> Option<u32> {
     match insn {
         Insn::Thumb(insn) => match pc_sum_thumb(insn) {
             Some(rd) => constant(rd).map(|offset| offset.wrapping_add(insn.addr as u32 + 4)),
-            None if insn.adr().is_some() || !absolute && insn.literal_word_register().is_some() => None,
+            None if insn.adr().is_some() || !absolute && (insn.literal_word_register().is_some() || insn.move_half().is_some()) => None,
             None => Thumb::completed_address(insn, state),
         },
         Insn::A32(insn) => {
@@ -367,7 +367,7 @@ fn completed_address(insn: &Insn, state: &State, image: &Image) -> Option<u32> {
                 return constant(other).map(|offset| offset.wrapping_add(insn.pc() as u32));
             }
             match insn.move_half() {
-                Some((register, half, true)) => constant(register).map(|low| half << 16 | low & 0xFFFF),
+                Some((register, half, true)) if absolute => constant(register).map(|low| half << 16 | low & 0xFFFF),
                 _ => None,
             }
         }
@@ -954,8 +954,10 @@ pub(crate) fn load(file: &object::File, image: &mut Image) {
         *target &= !1;
     }
 
-    image.frames = frames;
-    image.frames_merge = true;
+    if !frames.is_empty() {
+        image.frames = frames;
+        image.frames_merge = true;
+    }
 
     // An unstripped file says where the sets change itself.
     let mut mapping: Vec<(u64, InstructionSet)> = file
@@ -1047,10 +1049,12 @@ fn instruction_sets(image: &Image, seeds: &[(u64, InstructionSet)]) -> Vec<(u64,
         }
         // The section decoded as nothing but the one set.
         probe.instruction_sets = vec![(0, set)];
-        let state = State::default();
+        let (state, mut after_call) = (State::default(), false);
         for decoded in Arm::decode(&probe, &section.data[(start - section.addr) as usize..], start) {
             let offset = (decoded.addr - section.addr) as usize;
-            let Some(insn) = decoded.insn.filter(|insn| !Arm::ends_code(insn)) else { break };
+            // Zeros end the code anywhere, and a NOP right after a call, as discovery has it.
+            let zeros = |insn: &Insn| matches!(insn, Insn::A32(insn) if insn.word == 0) || matches!(insn, Insn::Thumb(insn) if Thumb::ends_code(insn));
+            let Some(insn) = decoded.insn.filter(|insn| !zeros(insn) && !(after_call && Arm::ends_code(insn))) else { break };
             if seen[index][offset..offset + usize::from(decoded.len)].iter().any(Option::is_some) {
                 break;
             }
@@ -1071,7 +1075,9 @@ fn instruction_sets(image: &Image, seeds: &[(u64, InstructionSet)]) -> Vec<(u64,
                 let other = if set == InstructionSet::A32 { InstructionSet::Thumb } else { InstructionSet::A32 };
                 (target, if exchanges { other } else { set })
             };
-            match Arm::flow(&insn, &state, image) {
+            let flow = Arm::flow(&insn, &state, image);
+            after_call = matches!(flow, Some(Flow::Call(_) | Flow::CallIndirect(_)));
+            match flow {
                 None | Some(Flow::CallIndirect(_)) => {}
                 Some(Flow::Call(target) | Flow::Branch(target)) => pending.push(to(target)),
                 Some(Flow::Jump(target)) => {
@@ -1238,6 +1244,15 @@ mod tests {
         // BX LR at each and at the default.
         let words = [0xE350_0001, 0x979F_F100, 0xEA00_0003, 0x1014, 0x1018, 0xE12F_FF1E, 0xE12F_FF1E, 0xE12F_FF1E];
         assert_eq!(tables(&words), [(0x1004, vec![0x1008, 0x1014, 0x1018])]);
+    }
+
+    #[test]
+    fn a_branch_into_another_section_shows_no_function_whole() {
+        // BX LR; BEQ 0x2000, into a section of its own; BX LR. Read as a gap's function, the
+        // branch once sent decoding on in the wrong section's bytes.
+        let mut image = image(&[0xE12F_FF1E, 0x0A00_03FD, 0xE12F_FF1E], &[], 0x1000);
+        image.sections.push(Section { name: ".fini".into(), addr: 0x2000, data: 0xE12F_FF1Eu32.to_le_bytes().to_vec(), file_offset: None, executable: true, writable: false });
+        assert!(crate::analysis::analyze(&image).functions.iter().any(|function| function.addr == 0x1000));
     }
 
     #[test]

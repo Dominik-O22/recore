@@ -1080,6 +1080,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     }
                     Some(Flow::Halt | Flow::JumpIndirect(None)) => return false,
                     Some(Flow::Branch(target)) if target < addr || self.region_index(target).is_none() => return false,
+                    // Decoding goes on at a branch's target, which must lie in these bytes.
+                    Some(Flow::Branch(target)) if extended && self.region_index(target) != Some(index) => return false,
                     Some(Flow::Branch(target)) => {
                         if extended {
                             A::branch(&mut state, &insn);
