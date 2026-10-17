@@ -38,7 +38,7 @@ enum Command {
         /// Suites to run; all of them by default.
         #[arg(value_enum)]
         suites: Vec<Suite>,
-        /// The list of binaries, one path per line, relative to the working directory.
+        /// The list of binaries, one path per line, relative to the corpora's directory.
         #[arg(long, default_value = "bench/set.txt")]
         set: PathBuf,
         /// Only binaries whose path contains this.
@@ -96,6 +96,11 @@ fn saved(name: &str) -> PathBuf {
     PathBuf::from("target/bench").join(format!("{name}.json"))
 }
 
+/// The directory the corpora are in: `RECORE_CORPORA`, else `~/recore-corpora`, as corpus/store.py says.
+pub(crate) fn corpora() -> PathBuf {
+    std::env::var_os("RECORE_CORPORA").map_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("recore-corpora"), PathBuf::from)
+}
+
 fn main() -> Result<()> {
     // Every suite starts from no edits, whatever names and types are saved for these binaries.
     // SAFETY: no other thread has started yet.
@@ -108,7 +113,7 @@ fn main() -> Result<()> {
                 .map(str::trim)
                 .filter(|line| !line.is_empty() && !line.starts_with('#'))
                 .filter(|line| only.as_deref().is_none_or(|only| line.contains(only)))
-                .map(PathBuf::from)
+                .map(|line| corpora().join(line))
                 .collect();
             let wanted = |suite| suites.is_empty() || suites.contains(&suite);
             let before: Option<suites::Results> = match &compare {

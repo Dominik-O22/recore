@@ -23,12 +23,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "jt"))
 import build as elf  # noqa: E402  the ELF recipes: pinned URLs, hashes and the download cache
 
-ROOT = Path(__file__).resolve().parent.parent
-TOOLCHAIN = ROOT / "corpus-pe" / "toolchain"
+from store import CORPORA  # noqa: E402
+
+TOOLCHAIN = CORPORA / "corpus-pe" / "toolchain"
 TOOLCHAIN_URL = ("https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/"
                  "llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64.tar.xz")
 TOOLCHAIN_SHA256 = "5f9c6ed95b2d4bdb2869a488c5fd5857fbdabcf288a0aa3eb1da43f6a08d8ab4"
-TARGETS = {"x86_64-w64-mingw32": ROOT / "corpus-pe", "i686-w64-mingw32": ROOT / "corpus-pe32"}
+TARGETS = {"x86_64-w64-mingw32": CORPORA / "corpus-pe", "i686-w64-mingw32": CORPORA / "corpus-pe32"}
 JOBS = 4
 CFLAGS = ["-O2", "-g", "-gcodeview", "-mllvm", "-emit-jump-table-sizes-section"]
 META_SECTION = ".llvm_jump_table_sizes"
@@ -82,7 +83,7 @@ def run(argv, **kwargs):
 def toolchain():
     """Downloads and unpacks the pinned llvm-mingw release once; returns its bin directory."""
     if not (TOOLCHAIN / "bin").exists():
-        archive = ROOT / "corpus-pe" / "pkgs" / TOOLCHAIN_URL.rsplit("/", 1)[1]
+        archive = CORPORA / "corpus-pe" / "pkgs" / TOOLCHAIN_URL.rsplit("/", 1)[1]
         if not archive.exists():
             archive.parent.mkdir(parents=True, exist_ok=True)
             urllib.request.urlretrieve(TOOLCHAIN_URL, archive)

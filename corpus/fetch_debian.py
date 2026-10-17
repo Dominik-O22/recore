@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Adds Debian builds to a corpus: stripped executables plus their -dbgsym debug files.
 
-Usage: fetch_debian.py <arch> <corpus-dir>      e.g. amd64 corpus, arm64 corpus-arm64, armhf corpus-armhf
-                                                or armel corpus-armel
-Writes <corpus-dir>/bin/deb__<pkg>__<name> and <corpus-dir>/debug/deb__<pkg>__<name>.debug.
+Usage: fetch_debian.py <arch> <corpus>      e.g. amd64 corpus, arm64 corpus-arm64, armhf corpus-armhf
+                                            or armel corpus-armel
+Writes <corpus>/bin/deb__<pkg>__<name> and <corpus>/debug/deb__<pkg>__<name>.debug in the corpora's
+directory, which corpus/store.py names.
 Debian builds differ from Arch's: calls go through a PLT, and flags and compiler versions differ.
 """
 import lzma, re, subprocess, sys, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+from store import CORPORA
 
 MIRROR = "https://deb.debian.org"
 SUITE = "trixie"
@@ -84,7 +87,7 @@ def process(pkg, arch, corpus, binaries, debugs):
 
 
 def main():
-    arch, corpus = sys.argv[1], Path(sys.argv[2])
+    arch, corpus = sys.argv[1], CORPORA / sys.argv[2]
     for d in ("bin", "debug"):
         (corpus / d).mkdir(parents=True, exist_ok=True)
     binaries = index(f"{MIRROR}/debian/dists/{SUITE}/main/binary-{arch}/Packages.xz")

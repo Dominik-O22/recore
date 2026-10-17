@@ -16,7 +16,8 @@ import hashlib, shutil, struct, subprocess, sys, urllib.request, zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+from store import CORPORA
+
 SEVENZIP = ["mise", "x", "7zip@26.04", "--", "7zz"]
 MACHINE = {"corpus-pe": 0x8664, "corpus-pe32": 0x14C}
 PYTHON = "https://www.python.org/ftp/python/3.13.7"
@@ -233,7 +234,7 @@ def pdb_guid(path):
 
 
 def fetch(corpus_name):
-    corpus = ROOT / corpus_name
+    corpus = CORPORA / corpus_name
     pkgs = corpus / "pkgs"
     for d in (pkgs, corpus / "bin", corpus / "debug"):
         d.mkdir(parents=True, exist_ok=True)

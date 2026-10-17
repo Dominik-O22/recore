@@ -16,7 +16,7 @@ use rayon::prelude::*;
 
 #[derive(Parser)]
 struct Cli {
-    /// Corpus directory containing `bin/` and `debug/`.
+    /// The corpus, with `bin/` and `debug/`: a name in the corpora's directory, or an absolute path.
     #[arg(long, default_value = "corpus")]
     corpus: PathBuf,
     /// Where function signatures are kept, `<corpus>/signatures` unless given.
@@ -250,8 +250,14 @@ fn run_score(corpus: &Path, dir: &Path, detail: bool) -> Result<()> {
     Ok(())
 }
 
+/// The directory the corpora are in: `RECORE_CORPORA`, else `~/recore-corpora`, as corpus/store.py says.
+fn corpora() -> PathBuf {
+    std::env::var_os("RECORE_CORPORA").map_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("recore-corpora"), PathBuf::from)
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    cli.corpus = corpora().join(&cli.corpus);
     let signatures = cli.signatures.clone().unwrap_or_else(|| cli.corpus.join("signatures"));
     match cli.command {
         Command::Truth => run_truth(&cli.corpus),

@@ -6,7 +6,9 @@
 # table as the entry points, and its JSON is named after the layout.
 set -uo pipefail
 GHIDRA="$1"; OUT="$(realpath -m "$2")"; JOBS="${3:-4}"; EXTRA="${4:-}"
-HERE="$(cd "$(dirname "$0")" && pwd)"; CORPUS="${CORPUS:-$HERE/../corpus}"
+# CORPUS is the corpus to run over, the x86-64 one in the directory corpus/store.py names unless set.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+CORPUS="${CORPUS:-${RECORE_CORPORA:-$HOME/recore-corpora}/corpus}"
 mkdir -p "$OUT/logs" "$OUT/proj"
 
 one() {
