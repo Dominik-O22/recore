@@ -144,6 +144,26 @@ impl Insn {
         Some((at, at + size))
     }
 
+    /// `[start, end)` of the doubleword an `LDRD` or `VLDR` reads at an offset from a register
+    /// that holds an address past it, as near as `ADR.W` reaches: a literal pool, whose address
+    /// GCC forms with `ADR` to load a 64-bit constant.
+    #[inline]
+    pub(crate) fn pool_load(self, state: &State) -> Option<(u64, u64)> {
+        /// How far `ADR.W` reaches.
+        const REACH: u64 = 4095;
+        let (hw1, hw2) = (self.hw1, self.hw2);
+        // LDRD Rt, Rt2, [Rn, #imm] without writeback, and VLDR of a double register: both are
+        // 32-bit instructions.
+        let loads = hw1 & 0xFF70 == 0xE950 || hw1 & 0xFF30 == 0xED10 && hw2 & 0x0F00 == 0x0B00;
+        if !loads || usize::from(hw1 & 0xF) == PC {
+            return None;
+        }
+        let (offset, size) = (u64::from(hw2 & 0xFF) * 4, 8);
+        let Value::Const(base) = state.registers[usize::from(hw1 & 0xF)] else { return None };
+        let at = if hw1 & 0x0080 != 0 { u64::from(base) + offset } else { u64::from(base).wrapping_sub(offset) };
+        (at > self.addr && at - self.addr <= REACH && at % 4 == 0).then_some((at, at + size))
+    }
+
     /// The register a literal `LDR` of a word loads.
     pub(crate) fn literal_word_register(self) -> Option<usize> {
         if !self.wide() {
@@ -965,8 +985,9 @@ impl Arch for Thumb {
         (insn.hw1 & 0xFE80 == 0xF880 && insn.rn() != PC).then(|| base(insn.rn()).map(|base| base + u64::from(insn.hw2 & 0xFFF))).flatten()
     }
 
-    fn literal(insn: &Insn) -> Option<(u64, u64)> {
-        insn.literal_range()
+    #[inline]
+    fn literal(insn: &Insn, state: &State) -> Option<(u64, u64)> {
+        insn.literal_range().or_else(|| insn.pool_load(state))
     }
 
     /// Whether the code at `target`, whose address with the Thumb bit the code forms or which
@@ -1349,7 +1370,7 @@ mod tests {
         // At 0x1002, LDR R0, [PC, #4] reads the word at 0x1008: (0x1002 + 4) & !3 is 0x1004.
         let bytes = [0x00, 0xBF, 0x01, 0x48, 0x70, 0x47, 0x00, 0xBF, 0x35, 0x12, 0x00, 0x08];
         let insn = Thumb::decode(&image(&bytes, 0x1000), &bytes, 0x1000).nth(1).unwrap().insn.unwrap();
-        assert_eq!((Thumb::literal(&insn), insn.literal), (Some((0x1008, 0x100C)), Some(0x0800_1235)));
+        assert_eq!((Thumb::literal(&insn, &State::default()), insn.literal), (Some((0x1008, 0x100C)), Some(0x0800_1235)));
         assert_eq!(Thumb::address_taken(&insn, &State::default(), &image(&bytes, 0x1000)), Some(0x0800_1234));
     }
 
@@ -1443,6 +1464,15 @@ mod tests {
         let code = |first: &[u16]| [&[0xB510][..], &bl(0x02, 0x0C), &[0x2800, 0xD005, 0xBD10, 0xB510, 0x2801, 0xD001, 0x2000, 0xBD10], first, &[0x2001, 0xBD10]].concat();
         assert_eq!(functions(&code(&[])), [0x00, 0x0C]);
         assert_eq!(functions(&code(&[0xB510])), [0x00, 0x0C, 0x16]);
+    }
+
+    #[test]
+    fn a_doubleword_loaded_through_an_adr_is_data() {
+        // 0x00: ADR R3, 0x08; LDRD R2, R3, [R3], or MOVS R2, #0; NOP; BX LR. At 0x08 the
+        // constant, whose words read as MOVS R0, #1; BX LR and MOVS R0, #2; BX LR.
+        let code = |load: [u16; 2]| [&[0xA301][..], &load, &[0x4770, 0x2001, 0x4770, 0x2002, 0x4770]].concat();
+        assert_eq!(functions(&code([0xE9D3, 0x2300])), [0x00]);
+        assert_eq!(functions(&code([0x2200, 0xBF00])), [0x00, 0x08, 0x0C]);
     }
 
     #[test]

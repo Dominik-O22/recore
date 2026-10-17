@@ -212,8 +212,9 @@ pub trait Arch: 'static {
     const LITERAL_POOLS: bool = false;
 
     /// `[start, end)` of the data among the code that `insn` reads at an address relative to
-    /// its own, as a load from a literal pool does. Nothing there is an instruction.
-    fn literal(_insn: &Self::Insn) -> Option<(u64, u64)> {
+    /// its own, as a load from a literal pool does, or through a register that `state` says
+    /// holds such an address. Nothing there is an instruction.
+    fn literal(_insn: &Self::Insn, _state: &Self::State) -> Option<(u64, u64)> {
         None
     }
 

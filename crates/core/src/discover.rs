@@ -468,7 +468,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 };
                 after_call = false;
                 self.regions[index].cover(offset, usize::from(decoded.len.max(1)));
-                if let Some((start, end)) = A::literal(insn).filter(|_| !speculative) {
+                if let Some((start, end)) = A::literal(insn, &state).filter(|_| !speculative) {
                     self.mark_literal(start, end);
                 }
                 if A::CALL_MAY_BE_FAR_JUMP && !speculative && trusted && A::branches_reach_far(insn) {
@@ -1068,7 +1068,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 if inside || own_pool || A::is_padding(&insn) || self.frame_of(decoded.addr).is_some() {
                     return false;
                 }
-                if let Some(pool) = A::literal(&insn).filter(|_| extended) {
+                if let Some(pool) = A::literal(&insn, &state).filter(|_| extended) {
                     pools.push(pool);
                 }
                 let flow = A::flow(&insn, &state, self.image);
@@ -1173,7 +1173,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 }
                 instructions.push(decoded.addr);
                 end = decoded.next_addr();
-                if let Some(literal) = A::literal(&insn) {
+                if let Some(literal) = A::literal(&insn, &state) {
                     pools.push(literal);
                 }
                 ended = match A::flow(&insn, &state, self.image) {
