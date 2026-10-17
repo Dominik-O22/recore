@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
-"""Builds Cortex-M programs for corpus-thumb with clang, so every function's address is known.
+"""Builds Cortex-M programs for corpus-thumb with clang and GCC, so every function's address is known.
 
 Each program is open source C from a pinned archive, unpacked into corpus-thumb/pkgs/<project>,
-compiled by clang for one Cortex-M core at one optimisation level and linked by rust-lld into an
-ELF image that runs from flash. What a project leaves to its user, such as `main`, a port or a
+compiled by clang or GCC for one Cortex-M core at one optimisation level and linked by GNU ld into
+an ELF image that runs from flash. What a project leaves to its user, such as `main`, a port or a
 configuration header, is in corpus/thumb or shared with the 8051 corpus in corpus/8051. Every
 program has the same small runtime from corpus/thumb/runtime: the vector table and reset handler,
-a serial console, and the few C library functions the projects call. `printf` is the printf
-project's. The compiler's helpers (division, soft floating point, `memcpy`) come from the
-`compiler_builtins` that Rust ships for each Cortex-M target, which `rustup target add` installs.
+a serial console, and what the C library leaves out. `printf` is the printf project's.
+
+GCC, GNU ld, objcopy and the libraries come from the Arm GNU Toolchain that mise.corpus.toml pins,
+found with `mise where`, so `MISE_ENV=corpus mise install` must have installed it; clang is the
+system's. Both compilers' programs link the toolchain's libgcc, for division and soft floating
+point, and newlib-nano, for text, numbers, `memcpy` and `malloc`. The C headers are the runtime's
+own, the same for both compilers.
+
+A program is named <project>_<core>_<opt>_<compiler>, with `_vendor` after it when laid out as a
+vendor's build is: without -ffunction-sections and --gc-sections, so a function ending in a call
+that never returns runs into the next and every function of a translation unit stays in.
 
 For each program this writes
   corpus-thumb/bin/<name>.toml     the layout recore loads, naming the image
-  corpus-thumb/image/<name>.bin    the flash, as `llvm-objcopy -O binary` cuts it from the ELF
+  corpus-thumb/image/<name>.bin    the flash, as `objcopy -O binary` cuts it from the ELF
   corpus-thumb/debug/<name>.debug  the ELF, with its symbols, mapping symbols and DWARF
 
 Usage: build_thumb.py [--force] [name...]
 """
-import hashlib, shutil, subprocess, sys, tarfile, urllib.request
+import functools, hashlib, os, shutil, subprocess, sys, tarfile, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -81,22 +89,25 @@ PROJECTS = {
 
 @dataclass
 class Core:
-    """A Cortex-M core: how clang targets it, the Rust target whose compiler helpers it links,
-    and where its flash starts."""
-    flags: list[str]
-    rust_target: str
+    """A Cortex-M core: how clang and GCC target it, and where its flash starts. GCC's flags also
+    pick the toolchain's libraries for the core."""
+    clang: list[str]
+    gcc: list[str]
     flash: int
 
 
 CORES = {
     # Thumb-1 only (ARMv6-M), with flash at 0 as on an nRF51 or an LPC11xx.
-    "m0": Core(["--target=thumbv6m-none-eabi", "-mcpu=cortex-m0", "-mfloat-abi=soft"], "thumbv6m-none-eabi", 0x00000000),
+    "m0": Core(["--target=thumbv6m-none-eabi", "-mcpu=cortex-m0", "-mfloat-abi=soft"],
+               ["-mcpu=cortex-m0", "-mthumb", "-mfloat-abi=soft"], 0x00000000),
     # Thumb-2 (ARMv7-M), with flash where an STM32 has it.
-    "m3": Core(["--target=thumbv7m-none-eabi", "-mcpu=cortex-m3", "-mfloat-abi=soft"], "thumbv7m-none-eabi", 0x08000000),
-    "m4": Core(["--target=thumbv7em-none-eabi", "-mcpu=cortex-m4", "-mfloat-abi=soft"], "thumbv7em-none-eabi", 0x08000000),
+    "m3": Core(["--target=thumbv7m-none-eabi", "-mcpu=cortex-m3", "-mfloat-abi=soft"],
+               ["-mcpu=cortex-m3", "-mthumb", "-mfloat-abi=soft"], 0x08000000),
+    "m4": Core(["--target=thumbv7em-none-eabi", "-mcpu=cortex-m4", "-mfloat-abi=soft"],
+               ["-mcpu=cortex-m4", "-mthumb", "-mfloat-abi=soft"], 0x08000000),
     # With its floating-point unit, so the code has VFP instructions.
     "m4f": Core(["--target=thumbv7em-none-eabihf", "-mcpu=cortex-m4", "-mfpu=fpv4-sp-d16", "-mfloat-abi=hard"],
-                "thumbv7em-none-eabihf", 0x08000000),
+                ["-mcpu=cortex-m4", "-mthumb", "-mfpu=fpv4-sp-d16", "-mfloat-abi=hard"], 0x08000000),
 }
 
 
@@ -120,10 +131,9 @@ class Program:
     # translation units; their roots are on the include path after `extra_include`.
     extra: dict[str, list[str]] = field(default_factory=dict)
     extra_include: list[str] = field(default_factory=list)
-    # Laid out as GNU ld lays out a vendor's build without -ffunction-sections: one section of
-    # code per translation unit, so a function ending in a call that never returns runs into the
-    # next, and zeros, not lld's traps, in the gaps between the units.
-    gnu_layout: bool = False
+    compiler: str = "clang"
+    # Laid out as a vendor's build is: one section of code per translation unit, none removed.
+    vendor: bool = False
 
 
 FREERTOS = {"sources": ["tasks.c", "queue.c", "list.c", "timers.c", "event_groups.c", "portable/MemMang/heap_4.c"],
@@ -137,7 +147,8 @@ UIP = {"sources": ["uip/psock.c", "uip/timer.c", "uip/uip.c", "uip/uip_arp.c", "
        "exclude": ["apps/webserver/httpd-fsdata.c"], "include": ["uip", "lib", "apps/webserver", "unix"],
        "glue": ["thumb/uip"]}
 
-PROGRAMS = {
+# The programs clang builds, each function in its own section.
+CLANG = {
     "aes_m0_Os": Program("tiny-AES-c", "m0", "Os", ["aes.c", "test.c"]),
     "aes_m4_O2": Program("tiny-AES-c", "m4", "O2", ["aes.c", "test.c"]),
     "crypto_m3_O2": Program("crypto-algorithms", "m3", "O2", ["*.c"], exclude=["base64_test.c", "aes*.c"],
@@ -194,17 +205,19 @@ PROGRAMS = {
                          extra_include=["CMSIS/Core/Include"]),
     "minmea_m3_O2": Program("minmea", "m3", "O2", ["minmea.c", "example.c"], glue=["thumb/minmea"]),
 }
-# The same projects laid out as a vendor's build is, for Thumb-1 and Thumb-2.
-GNU_LAYOUT = {
-    "freertos_m0_Os_gnu": ("freertos_m0_Os", "m0", "Os"), "freertos_m3_O2_gnu": ("freertos_m3_O2", "m3", "O2"),
-    "coremark_m0_O2_gnu": ("coremark_m0_O2", "m0", "O2"), "coremark_m3_Os_gnu": ("coremark_m3_O0", "m3", "Os"),
-    "fatfs_m0_O2_gnu": ("fatfs_m0_O2", "m0", "O2"), "fatfs_m3_Os_gnu": ("fatfs_m4_Os", "m3", "Os"),
-    "littlefs_m0_O2_gnu": ("littlefs_m0_O2", "m0", "O2"), "littlefs_m3_Os_gnu": ("littlefs_m3_Os", "m3", "Os"),
-    "uip_m0_Os_gnu": ("uip_m3_Os", "m0", "Os"), "uip_m3_O2_gnu": ("uip_m3_Os", "m3", "O2"),
-    "printf_m0_Os_gnu": ("printf_m0_Os", "m0", "Os"), "minmea_m3_O2_gnu": ("minmea_m3_O2", "m3", "O2"),
-}
-for name, (like, core, opt) in GNU_LAYOUT.items():
-    PROGRAMS[name] = replace(PROGRAMS[like], core=core, opt=opt, gnu_layout=True)
+# Some of them again laid out as a vendor's build is, for Thumb-1 and Thumb-2, with the settings of
+# the clang program named first.
+CLANG_VENDOR = [("freertos_m0_Os", "m0", "Os"), ("freertos_m3_O2", "m3", "O2"), ("coremark_m0_O2", "m0", "O2"),
+                ("coremark_m3_O0", "m3", "Os"), ("fatfs_m0_O2", "m0", "O2"), ("fatfs_m4_Os", "m3", "Os"),
+                ("littlefs_m0_O2", "m0", "O2"), ("littlefs_m3_Os", "m3", "Os"), ("uip_m3_Os", "m0", "Os"),
+                ("uip_m3_Os", "m3", "O2"), ("printf_m0_Os", "m0", "Os"), ("minmea_m3_O2", "m3", "O2")]
+def program_name(like, core, opt, compiler, vendor):
+    return f"{like.split('_')[0]}_{core}_{opt}_{compiler}" + ("_vendor" if vendor else "")
+
+
+PROGRAMS = {program_name(like, p.core, p.opt, "clang", False): p for like, p in CLANG.items()}
+PROGRAMS |= {program_name(like, core, opt, "clang", True): replace(CLANG[like], core=core, opt=opt, vendor=True)
+             for like, core, opt in CLANG_VENDOR}
 
 
 def run(argv, **kwargs):
@@ -236,28 +249,11 @@ def fetch(name):
     return root
 
 
-def sysroot():
-    return Path(run(["rustc", "--print", "sysroot"]).strip())
-
-
-def linker():
-    host = run(["rustc", "-vV"]).split("host: ", 1)[1].split()[0]
-    return sysroot() / "lib" / "rustlib" / host / "bin" / "rust-lld"
-
-
-def builtins(core):
-    """An archive of the compiler helpers Rust ships for the core's target, made once from the
-    objects of its `compiler_builtins` rlib, whose metadata member the linker would not take."""
-    target = CORES[core].rust_target
-    archive = CORPUS / "obj" / "builtins" / f"{target}.a"
-    if not archive.exists():
-        (rlib,) = (sysroot() / "lib" / "rustlib" / target / "lib").glob("libcompiler_builtins-*.rlib")
-        work = archive.parent / target
-        shutil.rmtree(work, ignore_errors=True)
-        work.mkdir(parents=True)
-        run(["llvm-ar", "x", rlib], cwd=work)
-        run(["llvm-ar", "rcs", archive, *sorted(work.glob("*.o"))])
-    return archive
+@functools.cache
+def toolchain():
+    """The bin directory of the Arm GNU Toolchain that mise.corpus.toml pins."""
+    where = run(["mise", "where", "gcc-arm-none-eabi"], cwd=ROOT, env={**os.environ, "MISE_ENV": "corpus"})
+    return Path(where.strip()) / "bin"
 
 
 LINKER_SCRIPT = """\
@@ -269,7 +265,7 @@ ENTRY(Reset_Handler)
 _estack = ORIGIN(RAM) + LENGTH(RAM);
 SECTIONS {{
   .isr_vector : {{ KEEP(*(.isr_vector)) }} > FLASH
-  .text : {{ *(.text .text.*) }} > FLASH {fill}
+  .text : {{ *(.text .text.*) }} > FLASH
   .rodata : {{ *(.rodata .rodata.*) . = ALIGN(4); }} > FLASH
   .data : {{ _sdata = .; *(.data .data.*) . = ALIGN(4); _edata = .; }} > RAM AT > FLASH
   _sidata = LOADADDR(.data);
@@ -296,8 +292,9 @@ def build(name, program):
                *(f"-I{root / directory}" for directory in [".", *program.include]),
                *(f"-I{extra / directory}" for extra in extra_roots.values() for directory in [".", *program.extra_include]),
                "-isystem", str(RUNTIME / "include")]
-    sections = [] if program.gnu_layout else ["-ffunction-sections", "-fdata-sections"]
-    flags = [*core.flags, f"-{program.opt}", "-g", "-ffreestanding", *sections,
+    sections = [] if program.vendor else ["-ffunction-sections", "-fdata-sections"]
+    compiler = ["clang", *core.clang] if program.compiler == "clang" else [toolchain() / "arm-none-eabi-gcc", *core.gcc]
+    flags = [*compiler, f"-{program.opt}", "-g", "-ffreestanding", *sections,
              "-fno-common", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-w", *program.flags]
 
     def compile_unit(source):
@@ -305,17 +302,20 @@ def build(name, program):
         if obj.exists():
             raise RuntimeError(f"two translation units are named {source.stem}")
         unit = [flag.format(stem=source.stem.replace("-", "_")) for flag in program.unit_flags] if root in source.parents else []
-        run(["clang", *flags, *include, *unit, f"-I{source.parent}", "-c", source, "-o", obj])
+        run([*flags, *include, *unit, f"-I{source.parent}", "-c", source, "-o", obj])
         return obj
 
     with ThreadPoolExecutor(JOBS) as pool:
         objects = list(pool.map(compile_unit, sources))
     script = work / "link.ld"
-    script.write_text(LINKER_SCRIPT.format(flash=core.flash, ram=RAM, fill="=0" if program.gnu_layout else ""))
+    script.write_text(LINKER_SCRIPT.format(flash=core.flash, ram=RAM))
     elf = work / f"{name}.elf"
-    run([linker(), "-flavor", "gnu", "-T", script, "--gc-sections", "-o", elf, *objects, builtins(program.core)])
+    # GCC as the linker's driver adds libgcc and the C library of the core's multilib.
+    gc = [] if program.vendor else ["-Wl,--gc-sections"]
+    run([toolchain() / "arm-none-eabi-gcc", *core.gcc, "--specs=nano.specs", "-nostartfiles", "-T", script, *gc,
+         "-o", elf, *objects, "-lm"])
     image = CORPUS / "image" / f"{name}.bin"
-    run(["llvm-objcopy", "-O", "binary", elf, image])
+    run([toolchain() / "arm-none-eabi-objcopy", "-O", "binary", elf, image])
     shutil.copy(elf, CORPUS / "debug" / f"{name}.debug")
     size = image.stat().st_size
     (CORPUS / "bin" / f"{name}.toml").write_text(
@@ -333,13 +333,13 @@ def main():
     failed = 0
     for name in names:
         if not force and (CORPUS / "bin" / f"{name}.toml").exists():
-            print(f"{name:20} already built", flush=True)
+            print(f"{name:32} already built", flush=True)
             continue
         try:
-            print(f"{name:20} {build(name, PROGRAMS[name]) / 1e3:.1f} kB", flush=True)
+            print(f"{name:32} {build(name, PROGRAMS[name]) / 1e3:.1f} kB", flush=True)
         except Exception as error:
             failed += 1
-            print(f"{name:20} FAILED: {error}", flush=True)
+            print(f"{name:32} FAILED: {error}", flush=True)
     sys.exit(1 if failed else 0)
 
 
