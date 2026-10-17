@@ -103,7 +103,7 @@ Scored against debug information, on the same binaries as Ghidra. Mach-O binarie
 | | Ghidra | 99.7% | 97.1% | 487 of 535 |
 | Linux AArch64 | recore | 100.0% | 99.9% | |
 | | Ghidra | 100.0% | 99.9% | |
-| Linux 32-bit ARM, armhf | recore | 99.1% | 99.6% | 5,090 of 5,158 |
+| Linux 32-bit ARM, armhf | recore | 99.1% | 99.7% | 5,090 of 5,158 |
 | | Ghidra | 64.3% | 99.8% | 4,123 of 5,158 |
 | Linux 32-bit ARM, armel | recore | 99.0% | 99.6% | 5,252 of 5,323 |
 | | Ghidra | 55.1% | 99.7% | 3,821 of 5,323 |
@@ -120,7 +120,7 @@ Scored against debug information, on the same binaries as Ghidra. Mach-O binarie
 | x86-64 Mach-O, function starts hidden | recore | 99.2% | 99.2% | |
 | | Ghidra | 72.0% | 98.2% | |
 
-The two 32-bit ARM corpora are the Debian builds of the same packages as the others. armhf is Thumb-2, with A32 in the PLT, in the C runtime and in all the Rust code. armel is A32 throughout. Their truth is the symbol table of each debug file, where `$a`, `$t` and `$d` symbols say what each byte is, and their jump tables are the ones GCC and clang dispatch to in five ways, each kept only where every case is an instruction of its function. A dispatch that runs only for an index in range, as GCC's `ADDLS PC, PC, Rm, LSL #2`, falls through to its default, and both the truth and recore count the instruction after it as a case. A stripped binary has no such symbols, and recore tells A32 from Thumb by the bit ARM sets on every pointer to Thumb code: it puts 99.96% of armhf functions and every armel one in the right instruction set. Ghidra took 96 minutes of analysis over the 152 binaries, with 4 cores each, and recore 7 seconds on one core. The rules that find them were worked out on these binaries. On 58 more, from 14 packages a router or an IoT device carries (BusyBox, Dropbear, dnsmasq, hostapd, wpa_supplicant, iptables, OpenVPN, lighttpd, Mosquitto and others), scored once, recore finds 99.1% of armhf functions at 99.7% precision and 98.7% of armel ones at 99.4%, with 1,081 of 1,091 and 1,079 of 1,104 jump tables exact. Of the functions Ghidra misses, recore first finds a third through a pointer in data, a quarter through `.ARM.exidx`, a fifth in the gaps between functions, where Debian's builds keep library code nothing calls, and a tenth through an address the code computes.
+The two 32-bit ARM corpora are the Debian builds of the same packages as the others. armhf is Thumb-2, with A32 in the PLT, in the C runtime and in all the Rust code. armel is A32 throughout. Their truth is the symbol table of each debug file, where `$a`, `$t` and `$d` symbols say what each byte is, and their jump tables are the ones GCC and clang dispatch to in five ways, each kept only where every case is an instruction of its function. A dispatch that runs only for an index in range, as GCC's `ADDLS PC, PC, Rm, LSL #2`, falls through to its default, and both the truth and recore count the instruction after it as a case. A stripped binary has no such symbols, and recore tells A32 from Thumb by the bit ARM sets on every pointer to Thumb code: it puts 99.96% of armhf functions and every armel one in the right instruction set. Ghidra took 96 minutes of analysis over the 152 binaries, with 4 cores each, and recore 7 seconds on one core. The rules that find them were worked out on these binaries. On 58 more, from 14 packages a router or an IoT device carries (BusyBox, Dropbear, dnsmasq, hostapd, wpa_supplicant, iptables, OpenVPN, lighttpd, Mosquitto and others), scored once, recore finds 99.1% of armhf functions at 99.8% precision and 98.7% of armel ones at 99.4%, with 1,081 of 1,091 and 1,079 of 1,104 jump tables exact. Of the functions Ghidra misses, recore first finds a third through a pointer in data, a quarter through `.ARM.exidx`, a fifth in the gaps between functions, where Debian's builds keep library code nothing calls, and a tenth through an address the code computes.
 
 The Linux AArch64 and Mach-O corpora have no jump table truth. A stripped Mach-O binary keeps the linker's list of function starts and both tools read it, so the rows with it hidden show what each finds on its own.
 
@@ -190,18 +190,18 @@ A Cortex-M layout needs only `machine = "cortex-m"` and its flash region. recore
 
 | Cortex-M | | Functions found | Precision | Jump tables exact |
 |---|---|---|---|---|
-| 27 programs, clang | recore | 98.7% | 95.0% | 119 of 119 |
+| 27 programs, clang | recore | 98.7% | 98.9% | 119 of 119 |
 | | Ghidra | 86.2% | 96.9% | 112 of 119 |
-| 27 programs, GCC | recore | 99.0% | 94.8% | 41 of 41 |
+| 27 programs, GCC | recore | 99.0% | 99.1% | 41 of 41 |
 | | Ghidra | 87.5% | 98.1% | 36 of 41 |
-| 12 vendor-style builds, clang | recore | 98.3% | 95.8% | 57 of 57 |
-| | Ghidra | 69.5% | 97.6% | 49 of 57 |
-| 12 vendor-style builds, GCC | recore | 99.2% | 95.2% | 27 of 28 |
-| | Ghidra | 64.0% | 98.0% | 15 of 28 |
+| 12 vendor-style builds, clang | recore | 98.3% | 98.9% | 57 of 57 |
+| | Ghidra | 69.3% | 97.7% | 49 of 57 |
+| 12 vendor-style builds, GCC | recore | 99.2% | 98.9% | 27 of 28 |
+| | Ghidra | 63.8% | 98.0% | 15 of 28 |
 
-recore analyzes all 78 in 128 ms, none taking more than 4 ms. Most of the functions Ghidra misses are reached only by a tail call, by an address the code builds with `MOVW` and `MOVT`, or, in the vendor-style builds, by nothing at all. recore finds those by dividing the unreached code between functions into whole functions. Its precision is lower than Ghidra's because of libgcc's hand-written assembly, which every program links. Of the 325 starts recore puts inside a function, 298 are in libgcc's floating point and division routines, where `__aeabi_ddiv` branches into the end of `__aeabi_dmul` and Thumb-1 division leaves a `BX LR` after its last branch. Ghidra splits these two routines as well, with two starts inside them per program to recore's five. GCC's Thumb-1 switches call libgcc's `__gnu_thumb1_case_*` helpers with the table after the call, and recore reads all 15 of those tables.
+recore analyzes all 78 in 103 ms, none taking more than 2 ms. Most of the functions Ghidra misses are reached only by a tail call, by an address the code builds with `MOVW` and `MOVT`, or, in the vendor-style builds, by nothing at all. recore finds those by dividing the unreached code between functions into whole functions. libgcc's hand-written floating point shares code between routines. `__aeabi_ddiv` jumps into the end of `__aeabi_dmul`, and both reach their special cases with `BLEQ`. recore gives such code to the routine whose stack frame it pops. Of the 77 starts it still puts inside a function, 64 are a `BX LR` that Thumb-1 division leaves after its last branch, which looks the same as an empty function. GCC's Thumb-1 switches call libgcc's `__gnu_thumb1_case_*` helpers with the table after the call, and recore reads all 15 of those tables.
 
-All but 5 of the 7,757 functions recore finds decompile, in 3.7 ms on average, and those 5 are data it took for code. Against DWARF the number of parameters is right for 85.9% of the C functions clang built and 80.2% of those GCC built. GCC saves a spare register to keep the stack aligned, as in `PUSH {R3, R4, R5, LR}`, and the decompiler takes the saved `R3` for a fourth argument. The System Control Space registers, such as `SYST_RVR` and the NVIC's, are named without a names file.
+All 7,478 functions recore finds decompile, in 3.8 ms on average. Against DWARF the number of parameters is right for 85.9% of the C functions clang built and 84.7% of those GCC built. The System Control Space registers, such as `SYST_RVR` and the NVIC's, are named without a names file.
 
 ## What Ghidra does that recore does not
 
