@@ -1068,6 +1068,17 @@ int rd_register_at(RdSession *session, uint64_t addr, char *err, size_t errlen) 
   });
 }
 
+// Gives the context variable `name` the value `value` over the code from `start` up to `end`,
+// or to the end of the address space where `end` is 0: how the instructions there are decoded,
+// as ARM's TMode says Thumb or A32.
+int rd_set_context(RdSession *session, const char *name, uint64_t start, uint64_t end, uint32_t value, char *err,
+                   size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Address to = end == 0 ? Address() : session->address(end);
+    session->arch->context->setVariableRegion(name, session->address(start), to, value);
+  });
+}
+
 // Says that the `len` bytes of code at `addr` are those at `target`: reading them reads those,
 // and a jump or call into them goes to the code at `target`.
 void rd_mirror(RdSession *session, uint64_t addr, uint64_t len, uint64_t target) {

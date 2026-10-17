@@ -195,7 +195,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     session.add_strings(&analysis)?;
     session.add_classes(&analysis)?;
     session.add_objc(&image)?;
-    let recores = image.format == Format::Pe || matches!(image.machine, Machine::I8051 | Machine::Thumb);
+    let recores = image.format == Format::Pe || matches!(image.machine, Machine::I8051 | Machine::Thumb | Machine::Arm);
     if options.jump_tables == JumpTables::Recore || (options.jump_tables == JumpTables::Auto && recores) {
         session.override_jump_tables(&analysis, &facts)?;
     }

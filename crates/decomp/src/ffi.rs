@@ -147,6 +147,7 @@ unsafe extern "C" {
     pub fn rd_session_free(session: *mut RdSession);
     pub fn rd_map_space(session: *mut RdSession, base: u64, name: *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_register_at(session: *mut RdSession, addr: u64, err: *mut c_char, errlen: usize) -> i32;
+    pub fn rd_set_context(session: *mut RdSession, name: *const c_char, start: u64, end: u64, value: u32, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_mirror(session: *mut RdSession, addr: u64, len: u64, target: u64);
     pub fn rd_redirect(session: *mut RdSession, from: u64, to: u64);
     pub fn rd_call_switches(session: *mut RdSession, call: u64, selector: *const c_char, assist: *const c_char, count: u64, list: u64, err: *mut c_char, errlen: usize) -> i32;
