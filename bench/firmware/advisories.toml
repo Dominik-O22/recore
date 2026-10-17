@@ -10,6 +10,8 @@
 # needs names what has to be compiled in for the code to be there at all:
 #   variant:<names>  the installed package is one of these build variants (dnsmasq, dnsmasq-full, ...);
 #   busybox:<SYMBOL> the BusyBox option is on in the tree's Config-defaults.in.
+# built names the option in dnsmasq's list of compile options, `no-<option>` when it is left out,
+# which the labeller checks against the variant rule in every binary.
 # text is what an agent is given: the published description, without the fix commit.
 # tell is a string the fix adds, where one decides the cell, so results can leave those cells out.
 # Fix versions were read from each project's CHANGELOG or from `git tag --contains <fix>`.
@@ -28,6 +30,7 @@ files = ["usr/sbin/dnsmasq"]
 fixed = "2.83"
 backport = "Fix-remote-buffer-overflow-CERT-VU-434904"
 needs = "variant:dnsmasq-full"
+built = "DNSSEC"
 text = "A flaw was found in dnsmasq before version 2.83. A heap-based buffer overflow was discovered in the way RRSets are sorted before validating with DNSSEC data. An attacker on the network, who can forge DNS replies such as that they are accepted as valid, could use this flaw to cause a buffer overflow with arbitrary data in a heap memory segment, possibly executing code on the machine."
 
 [[advisory]]
@@ -61,6 +64,7 @@ files = ["usr/sbin/dnsmasq"]
 fixed = "2.87"
 backport = "CVE-2022-0934"
 needs = "variant:dnsmasq-dhcpv6,dnsmasq-full"
+built = "DHCPv6"
 text = "A single-byte, non-arbitrary write/use-after-free flaw was found in dnsmasq. This flaw allows an attacker who sends a crafted packet processed by dnsmasq, potentially causing a denial of service."
 
 [[advisory]]
