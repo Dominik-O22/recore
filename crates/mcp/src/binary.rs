@@ -9,7 +9,8 @@ use recore::Image;
 use recore::edits::Edits;
 use recore::program::Program;
 use recore_decomp::isolate::{FunctionRecord, Options, Worker};
-use recore_decomp::{Flow, Instruction, Local};
+use recore::structs::Recovered;
+use recore_decomp::{Flow, Instruction, Local, StructReport};
 
 /// How long the decompiler process gets for a request that is not a decompilation.
 pub const QUICK: Duration = Duration::from_secs(30);
@@ -59,8 +60,10 @@ impl Binary {
         Ok(Binary { path: path.to_path_buf(), stamp, program, edits, found_names, analysis_ms, worker })
     }
 
-    /// Changes the binary's edits and saves them. The decompiler process is replaced by one that
-    /// starts from the new edits, so the next decompilation waits for it to set up again.
+    /// Changes the binary's edits and saves them. The decompiler process takes names, comments
+    /// and named structs as it runs. A declaration, a type, a name taken away or a struct whose
+    /// layout grows replaces it with one that starts from the new edits, so the next
+    /// decompilation waits for it to set up again.
     pub fn edit(&mut self, change: impl FnOnce(&mut Edits)) -> Result<()> {
         let mut edits = self.edits.clone();
         change(&mut edits);
@@ -70,7 +73,7 @@ impl Binary {
             function.name.clone_from(found);
         }
         self.edits.apply(&mut self.program.analysis);
-        self.worker.restart();
+        self.worker.update(&self.edits, QUICK);
         Ok(())
     }
 
@@ -107,6 +110,18 @@ impl Binary {
     /// The variables of the function at `addr`, which costs one decompilation.
     pub fn locals(&mut self, addr: u64, timeout: Duration) -> Result<Vec<Local>> {
         self.worker.locals(addr, timeout).map_err(anyhow::Error::msg)
+    }
+
+    /// The struct the decompiler recovered under the name `name` and those it points to. Its
+    /// function is decompiled first if the decompiler process has not.
+    pub fn recovered(&mut self, name: &str) -> Result<Recovered> {
+        self.worker.recovered(name, QUICK).map_err(anyhow::Error::msg)
+    }
+
+    /// What struct recovery made of the objects the function at `addr` reaches through its
+    /// pointers, which costs one decompilation.
+    pub fn structs(&mut self, addr: u64, timeout: Duration) -> Result<StructReport> {
+        self.worker.structs(addr, timeout).map_err(anyhow::Error::msg)
     }
 
     /// Checks a C declaration against the decompiler without saving it.

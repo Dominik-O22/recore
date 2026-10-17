@@ -3,7 +3,9 @@
 use std::fmt::Write;
 
 use anyhow::{Context, Result, bail, ensure};
+use recore::edits::Edits;
 use recore::program::{Pattern, matches};
+use recore::structs::{Recovered, Slot, auto_function, field_name};
 use serde::Deserialize;
 
 use crate::binary::{Binary, QUICK};
@@ -32,6 +34,11 @@ enum Named {
     Address(u64),
     /// A variable of the function at `function`, at the place the decompiler reports for it.
     Local { function: u64, place: String, was: String },
+    /// A struct by the name it has now, with its recovered tree when the edits do not keep it
+    /// yet.
+    Struct { name: String, recovered: Option<Recovered> },
+    /// A field of a struct, by its name now.
+    Field { name: String, recovered: Option<Recovered>, field: String },
 }
 
 /// Checks that `addr` can carry a name: a function entry, or data.
@@ -63,6 +70,55 @@ fn local(binary: &mut Binary, function: &str, var: &str, name: &str) -> Result<N
     Ok(Named::Local { function, place: found.place.clone(), was: var.to_string() })
 }
 
+/// The struct, or with `Struct.field` the field, that `text` names: one the edits keep, or
+/// one the decompiler recovered, by the name `decompile` prints. None for anything else.
+fn struct_target(binary: &mut Binary, text: &str) -> Result<Option<Named>> {
+    let (name, field) = match text.split_once('.') {
+        Some((name, field)) => (name, Some(field)),
+        None => (text, None),
+    };
+    let kept = binary.edits.structs.contains_key(name);
+    if !kept && auto_function(name).is_none() {
+        ensure!(field.is_none(), "there is no struct `{name}`");
+        return Ok(None);
+    }
+    let recovered = if kept { None } else { Some(binary.recovered(name)?) };
+    Ok(Some(match field {
+        Some(field) => Named::Field { name: name.to_string(), recovered, field: field.to_string() },
+        None => Named::Struct { name: name.to_string(), recovered },
+    }))
+}
+
+/// Gives the struct `name` the name `new` in `edits`, keeping its recovered tree first if
+/// `recovered` holds one, and says what happened.
+fn name_struct(binary: &mut Binary, edits: &mut Edits, name: &str, recovered: Option<&Recovered>, new: &str) -> Result<String> {
+    ensure!(!new.is_empty(), "a struct keeps a name; give it another");
+    // A type of the engine's, or one declared in C, would be shadowed.
+    if !edits.structs.contains_key(new) && binary.type_layout(new).is_ok() {
+        bail!("the decompiler already has a type `{new}`");
+    }
+    let mut out = String::new();
+    if let Some(recovered) = recovered {
+        edits.adopt(recovered);
+        write!(out, "{name} is now {new}, the struct {:#x} is passed in {}", recovered.function, recovered.slot)?;
+        let others: Vec<&str> = recovered.structs.iter().map(|(other, _)| other.as_str()).filter(|other| *other != name).collect();
+        if !others.is_empty() {
+            write!(out, "; kept with it under the names they have: {}", others.join(", "))?;
+        }
+    } else {
+        write!(out, "{name} is now {new}")?;
+    }
+    if let Some(joined) = edits.name_struct(name, new)? {
+        let added: Vec<String> = joined.after.fields().iter().filter(|(offset, _)| !joined.before.fields().contains_key(offset)).map(|(&offset, field)| format!("+{offset:#x} {}", field_name(offset, field))).collect();
+        out = format!("{name} joins {new}: ");
+        out += &if added.is_empty() { "adds no field".to_string() } else { format!("adds {}", added.join(", ")) };
+        if joined.after.size() != joined.before.size() {
+            write!(out, "; {new} grows from {:#x} to {:#x} bytes", joined.before.size(), joined.after.size())?;
+        }
+    }
+    Ok(out)
+}
+
 pub fn rename(binary: &mut Binary, args: Rename) -> Result<String> {
     let mut namings = args.names;
     match (args.addr, args.name) {
@@ -77,47 +133,69 @@ pub fn rename(binary: &mut Binary, args: Rename) -> Result<String> {
         ensure!(!name.chars().any(char::is_control), "a name cannot contain control characters");
         let named = match &naming.var {
             Some(var) => local(binary, &naming.addr, var.trim(), name)?,
-            None => {
-                let addr = addr_arg(&naming.addr)?;
-                nameable(binary, addr)?;
-                // Two functions under one name could not be told apart where a name is asked for.
-                if let Some(other) = binary.program.functions().find(|function| function.addr != addr && function.name.as_deref() == Some(name)) {
-                    bail!("{:#x} is already called `{name}`", other.addr);
+            None => match struct_target(binary, naming.addr.trim())? {
+                Some(named) => named,
+                None => {
+                    let addr = addr_arg(&naming.addr)?;
+                    nameable(binary, addr)?;
+                    // Two functions under one name could not be told apart where a name is asked for.
+                    if let Some(other) = binary.program.functions().find(|function| function.addr != addr && function.name.as_deref() == Some(name)) {
+                        bail!("{:#x} is already called `{name}`", other.addr);
+                    }
+                    Named::Address(addr)
                 }
-                Named::Address(addr)
-            }
+            },
         };
         changes.push((named, name.to_string()));
     }
-    binary.edit(|edits| {
-        for (named, name) in &changes {
-            match named {
-                Named::Address(addr) if name.is_empty() => drop(edits.names.remove(addr)),
-                Named::Address(addr) => drop(edits.names.insert(*addr, name.clone())),
-                Named::Local { function, place, .. } => {
-                    let names = edits.locals.entry(*function).or_default();
-                    if name.is_empty() {
-                        names.remove(place);
-                    } else {
-                        names.insert(place.clone(), name.clone());
-                    }
-                    if names.is_empty() {
-                        edits.locals.remove(function);
-                    }
-                }
-            }
-        }
-    })?;
-    let mut out = String::new();
+    // Struct changes depend on each other and may be refused, so all apply to a copy first.
+    let mut edits = binary.edits.clone();
+    let mut said: Vec<Option<String>> = Vec::new();
     for (named, name) in &changes {
-        match (named, name.as_str()) {
-            (Named::Address(addr), "") => writeln!(out, "{addr:#x} has the name the analysis gives it again: {}", describe(binary, *addr))?,
-            (Named::Address(addr), name) => writeln!(out, "{addr:#x} is now {name}")?,
-            (Named::Local { function, was, .. }, "") => writeln!(out, "{was} in {} has the name the decompiler gives it again", binary.program.label(*function))?,
-            (Named::Local { function, was, .. }, name) => writeln!(out, "{was} in {} is now {name}", binary.program.label(*function))?,
+        said.push(match named {
+            Named::Address(addr) => {
+                if name.is_empty() {
+                    edits.names.remove(addr);
+                } else {
+                    edits.names.insert(*addr, name.clone());
+                }
+                None
+            }
+            Named::Local { function, place, .. } => {
+                let names = edits.locals.entry(*function).or_default();
+                if name.is_empty() {
+                    names.remove(place);
+                } else {
+                    names.insert(place.clone(), name.clone());
+                }
+                if names.is_empty() {
+                    edits.locals.remove(function);
+                }
+                None
+            }
+            Named::Struct { name: old, recovered } => Some(name_struct(binary, &mut edits, old, recovered.as_ref(), name)?),
+            Named::Field { name: owner, recovered, field } => {
+                if let Some(recovered) = recovered {
+                    edits.adopt(recovered);
+                }
+                edits.name_field(owner, field, name)?;
+                Some(if name.is_empty() { format!("{owner}.{field} has its first name again") } else { format!("{owner}.{field} is now {name}") })
+            }
+        });
+    }
+    binary.edit(|saved| *saved = edits)?;
+    let mut out = String::new();
+    for ((named, name), said) in changes.iter().zip(said) {
+        match (named, name.as_str(), said) {
+            (_, _, Some(said)) => writeln!(out, "{said}")?,
+            (Named::Address(addr), "", _) => writeln!(out, "{addr:#x} has the name the analysis gives it again: {}", describe(binary, *addr))?,
+            (Named::Address(addr), name, _) => writeln!(out, "{addr:#x} is now {name}")?,
+            (Named::Local { function, was, .. }, "", _) => writeln!(out, "{was} in {} has the name the decompiler gives it again", binary.program.label(*function))?,
+            (Named::Local { function, was, .. }, name, _) => writeln!(out, "{was} in {} is now {name}", binary.program.label(*function))?,
+            (Named::Struct { .. } | Named::Field { .. }, _, None) => unreachable!("struct changes say what they did"),
         }
     }
-    writeln!(out, "saved; the decompiler is starting again with the new names")?;
+    writeln!(out, "saved; later answers use the new names")?;
     Ok(out)
 }
 
@@ -185,7 +263,20 @@ pub struct Type {
 
 pub fn type_(binary: &mut Binary, args: Type) -> Result<String> {
     if let Some(name) = args.name {
-        return binary.type_layout(name.trim()).with_context(|| format!("the decompiler knows no type `{name}`"));
+        let name = name.trim();
+        let layout = match binary.type_layout(name) {
+            // A recovered struct the decompiler process has not met yet: its function says it.
+            Err(_) if auto_function(name).is_some() => {
+                binary.recovered(name)?;
+                binary.type_layout(name)
+            }
+            layout => layout,
+        };
+        let mut out = layout.with_context(|| format!("the decompiler knows no type `{name}`"))?;
+        for (function, slot) in holders(&binary.edits, name) {
+            writeln!(out, "{} is passed it in {slot}", binary.program.label(function))?;
+        }
+        return Ok(out);
     }
     let mut out = String::new();
     writeln!(out, "{} declarations made with `declare`:", binary.edits.declarations.len())?;
@@ -196,8 +287,19 @@ pub fn type_(binary: &mut Binary, args: Type) -> Result<String> {
     for (addr, kind) in &binary.edits.types {
         writeln!(out, "{addr:#x} {kind}")?;
     }
-    writeln!(out, "Give `name` to see the layout of one type, declared or built in.")?;
+    writeln!(out, "{} structs kept with `rename`:", binary.edits.structs.len())?;
+    for (name, layout) in &binary.edits.structs {
+        let held: Vec<String> = holders(&binary.edits, name).map(|(function, slot)| format!("{} in {slot}", binary.program.label(function))).collect();
+        let held = if held.is_empty() { String::new() } else { format!(", passed to {}", held.join(", ")) };
+        writeln!(out, "{name}, {:#x} bytes, {} fields{held}", layout.size(), layout.fields().len())?;
+    }
+    writeln!(out, "Give `name` to see the layout of one type, declared, kept or built in.")?;
     Ok(out)
+}
+
+/// The functions passed a pointer to the kept struct `name`, each with the slot.
+fn holders<'a>(edits: &'a Edits, name: &'a str) -> impl Iterator<Item = (u64, &'a Slot)> {
+    edits.holders.iter().flat_map(move |(&function, slots)| slots.iter().filter(move |(_, held)| *held == name).map(move |(slot, _)| (function, slot)))
 }
 
 #[derive(Deserialize)]

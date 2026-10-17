@@ -12,7 +12,7 @@ const NUMERIC: [&str; 9] = ["limit", "len", "timeout", "count", "param", "arg", 
 /// Options that may be given again and again, and reach the tool as a list.
 const REPEATED: [&str; 4] = ["args", "set", "read", "dump"];
 /// Options that are on or off.
-const FLAGS: [&str; 4] = ["pcode", "returns", "full", "addresses"];
+const FLAGS: [&str; 5] = ["pcode", "returns", "full", "addresses", "refused"];
 
 pub fn usage() -> String {
     let mut text = String::from(
@@ -64,7 +64,7 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
         // Separated by spaces or by commas.
         ("decompile", functions) => drop(named.insert("functions".into(), json!(functions.iter().flat_map(|listed| listed.split(',')).filter(|function| !function.is_empty()).collect::<Vec<_>>()))),
         ("strings" | "imports" | "functions" | "classes" | "symbols", [pattern]) => drop(named.insert("pattern".into(), json!(pattern))),
-        ("disassemble" | "pcode" | "trace", [function]) => drop(named.insert("function".into(), json!(function))),
+        ("disassemble" | "pcode" | "trace" | "structs", [function]) => drop(named.insert("function".into(), json!(function))),
         // The function, then its arguments: numbers, or `hex:`, `str:` and `buf:` for memory.
         ("run", [function, args @ ..]) if !named.contains_key("function") => {
             named.insert("function".into(), json!(function));

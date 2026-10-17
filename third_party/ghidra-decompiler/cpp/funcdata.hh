@@ -139,6 +139,8 @@ public:
   ~Funcdata(void);							///< Destructor
   const string &getName(void) const { return name; }			///< Get the function's local symbol name
   const string &getDisplayName(void) const { return displayName; }	///< Get the name to display in output
+  // recore: renames the function after it was made, as Scope::renameSymbol does its symbol.
+  void setName(const string &nm) { name = nm; displayName = nm; }
   const Address &getAddress(void) const { return baseaddr; }		///< Get the entry point address
   int4 getSize(void) const { return size; }				///< Get the function body size in bytes
   Architecture *getArch(void) const { return glb; }			///< Get the program/architecture owning \b this function
