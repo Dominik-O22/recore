@@ -808,6 +808,7 @@ impl Arch for Arm {
                 let body = insn.data_processing().is_some_and(|(.., rd, _)| rd != PC);
                 (insn.probes_stack() || body) && second.saves_return()
             }
+            (Insn::A32(insn), None) => insn.saves_return() || insn.probes_stack(),
             (Insn::A32(insn), _) => insn.saves_return(),
             (Insn::Thumb(insn), Some(Insn::Thumb(second))) => Thumb::opens_function(insn, Some(second)),
             (Insn::Thumb(insn), _) => Thumb::opens_function(insn, None),

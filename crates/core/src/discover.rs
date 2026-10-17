@@ -449,6 +449,14 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 // between functions, not after a call that falls through.
                 let clock = self.clock;
                 self.regions[index].touch(offset, clock);
+                // Nor does a function save the return address after it called, which it saved
+                // before: what does so after a call opens the next function, where code is not
+                // tiled and no padding marks where it starts.
+                if after_call && A::LITERAL_POOLS && !A::TILES_GAPS && decoded.insn.is_some_and(|insn| A::opens_function(insn, None)) {
+                    self.regions[index].insn_len[offset] = 0;
+                    self.regions[index].flags[offset] |= FOLLOWS_BREAK;
+                    break;
+                }
                 let Some(insn) = decoded.insn.filter(|insn| !(after_call && A::ends_code(insn))) else {
                     self.regions[index].insn_len[offset] = 0;
                     break;
