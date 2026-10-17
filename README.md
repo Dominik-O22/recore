@@ -90,7 +90,7 @@ Opus 5.5 is left out: in three sessions its safeguards stopped the response afte
 
 The analysis is written from scratch in Rust: loading, function discovery, calls that never return, jump tables, strings, references, library function names by fingerprint, and C++, Objective-C and Swift classes with their methods. The C comes from Ghidra's decompiler engine, compiled into recore and fed recore's analysis instead of Ghidra's.
 
-It reads ELF, Windows PE and Mach-O for x86, x86-64 and AArch64, and raw firmware that a layout file describes: 8051 and ARM Cortex-M.
+It reads ELF, Windows PE and Mach-O for x86, x86-64 and AArch64, ELF for 32-bit ARM, A32 and Thumb-2 side by side, and raw firmware that a layout file describes: 8051 and ARM Cortex-M.
 
 ## Fast is not sloppy
 
@@ -102,6 +102,10 @@ Scored against debug information, on the same binaries as Ghidra. Mach-O binarie
 | | Ghidra | 99.7% | 97.1% | 487 of 535 |
 | Linux AArch64 | recore | 100.0% | 99.9% | |
 | | Ghidra | 100.0% | 99.9% | |
+| Linux 32-bit ARM, armhf | recore | 99.1% | 99.6% | 5,090 of 5,161 |
+| | Ghidra | 64.3% | 99.8% | 4,123 of 5,161 |
+| Linux 32-bit ARM, armel | recore | 99.0% | 99.6% | 5,252 of 5,323 |
+| | Ghidra | 55.1% | 99.7% | 3,821 of 5,323 |
 | Windows x86 | recore | 99.3% | 98.8% | 6,244 of 6,277 |
 | | Ghidra | 83.1% | 98.5% | 5,834 of 6,277 |
 | Windows x86-64 | recore | 99.8% | 98.2% | 3,151 of 3,159 |
@@ -114,6 +118,8 @@ Scored against debug information, on the same binaries as Ghidra. Mach-O binarie
 | | Ghidra | 99.9% | 99.1% | |
 | x86-64 Mach-O, function starts hidden | recore | 99.2% | 99.2% | |
 | | Ghidra | 72.0% | 98.2% | |
+
+The two 32-bit ARM corpora are the Debian builds of the same packages as the others. armhf is Thumb-2, with A32 in the PLT, in the C runtime and in all the Rust code. armel is A32 throughout. Their truth is the symbol table of each debug file, where `$a`, `$t` and `$d` symbols say what each byte is, and their jump tables are the ones GCC and clang dispatch to in five ways, each kept only where every case is an instruction of its function. A stripped binary has no such symbols, and recore tells A32 from Thumb by the bit ARM sets on every pointer to Thumb code: it puts 99.96% of armhf functions and every armel one in the right instruction set. Ghidra took 96 minutes of analysis over the 152 binaries, with 4 cores each, and recore 7 seconds on one core. Of the functions Ghidra misses, recore first finds a third through a pointer in data, a quarter through `.ARM.exidx`, a fifth in the gaps between functions, where Debian's builds keep library code nothing calls, and a tenth through an address the code computes.
 
 The Linux AArch64 and Mach-O corpora have no jump table truth. A stripped Mach-O binary keeps the linker's list of function starts and both tools read it, so the rows with it hidden show what each finds on its own.
 
@@ -130,9 +136,11 @@ Decompiled function signatures against PDB records, 8 binaries per corpus:
 
 Each tool's percentages are over the functions it decompiled, and recore decompiles more of them. On the 8,523 32-bit functions both decompiled, recore gets the parameters of 86.5% right and Ghidra 86.1%.
 
+Against DWARF, on six programs of each Linux ARM corpus, recore gets the parameter count right for 72.4% of armhf functions and 72.8% of armel ones, and for 75.8% of arm64 ones on the same programs. In C code that is 85.4%, 85.0% and 92.7%. A 64-bit argument takes two registers on 32-bit ARM, which is part of the gap.
+
 References from code to data have no ground truth, so they are scored against Ghidra's own, on 11 binaries: recore finds 96.6% of them on Linux x86-64, 91.8% on Windows x86, 96.0% on Windows x86-64 and 85.2% on Linux AArch64. Most of the rest are a later element or field of an object recore refers to the start of, which Ghidra reaches by following a loop or a constant index.
 
-With unwind tables hidden, recore finds 99.8% of functions on Linux x86-64 and 99.2% on Linux AArch64. It finds every C++ class that has type information in the Linux and macOS corpora, 13,952 of them, at the right vtable address.
+With unwind tables hidden, recore finds 99.8% of functions on Linux x86-64 and 99.2% on Linux AArch64. 32-bit ARM C code has no unwind table to hide, and its C++ and Rust code has `.ARM.exidx`. With that hidden, recore finds 98.6% on armhf and 98.3% on armel, and takes many landing pads of the C++ and Rust code for functions, at 95.0% and 78.4% precision. A binary with landing pads keeps the table, since unwinding needs it. It finds every C++ class that has type information in the Linux and macOS corpora, 13,952 of them, at the right vtable address.
 
 ## Firmware
 
@@ -183,14 +191,14 @@ A Cortex-M layout needs only `machine = "cortex-m"` and its flash region. recore
 |---|---|---|---|---|
 | 27 programs | recore | 99.9% | 100.0% | 119 of 119 |
 | | Ghidra | 91.5% | 98.6% | 112 of 119 |
-| 12 vendor-style builds | recore | 99.2% | 99.9% | 57 of 59 |
+| 12 vendor-style builds | recore | 99.3% | 99.9% | 57 of 59 |
 | | Ghidra | 66.8% | 98.6% | 49 of 59 |
 
 recore analyzes all 39 in 55 ms, none taking more than 3 ms. Most of the functions Ghidra misses are reached only by a tail call, by an address the code builds with `MOVW` and `MOVT`, or, in the vendor-style builds, by nothing at all. recore finds those by dividing the unreached code between functions into whole functions. Every function decompiles, in 3 ms on average, and against DWARF the number of parameters is right for 86.7% of the C functions. The System Control Space registers, such as `SYST_RVR` and the NVIC's, are named without a names file. The corpus has no GCC-built code, because no ARM GCC was at hand. GCC's Thumb-1 switch helpers are recognised, and tested only on hand-assembled code.
 
 ## What Ghidra does that recore does not
 
-- **Processors.** Ghidra covers dozens. recore covers five.
+- **Processors.** Ghidra covers dozens. recore covers six.
 - **Types.** Ghidra ships struct layouts for the common libraries and lets a user edit types in a GUI. recore knows the types a caller declares, the prototypes of Windows, C library and macOS functions, classes from MSVC and Itanium type information and Objective-C metadata, and, when a binary has DWARF or a PDB, the structs, prototypes and globals in it. Without debug info, recore gives each pointer parameter a function reads fields through a struct of those fields, so the C reads `param_1->field_0x28`. Ghidra prints `*(long *)(param_1 + 0x28)` until a user creates the struct. `rename` names a recovered struct and its fields and saves them, and giving two functions' structs one name makes them one type.
 - **A GUI**, a debugger, scripting, and a database of everything it found.
 
@@ -226,7 +234,7 @@ For Claude Code, in `.mcp.json`:
 
 ## Reproducing the numbers
 
-The corpora are not in the repository. `corpus/fetch*.py` download them, except the monitor firmware, a vendor's image that is not ours to share, `corpus/build_8051.py` builds the 8051 programs with SDCC, `corpus/build_thumb.py` the Cortex-M ones with clang, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. `recore-bench run analysis --save <name>` and `--compare <name>` hold a change against an earlier build. Next to the times they report the processor instructions executed, which stay the same to a few hundredths of a percent whatever else the machine is doing.
+The corpora are not in the repository. `corpus/fetch*.py` download them, except the monitor firmware, a vendor's image that is not ours to share, `corpus/build_8051.py` builds the 8051 programs with SDCC, `corpus/build_thumb.py` the Cortex-M ones with clang, `ghidra/run-reference.sh` runs Ghidra over them and records its times, and `check.sh` analyzes and scores them with recore. Ghidra refuses a project path that has a part starting with a dot. `ghidra/run-refs.sh` and `recore-corpus score-references` produce the reference comparison. `recore-bench run analysis --save <name>` and `--compare <name>` hold a change against an earlier build. Next to the times they report the processor instructions executed, which stay the same to a few hundredths of a percent whatever else the machine is doing.
 
 The speed table compares Ghidra's `Total Time` per binary with the wall time of `recore-mcp summary`, fastest of three runs, and `ghidra/speed.py` measures it. Both ran on the same Ryzen 7 9850X3D. Ghidra analyzed several binaries at a time with 4 cores each, and recore one at a time, with all cores or pinned to one with `taskset`.
 
