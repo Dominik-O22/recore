@@ -68,7 +68,13 @@ The SDK builds use the release's own toolchain and flags, so the rebuilt binary 
 
 The agent gets 40 to 60 unpacked images and 5 to 8 advisories, with the advisory text as published and no fix commit. It fills a matrix: for each image and advisory, vulnerable, fixed or absent, with the binary and the function that decide it as evidence. Images are named `img01` and so on, in random order. The rootfs keeps `/etc/openwrt_release` and the package database, as a defender's images would.
 
-The session has a wall-clock budget, 45 minutes for the full tier. That is what makes the fleet size count. A full tier has about 50 images with 5 to 10 daemons each, a few hundred binaries. Ghidra's headless analysis of the binaries alone takes longer than the budget on one machine (measured: see the measurements below), so a Ghidra agent has to choose which binaries to analyze. A recore agent can afford all of them.
+The session has a wall-clock budget, 45 minutes for the full tier. The budget only makes the fleet size count when the agent has to look at many binaries. Ghidra took 6 s of analysis and 9.4 s of wall time per OpenWrt binary in the first measurements, so an advisory that names one daemon costs it 50 binaries and about 8 minutes per tier, well inside the budget. Speed shows where the advisory does not say which binary carries the code:
+
+- **Library advisories.** A flaw in libubox, musl or another shared library: the agent has to find which programs call the vulnerable function, not only whether the library has the fix.
+- **Bundled copies.** Code that programs carry inside them, such as dropbear's libtommath or BusyBox's DHCP client, which also exists as standalone code elsewhere.
+- **Component unknown.** An advisory that names the bug and the protocol but not the program, as vendor advisories often do.
+
+Each full tier carries at least two such advisories. An image has 85 to 96 programs and libraries, so a fleet of 50 has about 4,500, roughly 12 hours of Ghidra wall time on one 4-core job (inferred from the per-binary average), so a Ghidra agent has to choose which to analyze. recore analyzed all 3,228 distinct ones in the 197 images in 8.5 s on one core.
 
 Each advisory in a task is picked so the version alone misjudges some of its cells. A full tier mixes one advisory a string decides (Terrapin), one compiled-out case (CVE-2022-0934 with some `dnsmasq-full` images), one mixed-status binary (24.10.7's dnsmasq) and at least two advisories published after the models' training data (the 2026 dnsmasq, uhttpd and odhcpd fixes).
 
