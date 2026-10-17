@@ -11,8 +11,10 @@
 //! that a byte or halfword table in `.rodata` gives, `ADD PC, PC, Rm, LSL #2`, or without such a
 //! table jumps into a row of branches after the dispatch, one per case. Without PIC it loads PC
 //! from a table of addresses that follows, `LDR PC, [PC, Rm, LSL #2]`. Clang, which builds the
-//! Rust programs, adds to the table's address an offset the table holds: `ADD PC, Rt, Re`. Where the table is not
-//! among the code, its length is the bound the compare before the dispatch puts on the index.
+//! Rust programs, adds to the table's address an offset the table holds: `ADD PC, Rt, Re`. Where
+//! the table is not among the code, its length is the bound the compare before the dispatch puts
+//! on the index. A dispatch that is conditional, as `ADDLS PC, PC, Rm, LSL #2`, has the
+//! instruction after it as a case too.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -69,6 +71,8 @@ impl<'a> Code<'a> {
             .collect();
         marks.sort_unstable_by_key(|&(addr, _)| addr);
         marks.dedup_by_key(|&mut (addr, _)| addr);
+        // GCC marks the byte that pads a table of an odd length as data of its own.
+        marks.dedup_by_key(|&mut (_, run)| run);
         Code { sections, marks }
     }
 
@@ -487,6 +491,10 @@ pub fn jump_tables(name: String, binary: &object::File, debug: &object::File) ->
             match a32_dispatch(&code, &readonly, &data, &instructions, index) {
                 None => {}
                 Some(Ok(mut table)) => {
+                    // A dispatch that runs only for an index in range falls through to the default.
+                    if instructions[index].3.is_some_and(|instruction| instruction.condition != ConditionCode::AL) {
+                        table.targets.push(table.jump + 4);
+                    }
                     table.targets.sort_unstable();
                     table.targets.dedup();
                     match table.targets.iter().find(|&&target| instructions.binary_search_by_key(&target, |&(at, _, _, _)| at).is_err()) {

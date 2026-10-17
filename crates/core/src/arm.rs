@@ -888,7 +888,15 @@ pub(crate) fn load(file: &object::File, image: &mut Image) {
     // GNU ld writes in A32.
     let mut seeds = vec![marked(image.entry)];
     seeds.extend(file.dynamic_symbols().filter(|symbol| symbol.kind() == object::SymbolKind::Text && symbol.is_definition()).map(|symbol| marked(symbol.address())));
-    seeds.extend(image.relative_targets.iter().filter(|&&(_, target)| is_code(image, target & !1)).map(|&(_, target)| marked(target)));
+    // A pointer without the Thumb bit may be a label in Thumb code, as a table of them for a
+    // computed goto holds, and not A32 code: it counts where what it points at reads as A32.
+    seeds.extend(
+        image
+            .relative_targets
+            .iter()
+            .filter(|&&(_, target)| is_code(image, target & !1) && (target & 1 != 0 || target % 4 == 0 && image.bytes_from(target).is_some_and(|bytes| reads_as_a32(&bytes[..bytes.len().min(48)]))))
+            .map(|&(_, target)| marked(target)),
+    );
     seeds.extend(dynamic_code_pointers(file).into_iter().map(marked));
     seeds.extend(image.sections.iter().filter(|section| section.is_stubs()).map(|section| (section.addr, InstructionSet::A32)));
 
@@ -945,6 +953,17 @@ fn exception_index(file: &object::File) -> Vec<(u64, u64)> {
         .collect();
     entries.sort_unstable();
     entries.windows(2).filter(|pair| pair[0].1 && pair[0].0 < pair[1].0).map(|pair| (pair[0].0, pair[1].0)).collect()
+}
+
+/// Whether `bytes` read as A32 code. Nearly every instruction a compiler writes runs whatever
+/// the flags, and so has condition 14 in its top four bits, where Thumb code read four bytes at a
+/// time has any of them. The data among code, small numbers and offsets either way of zero, has 0
+/// or 15 there and says nothing. Thumb code that calls through the PLT has 14 there often, for
+/// the second half of a `BLX`, so this tells A32 from a label inside Thumb code and no more.
+fn reads_as_a32(bytes: &[u8]) -> bool {
+    let conditions: Vec<u32> = bytes.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap()) >> 28).filter(|condition| (1..15).contains(condition)).collect();
+    let always = conditions.iter().filter(|&&condition| condition == 14).count();
+    conditions.len() >= 2 && always * 4 >= conditions.len() * 3
 }
 
 /// `DT_INIT` and `DT_FINI`, the functions the loader calls before and after the program, with
@@ -1017,6 +1036,8 @@ fn instruction_sets(image: &Image, seeds: &[(u64, InstructionSet)]) -> Vec<(u64,
             }
         }
     }
+    // What nothing reaches is in the set of what comes before it, as the functions of one source
+    // file are.
     let first = seeds.first().map_or(InstructionSet::A32, |&(_, set)| set);
     let mut sets: Vec<(u64, InstructionSet)> = Vec::new();
     for (section, seen) in code.iter().zip(&seen) {
