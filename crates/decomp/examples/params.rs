@@ -3,7 +3,8 @@
 //! DWARF gives the source-level count: `DW_TAG_formal_parameter` children of every
 //! `DW_TAG_subprogram` that has a `DW_AT_low_pc`.
 //!
-//! `cargo run --release -p recore-decomp --example params -- corpus/bin/NAME corpus/debug/NAME.debug [--style=decompile] [--passes=2] [--list=40]`
+//! `cargo run --release -p recore-decomp --example params -- <corpora>/corpus/bin/NAME <corpora>/corpus/debug/NAME.debug [--style=decompile] [--passes=2] [--list=40]`
+//! where `<corpora>` is the corpora's directory, which corpus/store.py names.
 
 use std::collections::BTreeMap;
 use std::path::Path;

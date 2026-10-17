@@ -16,8 +16,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-CORPUS = HERE.parent
-SRC = HERE / "src"
+sys.path.insert(0, str(HERE.parent))
+from store import CORPORA  # noqa: E402
+
+CORPUS = CORPORA / "corpus"
+SRC = CORPUS / "jt-src"
 JOBS = 4
 CFLAGS = ["-O2", "-g", "-fPIE", "-fno-plt", "-fstack-protector-strong", "-fcf-protection",
           "-mllvm", "-emit-jump-table-sizes-section"]

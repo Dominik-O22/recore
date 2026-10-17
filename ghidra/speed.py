@@ -3,22 +3,25 @@
 fastest of three runs each, pinned to one core and with all cores, against Ghidra's own Total
 Time from each corpus's `ghidra/times.txt`.
 
-Usage: speed.py <repo> <recore-mcp> [cutoff], where a cutoff date keeps only the binaries whose
-Ghidra export is older than it."""
+Usage: speed.py <recore-mcp> [cutoff], where a cutoff date keeps only the binaries whose Ghidra
+export is older than it. The corpora are where corpus/store.py says."""
 import datetime, os, statistics, subprocess, sys, time
-repo, mcp = sys.argv[1], sys.argv[2]
-cut = datetime.datetime.fromisoformat(sys.argv[3]).timestamp() if len(sys.argv) > 3 else float("inf")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "corpus"))
+from store import CORPORA  # noqa: E402
+mcp = sys.argv[1]
+cut = datetime.datetime.fromisoformat(sys.argv[2]).timestamp() if len(sys.argv) > 2 else float("inf")
 rows = []
 for corpus in ["corpus", "corpus-pe", "corpus-pe32"]:
     times = {}
-    for line in open(f"{repo}/{corpus}/ghidra/times.txt"):
+    for line in open(f"{CORPORA}/{corpus}/ghidra/times.txt"):
         p = line.split()
         if len(p) >= 2 and p[1].isdigit():
             times.setdefault(p[0], int(p[1]))
-    for f in sorted(os.listdir(f"{repo}/{corpus}/ghidra")):
+    for f in sorted(os.listdir(f"{CORPORA}/{corpus}/ghidra")):
         name = f[:-5]
-        if f.endswith(".json") and os.path.getmtime(f"{repo}/{corpus}/ghidra/{f}") < cut and name in times:
-            rows.append((f"{repo}/{corpus}/bin/{name}", times[name]))
+        if f.endswith(".json") and os.path.getmtime(f"{CORPORA}/{corpus}/ghidra/{f}") < cut and name in times:
+            rows.append((f"{CORPORA}/{corpus}/bin/{name}", times[name]))
 
 def fastest(path, env, pin=()):
     best = float("inf")

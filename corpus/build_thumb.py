@@ -31,8 +31,10 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
+from store import CORPORA
+
 ROOT = Path(__file__).resolve().parent.parent
-CORPUS = ROOT / "corpus-thumb"
+CORPUS = CORPORA / "corpus-thumb"
 GLUE = Path(__file__).resolve().parent
 RUNTIME = GLUE / "thumb" / "runtime"
 JOBS = 8

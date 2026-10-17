@@ -10,8 +10,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 MIRROR = "https://geo.mirror.pkgbuild.com"
+from store import CORPORA
+
 HERE = Path(__file__).parent
-PKGS, BIN, DEBUG = HERE / "pkgs", HERE / "bin", HERE / "debug"
+PKGS, BIN, DEBUG = (CORPORA / "corpus" / d for d in ("pkgs", "bin", "debug"))
 MAX_PER_PACKAGE = 12  # coreutils alone ships ~100 near-identical small tools
 
 

@@ -25,8 +25,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-CORPUS = ROOT / "corpus-8051"
+from store import CORPORA
+
+CORPUS = CORPORA / "corpus-8051"
 GLUE = Path(__file__).resolve().parent / "8051"
 LIBRARY = Path("/usr/share/sdcc/lib/src")
 JOBS = 8

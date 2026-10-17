@@ -1,7 +1,8 @@
 //! Times session startup and per-function decompilation, then checks that sessions running on
 //! several threads produce the same output as the same sessions running one after another.
 //!
-//! `cargo run --release -p recore-decomp --example bench -- corpus/bin/coreutils__install [threads] [--style=paramid|normalize] [--jump-tables]`
+//! `cargo run --release -p recore-decomp --example bench -- <corpora>/corpus/bin/coreutils__install [threads] [--style=paramid|normalize] [--jump-tables]`
+//! where `<corpora>` is the corpora's directory, which corpus/store.py names.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

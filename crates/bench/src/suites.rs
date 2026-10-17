@@ -96,8 +96,9 @@ fn ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1e3
 }
 
+/// A binary as `bench/set.txt` names it, so that saved results compare wherever the corpora are.
 fn name(binary: &Path) -> String {
-    binary.display().to_string()
+    binary.strip_prefix(crate::corpora()).unwrap_or(binary).display().to_string()
 }
 
 /// A program built next to this one.

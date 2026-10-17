@@ -1,6 +1,7 @@
 //! Decompiles a few functions of a binary and prints the C with the recovered parameters.
 //!
-//! `cargo run --release -p recore-decomp --example demo -- corpus/bin/coreutils__install [count | 0xADDR...]`
+//! `cargo run --release -p recore-decomp --example demo -- <corpora>/corpus/bin/coreutils__install [count | 0xADDR...]`
+//! where `<corpora>` is the corpora's directory, which corpus/store.py names.
 
 use std::path::PathBuf;
 

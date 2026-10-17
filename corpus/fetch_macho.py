@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Builds a Mach-O corpus from Homebrew bottles: stripped executables plus the originals.
 
-Usage: fetch_macho.py <arch> <corpus-dir>      e.g. arm64 corpus-macho, or x86_64 corpus-macho-x86
-Writes <corpus-dir>/bin/brew__<formula>__<name>, stripped the way applications ship, and
-<corpus-dir>/debug/brew__<formula>__<name>.debug, the file as Homebrew built it. Homebrew does not
+Usage: fetch_macho.py <arch> <corpus>      e.g. arm64 corpus-macho, or x86_64 corpus-macho-x86
+Writes, in the corpora's directory that corpus/store.py names, <corpus>/bin/brew__<formula>__<name>, stripped the way applications ship, and
+<corpus>/debug/brew__<formula>__<name>.debug, the file as Homebrew built it. Homebrew does not
 strip, so the original's symbol table names every function; that is the truth to score against.
 
-Also writes <corpus-dir>/nostarts/<same name>: the stripped file with its LC_FUNCTION_STARTS load
+Also writes <corpus>/nostarts/<same name>: the stripped file with its LC_FUNCTION_STARTS load
 command made unreadable. Function starts are most of the truth, so an analysis that reads them
 scores against its own input; this copy leaves an analyzer the unwind tables to go on, and
 `recore corpus --no-frames` takes those away too.
@@ -16,6 +16,8 @@ Nothing downloaded is run. Needs llvm-strip and, for universal files, llvm-lipo.
 import hashlib, json, re, struct, subprocess, sys, tarfile, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+from store import CORPORA
 
 API = "https://formulae.brew.sh/api/formula"
 # The macOS releases whose bottles are taken, per architecture, most wanted first. Not every
@@ -115,7 +117,7 @@ def process(formula, arch, corpus):
 
 
 def main():
-    arch, corpus = sys.argv[1], Path(sys.argv[2])
+    arch, corpus = sys.argv[1], CORPORA / sys.argv[2]
     for d in ("bin", "debug", "nostarts", "pkgs"):
         (corpus / d).mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(6) as pool:
