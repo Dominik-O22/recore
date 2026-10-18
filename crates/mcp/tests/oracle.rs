@@ -4,12 +4,14 @@
 //! this is what says the oracle can be trusted.
 //!
 //! The something else is this machine for x86-64. The same C built for AArch64, x86-32 and
-//! Thumb is compared against the x86-64 result, since the C means the same on all of them. An
-//! 8051 program runs in µCsim, a simulator of the chip, and the oracle is compared with what it
-//! leaves in memory.
+//! Thumb is compared against the x86-64 result, since the C means the same on all of them. Float
+//! functions built for the x87 are run by this machine as a 32-bit program, and the oracle is
+//! compared with the 80 bits the processor leaves in ST0. An 8051 program runs in µCsim, a
+//! simulator of the chip, and the oracle is compared with what it leaves in memory.
 //!
-//! It builds with gcc, clang, rust-lld and sdcc and needs `s51` from the sdcc package, so it is
-//! ignored by default. Run it after a change to the interpreter, the shim or a specification:
+//! It builds with gcc, a gcc that can build 32-bit programs, clang, rust-lld and sdcc and needs
+//! `s51` from the sdcc package, so it is ignored by default. Run it after a change to the
+//! interpreter, the shim or a specification:
 //!
 //!     cargo test --release -p recore-mcp --test oracle -- --ignored
 //!
@@ -146,7 +148,7 @@ enum Needs {
     Everything,
     /// 64-bit registers, for a function that takes or gives 64 bits.
     Wide,
-    /// Floats in registers, which only x86-64 is asked for here.
+    /// Floats, which x86-64 and AArch64 take in registers.
     Floats,
 }
 
@@ -263,10 +265,51 @@ uint64_t mulhi(uint64_t a, uint64_t b) { return (uint64_t)(((unsigned __int128)a
 
 #ifdef FLOATS
 double dmix(double a, double b) { return a * b + a / (b == 0.0 ? 1.0 : b) - __builtin_sqrt(a < 0 ? -a : a); }
-int32_t ftoi(double d) { return (int32_t)d; }
+// Out of range the conversion is undefined, and x86 and AArch64 give different integers.
+int32_t ftoi(double d) { return d >= 2147483647.0 ? INT32_MAX : d <= -2147483648.0 ? INT32_MIN : (int32_t)d; }
 double itof(int32_t i) { return (double)i * 0.5; }
 float fmixf(float a, float b) { return a * b - a / (b == 0.0f ? 1.0f : b); }
 #endif
+"#;
+
+/// Float functions for the x87, built by gcc for 32-bit x86 with `-mfpmath=387`. They round
+/// through the control word, compare with `FNSTSW` or `FCOMI`, and give a `float` and a `double`
+/// back in ST0.
+const X87_FUNCTIONS: &[Function] = &[
+    Function { name: "xmix", params: &[any(F64), any(F64)], ret: F64, needs: Floats },
+    Function { name: "xmixf", params: &[any(F32), any(F32)], ret: F32, needs: Floats },
+    Function { name: "xsqrtf", params: &[any(F32)], ret: F32, needs: Floats },
+    Function { name: "xftoi", params: &[any(F64)], ret: I32, needs: Floats },
+    Function { name: "xftoll", params: &[any(F64)], ret: I64, needs: Floats },
+    Function { name: "xitof", params: &[any(I32)], ret: F64, needs: Floats },
+    Function { name: "xlltof", params: &[any(I64)], ret: F64, needs: Floats },
+    Function { name: "xcmp", params: &[any(F64), any(F64)], ret: I32, needs: Floats },
+    Function { name: "xpoly", params: &[any(F64), any(I32)], ret: F64, needs: Floats },
+    Function { name: "xmean", params: &[any(F32), any(F64), any(I32), any(F32)], ret: F32, needs: Floats },
+];
+
+const X87_SOURCE: &str = r#"
+#include <stdint.h>
+
+double xmix(double a, double b) { return a * b + a / (b == 0.0 ? 1.0 : b) - __builtin_sqrt(a < 0 ? -a : a); }
+float xmixf(float a, float b) { return a * b - a / (b == 0.0f ? 1.0f : b); }
+float xsqrtf(float a) { return __builtin_sqrtf(a < 0 ? -a : a) * 0.75f; }
+int32_t xftoi(double d) { return (int32_t)d; }
+int64_t xftoll(double d) { return (int64_t)d; }
+double xitof(int32_t i) { return (double)i * 0.5; }
+double xlltof(int64_t i) { return (double)i / 3.0; }
+int32_t xcmp(double a, double b) { return a < b ? 1 : a == b ? 2 : a > b ? 3 : 4; }
+
+double xpoly(double x, int32_t n) {
+    double s = 0;
+    for (int32_t i = 0; i < (n & 7); i++) s = s * x + (i & 1 ? -1.5 : 2.25);
+    return s < -1.0 ? -s : s > 1e6 ? 1e6 : s;
+}
+
+float xmean(float a, double b, int32_t n, float c) {
+    double m = (a + b + c) / 3;
+    return n > 0 && m > n ? (float)n : (float)m;
+}
 "#;
 
 /// The inputs of one function and what the machine it ran on gave.
@@ -354,7 +397,8 @@ struct Machine {
     /// The register a result of up to a word comes back in.
     result: &'static str,
     wide: bool,
-    floats: bool,
+    /// The register a float result comes back in, where floats are asked for.
+    floats: Option<&'static str>,
 }
 
 impl Machine {
@@ -362,7 +406,7 @@ impl Machine {
         match function.needs {
             Everything => true,
             Wide => self.wide,
-            Floats => self.floats,
+            Floats => self.floats.is_some(),
         }
     }
 }
@@ -370,10 +414,10 @@ impl Machine {
 fn native(dir: &Path, source: &Path) -> Machine {
     let image = dir.join("native.so");
     command("gcc", &["-O2", "-fPIC", "-shared", "-fno-math-errno", "-DWIDE", "-DFLOATS", "-o", path(&image), path(source)]);
-    Machine { name: "x86-64", image, addresses: BTreeMap::new(), result: "RAX", wide: true, floats: true }
+    Machine { name: "x86-64", image, addresses: BTreeMap::new(), result: "RAX", wide: true, floats: Some("XMM0") }
 }
 
-fn shared(dir: &Path, source: &Path, name: &'static str, target: &str, linker_machine: &[&str], result: &'static str, wide: bool) -> Machine {
+fn shared(dir: &Path, source: &Path, name: &'static str, target: &str, linker_machine: &[&str], result: &'static str, wide: bool, floats: Option<&'static str>) -> Machine {
     let object = dir.join(format!("{name}.o"));
     let image = dir.join(format!("{name}.so"));
     let target = format!("--target={target}");
@@ -381,12 +425,15 @@ fn shared(dir: &Path, source: &Path, name: &'static str, target: &str, linker_ma
     if wide {
         compile.push("-DWIDE");
     }
+    if floats.is_some() {
+        compile.push("-DFLOATS");
+    }
     command("clang", &compile);
     let mut link = vec!["-flavor", "gnu", "-shared"];
     link.extend(linker_machine);
     link.extend(["-o", path(&image), path(&object)]);
     command(rust_lld(), &link);
-    Machine { name, image, addresses: BTreeMap::new(), result, wide, floats: false }
+    Machine { name, image, addresses: BTreeMap::new(), result, wide, floats }
 }
 
 /// A Cortex-M3 image of flash at 0, with the layout file that names it.
@@ -419,7 +466,7 @@ fn thumb(dir: &Path, source: &Path) -> Machine {
             (kind == "T").then(|| (name.to_string(), u64::from_str_radix(address, 16).unwrap() & !1))
         })
         .collect();
-    Machine { name: "thumb", image, addresses, result: "r0", wide: false, floats: false }
+    Machine { name: "thumb", image, addresses, result: "r0", wide: false, floats: None }
 }
 
 /// The first value a register has in an answer of `run`, as the bits it printed.
@@ -442,19 +489,25 @@ fn same(ret: Ty, expected: u64, got: u64) -> bool {
 fn ask(client: &mut Client, machine: &Machine, case: &Case) -> u64 {
     let function = case.function;
     let mut args = Vec::new();
-    let mut set = Vec::new();
+    let set: Vec<String> = Vec::new();
     for (param, &value) in function.params.iter().zip(&case.args) {
         match value {
             Input::Int(int) if param.ty == U64 => args.push(json!(int as u64)),
             Input::Int(int) => args.push(json!(int)),
-            Input::Float(bits) => set.push(format!("XMM{}={bits:#x}", set.len())),
+            Input::Float(bits) => args.push(json!(float_arg(param.ty, bits))),
         }
     }
     let place = machine.addresses.get(function.name).map_or_else(|| function.name.to_string(), |address| format!("{address:#x}"));
-    let read: Vec<&str> = if function.ret.is_float() { vec!["XMM0"] } else { vec![] };
+    let float = machine.floats.unwrap_or("none");
+    let read: Vec<&str> = if function.ret.is_float() { vec![float] } else { vec![] };
     let answer = client.tool("run", json!({ "path": machine.image, "function": place, "args": args, "set": set, "read": read })).unwrap_or_else(|error| panic!("{} {}: {error}", machine.name, function.name));
     assert!(answer.contains(" returned "), "{} {} {:?}: {answer}", machine.name, function.name, case.args);
-    register(&answer, if function.ret.is_float() { "XMM0" } else { machine.result }) as u64
+    register(&answer, if function.ret.is_float() { float } else { machine.result }) as u64
+}
+
+/// A float argument as `run` takes one, in the fewest digits that read back as it.
+fn float_arg(ty: Ty, bits: u64) -> String {
+    if ty == F32 { format!("f32:{:?}", f32::from_bits(bits as u32)) } else { format!("f64:{:?}", f64::from_bits(bits)) }
 }
 
 #[test]
@@ -486,8 +539,8 @@ fn the_oracle_agrees_with_the_machines() {
 
     let machines = [
         native(&dir, &source),
-        shared(&dir, &source, "aarch64", "aarch64-linux-gnu", &[], "x0", true),
-        shared(&dir, &source, "x86-32", "i686-linux-gnu", &["-m", "elf_i386"], "EAX", false),
+        shared(&dir, &source, "aarch64", "aarch64-linux-gnu", &[], "x0", true, Some("d0")),
+        shared(&dir, &source, "x86-32", "i686-linux-gnu", &["-m", "elf_i386"], "EAX", false, None),
         thumb(&dir, &source),
     ];
     let mut client = Client::start();
@@ -506,6 +559,115 @@ fn the_oracle_agrees_with_the_machines() {
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(compared > 4000, "only {compared} cases were compared");
     assert!(mismatches.is_empty(), "{} of {compared} cases differ, the first:\n{}", mismatches.len(), mismatches.iter().take(10).cloned().collect::<Vec<_>>().join("\n"));
+}
+
+/// A C program for 32-bit x86 that calls the x87 functions on the cases and prints what each
+/// gave: an integer, or all 80 bits a float function leaves in ST0, read by declaring it to
+/// return a `long double`, which comes back in ST0 too.
+fn x87_driver(cases: &[Case]) -> String {
+    let mut c = String::from(
+        "#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n\
+         static double double_(uint64_t b) { double x; memcpy(&x, &b, 8); return x; }\n\
+         static float single(uint32_t b) { float x; memcpy(&x, &b, 4); return x; }\n\
+         static void extended(int i, long double x) { uint64_t low; uint16_t high; memcpy(&low, &x, 8); memcpy(&high, (char *)&x + 8, 2); printf(\"%d %04x%016llx\\n\", i, high, (unsigned long long)low); }\n",
+    );
+    for function in X87_FUNCTIONS {
+        let params: Vec<&str> = function.params.iter().map(|param| param.ty.c()).collect();
+        let ret = if function.ret.is_float() { "long double" } else { function.ret.c() };
+        writeln!(c, "{ret} {}_raw({}) __asm__(\"{}\");", function.name, params.join(", "), function.name).unwrap();
+    }
+    c.push_str("int main(void) {\n");
+    for (index, case) in cases.iter().enumerate() {
+        let args: Vec<String> = case.function.params.iter().zip(&case.args).map(|(param, &value)| literal(param.ty, value)).collect();
+        let call = format!("{}_raw({})", case.function.name, args.join(", "));
+        if case.function.ret.is_float() {
+            writeln!(c, "    extended({index}, {call});").unwrap();
+        } else {
+            writeln!(c, "    printf(\"{index} %llx\\n\", (unsigned long long)({call}));").unwrap();
+        }
+    }
+    c.push_str("    return 0;\n}\n");
+    c
+}
+
+/// How far apart two extended floats are, in units in the last place of the 64-bit significand,
+/// counted along the line of every extended float.
+fn ulps(a: u128, b: u128) -> u128 {
+    let line = |bits: u128| if bits >> 79 == 1 { -((bits & ((1 << 79) - 1)) as i128) } else { bits as i128 };
+    line(a).abs_diff(line(b))
+}
+
+#[test]
+#[ignore = "needs a gcc that builds 32-bit programs: cargo test --release -p recore-mcp --test oracle -- --ignored"]
+fn the_oracle_agrees_with_the_x87() {
+    require(&["gcc"]);
+    let dir = edits_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("x87.c");
+    std::fs::write(&source, X87_SOURCE).unwrap();
+    let mut rng = Rng(0x0123_4567_89ab_cdef);
+    let mut cases: Vec<Case> = Vec::new();
+    for function in X87_FUNCTIONS {
+        for _ in 0..CASES {
+            let mut args: Vec<Input> = function.params.iter().map(|param| param.ty.generate(&mut rng, param.range)).collect();
+            // A not-a-number now and then, and a second operand equal to the first.
+            for (param, arg) in function.params.iter().zip(&mut args) {
+                if param.ty.is_float() && rng.below(12) == 0 {
+                    *arg = Input::Float(if param.ty == F32 { u64::from(f32::NAN.to_bits()) } else { f64::NAN.to_bits() });
+                }
+            }
+            if function.params.len() == 2 && function.params[0].ty == function.params[1].ty && rng.below(8) == 0 {
+                args[1] = args[0];
+            }
+            cases.push(Case { function, args, expected: 0 });
+        }
+    }
+    // A Pentium has no FCOMI, so gcc compares with FNSTSW AX as MSVC does, and a Pentium Pro does.
+    let mut compared = 0;
+    let mut mismatches = Vec::new();
+    let mut largest = 0;
+    let mut client = Client::start();
+    for march in ["pentium", "pentiumpro"] {
+        let object = dir.join(format!("x87-{march}.o"));
+        let image = dir.join(format!("x87-{march}.so"));
+        let reference = dir.join(format!("x87-{march}"));
+        let flags = ["-m32", "-O2", "-fPIC", "-mfpmath=387", "-fno-math-errno"];
+        let march_flag = format!("-march={march}");
+        command("gcc", &[&flags[..], &[march_flag.as_str(), "-c", path(&source), "-o", path(&object)]].concat());
+        command("gcc", &["-m32", "-shared", "-nostdlib", "-o", path(&image), path(&object)]);
+        std::fs::write(dir.join("x87-driver.c"), x87_driver(&cases)).unwrap();
+        command("gcc", &["-m32", "-O0", "-o", path(&reference), path(&dir.join("x87-driver.c")), path(&object)]);
+        let expected: Vec<u128> = command(&reference, &[]).lines().map(|line| u128::from_str_radix(line.split_once(' ').unwrap().1, 16).unwrap()).collect();
+        for (case, &want) in cases.iter().zip(&expected) {
+            let function = case.function;
+            // A 64-bit integer takes two slots of the stack, the low half first.
+            let args: Vec<serde_json::Value> = function.params.iter().zip(&case.args).flat_map(|(param, &value)| match value {
+                Input::Int(int) if param.ty == I64 => vec![json!(int as u32), json!((int >> 32) as u32)],
+                Input::Int(int) => vec![json!(int)],
+                Input::Float(bits) => vec![json!(float_arg(param.ty, bits))],
+            }).collect();
+            let answer = client.tool("run", json!({ "path": image, "function": function.name, "args": args, "read": ["ST0", "EDX"] })).unwrap();
+            assert!(answer.contains(" returned "), "{march} {} {:?}: {answer}", function.name, case.args);
+            let got = match function.ret {
+                F32 | F64 => register(&answer, "ST0"),
+                I64 => register(&answer, "EDX") << 32 | register(&answer, "EAX"),
+                _ => register(&answer, "EAX"),
+            };
+            compared += 1;
+            let mask = if function.ret.is_float() { (1 << 80) - 1 } else { (1 << function.ret.bits()) - 1 };
+            if got & mask != want & mask {
+                if function.ret.is_float() {
+                    largest = largest.max(ulps(got, want));
+                }
+                mismatches.push(format!("{march} {}{:?}: the processor gave {want:#x}, the oracle {got:#x}", function.name, case.args));
+            }
+        }
+    }
+    drop(client);
+    std::fs::remove_dir_all(&dir).unwrap();
+    eprintln!("{} of {compared} x87 cases agree, the largest difference {largest} units in the last place", compared - mismatches.len());
+    assert!(compared >= 2 * X87_FUNCTIONS.len() * CASES, "only {compared} cases were compared");
+    assert!(mismatches.is_empty(), "{} of {compared} cases differ, the largest by {largest} units in the last place, the first:\n{}", mismatches.len(), mismatches.iter().take(10).cloned().collect::<Vec<_>>().join("\n"));
 }
 
 /// Inputs of the 8051 program, which it runs every function on.
