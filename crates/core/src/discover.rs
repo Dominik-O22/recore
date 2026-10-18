@@ -335,6 +335,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
 
     fn add_start(&mut self, addr: u64, origin: Origin) {
         let referenced = matches!(origin, Origin::Call | Origin::AddressTaken | Origin::DataPointer | Origin::Export | Origin::Thunk);
+        let weak = self.taken_is_weak() && matches!(origin, Origin::AddressTaken | Origin::DataPointer);
         let Some(index) = self.region_index(addr) else {
             if referenced {
                 self.referenced.insert(addr);
@@ -355,7 +356,6 @@ impl<'a, A: Arch> Explorer<'a, A> {
         if *flags & ASKED_AS_START != 0 {
             return;
         }
-        let weak = A::TAKEN_IS_WEAK && matches!(origin, Origin::AddressTaken | Origin::DataPointer);
         if weak && self.rejected.contains(&addr) {
             return;
         }
@@ -495,7 +495,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     if let Some(data) = A::data_address(insn, &state).filter(|_| trusted && !speculative) {
                         self.data_addresses.push(data);
                     }
-                    let mut taken = A::address_taken(insn, &state, self.image).filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target));
+                    let mut taken = A::address_taken(insn, &state, self.image).filter(|&target| self.may_be_address(target));
                     let in_code = taken.is_some_and(|target| self.region_index(target).is_some());
                     if in_code && !A::code_pointer(self.image, taken.unwrap_or_default()) {
                         taken = None;
@@ -593,6 +593,24 @@ impl<'a, A: Arch> Explorer<'a, A> {
         }
     }
 
+    /// Whether an address taken or a word in data is only weak evidence of a function: see
+    /// [`Arch::TAKEN_IS_WEAK`]. So it is too where the relocations are stripped, as nothing
+    /// tells those addresses from numbers.
+    fn taken_is_weak(&self) -> bool {
+        A::TAKEN_IS_WEAK || self.image.relocations_stripped
+    }
+
+    /// Whether a value the code holds may be an address. Where the loader relocates the
+    /// addresses in code, only a value some relocation carries is one. Where the relocations
+    /// are stripped, nothing tells them apart, so any value the image maps may be one: not the
+    /// `push 1` or the -1.0 of `push 0xbf800000`.
+    fn may_be_address(&self, value: u64) -> bool {
+        if self.image.relocations_stripped {
+            return self.image.section_at(value).is_some() || self.image.is_zero_filled(value);
+        }
+        !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(&value)
+    }
+
     /// Marks `[start, end)` as a literal the code reads, which is no instruction.
     fn mark_literal(&mut self, start: u64, end: u64) {
         let Some(index) = self.region_index(start) else { return };
@@ -612,7 +630,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// that decides nothing while exploring.
     fn note_references(&mut self, insn: &A::Insn, state: &A::State, at: u64, speculative: bool) {
         let accessed = A::memory_reference(insn, state)
-            .filter(|target| !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(target))
+            .filter(|&target| self.may_be_address(target))
             .filter(|&target| self.is_data(target));
         match accessed {
             Some(target) if speculative => self.uncertain_ref_sites.push((at, target, true)),
@@ -791,7 +809,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 .iter()
                 .filter(|(_, origin)| {
                     !matches!(origin, Origin::TailCall | Origin::GapAligned | Origin::GapEndbr)
-                        && !(A::TAKEN_IS_WEAK && matches!(origin, Origin::AddressTaken | Origin::DataPointer))
+                        && !(self.taken_is_weak() && matches!(origin, Origin::AddressTaken | Origin::DataPointer))
                 })
                 .map(|(&addr, _)| addr),
         );
@@ -824,7 +842,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let labels_in_data = self.image.data_in_code;
         let is_weak = |addr: u64, origin: &Origin| match origin {
             Origin::TailCall | Origin::GapAligned | Origin::GapEndbr => true,
-            Origin::AddressTaken => A::TAKEN_IS_WEAK,
+            Origin::AddressTaken => self.taken_is_weak(),
             Origin::DataPointer => labels_in_data || addr % A::FUNCTION_ALIGN != 0,
             _ => false,
         };
@@ -1474,7 +1492,7 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
     // decoded as a function all the same, and what that found stays found: literals in real
     // code, calls that are none, Thumb-2 where there is none. Passes that leave those addresses
     // out from the start follow until no more turn out so.
-    if A::TAKEN_IS_WEAK {
+    if A::TAKEN_IS_WEAK || image.relocations_stripped {
         let mut rejected = FxHashSet::default();
         loop {
             let before = rejected.len();
@@ -1659,11 +1677,11 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
     explorer.demote_frame_borrowers();
     // What these remove may have been all that kept a jump across an entry point from
     // showing it as a guess.
-    if A::CALL_MAY_BE_FAR_JUMP || A::TAKEN_IS_WEAK {
+    if A::CALL_MAY_BE_FAR_JUMP || explorer.taken_is_weak() {
         if A::CALL_MAY_BE_FAR_JUMP {
             explorer.demote_far_jumps();
         }
-        if A::TAKEN_IS_WEAK {
+        if explorer.taken_is_weak() {
             explorer.demote_taken_inside_code();
         }
         while explorer.demote_crossed_starts() {}

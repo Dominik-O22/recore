@@ -267,6 +267,7 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
         symbol_names,
         frames,
         relative_targets,
+        relocations_stripped: false,
         data_in_code: false,
         frames_merge: false,
         banking: Default::default(),

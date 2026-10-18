@@ -13,8 +13,11 @@ use crate::image::Section;
 pub struct Metadata {
     /// Import address table slot to the name of the function the loader binds there.
     pub import_slots: FxHashMap<u64, String>,
-    /// `(slot, value)` for every pointer the loader would rebase.
+    /// `(slot, value)` for every pointer the loader would rebase. Where the relocations are
+    /// stripped, every aligned word of data whose value lands in the image.
     pub relative_targets: Vec<(u64, u64)>,
+    /// Whether the image has no relocation directory, so loads only at its preferred base.
+    pub relocations_stripped: bool,
     pub exports: Vec<u64>,
     /// `[start, end)` of every `RUNTIME_FUNCTION` in the exception directory.
     pub frames: Vec<(u64, u64)>,
@@ -48,16 +51,20 @@ pub fn load<Pe: ImageNtHeaders>(data: &[u8], sections: &[Section]) -> Result<Met
         }
     }
 
+    let read_word = |bytes: &[u8]| {
+        let mut raw = [0u8; 8];
+        raw[..bytes.len()].copy_from_slice(bytes);
+        u64::from_le_bytes(raw)
+    };
     // The value at a relocated slot: a pointer of the image's own width.
     let read_pointer = |addr: u64, size: usize| {
         let section = sections.iter().find(|s| s.contains(addr))?;
-        let bytes = section.data.get((addr - section.addr) as usize..)?.get(..size)?;
-        let mut raw = [0u8; 8];
-        raw[..size].copy_from_slice(bytes);
-        Some(u64::from_le_bytes(raw))
+        Some(read_word(section.data.get((addr - section.addr) as usize..)?.get(..size)?))
     };
     let mut relative_targets = Vec::new();
-    if let Some(mut blocks) = pe.data_directories().relocation_blocks(data, &pe.section_table())? {
+    let blocks = pe.data_directories().relocation_blocks(data, &pe.section_table())?;
+    let relocations_stripped = blocks.is_none();
+    if let Some(mut blocks) = blocks {
         while let Some(block) = blocks.next()? {
             for relocation in block {
                 let size = match relocation.typ {
@@ -67,6 +74,25 @@ pub fn load<Pe: ImageNtHeaders>(data: &[u8], sections: &[Section]) -> Result<Met
                 };
                 let slot = base + u64::from(relocation.virtual_address);
                 relative_targets.extend(read_pointer(slot, size).map(|value| (slot, value)));
+            }
+        }
+    } else {
+        // Nothing says which words are addresses, so each aligned word in data that lands in
+        // the image may be one. What reads them still checks what each points at. Text is the
+        // exception: in an image based at 0x400000, "ons\0" and the UTF-16 "s\0t\0" land in
+        // its code, so a word that reads as text beside another that does is text. Resources
+        // hold offsets, never addresses.
+        let in_image = |value: u64| sections.iter().any(|s| s.contains(value));
+        let is_text = |word: &[u8]| word.iter().all(|&byte| byte == 0 || byte == b' ' || byte.is_ascii_graphic()) && word.iter().any(|&byte| byte != 0);
+        for section in sections.iter().filter(|s| !s.executable && s.name != ".rsrc") {
+            let words: Vec<&[u8]> = section.data.chunks_exact(pointer_size as usize).collect();
+            for (i, &word) in words.iter().enumerate() {
+                let slot = section.addr + pointer_size * i as u64;
+                let value = read_word(word);
+                let text = is_text(word) && (i > 0 && is_text(words[i - 1]) || words.get(i + 1).is_some_and(|next| is_text(next)));
+                if in_image(value) && !text && !import_slots.contains_key(&slot) {
+                    relative_targets.push((slot, value));
+                }
             }
         }
     }
@@ -81,7 +107,7 @@ pub fn load<Pe: ImageNtHeaders>(data: &[u8], sections: &[Section]) -> Result<Met
 
     let frames = sections.iter().find(|s| s.name == ".pdata").map(|pdata| function_frames(pdata, sections, base)).unwrap_or_default();
 
-    Ok(Metadata { import_slots, relative_targets, exports, frames })
+    Ok(Metadata { import_slots, relative_targets, relocations_stripped, exports, frames })
 }
 
 /// Function extents from the exception directory. Each entry is three RVAs: begin, end, and
