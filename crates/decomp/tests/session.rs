@@ -175,6 +175,37 @@ fn a_function_takes_the_register_it_hands_on_once_its_callee_is_known() {
     assert_eq!(storage, ["ECX"], "{}", function.c_text);
 }
 
+/// MSVC's `cos` loads its argument with a call and comes back from it into the routine that
+/// `_CIcos` calls, which returns for both: it calls that routine and returns.
+#[test]
+fn a_function_that_comes_back_from_a_call_into_the_next_one_calls_it() {
+    use recore::image::{Format, Machine};
+    #[rustfmt::skip]
+    let code = [
+        0xe8, 0x0b, 0x00, 0x00, 0x00,  // 0x1000  call 0x1010
+        0xe8, 0x0f, 0x00, 0x00, 0x00,  // 0x1005  call 0x1019
+        0xc3,                          // 0x100a  ret
+        0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+        0x8d, 0x54, 0x24, 0x04,        // 0x1010  lea edx, [esp+4]
+        0xe8, 0x07, 0x00, 0x00, 0x00,  // 0x1014  call 0x1020
+        0xd9, 0xff,                    // 0x1019  fcos
+        0xc3,                          // 0x101b  ret
+        0xcc, 0xcc, 0xcc, 0xcc,
+        0xdd, 0x02,                    // 0x1020  fld qword [edx]
+        0xc3,                          // 0x1022  ret
+    ];
+    let section = recore::image::Section { name: ".text".into(), addr: 0x1000, data: code.to_vec(), file_offset: None, executable: true, writable: false };
+    let image = recore::Image::bare("test".into(), Format::Pe, Machine::X86, 0x1000, vec![section]);
+    let analysis = recore::analyze(&image);
+    let noreturn: Vec<u64> = analysis.functions.iter().filter(|function| function.noreturn).map(|function| function.addr).collect();
+    assert_eq!(noreturn, [0u64; 0]);
+    let mut session = Session::from_image(&image, &analysis).unwrap();
+    session.add_functions(&Facts::derive(&image, &analysis)).unwrap();
+
+    let cos = session.decompile(0x1010).unwrap();
+    assert!(!cos.bad_data && cos.c_text.contains("func_0x00001019();\n  return;"), "{}", cos.c_text);
+}
+
 /// The engine's C parser accepts the exported prototypes of every archive, bar a few.
 #[test]
 fn archive_prototypes_parse() {
