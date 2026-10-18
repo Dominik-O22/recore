@@ -23,5 +23,10 @@ for corpus in corpus corpus-arm64 corpus-armhf corpus-armel corpus-pe32 corpus-p
     ./target/release/recore corpus "$in/nostarts" "$out/recore-nostarts" 2>/dev/null
     dirs+=("$out/recore-nostarts")
   fi
+  # The same PE images with their base relocations stripped, as corpus/strip_relocs.py writes them.
+  if [ -d "$in/norelocs" ]; then
+    ./target/release/recore corpus "$in/norelocs" "$out/recore-norelocs" 2>/dev/null
+    dirs+=("$out/recore-norelocs")
+  fi
   ./target/release/recore-corpus --corpus "$in" score "${dirs[@]}" "$@"
 done
