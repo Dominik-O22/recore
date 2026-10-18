@@ -111,6 +111,42 @@ fn a_callee_takes_every_argument_it_pops() {
     assert!(caller.c_text.contains("return 0x2a;"), "{}", caller.c_text);
 }
 
+/// A fastcall callee that only stores the register it is passed still takes it, and its caller
+/// passes it.
+#[test]
+fn a_fastcall_callee_takes_the_registers_it_stores() {
+    use recore::image::{Format, Machine};
+    #[rustfmt::skip]
+    let code = [
+        0xb9, 0x2a, 0x00, 0x00, 0x00,              // 0x1000  mov ecx, 0x2a
+        0xe8, 0x16, 0x00, 0x00, 0x00,              // 0x1005  call 0x1020
+        0xba, 0x07, 0x00, 0x00, 0x00,              // 0x100a  mov edx, 7
+        0xe8, 0x17, 0x00, 0x00, 0x00,              // 0x100f  call 0x102b
+        0xc3,                                      // 0x1014  ret
+        0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+        0x89, 0x0d, 0x00, 0x20, 0x00, 0x00,        // 0x1020  mov [0x2000], ecx
+        0xc3,                                      // 0x1026  ret
+        0xcc, 0xcc, 0xcc, 0xcc,
+        0x89, 0x15, 0x04, 0x20, 0x00, 0x00,        // 0x102b  mov [0x2004], edx
+        0xc3,                                      // 0x1031  ret
+    ];
+    let text = recore::image::Section { name: ".text".into(), addr: 0x1000, data: code.to_vec(), file_offset: None, executable: true, writable: false };
+    let data = recore::image::Section { name: ".data".into(), addr: 0x2000, data: vec![0; 8], file_offset: None, executable: false, writable: true };
+    let image = recore::Image::bare("test".into(), Format::Pe, Machine::X86, 0x1000, vec![text, data]);
+    let analysis = recore::analyze(&image);
+    let mut session = Session::from_image(&image, &analysis).unwrap();
+    session.add_functions(&Facts::derive(&image, &analysis)).unwrap();
+    session.keep_prototypes(true);
+
+    for (callee, register) in [(0x1020, "ECX"), (0x102b, "EDX")] {
+        let function = session.decompile(callee).unwrap();
+        let storage: Vec<&str> = function.params.iter().map(|p| p.storage.as_str()).collect();
+        assert_eq!(storage.last(), Some(&register), "{}", function.c_text);
+    }
+    let caller = session.decompile(0x1000).unwrap();
+    assert!(caller.c_text.contains("(0x2a);") && caller.c_text.contains(",7);"), "{}", caller.c_text);
+}
+
 /// The engine's C parser accepts the exported prototypes of every archive, bar a few.
 #[test]
 fn archive_prototypes_parse() {
