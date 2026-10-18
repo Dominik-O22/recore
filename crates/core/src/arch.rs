@@ -130,7 +130,8 @@ pub trait Arch: 'static {
 
     /// Whether a function may run on into the one after it, which then returns for both: how
     /// hand-written code and code a linker has factored share their endings. Elsewhere code
-    /// that runs off the end of its function is code that never returns.
+    /// that runs off the end of its function is code that never returns, unless it comes back
+    /// from a call right at the next function's entry.
     const RUNS_ON: bool = false;
 
     /// Whether unreached code counts as functions on the strength of dividing into them with

@@ -79,6 +79,9 @@ pub struct Facts {
     /// `(function, bytes)`: a 32-bit x86 function that pops that many bytes of arguments as it
     /// returns, as [`recore::cfg::stack_purges`] reads it.
     pub purges: Vec<(u64, u16)>,
+    /// Functions that run on into the next one, as [`recore::report::AnalyzedFunction::runs_on`]
+    /// has it: they end by calling it and returning.
+    pub runs_on: Vec<u64>,
 }
 
 /// A call to a library routine that jumps on to one of several places and does not return.
@@ -262,6 +265,7 @@ impl Facts {
             }
         }
         facts.purges = recore::cfg::stack_purges(image, analysis);
+        facts.runs_on = analysis.functions.iter().filter(|f| f.runs_on.is_some()).map(|f| f.fragment_of.unwrap_or(f.addr)).collect();
         if image.machine == Machine::Arm {
             // A32 and Thumb code reach an import by BL or BLX to its PLT stub.
             use recore::arch::Arch;

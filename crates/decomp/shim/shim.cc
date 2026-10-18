@@ -184,8 +184,10 @@ class SectionImage : public LoadImage {
   // number of bytes.
   unordered_map<uint64_t, int4> data_after;
   // Code runs from the end of one function into the start of the next on purpose, to share
-  // that one's code: see rd_functions_run_on.
+  // that one's code: see rd_functions_run_on. `runs_on` holds the functions that do so where
+  // the others do not: see rd_runs_on.
   bool functions_run_on = false;
+  set<uint64_t> runs_on;
 
   SectionImage(const string &lang, const RdSection *secs, size_t count)
       : LoadImage("recore"), language(lang) {
@@ -312,15 +314,15 @@ class SectionSleigh : public Sleigh {
   int4 oneInstruction(PcodeEmit &emit, const Address &addr) const override {
     uintb at = addr.getOffset();
     if (image.hidden(at)) throw BadDataError("The instruction is the entry of another function");
-    if (image.mirrors.empty() && image.redirects.empty() && image.switch_calls.empty() && image.data_after.empty() &&
-        !image.functions_run_on)
+    bool runs_on = image.functions_run_on || image.runs_on.count(image.current) != 0;
+    if (image.mirrors.empty() && image.redirects.empty() && image.switch_calls.empty() && image.data_after.empty() && !runs_on)
       return Sleigh::oneInstruction(emit, addr);
     auto jump = image.switch_calls.find(at);
     Retargeted retargeted(emit, image, jump == image.switch_calls.end() ? nullptr : &jump->second);
     int4 length = Sleigh::oneInstruction(retargeted, addr);
     auto data = image.data_after.find(at);
     if (data != image.data_after.end()) length += data->second;
-    if (image.functions_run_on && retargeted.runs_on && image.hidden(at + length)) {
+    if (runs_on && retargeted.runs_on && image.hidden(at + length)) {
       // The function ends by running into the next one: it calls that one and returns, as the
       // engine has it for a jump that is a tail call.
       VarnodeData next = {image.space, at + length, 1};
@@ -1176,6 +1178,10 @@ int rd_call_switches(RdSession *session, uint64_t call, const char *selector, co
 // to: the first function then ends in a call to the second and a return. Without this such
 // flow is cut off, as what follows a call that was not known to never return.
 void rd_functions_run_on(RdSession *session, int on) { session->image->functions_run_on = on != 0; }
+
+// Says the same of the function at `function` alone: it comes back from a call into the start
+// of the next function, as hand-written x86 code such as MSVC's `cos` does.
+void rd_runs_on(RdSession *session, uint64_t function) { session->image->runs_on.insert(function); }
 
 // Says that the convention returns a result in the register it passes the first argument in.
 void rd_result_in_first_argument(RdSession *session, int shared) { session->result_in_first_argument = shared != 0; }
