@@ -1,6 +1,8 @@
 //! The control-flow graph of one function: its basic blocks and where each can go next.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+use rayon::prelude::*;
 
 use crate::arch::{Arch, FieldUse, Flow};
 use crate::image::{Image, Machine};
@@ -128,6 +130,59 @@ pub fn takes_variable_arguments(image: &Image, start: u64, end: u64) -> bool {
         Machine::Aarch64 => with::<crate::arm64::Arm64>(image, start, end),
         Machine::Arm => with::<crate::arm::Arm>(image, start, end),
     }
+}
+
+/// The bytes of arguments each 32-bit x86 function pops off the stack as it returns, as
+/// `(entry, bytes)` sorted by entry: the `n` of `RET n`, where every return reachable from the
+/// entry, in the function or its fragments, has the same nonzero `n`. A callee-cleanup
+/// convention (stdcall, thiscall, fastcall) returns so, and pops every argument the caller
+/// pushed, whether the function reads it or not.
+pub fn stack_purges(image: &Image, analysis: &Analysis) -> Vec<(u64, u16)> {
+    if image.machine != Machine::X86 {
+        return Vec::new();
+    }
+    let mut bodies: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
+    for function in &analysis.functions {
+        bodies.entry(function.fragment_of.unwrap_or(function.addr)).or_default().extend(&function.ranges);
+    }
+    let bodies: Vec<(u64, Vec<(u64, u64)>)> = bodies.into_iter().collect();
+    bodies
+        .into_par_iter()
+        .filter_map(|(entry, mut body)| {
+            body.sort_unstable();
+            Some((entry, stack_purge(image, analysis, &body, entry)?))
+        })
+        .collect()
+}
+
+/// What [`stack_purges`] says of the function at `entry` whose sorted body is `body`.
+fn stack_purge(image: &Image, analysis: &Analysis, body: &[(u64, u64)], entry: u64) -> Option<u16> {
+    let cfg = cfg(image, analysis, body);
+    let mut purge = None;
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![entry];
+    while let Some(start) = pending.pop() {
+        let Ok(index) = cfg.blocks.binary_search_by_key(&start, |block| block.start) else { continue };
+        if !seen.insert(start) {
+            continue;
+        }
+        let block = &cfg.blocks[index];
+        pending.extend(&block.successors);
+        if block.exit != Some(Exit::Return) {
+            continue;
+        }
+        let last = cfg.instructions[..cfg.instructions.partition_point(|&addr| addr < block.end)].last()?;
+        let popped = match image.bytes_from(*last)? {
+            [0xc2, low, high, ..] => u16::from_le_bytes([*low, *high]),
+            [0xc3, ..] | [0xf3, 0xc3, ..] => 0,
+            // A far return, or an interrupt's.
+            _ => return None,
+        };
+        if purge.replace(popped).is_some_and(|other| other != popped) {
+            return None;
+        }
+    }
+    purge.filter(|&popped| popped > 0)
 }
 
 /// The control-flow graph of the function whose body is `body`, as `[start, end)` ranges.

@@ -76,6 +76,9 @@ pub struct Facts {
     /// `(function, jump)`: a branch through a register that returns, which recore reads from
     /// the stack it was popped off, and the engine would take for a jump it cannot follow.
     pub returns: Vec<(u64, u64)>,
+    /// `(function, bytes)`: a 32-bit x86 function that pops that many bytes of arguments as it
+    /// returns, as [`recore::cfg::stack_purges`] reads it.
+    pub purges: Vec<(u64, u16)>,
 }
 
 /// A call to a library routine that jumps on to one of several places and does not return.
@@ -258,6 +261,7 @@ impl Facts {
                 facts.jump_tables.extend(jumps.map(|(index, _)| (owner, index)));
             }
         }
+        facts.purges = recore::cfg::stack_purges(image, analysis);
         if image.machine == Machine::Arm {
             // A32 and Thumb code reach an import by BL or BLX to its PLT stub.
             use recore::arch::Arch;
