@@ -361,6 +361,11 @@ fn a_function_runs_on_the_arguments_it_is_given() {
     let truncate = |client: &mut Client, bits: &str| client.tool("run", json!({ "path": ORACLE_ELF, "function": "0x1420", "set": [format!("XMM0={bits}")], "bits": 32 })).unwrap();
     assert_eq!(truncate(&mut client, "0x4004000000000000"), "0x1420(truncate) returned RAX = 0x2 (2) after 2 instructions\n");
     assert_eq!(truncate(&mut client, "0x7ff8000000000000"), "0x1420(truncate) returned RAX = 0x80000000 (2147483648, -2147483648 signed) after 2 instructions\n");
+    assert_eq!(truncate(&mut client, "f64:-2.75"), "0x1420(truncate) returned RAX = 0xfffffffe (4294967294, -2 signed) after 2 instructions\n");
+    // A float argument goes in XMM0, and a register reads as a float of its low bytes.
+    let floats = |client: &mut Client, read: &str| client.tool("run", json!({ "path": ORACLE_ELF, "function": "0x1420", "args": ["f64:2.5"], "read": [read], "bits": 32 }));
+    assert_eq!(floats(&mut client, "XMM0:f64").unwrap(), "0x1420(truncate) returned RAX = 0x2 (2) after 2 instructions\nXMM0:f64 = 0x4004000000000000 (2.5)\n");
+    assert!(floats(&mut client, "XMM0:f16").unwrap_err().contains("as a float with `:f32` or `:f64`"));
     // Sizes the oracle cannot give, and a memory the processor does not have, are refused.
     assert!(run(&mut client, "0x11c1", json!(["buf:0xffffffffff", 1])).unwrap_err().contains("more than the 16777216 that fit a block"));
     assert!(client.tool("run", json!({ "path": ORACLE_ELF, "function": "0x1302", "set": ["xdata:0x100=hex:00"] })).unwrap_err().contains("this processor has no memory called xdata"));

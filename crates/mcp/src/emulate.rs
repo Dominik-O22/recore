@@ -24,6 +24,8 @@ use serde::Deserialize;
 
 use crate::binary::Binary;
 
+mod x87;
+
 /// Bytes in a page of the sparse memory each space keeps.
 const PAGE: usize = 4096;
 /// Bytes lifted at a time from where execution goes next.
@@ -199,9 +201,22 @@ struct Abi {
     /// Registers that hold the rest of a result wider than `result`, the lowest first.
     result_rest: &'static [&'static str],
     big_endian: bool,
+    /// Registers that take float arguments, in order, and after them the stack; `None` where it
+    /// depends on how the binary was built, as on 32-bit ARM.
+    floats: Option<&'static [&'static str]>,
+    /// Whether an argument goes in the register of its position among all the arguments, as on
+    /// Windows x64, rather than in the next free one of its kind.
+    positional: bool,
+    /// The x87 control word a thread starts with, and the system that sets it.
+    control_word: Option<(u128, &'static str)>,
 }
 
-const SYSTEM_V: Abi = Abi { args: &[], result: "", stack: "", returns: Returns::Pushed, shadow: 0, mode_bit: 0, arm_arithmetic: false, alignment: 16, pointer: 0, code: "ram", spaces: &["ram"], result_rest: &[], big_endian: false };
+const SYSTEM_V: Abi = Abi { args: &[], result: "", stack: "", returns: Returns::Pushed, shadow: 0, mode_bit: 0, arm_arithmetic: false, alignment: 16, pointer: 0, code: "ram", spaces: &["ram"], result_rest: &[], big_endian: false, floats: None, positional: false, control_word: None };
+
+const XMM: [&str; 8] = ["XMM0", "XMM1", "XMM2", "XMM3", "XMM4", "XMM5", "XMM6", "XMM7"];
+/// Windows rounds x87 results to 53 bits, as a double has, and Linux and macOS to 64.
+const WINDOWS_X87: Option<(u128, &str)> = Some((0x27f, "Windows"));
+const UNIX_X87: Option<(u128, &str)> = Some((0x37f, "Linux and macOS"));
 
 /// The memories of an 8051 and the bits in them.
 const EIGHT051: [&str; 5] = ["CODE", "INTMEM", "EXTMEM", "SFR", "BITS"];
@@ -209,10 +224,10 @@ const EIGHT051: [&str; 5] = ["CODE", "INTMEM", "EXTMEM", "SFR", "BITS"];
 fn abi(image: &Image) -> Result<Abi> {
     let pointer = image.machine.pointer_size();
     let abi = match image.machine {
-        Machine::X86_64 if image.format == Format::Pe => Abi { args: &["RCX", "RDX", "R8", "R9"], result: "RAX", stack: "RSP", shadow: 32, ..SYSTEM_V },
-        Machine::X86_64 => Abi { args: &["RDI", "RSI", "RDX", "RCX", "R8", "R9"], result: "RAX", stack: "RSP", ..SYSTEM_V },
-        Machine::X86 => Abi { result: "EAX", stack: "ESP", ..SYSTEM_V },
-        Machine::Aarch64 => Abi { args: &["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"], result: "x0", stack: "sp", returns: Returns::Link("x30"), arm_arithmetic: true, ..SYSTEM_V },
+        Machine::X86_64 if image.format == Format::Pe => Abi { args: &["RCX", "RDX", "R8", "R9"], result: "RAX", stack: "RSP", shadow: 32, floats: Some(&XMM[..4]), positional: true, control_word: WINDOWS_X87, ..SYSTEM_V },
+        Machine::X86_64 => Abi { args: &["RDI", "RSI", "RDX", "RCX", "R8", "R9"], result: "RAX", stack: "RSP", floats: Some(&XMM), control_word: UNIX_X87, ..SYSTEM_V },
+        Machine::X86 => Abi { result: "EAX", stack: "ESP", floats: Some(&[]), control_word: if image.format == Format::Pe { WINDOWS_X87 } else { UNIX_X87 }, ..SYSTEM_V },
+        Machine::Aarch64 => Abi { args: &["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"], result: "x0", stack: "sp", returns: Returns::Link("x30"), arm_arithmetic: true, floats: Some(&["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"]), ..SYSTEM_V },
         Machine::Thumb | Machine::Arm => Abi { args: &["r0", "r1", "r2", "r3"], result: "r0", stack: "sp", returns: Returns::Link("lr"), mode_bit: 1, arm_arithmetic: true, alignment: 8, ..SYSTEM_V },
         // Arguments of an 8051 function are in places that depend on its compiler and on the
         // function, so the caller sets them. The first byte of a result is in DPL for SDCC and
@@ -459,10 +474,19 @@ pub enum Stop {
     Fault(String),
 }
 
+/// A number given for an argument or a register: an integer, or the bits of a float of 4 or 8
+/// bytes. A float argument goes where the platform passes floats, and a float put in a 10-byte
+/// x87 register becomes the extended float of the same value.
+#[derive(Debug, Clone, Copy)]
+pub enum Scalar {
+    Int(u128),
+    Float { bits: u128, size: usize },
+}
+
 /// An argument of the call.
 #[derive(Debug, Clone)]
 pub enum Arg {
-    Value(u128),
+    Value(Scalar),
     /// Bytes put in scratch memory, whose address is passed.
     Buffer(Vec<u8>),
 }
@@ -473,10 +497,11 @@ pub struct Call {
     pub entry: u64,
     pub args: Vec<Arg>,
     /// Registers set before the run, which comes after the arguments are placed.
-    pub registers: Vec<(String, u128)>,
+    pub registers: Vec<(String, Scalar)>,
     /// Memory written before the run.
     pub memory: Vec<(Option<String>, u64, Vec<u8>)>,
-    /// Registers read after the run, besides the one that holds the result.
+    /// Registers read after the run, besides the one that holds the result, each as it is or with
+    /// `:f32` or `:f64` as a float of that size.
     pub read: Vec<String>,
     /// Memory read after the run: address and length.
     pub dump: Vec<(Option<String>, u64, usize)>,
@@ -491,6 +516,15 @@ pub struct Buffer {
     pub after: Vec<u8>,
 }
 
+/// A register as the answer shows it.
+pub struct Reading {
+    pub name: String,
+    pub bits: u128,
+    pub size: usize,
+    /// Whether the bits are a float, shown in decimal.
+    pub float: bool,
+}
+
 /// What a run did.
 pub struct Outcome {
     pub stop: Stop,
@@ -499,8 +533,8 @@ pub struct Outcome {
     /// What the oracle chose or found that changes how to read the run.
     pub notes: Vec<String>,
     /// The register that holds the result, and what it held.
-    pub result: (String, u128, usize),
-    pub registers: Vec<(String, u128, usize)>,
+    pub result: Reading,
+    pub registers: Vec<Reading>,
     pub dumps: Vec<(Option<String>, u64, Vec<u8>)>,
     pub buffers: Vec<Buffer>,
     /// Memory the run wrote besides its stack and its buffers: space, address and bytes, in runs.
@@ -539,6 +573,8 @@ struct Emulator<'a> {
     /// Where the next allocation in scratch memory goes.
     heap: u64,
     stand_ins: BTreeMap<String, u64>,
+    /// Whether the run did x87 arithmetic, which the control word rounds.
+    x87: bool,
 }
 
 /// A region of `size` bytes below `top` that no section of the image is in.
@@ -581,7 +617,7 @@ impl<'a> Emulator<'a> {
         }
         let register_banks = (image.machine == Machine::I8051).then(|| spaces.intern("INTMEM"));
         let memory = Memory { pages: FxHashMap::default(), code: spaces.intern(abi.code), big_endian: abi.big_endian, unwritten: 0, unwritten_first: Vec::new() };
-        Ok(Emulator { binary, abi, spaces, memory, lifted: FxHashMap::default(), registers: FxHashMap::default(), imports, stack, scratch, sentinel, internal_stack: None, stack_high: 0, register_banks, blocks: Vec::new(), steps: 0, notes: Vec::new(), heap: scratch.0 + PAGE as u64, stand_ins: BTreeMap::new() })
+        Ok(Emulator { binary, abi, spaces, memory, lifted: FxHashMap::default(), registers: FxHashMap::default(), imports, stack, scratch, sentinel, internal_stack: None, stack_high: 0, register_banks, blocks: Vec::new(), steps: 0, notes: Vec::new(), heap: scratch.0 + PAGE as u64, stand_ins: BTreeMap::new(), x87: false })
     }
 
     fn register(&mut self, name: &str) -> Result<Varnode, String> {
@@ -637,6 +673,21 @@ impl<'a> Emulator<'a> {
     fn write_register(&mut self, name: &str, value: u128) -> Result<(), String> {
         let place = self.register(name)?;
         self.put(place, value)
+    }
+
+    fn write_scalar(&mut self, name: &str, value: Scalar) -> Result<(), String> {
+        let place = self.register(name)?;
+        let bits = match value {
+            Scalar::Float { bits, size } if place.size == 10 => x87::widen(bits, size)?,
+            Scalar::Float { size, .. } if size > place.size => return Err(format!("{name} has {} bytes, too few for a float of {size}", place.size)),
+            Scalar::Int(bits) | Scalar::Float { bits, .. } => bits,
+        };
+        self.put(place, bits)
+    }
+
+    /// How the x87 rounds now, as its control word says.
+    fn control(&mut self) -> Result<x87::Control, String> {
+        Ok(x87::Control::from_word(self.read_register("FPUControlWord")?))
     }
 
     fn read_pointer(&mut self, addr: u64) -> u64 {
@@ -723,7 +774,13 @@ impl<'a> Emulator<'a> {
                         inputs.push((self.get(input)?, input.size));
                     }
                     let out = op.out.ok_or_else(|| format!("{code:?} with no output"))?;
-                    let value = compute(code, out.size, &inputs, self.abi.arm_arithmetic)?;
+                    let value = if x87::applies(code, out.size, &inputs) {
+                        self.x87 = true;
+                        let control = self.control()?;
+                        x87::compute(code, out.size, &inputs, control)?
+                    } else {
+                        compute(code, out.size, &inputs, self.abi.arm_arithmetic)?
+                    };
                     self.put(out, value)?;
                 }
             }
@@ -867,6 +924,9 @@ impl<'a> Emulator<'a> {
 
     /// Puts the arguments where the function finds them. Gives the buffers passed.
     fn start(&mut self, call: &Call) -> Result<Vec<Buffer>, String> {
+        if let Some((word, _)) = self.abi.control_word {
+            self.write_register("FPUControlWord", word)?;
+        }
         let mut values = Vec::new();
         let mut buffers = Vec::new();
         for (index, arg) in call.args.iter().enumerate() {
@@ -876,7 +936,7 @@ impl<'a> Emulator<'a> {
                     let addr = self.allocate(bytes.len() as u64).ok_or("scratch memory ran out")?;
                     self.write_memory(addr, bytes, false);
                     buffers.push(Buffer { arg: index + 1, addr, before: bytes.clone(), after: Vec::new() });
-                    values.push(u128::from(addr));
+                    values.push(Scalar::Int(u128::from(addr)));
                 }
             }
         }
@@ -888,7 +948,7 @@ impl<'a> Emulator<'a> {
         } else {
             self.start_on_stack(&values)?;
             for (name, value) in &call.registers {
-                self.write_register(name, *value)?;
+                self.write_scalar(name, *value)?;
             }
         }
         for (space, _, _) in &call.dump {
@@ -904,18 +964,35 @@ impl<'a> Emulator<'a> {
     }
 
     /// Arguments and the return address for a machine with a stack in memory or a link register.
-    fn start_on_stack(&mut self, values: &[u128]) -> Result<(), String> {
+    fn start_on_stack(&mut self, values: &[Scalar]) -> Result<(), String> {
         let pointer = self.abi.pointer;
-        let in_registers = values.len().min(self.abi.args.len());
-        for (name, &value) in self.abi.args.iter().zip(values) {
-            self.write_register(name, value)?;
+        let (mut ints, mut floats) = (0, 0);
+        let mut on_stack = Vec::new();
+        for (index, &value) in values.iter().enumerate() {
+            let (registers, taken, bits) = match value {
+                Scalar::Int(bits) => (self.abi.args, &mut ints, bits),
+                Scalar::Float { bits, .. } => (self.abi.floats.ok_or("where a float argument goes on 32-bit ARM depends on how the binary was built: pass its bits as an integer, or set its register")?, &mut floats, bits),
+            };
+            match registers.get(if self.abi.positional { index } else { *taken }) {
+                Some(name) => {
+                    *taken += 1;
+                    self.write_register(name, bits)?;
+                }
+                None => on_stack.push(value),
+            }
         }
-        let on_stack = &values[in_registers..];
-        let args_size = on_stack.len() as u64 * pointer;
+        // A slot of the stack is a pointer wide, and a double takes two on x86.
+        let slot = |value: &Scalar| match value {
+            Scalar::Float { size, .. } => (*size as u64).max(pointer),
+            Scalar::Int(_) => pointer,
+        };
+        let args_size: u64 = on_stack.iter().map(slot).sum();
         let base = (self.stack.1 - self.abi.shadow - args_size) & !(self.abi.alignment - 1);
-        let args_at = base + self.abi.shadow;
-        for (index, &value) in on_stack.iter().enumerate() {
-            self.memory.write(&self.binary.program.image, self.memory.code, args_at + index as u64 * pointer, pointer as usize, value, false);
+        let mut at = base + self.abi.shadow;
+        for value in &on_stack {
+            let (Scalar::Int(bits) | Scalar::Float { bits, .. }) = *value;
+            self.memory.write(&self.binary.program.image, self.memory.code, at, slot(value) as usize, bits, false);
+            at += slot(value);
         }
         let sentinel = u128::from(self.sentinel);
         let sp = match self.abi.returns {
@@ -946,7 +1023,7 @@ impl<'a> Emulator<'a> {
     /// sets, or the one the startup code sets, or `INITIAL_SP`.
     fn start_internal(&mut self, call: &Call) -> Result<(), String> {
         for (name, value) in &call.registers {
-            self.write_register(name, *value)?;
+            self.write_scalar(name, *value)?;
         }
         if call.registers.iter().any(|(name, _)| name.eq_ignore_ascii_case(self.abi.stack)) {
             self.notes.push("the internal stack began where the caller set SP".into());
@@ -1043,6 +1120,30 @@ impl<'a> Emulator<'a> {
         }
     }
 
+    /// A register as the caller asked to read it: `ST0`, or `XMM0:f64` for a float in its low
+    /// bytes. A 10-byte register is an x87 one, which holds a float, and a float read from it
+    /// is rounded as a store of it would be.
+    fn reading(&mut self, name: String) -> Result<Reading, String> {
+        let (register, view) = match name.split_once(':') {
+            None => (name.as_str(), None),
+            Some((register, "f32")) => (register, Some(4)),
+            Some((register, "f64")) => (register, Some(8)),
+            Some(_) => return Err(format!("`{name}`: a register reads as it is, or as a float with `:f32` or `:f64`")),
+        };
+        let place = self.register(register)?;
+        let held = self.get(place)?;
+        let (bits, size) = match view {
+            None => (held, place.size),
+            Some(size) if place.size == 10 => {
+                let control = self.control()?;
+                (x87::narrow(held, size, control)?, size)
+            }
+            Some(size) if size > place.size => return Err(format!("{register} has {} bytes, too few for a float of {size}", place.size)),
+            Some(size) => (held & mask(size), size),
+        };
+        Ok(Reading { name, bits, size, float: view.is_some() || place.size == 10 })
+    }
+
     fn outcome(&mut self, call: &Call, stop: Stop, mut buffers: Vec<Buffer>) -> Result<Outcome, String> {
         let code = self.memory.code;
         for buffer in &mut buffers {
@@ -1050,18 +1151,20 @@ impl<'a> Emulator<'a> {
         }
         let mut registers = Vec::new();
         for name in self.abi.result_rest.iter().map(|name| name.to_string()).chain(call.read.iter().cloned()) {
-            let place = self.register(&name)?;
-            registers.push((name, self.get(place)?, place.size));
+            registers.push(self.reading(name)?);
+        }
+        if let Some((word, system)) = self.abi.control_word.filter(|_| self.x87 && !call.registers.iter().any(|(name, _)| name.eq_ignore_ascii_case("FPUControlWord"))) {
+            let x87::Control { precision, .. } = x87::Control::from_word(word);
+            self.notes.push(format!("the x87 began with control word {word:#x}, which a thread starts with on {system}: {precision}-bit precision, rounding to nearest. Set FPUControlWord to change it"));
         }
         let mut dumps = Vec::new();
         for (space, addr, len) in &call.dump {
             let space = self.space_named(space.as_deref())?;
             dumps.push((self.space_label(space), *addr, self.memory.peek(&self.binary.program.image, space, *addr, *len)));
         }
-        let result = self.abi.result;
-        let place = self.register(result)?;
+        let result = self.reading(self.abi.result.to_string())?;
         let unwritten = (self.memory.unwritten, self.memory.unwritten_first.iter().map(|&(space, addr)| (self.space_label(space), addr)).collect());
-        Ok(Outcome { stop, steps: self.steps, notes: std::mem::take(&mut self.notes), result: (result.to_string(), self.get(place)?, place.size), registers, dumps, buffers, writes: self.writes(), unwritten, stand_ins: std::mem::take(&mut self.stand_ins) })
+        Ok(Outcome { stop, steps: self.steps, notes: std::mem::take(&mut self.notes), result, registers, dumps, buffers, writes: self.writes(), unwritten, stand_ins: std::mem::take(&mut self.stand_ins) })
     }
 }
 
@@ -1127,17 +1230,27 @@ fn hex_bytes(text: &str) -> Result<Vec<u8>> {
     digits.chunks(2).map(|pair| u8::from_str_radix(std::str::from_utf8(pair)?, 16).with_context(|| format!("`{text}` is not hex"))).collect()
 }
 
-/// An argument given as text: a number, or `hex:` bytes, `str:` text with its end, or `buf:` a
-/// count of zero bytes, each of which is put in memory and passed by its address.
+/// A number, or `f32:` or `f64:` and a float in decimal.
+fn scalar(text: &str) -> Result<Scalar> {
+    let not_a_float = || format!("`{text}` is not a float: write a decimal, as 1.5, -2e-3 or inf");
+    Ok(match text.split_once(':') {
+        Some(("f32", value)) => Scalar::Float { bits: u128::from(value.trim().parse::<f32>().with_context(not_a_float)?.to_bits()), size: 4 },
+        Some(("f64", value)) => Scalar::Float { bits: u128::from(value.trim().parse::<f64>().with_context(not_a_float)?.to_bits()), size: 8 },
+        _ => Scalar::Int(number(text)?),
+    })
+}
+
+/// An argument given as text: a number or a float, or `hex:` bytes, `str:` text with its end, or
+/// `buf:` a count of zero bytes, each of which is put in memory and passed by its address.
 fn arg(given: &Given) -> Result<Arg> {
     Ok(match given {
-        Given::Signed(value) => Arg::Value(*value as u128),
-        Given::Unsigned(value) => Arg::Value(u128::from(*value)),
+        Given::Signed(value) => Arg::Value(Scalar::Int(*value as u128)),
+        Given::Unsigned(value) => Arg::Value(Scalar::Int(u128::from(*value))),
         Given::Text(text) => match text.split_once(':') {
             Some(("hex", bytes)) => Arg::Buffer(hex_bytes(bytes)?),
             Some(("str", text)) => Arg::Buffer(text.bytes().chain([0]).collect()),
             Some(("buf", count)) => Arg::Buffer(vec![0; size(count)?]),
-            _ => Arg::Value(number(text)?),
+            _ => Arg::Value(scalar(text)?),
         },
     })
 }
@@ -1160,9 +1273,14 @@ fn hex(bytes: &[u8]) -> String {
     format!("{}{more}", shown.join(" "))
 }
 
-/// A register's value as hex and decimal, as unsigned and, if its top bit is set, as signed, of
-/// the low `bits` bits of it when the caller says the function returns fewer than it holds.
-fn value(name: &str, held: u128, size: usize, bits: Option<u32>) -> String {
+/// A register's value as hex and decimal: a float's in decimal, and an integer's as unsigned and,
+/// if its top bit is set, as signed, of the low `bits` bits of it when the caller says the
+/// function returns fewer than it holds.
+fn value(reading: &Reading, bits: Option<u32>) -> String {
+    let &Reading { ref name, bits: held, size, float } = reading;
+    if float {
+        return format!("{name} = {held:#x} ({})", x87::decimal(held, size));
+    }
     let width = bits.map_or(8 * size, |bits| (bits as usize).clamp(1, 8 * size));
     let held = if width >= 128 { held } else { held & ((1u128 << width) - 1) };
     let mut text = format!("{name} = {held:#x} ({held}");
@@ -1200,20 +1318,20 @@ pub fn run(binary: &mut Binary, args: Run) -> Result<String> {
             let bytes = what.strip_prefix("hex:").map(hex_bytes).with_context(|| format!("`{setting}`: memory takes `hex:` bytes"))??;
             call.memory.push((space, parse_addr(addr).with_context(|| format!("`{addr}` is not an address"))?, bytes));
         } else {
-            call.registers.push((place.to_string(), number(what)?));
+            call.registers.push((place.to_string(), scalar(what)?));
         }
     }
     let outcome = emulate(binary, &call)?;
     let label = binary.program.label(entry);
     let mut out = String::new();
-    let (name, bits, size) = &outcome.result;
+    let result = &outcome.result;
     match &outcome.stop {
-        Stop::Returned => writeln!(out, "{label} returned {} after {} instructions", value(name, *bits, *size, args.bits), outcome.steps)?,
-        Stop::Steps => writeln!(out, "{label} did not return in {} instructions; {name} holds {:#x}", outcome.steps, bits)?,
+        Stop::Returned => writeln!(out, "{label} returned {} after {} instructions", value(result, args.bits), outcome.steps)?,
+        Stop::Steps => writeln!(out, "{label} did not return in {} instructions; {} holds {:#x}", outcome.steps, result.name, result.bits)?,
         Stop::Fault(fault) => writeln!(out, "{label} stopped after {} instructions: {fault}", outcome.steps)?,
     }
-    for (name, bits, size) in &outcome.registers {
-        writeln!(out, "{}", value(name, *bits, *size, None))?;
+    for reading in &outcome.registers {
+        writeln!(out, "{}", value(reading, None))?;
     }
     for (space, addr, bytes) in &outcome.dumps {
         writeln!(out, "{} at {}: {}", count(bytes.len(), "byte"), place(space, *addr), hex(bytes))?;
@@ -1299,7 +1417,7 @@ mod tests {
         let (one, two) = (u128::from(1.0f32.to_bits()), u128::from(2.0f32.to_bits()));
         assert_eq!(run(Code::FAdd, 4, &[(one, 4), (one, 4)]), two);
         assert_eq!(run(Code::Trunc, 4, &[(u128::from((-2.5f32).to_bits()), 4)]), 0xffff_fffe);
-        assert_eq!(compute(Code::FAdd, 10, &[(0, 10), (0, 10)], false), Err("floating point of 10 bytes is not run".into()));
+        assert_eq!(compute(Code::FAdd, 2, &[(0, 2), (0, 2)], false), Err("floating point of 2 bytes is not run".into()));
     }
 
     #[test]
