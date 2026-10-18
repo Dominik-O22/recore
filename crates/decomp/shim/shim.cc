@@ -480,7 +480,9 @@ struct RdSession {
 
 // Whether a value goes nowhere except through copies and merges into storage that nothing reads
 // directly. A read after a call that may have written the storage is not a read of the value.
+// Storage that outlasts the function, such as a global, is read by whoever reads it next.
 static bool never_read(const Varnode *vn, set<const Varnode *> &seen) {
+  if (vn->isPersist()) return false;
   if (!seen.insert(vn).second) return true;
   for (auto it = vn->beginDescend(); it != vn->endDescend(); ++it) {
     const PcodeOp *op = *it;
