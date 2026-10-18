@@ -343,10 +343,18 @@ impl State {
             }
             Value::Pointer { table, limit: bound } => {
                 // Without a bounds check, the table runs for as long as consecutive slots hold
-                // relocated code pointers.
+                // relocated code pointers. An image without relocations holds them as they are.
                 let limit = Limit::entries(bound);
+                let entry = |slot: u64| {
+                    if image.relocations_stripped {
+                        let word = image.bytes_from(slot)?.get(..pointer_size as usize)?;
+                        Some(word.iter().rev().fold(0, |value, &byte| value << 8 | u64::from(byte)))
+                    } else {
+                        pointer_slots.get(&slot).copied()
+                    }
+                };
                 let entries: Vec<u64> = (0..limit as u64)
-                    .map_while(|i| pointer_slots.get(&(table + pointer_size * i)).copied())
+                    .map_while(|i| entry(table + pointer_size * i))
                     .take_while(|&target| if bound.is_some() { is_code(target) } else { is_target(target) })
                     .collect();
                 // A bounded table that stops short was misread.
