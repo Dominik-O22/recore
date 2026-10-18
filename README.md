@@ -89,7 +89,7 @@ Opus 5.5 is left out: in three sessions its safeguards stopped the response afte
 
 ## How
 
-The analysis is written from scratch in Rust: loading, function discovery, calls that never return, jump tables, strings, references, library function names by fingerprint, and C++, Objective-C and Swift classes with their methods. The C comes from Ghidra's decompiler engine, compiled into recore and fed recore's analysis instead of Ghidra's. `run` interprets the p-code of the same engine's processor specifications, and computes the x87's 80-bit floats in software, rounding each result as the processor does.
+The analysis is written from scratch in Rust: loading, function discovery, calls that never return, jump tables, strings, references, library function names by fingerprint, and C++, Objective-C and Swift classes with their methods. The C comes from Ghidra's decompiler engine, compiled into recore and fed recore's analysis instead of Ghidra's. `run` interprets the p-code of the same engine's processor specifications, and computes the x87's 80-bit floats in software. Its arithmetic rounds as the processor's does, and its transcendental instructions come within a unit in the last place of the processor's.
 
 It reads ELF, Windows PE and Mach-O for x86, x86-64 and AArch64, ELF for 32-bit ARM, A32 and Thumb-2 side by side, and raw firmware that a layout file describes: 8051 and ARM Cortex-M.
 

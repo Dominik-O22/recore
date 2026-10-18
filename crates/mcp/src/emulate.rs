@@ -133,9 +133,15 @@ struct Op {
 /// One instruction: its length and what it does.
 struct Lifted {
     len: u64,
-    /// What it does, or why that is not known. An operation the interpreter lacks fails the run
-    /// only if the run gets to it.
-    ops: Result<Vec<Op>, String>,
+    semantics: Semantics,
+}
+
+enum Semantics {
+    /// The p-code of the processor specification, or why it is not known. An operation the
+    /// interpreter lacks fails the run only if the run gets to it.
+    Pcode(Result<Vec<Op>, String>),
+    /// An x87 instruction run whole, which the specification leaves opaque or approximate.
+    X87(x87::Instruction),
 }
 
 fn operand(spaces: &mut Spaces, text: &str) -> Result<Varnode> {
@@ -690,6 +696,46 @@ impl<'a> Emulator<'a> {
         Ok(x87::Control::from_word(self.read_register("FPUControlWord")?))
     }
 
+    /// Runs an x87 instruction on the register stack, and sets the condition bits it defines in
+    /// their registers and in the status word, which the specification keeps apart.
+    fn x87_instruction(&mut self, instruction: x87::Instruction) -> Result<(), String> {
+        self.x87 = true;
+        let control = self.control()?;
+        let outcome = x87::execute(instruction, self.read_register("ST0")?, self.read_register("ST1")?, control);
+        let mut stack = [0; 8];
+        for (index, held) in stack.iter_mut().enumerate() {
+            *held = self.read_register(&format!("ST{index}"))?;
+        }
+        match outcome.stack {
+            x87::Stack::Replace(top) => stack[0] = top,
+            x87::Stack::Pop(top) => {
+                // The specification pops by moving each register up, and leaves ST7 as it was.
+                stack.copy_within(1.., 0);
+                stack[0] = top;
+            }
+            x87::Stack::ReplacePush(top, pushed) => {
+                stack.copy_within(..7, 1);
+                stack[1] = top;
+                stack[0] = pushed;
+            }
+            x87::Stack::Push(pushed) => {
+                stack.copy_within(..7, 1);
+                stack[0] = pushed;
+            }
+        }
+        for (index, value) in stack.into_iter().enumerate() {
+            self.write_register(&format!("ST{index}"), value)?;
+        }
+        let mut status = self.read_register("FPUStatusWord")?;
+        for (index, (condition, bit)) in outcome.conditions.into_iter().zip([8, 9, 10, 14]).enumerate() {
+            if let Some(set) = condition {
+                self.write_register(&format!("C{index}"), u128::from(set))?;
+                status = status & !(1 << bit) | u128::from(set) << bit;
+            }
+        }
+        self.write_register("FPUStatusWord", status)
+    }
+
     fn read_pointer(&mut self, addr: u64) -> u64 {
         self.memory.read(&self.binary.program.image, self.memory.code, addr, self.abi.pointer as usize) as u64
     }
@@ -717,8 +763,12 @@ impl<'a> Emulator<'a> {
             if instruction.text == "(bad)" {
                 break;
             }
-            let ops = instruction.pcode.iter().map(|line| parse_op(&mut self.spaces, line)).collect::<Result<Vec<_>>>().map_err(|error| format!("{error:#}"));
-            self.lifted.entry(instruction.addr).or_insert_with(|| Rc::new(Lifted { len: instruction.len, ops }));
+            let x86 = matches!(self.binary.program.image.machine, Machine::X86 | Machine::X86_64);
+            let semantics = match instruction.text.split(' ').next().and_then(x87::Instruction::parse) {
+                Some(whole) if x86 => Semantics::X87(whole),
+                _ => Semantics::Pcode(instruction.pcode.iter().map(|line| parse_op(&mut self.spaces, line)).collect::<Result<Vec<_>>>().map_err(|error| format!("{error:#}"))),
+            };
+            self.lifted.entry(instruction.addr).or_insert_with(|| Rc::new(Lifted { len: instruction.len, semantics }));
         }
         self.lifted.get(&pc).cloned().ok_or_else(|| format!("no instruction decodes at {pc:#x}"))
     }
@@ -726,7 +776,13 @@ impl<'a> Emulator<'a> {
     /// Runs the operations of the instruction at `pc`: where execution goes next, or `None` for
     /// the instruction after it.
     fn execute(&mut self, lifted: &Lifted) -> Result<Option<u64>, String> {
-        let ops = lifted.ops.as_ref().map_err(Clone::clone)?;
+        let ops = match &lifted.semantics {
+            Semantics::Pcode(ops) => ops.as_ref().map_err(Clone::clone)?,
+            &Semantics::X87(instruction) => {
+                self.x87_instruction(instruction)?;
+                return Ok(None);
+            }
+        };
         let mut index = 0;
         while let Some(op) = ops.get(index) {
             let here = index;
