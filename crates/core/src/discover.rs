@@ -601,10 +601,14 @@ impl<'a, A: Arch> Explorer<'a, A> {
     }
 
     /// Whether a value the code holds may be an address. Where the loader relocates the
-    /// addresses in code, only a value some relocation carries is one; where the relocations
-    /// are stripped, nothing tells them apart and what the value points at decides.
+    /// addresses in code, only a value some relocation carries is one. Where the relocations
+    /// are stripped, nothing tells them apart, so any value the image maps may be one: not the
+    /// `push 1` or the -1.0 of `push 0xbf800000`.
     fn may_be_address(&self, value: u64) -> bool {
-        !A::ADDRESSES_ARE_RELOCATED || self.image.relocations_stripped || self.pointer_values.contains(&value)
+        if self.image.relocations_stripped {
+            return self.image.section_at(value).is_some() || self.image.is_zero_filled(value);
+        }
+        !A::ADDRESSES_ARE_RELOCATED || self.pointer_values.contains(&value)
     }
 
     /// Marks `[start, end)` as a literal the code reads, which is no instruction.

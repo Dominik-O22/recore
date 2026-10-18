@@ -1,6 +1,6 @@
 //! A 32-bit PE image whose base relocations are stripped, so nothing marks which words are
 //! addresses: its switch table and the callbacks it takes the address of are found from the
-//! bytes alone.
+//! bytes alone, and the numbers it pushes that land outside it are not taken for addresses.
 
 use recore::image::{Format, Image, Machine, Section};
 use recore::report::Origin;
@@ -19,7 +19,10 @@ fn reads_a_switch_table_and_a_taken_address_without_relocations() {
         0x68, 0x3c, 0x10, 0x40, 0x00, 0x58, 0xc3,  // 0x401022  push 0x40103c; pop eax; ret
         0x31, 0xc0, 0xc3,                          // 0x401029  xor eax, eax; ret
         0x10, 0x10, 0x40, 0x00, 0x16, 0x10, 0x40, 0x00, 0x1c, 0x10, 0x40, 0x00, 0x22, 0x10, 0x40, 0x00,
-        0xb8, 0x07, 0x00, 0x00, 0x00, 0xc3,        // 0x40103c  mov eax, 7; ret
+        0x68, 0x01, 0x00, 0x00, 0x00,              // 0x40103c  push 1
+        0x68, 0x00, 0x00, 0x80, 0xbf,              // 0x401041  push 0xbf800000, which is -1.0
+        0x83, 0xc4, 0x08,                          // 0x401046  add esp, 8
+        0xb8, 0x07, 0x00, 0x00, 0x00, 0xc3,        // 0x401049  mov eax, 7; ret
     ];
     let text = Section { name: ".text".into(), addr: 0x401000, data: code.to_vec(), file_offset: None, executable: true, writable: false };
     let image = Image { base: 0x400000, relocations_stripped: true, ..Image::bare("stripped".into(), Format::Pe, Machine::X86, 0x401000, vec![text]) };
@@ -30,4 +33,7 @@ fn reads_a_switch_table_and_a_taken_address_without_relocations() {
     assert_eq!(tables, [(0x401009, &[0x401010, 0x401016, 0x40101c, 0x401022][..])]);
     let callback = analysis.functions.iter().find(|function| function.addr == 0x40103c).map(|function| function.origin);
     assert_eq!(callback, Some(Origin::AddressTaken));
+    // Numbers the image does not map are no addresses.
+    let references: Vec<_> = analysis.data_refs.iter().map(|reference| (reference.from, reference.to)).collect();
+    assert_eq!(references, [(0x401009, 0x40102c), (0x401022, 0x40103c)]);
 }
