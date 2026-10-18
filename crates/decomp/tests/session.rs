@@ -147,6 +147,34 @@ fn a_fastcall_callee_takes_the_registers_it_stores() {
     assert!(caller.c_text.contains("(0x2a);") && caller.c_text.contains(",7);"), "{}", caller.c_text);
 }
 
+/// A function that hands the register it is passed on to its callee takes it, even when it was
+/// first decompiled before that callee was known, as for one of its own callers.
+#[test]
+fn a_function_takes_the_register_it_hands_on_once_its_callee_is_known() {
+    use recore::image::{Format, Machine};
+    #[rustfmt::skip]
+    let code = [
+        0xe8, 0x1b, 0x00, 0x00, 0x00,  // 0x1000  call 0x1020
+        0xc3,                          // 0x1005  ret
+        0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+        0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+        0x8d, 0x41, 0x01,              // 0x1020  lea eax, [ecx+1]
+        0xc3,                          // 0x1023  ret
+    ];
+    let section = recore::image::Section { name: ".text".into(), addr: 0x1000, data: code.to_vec(), file_offset: None, executable: true, writable: false };
+    let image = recore::Image::bare("test".into(), Format::Pe, Machine::X86, 0x1000, vec![section]);
+    let analysis = recore::analyze(&image);
+    let mut session = Session::from_image(&image, &analysis).unwrap();
+    session.add_functions(&Facts::derive(&image, &analysis)).unwrap();
+    session.keep_prototypes(true);
+
+    session.decompile(0x1000).unwrap();
+    session.decompile(0x1020).unwrap();
+    let function = session.decompile(0x1000).unwrap();
+    let storage: Vec<&str> = function.params.iter().map(|p| p.storage.as_str()).collect();
+    assert_eq!(storage, ["ECX"], "{}", function.c_text);
+}
+
 /// The engine's C parser accepts the exported prototypes of every archive, bar a few.
 #[test]
 fn archive_prototypes_parse() {
