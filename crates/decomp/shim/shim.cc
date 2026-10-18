@@ -2353,7 +2353,10 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     fd = session->function(addr);
     declared = fd->getFuncProto().isInputLocked() && session->kept.count(addr) == 0;
     if (fd->getFuncProto().isInputLocked() && session->kept.erase(addr) != 0) {
-      // Recover the prototype afresh instead of replaying the one kept from an earlier run.
+      // Recover the prototype afresh instead of replaying the one kept from an earlier run, its
+      // convention too: keeping the parameters locked it, and a function decompiled for a
+      // caller's sake before its own callees were known may have taken the wrong one.
+      fd->getFuncProto().setModelLock(false);
       fd->getFuncProto().setInputLock(false);
       fd->getFuncProto().setDotdotdot(false);
       arch->clearAnalysis(fd);
