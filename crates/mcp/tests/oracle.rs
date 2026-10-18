@@ -312,6 +312,41 @@ float xmean(float a, double b, int32_t n, float c) {
 }
 "#;
 
+/// Functions of the C library on the x87, built with `-funsafe-math-optimizations`, which has
+/// gcc compute `exp`, `log`, `sin`, `atan2`, `fmod` and the rest with the x87's own instructions.
+/// `pow` is glibc's for 32-bit x86, written for the x87 and taken from its `libm.a`.
+const X87_MATH: &[Function] = &[
+    Function { name: "xpow", params: &[any(F64), any(F64)], ret: F64, needs: Floats },
+    Function { name: "xexp", params: &[any(F64)], ret: F64, needs: Floats },
+    Function { name: "xlog", params: &[any(F64)], ret: F64, needs: Floats },
+    Function { name: "xlog1p", params: &[any(F64)], ret: F64, needs: Floats },
+    Function { name: "xsin", params: &[any(F64)], ret: F64, needs: Floats },
+    Function { name: "xtrig", params: &[any(F64)], ret: F64, needs: Floats },
+    Function { name: "xatan2", params: &[any(F64), any(F64)], ret: F64, needs: Floats },
+    Function { name: "xfmod", params: &[any(F64), any(F64)], ret: F64, needs: Floats },
+    Function { name: "xfmodw", params: &[any(F64), any(F64)], ret: F64, needs: Floats },
+    Function { name: "xremainder", params: &[any(F64), any(F64)], ret: F64, needs: Floats },
+    Function { name: "xconstants", params: &[any(F64), any(I32)], ret: F64, needs: Floats },
+];
+
+const X87_MATH_SOURCE: &str = r#"
+#include <math.h>
+#include <stdint.h>
+
+double xpow(double a, double b) { return pow(a, b); }
+double xexp(double a) { return exp(a); }
+double xlog(double a) { return log(a); }
+double xlog1p(double a) { return log1p(a); }
+double xsin(double a) { return sin(a); }
+double xtrig(double a) { return tan(a) + cos(a) * sin(a); }
+double xatan2(double a, double b) { return atan2(a, b); }
+double xfmod(double a, double b) { return fmod(a, b); }
+// A dividend so far above the divisor that FPREM takes it off in parts.
+double xfmodw(double a, double b) { return fmod(a * 0x1p300, b); }
+double xremainder(double a, double b) { return remainder(a, b); }
+double xconstants(double a, int32_t n) { return ldexp(a * 3.14159265358979323846264338327950288L + 0.693147180559945309417232121458176568L, n & 63); }
+"#;
+
 /// The inputs of one function and what the machine it ran on gave.
 struct Case {
     function: &'static Function,
@@ -571,7 +606,7 @@ fn x87_driver(cases: &[Case]) -> String {
          static float single(uint32_t b) { float x; memcpy(&x, &b, 4); return x; }\n\
          static void extended(int i, long double x) { uint64_t low; uint16_t high; memcpy(&low, &x, 8); memcpy(&high, (char *)&x + 8, 2); printf(\"%d %04x%016llx\\n\", i, high, (unsigned long long)low); }\n",
     );
-    for function in X87_FUNCTIONS {
+    for function in X87_FUNCTIONS.iter().chain(X87_MATH) {
         let params: Vec<&str> = function.params.iter().map(|param| param.ty.c()).collect();
         let ret = if function.ret.is_float() { "long double" } else { function.ret.c() };
         writeln!(c, "{ret} {}_raw({}) __asm__(\"{}\");", function.name, params.join(", "), function.name).unwrap();
@@ -590,11 +625,15 @@ fn x87_driver(cases: &[Case]) -> String {
     c
 }
 
-/// How far apart two extended floats are, in units in the last place of the 64-bit significand,
-/// counted along the line of every extended float.
+/// How far apart two extended floats of the same sign are, in units in the last place of the
+/// 64-bit significand. The format writes its integer bit, so the count goes by value and not by
+/// the bits: a normal number's exponent field counts from 1.
 fn ulps(a: u128, b: u128) -> u128 {
-    let line = |bits: u128| if bits >> 79 == 1 { -((bits & ((1 << 79) - 1)) as i128) } else { bits as i128 };
-    line(a).abs_diff(line(b))
+    let magnitude = |bits: u128| match bits >> 64 & 0x7fff {
+        0 => bits & u128::from(u64::MAX),
+        exponent => (exponent - 1) << 63 | bits & ((1 << 63) - 1),
+    };
+    if a >> 79 != b >> 79 { u128::MAX } else { magnitude(a).abs_diff(magnitude(b)) }
 }
 
 #[test]
@@ -605,9 +644,17 @@ fn the_oracle_agrees_with_the_x87() {
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("x87.c");
     std::fs::write(&source, X87_SOURCE).unwrap();
+    let math_source = dir.join("x87-math.c");
+    std::fs::write(&math_source, X87_MATH_SOURCE).unwrap();
+    // glibc's pow for the x87, under the name a caller uses.
+    let libm = command("gcc", &["-m32", "-print-file-name=libm.a"]);
+    assert!(Path::new(libm.trim()).is_file(), "this test needs glibc's 32-bit libm.a, which gcc does not find");
+    let pow = dir.join("pow.o");
+    command("ar", &["x", "--output", path(&dir), libm.trim(), "e_pow.o"]);
+    command("objcopy", &["--redefine-sym", "__ieee754_pow=pow", path(&dir.join("e_pow.o")), path(&pow)]);
     let mut rng = Rng(0x0123_4567_89ab_cdef);
     let mut cases: Vec<Case> = Vec::new();
-    for function in X87_FUNCTIONS {
+    for function in X87_FUNCTIONS.iter().chain(X87_MATH) {
         for _ in 0..CASES {
             let mut args: Vec<Input> = function.params.iter().map(|param| param.ty.generate(&mut rng, param.range)).collect();
             // A not-a-number now and then, and a second operand equal to the first.
@@ -625,18 +672,22 @@ fn the_oracle_agrees_with_the_x87() {
     // A Pentium has no FCOMI, so gcc compares with FNSTSW AX as MSVC does, and a Pentium Pro does.
     let mut compared = 0;
     let mut mismatches = Vec::new();
-    let mut largest = 0;
+    // For each function: the cases compared, those that differ, and by how much at most.
+    let mut tally: BTreeMap<&str, (usize, usize, u128)> = BTreeMap::new();
     let mut client = Client::start();
     for march in ["pentium", "pentiumpro"] {
         let object = dir.join(format!("x87-{march}.o"));
+        let math_object = dir.join(format!("x87-math-{march}.o"));
         let image = dir.join(format!("x87-{march}.so"));
         let reference = dir.join(format!("x87-{march}"));
         let flags = ["-m32", "-O2", "-fPIC", "-mfpmath=387", "-fno-math-errno"];
         let march_flag = format!("-march={march}");
         command("gcc", &[&flags[..], &[march_flag.as_str(), "-c", path(&source), "-o", path(&object)]].concat());
-        command("gcc", &["-m32", "-shared", "-nostdlib", "-o", path(&image), path(&object)]);
+        command("gcc", &[&flags[..], &[march_flag.as_str(), "-funsafe-math-optimizations", "-fno-stack-protector", "-c", path(&math_source), "-o", path(&math_object)]].concat());
+        // Bound to the image's own pow, which a call reaches directly and not through an import.
+        command("gcc", &["-m32", "-shared", "-nostdlib", "-Wl,-Bsymbolic", "-o", path(&image), path(&object), path(&math_object), path(&pow)]);
         std::fs::write(dir.join("x87-driver.c"), x87_driver(&cases)).unwrap();
-        command("gcc", &["-m32", "-O0", "-o", path(&reference), path(&dir.join("x87-driver.c")), path(&object)]);
+        command("gcc", &["-m32", "-O0", "-o", path(&reference), path(&dir.join("x87-driver.c")), path(&object), path(&math_object), path(&pow), "-lm"]);
         let expected: Vec<u128> = command(&reference, &[]).lines().map(|line| u128::from_str_radix(line.split_once(' ').unwrap().1, 16).unwrap()).collect();
         for (case, &want) in cases.iter().zip(&expected) {
             let function = case.function;
@@ -654,20 +705,30 @@ fn the_oracle_agrees_with_the_x87() {
                 _ => register(&answer, "EAX"),
             };
             compared += 1;
+            let entry = tally.entry(function.name).or_default();
+            entry.0 += 1;
             let mask = if function.ret.is_float() { (1 << 80) - 1 } else { (1 << function.ret.bits()) - 1 };
-            if got & mask != want & mask {
-                if function.ret.is_float() {
-                    largest = largest.max(ulps(got, want));
-                }
+            if got & mask == want & mask {
+                continue;
+            }
+            let units = if function.ret.is_float() { ulps(got, want) } else { u128::MAX };
+            entry.1 += 1;
+            entry.2 = entry.2.max(units);
+            // The x87's transcendental instructions are not rounded correctly, and the oracle's
+            // are, so a function that gives one back as it is may be a unit apart.
+            let library = X87_MATH.iter().any(|math| math.name == function.name);
+            if !library || units > 1 {
                 mismatches.push(format!("{march} {}{:?}: the processor gave {want:#x}, the oracle {got:#x}", function.name, case.args));
             }
         }
     }
     drop(client);
     std::fs::remove_dir_all(&dir).unwrap();
-    eprintln!("{} of {compared} x87 cases agree, the largest difference {largest} units in the last place", compared - mismatches.len());
-    assert!(compared >= 2 * X87_FUNCTIONS.len() * CASES, "only {compared} cases were compared");
-    assert!(mismatches.is_empty(), "{} of {compared} cases differ, the largest by {largest} units in the last place, the first:\n{}", mismatches.len(), mismatches.iter().take(10).cloned().collect::<Vec<_>>().join("\n"));
+    for (name, (tried, apart, largest)) in &tally {
+        eprintln!("{name}: {apart} of {tried} differ in ST0, by {largest} units in the last place at most");
+    }
+    assert!(compared >= 2 * (X87_FUNCTIONS.len() + X87_MATH.len()) * CASES, "only {compared} cases were compared");
+    assert!(mismatches.is_empty(), "{} of {compared} cases differ, the first:\n{}", mismatches.len(), mismatches.iter().take(10).cloned().collect::<Vec<_>>().join("\n"));
 }
 
 /// Inputs of the 8051 program, which it runs every function on.
