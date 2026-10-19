@@ -10,7 +10,7 @@ use crate::tools;
 /// Options whose value is a number. Everything else, addresses included, stays text.
 const NUMERIC: [&str; 9] = ["limit", "len", "timeout", "count", "param", "arg", "depth", "bits", "steps"];
 /// Options that may be given again and again, and reach the tool as a list.
-const REPEATED: [&str; 4] = ["args", "set", "read", "dump"];
+const REPEATED: [&str; 5] = ["args", "set", "read", "dump", "before"];
 /// Options that are on or off.
 const FLAGS: [&str; 5] = ["pcode", "returns", "full", "addresses", "refused"];
 

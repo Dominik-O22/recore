@@ -389,6 +389,9 @@ fn a_firmware_function_reports_the_memory_nothing_gave_it() {
     // The counter in RAM is a global the caller seeds.
     let bumped = run(&mut client, "0x50", json!([5]), json!(["0x20000000=hex:0a000000"])).unwrap();
     assert_eq!(bumped, "0x50 returned r0 = 0xf (15) after 6 instructions\nwrote 4 bytes at 0x20000000: 0f 00 00 00\n");
+    // A stack the caller puts in the chip's RAM, below the run's own, is the caller's to use.
+    let weighed = run(&mut client, "0x2c", json!([1, 2, 3, 4]), json!(["sp=0x20001000", "0x20001000=hex:0500000006000000"])).unwrap();
+    assert_eq!(weighed, "0x2c returned r0 = 0x5b (91) after 11 instructions\nwrote 8 bytes at 0x20000ff8: 00 00 00 00 01 00 e0 7e\n");
 }
 
 #[test]

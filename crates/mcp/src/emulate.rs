@@ -7,7 +7,9 @@
 //! This is the oracle: what the original does on chosen inputs, for a rewrite to be checked
 //! against, or for a finding to be shown with. It runs one function and what it calls, not the
 //! program: memory the run has not written and the file does not hold reads as zero, and the run
-//! says how many reads of that it made, since on a chip those are its peripherals.
+//! says how many reads of that it made, since on a chip those are its peripherals. A snapshot of
+//! a live process gives the run that process's memory instead (see [`snapshot`]), so a function
+//! can run on the state a program had.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -24,7 +26,11 @@ use serde::Deserialize;
 
 use crate::binary::Binary;
 
+mod snapshot;
+mod windows;
 mod x87;
+
+pub use snapshot::Snapshot;
 
 /// Bytes in a page of the sparse memory each space keeps.
 const PAGE: usize = 4096;
@@ -215,9 +221,12 @@ struct Abi {
     positional: bool,
     /// The x87 control word a thread starts with, and the system that sets it.
     control_word: Option<(u128, &'static str)>,
+    /// Whether the image runs on 32-bit Windows, whose system functions take their arguments
+    /// off the stack as they return, and whose threads find their state through `FS`.
+    windows: bool,
 }
 
-const SYSTEM_V: Abi = Abi { args: &[], result: "", stack: "", returns: Returns::Pushed, shadow: 0, mode_bit: 0, arm_arithmetic: false, alignment: 16, pointer: 0, code: "ram", spaces: &["ram"], result_rest: &[], big_endian: false, floats: None, positional: false, control_word: None };
+const SYSTEM_V: Abi = Abi { args: &[], result: "", stack: "", returns: Returns::Pushed, shadow: 0, mode_bit: 0, arm_arithmetic: false, alignment: 16, pointer: 0, code: "ram", spaces: &["ram"], result_rest: &[], big_endian: false, floats: None, positional: false, control_word: None, windows: false };
 
 const XMM: [&str; 8] = ["XMM0", "XMM1", "XMM2", "XMM3", "XMM4", "XMM5", "XMM6", "XMM7"];
 /// Windows rounds x87 results to 53 bits, as a double has, and Linux and macOS to 64.
@@ -232,7 +241,8 @@ fn abi(image: &Image) -> Result<Abi> {
     let abi = match image.machine {
         Machine::X86_64 if image.format == Format::Pe => Abi { args: &["RCX", "RDX", "R8", "R9"], result: "RAX", stack: "RSP", shadow: 32, floats: Some(&XMM[..4]), positional: true, control_word: WINDOWS_X87, ..SYSTEM_V },
         Machine::X86_64 => Abi { args: &["RDI", "RSI", "RDX", "RCX", "R8", "R9"], result: "RAX", stack: "RSP", floats: Some(&XMM), control_word: UNIX_X87, ..SYSTEM_V },
-        Machine::X86 => Abi { result: "EAX", stack: "ESP", floats: Some(&[]), control_word: if image.format == Format::Pe { WINDOWS_X87 } else { UNIX_X87 }, ..SYSTEM_V },
+        Machine::X86 if image.format == Format::Pe => Abi { result: "EAX", stack: "ESP", floats: Some(&[]), control_word: WINDOWS_X87, windows: true, ..SYSTEM_V },
+        Machine::X86 => Abi { result: "EAX", stack: "ESP", floats: Some(&[]), control_word: UNIX_X87, ..SYSTEM_V },
         Machine::Aarch64 => Abi { args: &["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"], result: "x0", stack: "sp", returns: Returns::Link("x30"), arm_arithmetic: true, floats: Some(&["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"]), ..SYSTEM_V },
         Machine::Thumb | Machine::Arm => Abi { args: &["r0", "r1", "r2", "r3"], result: "r0", stack: "sp", returns: Returns::Link("lr"), mode_bit: 1, arm_arithmetic: true, alignment: 8, ..SYSTEM_V },
         // Arguments of an 8051 function are in places that depend on its compiler and on the
@@ -391,24 +401,37 @@ struct Page {
 }
 
 /// The memory of every space but the constants, a page at a time.
-struct Memory {
+struct Memory<'a> {
     pages: FxHashMap<(Space, u64), Box<Page>>,
+    /// The process whose memory the space the image is in starts as, where it holds any.
+    snapshot: Option<&'a Snapshot>,
     /// The space the image's bytes are in.
     code: Space,
     big_endian: bool,
-    /// How many reads touched memory that nothing had written, and the first few addresses.
-    unwritten: u64,
-    unwritten_first: Vec<(Space, u64)>,
+    unwritten: Unwritten,
 }
 
-impl Memory {
+/// How many reads touched memory that nothing had written, and the first few addresses.
+#[derive(Default)]
+struct Unwritten {
+    count: u64,
+    first: Vec<(Space, u64)>,
+}
+
+impl Memory<'_> {
     fn page(&mut self, image: &Image, space: Space, index: u64) -> &mut Page {
-        let code = self.code;
+        let (code, snapshot) = (self.code, self.snapshot);
         self.pages.entry((space, index)).or_insert_with(|| {
             let mut page = Box::new(Page { bytes: [0; PAGE], known: [false; PAGE], dirty: [false; PAGE] });
             if space == code {
                 let start = index * PAGE as u64;
+                if let Some(snapshot) = snapshot {
+                    snapshot.fill(start, &mut page.bytes, &mut page.known);
+                }
                 for offset in 0..PAGE {
+                    if page.known[offset] {
+                        continue;
+                    }
                     let addr = start + offset as u64;
                     match image.section_at(addr) {
                         Some(section) => {
@@ -448,9 +471,9 @@ impl Memory {
             value |= if self.big_endian { byte << (8 * (size - 1 - index)) } else { byte << (8 * index) };
         }
         if !known {
-            self.unwritten += 1;
-            if self.unwritten_first.len() < UNWRITTEN_SHOWN {
-                self.unwritten_first.push((space, addr));
+            self.unwritten.count += 1;
+            if self.unwritten.first.len() < UNWRITTEN_SHOWN {
+                self.unwritten.first.push((space, addr));
             }
         }
         value
@@ -498,9 +521,10 @@ pub enum Arg {
 }
 
 /// What to run.
-#[derive(Debug)]
 pub struct Call {
     pub entry: u64,
+    /// The memory of a process the run starts from, where it holds any.
+    pub snapshot: Option<Snapshot>,
     pub args: Vec<Arg>,
     /// Registers set before the run, which comes after the arguments are placed.
     pub registers: Vec<(String, Scalar)>,
@@ -512,6 +536,9 @@ pub struct Call {
     /// Memory read after the run: address and length.
     pub dump: Vec<(Option<String>, u64, usize)>,
     pub steps: u64,
+    /// Functions run first, in order and with no arguments, whose work is setup: what they
+    /// write is not listed and their instructions are not counted.
+    pub before: Vec<u64>,
 }
 
 /// A buffer passed in, and how it was left.
@@ -556,7 +583,7 @@ struct Emulator<'a> {
     binary: &'a mut Binary,
     abi: Abi,
     spaces: Spaces,
-    memory: Memory,
+    memory: Memory<'a>,
     lifted: FxHashMap<u64, Rc<Lifted>>,
     registers: FxHashMap<String, Varnode>,
     /// The address of each call or tail call of an import, to its name and whether it is a tail call.
@@ -573,30 +600,50 @@ struct Emulator<'a> {
     register_banks: Option<Space>,
     /// The blocks of scratch memory given out, as address and size.
     blocks: Vec<(u64, u64)>,
+    /// Where the next allocation in scratch memory goes.
+    heap: u64,
+    tally: Tally,
+    /// The place of the stack pointer, whose value may not go below the run's stack, while the
+    /// run is on that stack.
+    stack_pointer: Option<Varnode>,
+    /// Where a fresh thread environment block goes, for a Windows thread the snapshot does not
+    /// hold.
+    fresh_teb: u64,
+    thread: windows::Thread,
+}
+
+/// What the answer says the run did, which a function run before it as setup leaves out.
+#[derive(Default)]
+struct Tally {
     /// Instructions run, and what the stand-ins charge for the bytes they move.
     steps: u64,
     notes: Vec<String>,
-    /// Where the next allocation in scratch memory goes.
-    heap: u64,
     stand_ins: BTreeMap<String, u64>,
     /// Whether the run did x87 arithmetic, which the control word rounds.
     x87: bool,
 }
 
-/// A region of `size` bytes below `top` that no section of the image is in.
-fn free_region(image: &Image, top: u64, size: u64) -> (u64, u64) {
-    let mut top = top;
+/// What a stand-in gives back: the value it returns, if it returns one, and the bytes of
+/// arguments it takes off the stack as it returns, as a 32-bit Windows function does.
+struct Return {
+    value: Option<u64>,
+    pops: u64,
+}
+
+/// A region of `size` bytes below `top` that none of the `[start, end)` ranges of `taken` is in.
+fn free_region(taken: &[(u64, u64)], top: u64, size: u64) -> Result<(u64, u64)> {
+    let mut below = top;
     loop {
-        let start = top - size;
-        if image.sections.iter().all(|section| section.end() <= start || section.addr >= top) {
-            return (start, top);
+        let start = below.checked_sub(size).with_context(|| format!("no {} KB below {top:#x} are free of the image and the snapshot, for the run's own memory", size >> 10))?;
+        match taken.iter().filter(|&&(from, to)| to > start && from < below).map(|&(from, _)| from).min() {
+            None => return Ok((start, below)),
+            Some(from) => below = from,
         }
-        top = start;
     }
 }
 
 impl<'a> Emulator<'a> {
-    fn new(binary: &'a mut Binary) -> Result<Emulator<'a>> {
+    fn new(binary: &'a mut Binary, snapshot: Option<&'a Snapshot>) -> Result<Emulator<'a>> {
         let image = &binary.program.image;
         let abi = abi(image)?;
         let imports = binary
@@ -609,8 +656,10 @@ impl<'a> Emulator<'a> {
                 CallTarget::Function(_) => None,
             })
             .collect();
-        let stack = free_region(image, 0x7ff0_0000, STACK);
-        let scratch = free_region(image, stack.0, SCRATCH);
+        let taken: Vec<(u64, u64)> = image.sections.iter().map(|section| (section.addr, section.end())).chain(snapshot.into_iter().flat_map(Snapshot::ranges)).collect();
+        let stack = free_region(&taken, 0x7ff0_0000, STACK)?;
+        let scratch = free_region(&taken, stack.0, SCRATCH)?;
+        let fresh_teb = free_region(&taken, scratch.0, PAGE as u64)?.0;
         // The first page of scratch memory is where the function returns to. An 8051 has 16-bit
         // code addresses, and the last that no section holds will do.
         let sentinel = match image.machine {
@@ -622,8 +671,11 @@ impl<'a> Emulator<'a> {
             spaces.intern(name);
         }
         let register_banks = (image.machine == Machine::I8051).then(|| spaces.intern("INTMEM"));
-        let memory = Memory { pages: FxHashMap::default(), code: spaces.intern(abi.code), big_endian: abi.big_endian, unwritten: 0, unwritten_first: Vec::new() };
-        Ok(Emulator { binary, abi, spaces, memory, lifted: FxHashMap::default(), registers: FxHashMap::default(), imports, stack, scratch, sentinel, internal_stack: None, stack_high: 0, register_banks, blocks: Vec::new(), steps: 0, notes: Vec::new(), heap: scratch.0 + PAGE as u64, stand_ins: BTreeMap::new(), x87: false })
+        let memory = Memory { pages: FxHashMap::default(), snapshot, code: spaces.intern(abi.code), big_endian: abi.big_endian, unwritten: Unwritten::default() };
+        Ok(Emulator {
+            binary, abi, spaces, memory, lifted: FxHashMap::default(), registers: FxHashMap::default(), imports, stack, scratch, sentinel, internal_stack: None, stack_high: 0, register_banks, blocks: Vec::new(),
+            heap: scratch.0 + PAGE as u64, tally: Tally::default(), stack_pointer: None, fresh_teb, thread: windows::Thread::default(),
+        })
     }
 
     fn register(&mut self, name: &str) -> Result<Varnode, String> {
@@ -667,6 +719,10 @@ impl<'a> Emulator<'a> {
         if self.internal_stack.is_some_and(|(_, sp)| place.space == sp.space && place.offset == sp.offset) {
             self.stack_high = self.stack_high.max(value as u64);
         }
+        // Below its stack a run would write over its scratch memory.
+        if self.stack_pointer.is_some_and(|sp| place.space == sp.space && place.offset == sp.offset) && (value as u64) < self.stack.0 {
+            return Err(format!("the stack overflowed the {} KB the run gives it", STACK >> 10));
+        }
         self.memory.write(&self.binary.program.image, place.space, place.offset, place.size, value, true);
         Ok(())
     }
@@ -699,7 +755,7 @@ impl<'a> Emulator<'a> {
     /// Runs an x87 instruction on the register stack, and sets the condition bits it defines in
     /// their registers and in the status word, which the specification keeps apart.
     fn x87_instruction(&mut self, instruction: x87::Instruction) -> Result<(), String> {
-        self.x87 = true;
+        self.tally.x87 = true;
         let control = self.control()?;
         let outcome = x87::execute(instruction, self.read_register("ST0")?, self.read_register("ST1")?, control);
         let mut stack = [0; 8];
@@ -743,6 +799,13 @@ impl<'a> Emulator<'a> {
     fn write_memory(&mut self, addr: u64, bytes: &[u8], mark: bool) {
         for (index, &byte) in bytes.iter().enumerate() {
             self.memory.write_byte(&self.binary.program.image, self.memory.code, addr + index as u64, byte, mark);
+        }
+    }
+
+    /// Adds `note` to the answer unless it is there already.
+    fn note_once(&mut self, note: String) {
+        if !self.tally.notes.contains(&note) {
+            self.tally.notes.push(note);
         }
     }
 
@@ -831,7 +894,7 @@ impl<'a> Emulator<'a> {
                     }
                     let out = op.out.ok_or_else(|| format!("{code:?} with no output"))?;
                     let value = if x87::applies(code, out.size, &inputs) {
-                        self.x87 = true;
+                        self.tally.x87 = true;
                         let control = self.control()?;
                         x87::compute(code, out.size, &inputs, control)?
                     } else {
@@ -885,7 +948,7 @@ impl<'a> Emulator<'a> {
         if len > LARGEST_BLOCK {
             return Err(format!("the run asked a stand-in to move {len} bytes, more than the {LARGEST_BLOCK} the oracle gives a block"));
         }
-        self.steps += len / 16;
+        self.tally.steps += len / 16;
         Ok(len)
     }
 
@@ -893,10 +956,10 @@ impl<'a> Emulator<'a> {
         self.memory.read(&self.binary.program.image, self.memory.code, addr, 1) as u8
     }
 
-    /// Runs the stand-in for the import `name` and gives the value it returns, if it does.
-    fn stand_in(&mut self, name: &str, tail: bool) -> Result<Option<u64>, String> {
+    /// Runs the stand-in for the import `name`.
+    fn stand_in(&mut self, name: &str, tail: bool) -> Result<Return, String> {
         let plain = name.trim_start_matches('_').trim_end_matches("_chk");
-        Ok(match plain {
+        let value = match plain {
             "memcpy" | "memmove" => {
                 let (to, from, len) = (self.argument(0, tail)?, self.argument(1, tail)?, self.argument(2, tail)?);
                 let len = self.length(len)?;
@@ -965,8 +1028,9 @@ impl<'a> Emulator<'a> {
             }
             "free" => None,
             "abort" | "exit" | "Exit" | "stack_chk_fail" | "assert_fail" => return Err(format!("the run called {name}")),
-            _ => return Err(format!("the run called {name}, an import with no stand-in")),
-        })
+            _ => return self.windows_stand_in(name, tail)?.ok_or_else(|| format!("the run called {name}, an import with no stand-in")),
+        };
+        Ok(Return { value, pops: 0 })
     }
 
     /// The space called `name`, in any case, or the one the image is in when there is no name.
@@ -982,6 +1046,13 @@ impl<'a> Emulator<'a> {
     fn start(&mut self, call: &Call) -> Result<Vec<Buffer>, String> {
         if let Some((word, _)) = self.abi.control_word {
             self.write_register("FPUControlWord", word)?;
+        }
+        if self.abi.windows {
+            let chosen = call.registers.iter().find(|(name, _)| name.eq_ignore_ascii_case(windows::SEGMENT)).map(|&(_, Scalar::Int(bits) | Scalar::Float { bits, .. })| bits as u64);
+            self.start_thread(chosen)?;
+        }
+        for &entry in &call.before {
+            self.prepare(entry, call.steps)?;
         }
         let mut values = Vec::new();
         let mut buffers = Vec::new();
@@ -1017,6 +1088,27 @@ impl<'a> Emulator<'a> {
             }
         }
         Ok(buffers)
+    }
+
+    /// Runs the function at `entry` to its return, as setup for the run that comes after it.
+    fn prepare(&mut self, entry: u64, steps: u64) -> Result<(), String> {
+        if matches!(self.abi.returns, Returns::Internal) {
+            return Err("an 8051 function runs on its own: there is nothing to run before it".into());
+        }
+        self.start_on_stack(&[])?;
+        let kept = std::mem::take(&mut self.tally.notes);
+        let label = self.binary.program.label(entry);
+        match self.run(entry, steps) {
+            Stop::Returned => {}
+            Stop::Steps => return Err(format!("{label}, run before, did not return in {steps} instructions")),
+            Stop::Fault(fault) => return Err(format!("{label}, run before, stopped: {fault}")),
+        }
+        // The caller may put the stack pointer anywhere before the run. The notes made before
+        // setup, such as which thread the run is on, are the run's.
+        self.stack_pointer = None;
+        self.tally = Tally { notes: kept, ..Tally::default() };
+        self.memory.unwritten = Unwritten::default();
+        Ok(())
     }
 
     /// Arguments and the return address for a machine with a stack in memory or a link register.
@@ -1082,13 +1174,13 @@ impl<'a> Emulator<'a> {
             self.write_scalar(name, *value)?;
         }
         if call.registers.iter().any(|(name, _)| name.eq_ignore_ascii_case(self.abi.stack)) {
-            self.notes.push("the internal stack began where the caller set SP".into());
+            self.tally.notes.push("the internal stack began where the caller set SP".into());
         } else if let Some(found) = self.startup_stack_pointer() {
             self.write_register(self.abi.stack, u128::from(found))?;
-            self.notes.push(format!("the internal stack began at SP = {found:#x}, as the startup code sets it"));
+            self.tally.notes.push(format!("the internal stack began at SP = {found:#x}, as the startup code sets it"));
         } else {
             self.write_register(self.abi.stack, INITIAL_SP)?;
-            self.notes.push(format!("the internal stack began at SP = {INITIAL_SP:#x}, which the oracle chose: set SP to put it elsewhere"));
+            self.tally.notes.push(format!("the internal stack began at SP = {INITIAL_SP:#x}, which the oracle chose: set SP to put it elsewhere"));
         }
         let internal = self.space_named(Some("INTMEM"))?;
         let place = self.register(self.abi.stack)?;
@@ -1103,6 +1195,13 @@ impl<'a> Emulator<'a> {
     }
 
     fn run(&mut self, entry: u64, steps: u64) -> Stop {
+        // The run guards its own stack, not one the caller put elsewhere with `set`.
+        if self.internal_stack.is_none() {
+            match self.register(self.abi.stack).and_then(|place| Ok((place, self.get(place)? as u64))) {
+                Ok((place, sp)) => self.stack_pointer = (self.stack.0..=self.stack.1).contains(&sp).then_some(place),
+                Err(fault) => return Stop::Fault(fault),
+            }
+        }
         let mut pc = entry;
         let started = Instant::now();
         let mut turns = 0u64;
@@ -1110,25 +1209,30 @@ impl<'a> Emulator<'a> {
             if pc == self.sentinel {
                 return Stop::Returned;
             }
-            if self.steps >= steps {
+            if self.tally.steps >= steps {
                 return Stop::Steps;
             }
             turns += 1;
             if turns.is_multiple_of(4096) && started.elapsed() > TIMEOUT {
                 return Stop::Fault(format!("the run took more than {} seconds", TIMEOUT.as_secs()));
             }
-            self.steps += 1;
+            self.tally.steps += 1;
             let lifted = match self.fetch(pc) {
                 Ok(lifted) => lifted,
                 Err(fault) => return Stop::Fault(fault),
             };
             let next = if let Some((name, tail)) = self.imports.get(&pc).cloned() {
-                *self.stand_ins.entry(name.clone()).or_default() += 1;
-                self.stand_in(&name, tail).and_then(|value| {
+                self.stand_in(&name, tail).and_then(|Return { value, pops }| {
+                    *self.tally.stand_ins.entry(name).or_default() += 1;
                     if let Some(value) = value {
                         self.write_register(self.abi.result, u128::from(value))?;
                     }
-                    if tail { self.return_from_tail().map(Some) } else { Ok(None) }
+                    let to = if tail { Some(self.return_from_tail()?) } else { None };
+                    if pops > 0 {
+                        let sp = self.read_register(self.abi.stack)?;
+                        self.write_register(self.abi.stack, sp + u128::from(pops))?;
+                    }
+                    Ok(to)
                 })
             } else {
                 self.execute(&lifted)
@@ -1166,13 +1270,17 @@ impl<'a> Emulator<'a> {
         (space != self.memory.code).then(|| self.spaces.0[space.0 as usize].clone())
     }
 
-    /// Whether the run's own stack, or a block of scratch memory it was given, is at `addr` of
-    /// `space`. A write that runs past a block lands outside it, and is reported.
+    /// Whether the run's own stack, a block of scratch memory it was given, or the thread's
+    /// environment block is at `addr` of `space`. A write that runs past a block lands outside
+    /// it, and is reported.
     fn is_private(&self, space: Space, addr: u64) -> bool {
         match self.internal_stack {
             // The first register bank is registers, which the answer does not list as memory.
             Some((base, _)) => self.spaces.0[space.0 as usize] == "INTMEM" && (addr < 8 || addr > base && addr <= self.stack_high),
-            None => space == self.memory.code && (addr >= self.stack.0 && addr < self.stack.1 || self.blocks.iter().any(|&(start, size)| addr >= start && addr - start < size)),
+            None => {
+                let within = |start: u64, size: u64| addr >= start && addr - start < size;
+                space == self.memory.code && (within(self.stack.0, STACK) || self.blocks.iter().any(|&(start, size)| within(start, size)) || self.thread.teb.is_some_and(|teb| within(teb, windows::TEB_SIZE)))
+            }
         }
     }
 
@@ -1209,9 +1317,9 @@ impl<'a> Emulator<'a> {
         for name in self.abi.result_rest.iter().map(|name| name.to_string()).chain(call.read.iter().cloned()) {
             registers.push(self.reading(name)?);
         }
-        if let Some((word, system)) = self.abi.control_word.filter(|_| self.x87 && !call.registers.iter().any(|(name, _)| name.eq_ignore_ascii_case("FPUControlWord"))) {
+        if let Some((word, system)) = self.abi.control_word.filter(|_| self.tally.x87 && !call.registers.iter().any(|(name, _)| name.eq_ignore_ascii_case("FPUControlWord"))) {
             let x87::Control { precision, .. } = x87::Control::from_word(word);
-            self.notes.push(format!("the x87 began with control word {word:#x}, which a thread starts with on {system}: {precision}-bit precision, rounding to nearest. Set FPUControlWord to change it"));
+            self.tally.notes.push(format!("the x87 began with control word {word:#x}, which a thread starts with on {system}: {precision}-bit precision, rounding to nearest. Set FPUControlWord to change it"));
         }
         let mut dumps = Vec::new();
         for (space, addr, len) in &call.dump {
@@ -1219,15 +1327,16 @@ impl<'a> Emulator<'a> {
             dumps.push((self.space_label(space), *addr, self.memory.peek(&self.binary.program.image, space, *addr, *len)));
         }
         let result = self.reading(self.abi.result.to_string())?;
-        let unwritten = (self.memory.unwritten, self.memory.unwritten_first.iter().map(|&(space, addr)| (self.space_label(space), addr)).collect());
-        Ok(Outcome { stop, steps: self.steps, notes: std::mem::take(&mut self.notes), result, registers, dumps, buffers, writes: self.writes(), unwritten, stand_ins: std::mem::take(&mut self.stand_ins) })
+        let unwritten = (self.memory.unwritten.count, self.memory.unwritten.first.iter().map(|&(space, addr)| (self.space_label(space), addr)).collect());
+        let Tally { steps, notes, stand_ins, .. } = std::mem::take(&mut self.tally);
+        Ok(Outcome { stop, steps, notes, result, registers, dumps, buffers, writes: self.writes(), unwritten, stand_ins })
     }
 }
 
 /// Runs `call` on the binary. The run, not the call, can fail: see [`Stop`]; an `Err` is a call
 /// that cannot be set up.
 pub fn emulate(binary: &mut Binary, call: &Call) -> Result<Outcome> {
-    let mut emulator = Emulator::new(binary)?;
+    let mut emulator = Emulator::new(binary, call.snapshot.as_ref())?;
     let buffers = emulator.start(call).map_err(anyhow::Error::msg)?;
     // What the setup wrote is not the function's doing.
     for page in emulator.memory.pages.values_mut() {
@@ -1251,6 +1360,9 @@ pub struct Run {
     dump: Vec<String>,
     steps: Option<u64>,
     bits: Option<u32>,
+    snapshot: Option<String>,
+    #[serde(default)]
+    before: Vec<String>,
 }
 
 /// A number or a text, as JSON has it.
@@ -1348,14 +1460,19 @@ fn value(reading: &Reading, bits: Option<u32>) -> String {
     text
 }
 
+/// Where a run of `function` starts: the function of that name, or else exactly the address,
+/// since the function the address is in may start before it.
+fn function_entry(binary: &Binary, function: &str) -> Result<u64> {
+    match binary.program.function_named(function) {
+        Ok(entry) => Ok(entry),
+        Err(_) => parse_addr(function).filter(|&addr| binary.program.image.is_code(addr)).with_context(|| format!("`{function}` is neither a function of the binary nor an address in its code")),
+    }
+}
+
 /// The `run` tool.
 pub fn run(binary: &mut Binary, args: Run) -> Result<String> {
     ensure!(args.bits != Some(0), "`bits` is at least 1");
-    // A name, or else exactly the address: the function the address is in may start before it.
-    let entry = match binary.program.function_named(&args.function) {
-        Ok(entry) => entry,
-        Err(_) => parse_addr(&args.function).filter(|&addr| binary.program.image.is_code(addr)).with_context(|| format!("`{}` is neither a function of the binary nor an address in its code", args.function))?,
-    };
+    let entry = function_entry(binary, &args.function)?;
     let mut dump = Vec::new();
     for range in &args.dump {
         let parts: Vec<&str> = range.split(':').collect();
@@ -1366,7 +1483,9 @@ pub fn run(binary: &mut Binary, args: Run) -> Result<String> {
         };
         dump.push((space, parse_addr(addr).with_context(|| format!("`{addr}` is not an address"))?, size(len)?));
     }
-    let mut call = Call { entry, args: args.args.iter().map(arg).collect::<Result<_>>()?, registers: Vec::new(), memory: Vec::new(), read: args.read, dump, steps: args.steps.unwrap_or(DEFAULT_STEPS) };
+    let snapshot = args.snapshot.as_deref().map(|dir| Snapshot::open(dir.as_ref())).transpose()?;
+    let before = args.before.iter().map(|function| function_entry(binary, function)).collect::<Result<_>>()?;
+    let mut call = Call { entry, snapshot, before, args: args.args.iter().map(arg).collect::<Result<_>>()?, registers: Vec::new(), memory: Vec::new(), read: args.read, dump, steps: args.steps.unwrap_or(DEFAULT_STEPS) };
     for setting in &args.set {
         let (place, what) = setting.split_once('=').with_context(|| format!("`{setting}` is not REGISTER=number, 0xADDRESS=hex:bytes or SPACE:0xADDRESS=hex:bytes"))?;
         let (space, addr) = place.rsplit_once(':').map_or((None, place), |(space, addr)| (Some(space.to_string()), addr));

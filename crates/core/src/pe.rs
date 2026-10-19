@@ -4,7 +4,7 @@
 use rustc_hash::FxHashMap;
 
 use anyhow::Result;
-use object::read::pe::{ImageNtHeaders, Import, PeFile};
+use object::read::pe::{ImageNtHeaders, Import, PeFile, ResourceDirectoryTable};
 use object::{LittleEndian as LE, Object};
 
 use crate::image::Section;
@@ -21,6 +21,8 @@ pub struct Metadata {
     pub exports: Vec<u64>,
     /// `[start, end)` of every `RUNTIME_FUNCTION` in the exception directory.
     pub frames: Vec<(u64, u64)>,
+    /// The address and size of the first version resource.
+    pub version_resource: Option<(u64, u64)>,
 }
 
 /// Loads the metadata of a 32-bit (`ImageNtHeaders32`) or 64-bit (`ImageNtHeaders64`) image.
@@ -107,7 +109,22 @@ pub fn load<Pe: ImageNtHeaders>(data: &[u8], sections: &[Section]) -> Result<Met
 
     let frames = sections.iter().find(|s| s.name == ".pdata").map(|pdata| function_frames(pdata, sections, base)).unwrap_or_default();
 
-    Ok(Metadata { import_slots, relative_targets, relocations_stripped, exports, frames })
+    let version_resource = version_resource(&pe, data).ok().flatten();
+
+    Ok(Metadata { import_slots, relative_targets, relocations_stripped, exports, frames, version_resource })
+}
+
+/// The address and size of the first `RT_VERSION` resource: the first name and the first
+/// language under the type.
+fn version_resource<Pe: ImageNtHeaders>(pe: &PeFile<Pe>, data: &[u8]) -> Result<Option<(u64, u64)>> {
+    const RT_VERSION: u16 = 16;
+    let Some(directory) = pe.data_directories().resource_directory(data, &pe.section_table())? else { return Ok(None) };
+    let first = |table: ResourceDirectoryTable| table.entries.first().map(|entry| entry.data(directory)).transpose();
+    let Some(version) = directory.root()?.entries.iter().find(|entry| entry.name_or_id().id() == Some(RT_VERSION)) else { return Ok(None) };
+    let Some(name) = version.data(directory)?.table() else { return Ok(None) };
+    let Some(language) = first(name)?.and_then(|data| data.table()) else { return Ok(None) };
+    let Some(entry) = first(language)?.and_then(|data| data.data()) else { return Ok(None) };
+    Ok(Some((pe.relative_address_base() + u64::from(entry.offset_to_data.get(LE)), u64::from(entry.size.get(LE)))))
 }
 
 /// Function extents from the exception directory. Each entry is three RVAs: begin, end, and

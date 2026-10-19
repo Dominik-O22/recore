@@ -450,6 +450,7 @@ impl Layout {
             frames: Vec::new(),
             relative_targets: Vec::new(),
             relocations_stripped: false,
+            version_resource: None,
             // An 8051 reads its constants and its switch tables from the code space, a Cortex-M
             // its literal pools and switch tables from among its code.
             data_in_code: matches!(self.machine, Machine::I8051 | Machine::Thumb),

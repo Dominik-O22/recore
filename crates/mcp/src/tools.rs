@@ -163,7 +163,7 @@ pub fn list() -> Value {
         ),
         tool(
             "run",
-            "Runs a function of the binary as its processor would and answers what it did: the value it returned, the buffers it was given as it left them, and the memory it wrote. This is what the original does on inputs you choose, to check a rewrite against or to show a finding. It runs the function and everything it calls, not the program: imports such as memcpy and malloc run as stand-ins, a call to any other import stops the run, and memory that nothing wrote and the file does not hold reads as zero, which the answer counts because on a chip that memory is the peripherals.",
+            "Runs a function of the binary as its processor would and answers what it did: the value it returned, the buffers it was given as it left them, and the memory it wrote. This is what the original does on inputs you choose, to check a rewrite against or to show a finding. It runs the function and everything it calls, not the program: imports such as memcpy and malloc run as stand-ins, as do the Windows functions the MSVC C runtime calls (the last error, TLS slots, the heap, critical sections, the version resource), a call to any other import stops the run, and memory that nothing wrote and the file does not hold reads as zero, which the answer counts because on a chip that memory is the peripherals. With `snapshot`, memory starts as a live process had it.",
             json!({
                 "function": function,
                 "args": { "type": "array", "items": { "type": ["integer", "string"] }, "description": "The arguments in order, as the platform's calling convention passes them. A number, decimal or hex as 0x1f; `f32:1.5` or `f64:1.5` for a float, passed where the platform passes floats (the stack on x86-32, XMM registers on x86-64, d0 to d7 on AArch64); `hex:4142` for bytes put in memory and passed by their address; `str:text` for a string with its end; `buf:16` for 16 zero bytes. Buffers are shown as the function left them." },
@@ -172,6 +172,8 @@ pub fn list() -> Value {
                 "dump": { "type": "array", "items": { "type": "string" }, "description": "Memory to show after the run, as ADDRESS:LENGTH or SPACE:ADDRESS:LENGTH, for what a returned pointer reaches." },
                 "bits": { "type": "integer", "minimum": 1, "description": "Width of the result in bits, for a function that returns fewer than its register holds (32 for an int)." },
                 "steps": { "type": "integer", "minimum": 1, "description": "Most instructions to run (default 10,000,000)." },
+                "snapshot": { "type": "string", "description": "A directory holding the memory of a live process, which the run starts from where it holds any: a `snapshot.tsv` of `region START END PERMISSIONS NAME` rows, each region's bytes in `START.bin` with START spelled as the row spells it, and `teb ADDRESS` rows for the threads of a Windows process, the first of which the run is on unless `set` gives FS_OFFSET. `set` and `args` apply on top, and the run keeps its own stack." },
+                "before": { "type": "array", "items": { "type": "string" }, "description": "Functions to run first, in order and with no arguments, as setup: their writes are not listed and their instructions not counted. For a C runtime whose startup has not run, such as MSVC's `_mtinit`, which sets up the locks and the thread data its string functions need." },
             }),
             &["function"],
         ),
