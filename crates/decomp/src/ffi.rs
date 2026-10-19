@@ -173,6 +173,7 @@ unsafe extern "C" {
     pub fn rd_set_storage(session: *mut RdSession, addr: u64, storage: *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_inline(session: *mut RdSession, caller: u64, function: u64, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_returns_nothing(session: *mut RdSession, addr: u64, err: *mut c_char, errlen: usize) -> i32;
+    pub fn rd_set_purge(session: *mut RdSession, addr: u64, bytes: u16, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_keep_registers(session: *mut RdSession, addr: u64, kept: *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_set_call_fixup(session: *mut RdSession, addr: u64, fixup: *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_add_pointer_table(session: *mut RdSession, addr: u64, name: *const c_char, count: usize, err: *mut c_char, errlen: usize) -> i32;

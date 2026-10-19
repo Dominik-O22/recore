@@ -530,6 +530,34 @@ static vector<ParameterPieces> stack_aggregate(Funcdata *fd) {
   return slots;
 }
 
+// The stack slots a function pops as it returns that none of the parameters the engine recovered
+// covers, as parameters of a slot each, under a convention that leaves the popping to the callee.
+// Such a function pops all its caller pushed, so an argument it never reads is still one of its
+// parameters, and a call to it still passes it.
+static vector<ParameterPieces> purged_slots(Funcdata *fd) {
+  vector<ParameterPieces> slots;
+  AddrSpace *stack = fd->getArch()->getStackSpace();
+  const FuncProto &proto = fd->getFuncProto();
+  if (stack == nullptr || proto.getModelExtraPop() != ProtoModel::extrapop_unknown ||
+      proto.getExtraPop() == ProtoModel::extrapop_unknown)
+    return slots;
+  const int4 word = stack->getAddrSize();  // the return address, and the size of a slot
+  for (uintb at = word; at < (uintb)proto.getExtraPop(); at += word) {
+    bool covered = false;
+    for (int4 i = 0; i < proto.numParams() && !covered; ++i) {
+      Address addr = proto.getParam(i)->getAddress();
+      covered = addr.getSpace() == stack && addr.getOffset() < at + word && at < addr.getOffset() + proto.getParam(i)->getSize();
+    }
+    if (covered) continue;
+    ParameterPieces piece;
+    piece.addr = Address(stack, at);
+    piece.type = fd->getArch()->types->getBase(word, TYPE_UNKNOWN);
+    piece.flags = 0;
+    slots.push_back(piece);
+  }
+  return slots;
+}
+
 // Whether the function's one register parameter exists only because the register is pushed.
 // MSVC reserves four bytes of stack with `push ecx`; when the address of that slot is passed on,
 // the engine cannot tell that the pushed value is never used, and reports ECX as a parameter.
@@ -1439,6 +1467,19 @@ int rd_returns_nothing(RdSession *session, uint64_t addr, char *err, size_t errl
   });
 }
 
+// Says that the function at `addr` pops `bytes` of arguments off the stack as it returns, as
+// x86's `RET n` does: a call to it leaves the stack pointer that much higher, and it takes
+// arguments in all of them, whether it reads them or not. The engine takes this from
+// Ghidra's own analysis, which recore does not run, and otherwise guesses that a call pops only
+// its return address.
+int rd_set_purge(RdSession *session, uint64_t addr, uint16_t bytes, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    // The engine's count includes the return address.
+    int4 address = session->arch->getDefaultCodeSpace()->getAddrSize();
+    session->function(addr)->getFuncProto().setExtraPop(bytes + address);
+  });
+}
+
 // Replaces every call to the function at `addr` with the p-code of the compiler spec's call
 // fixup `fixup`. Compiler helpers such as the stack-cookie check and `_alloca_probe` break the
 // calling convention, and their fixup says what they really do to the caller.
@@ -2343,11 +2384,16 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       root->reset(*fd);
       if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
     }
-    if (session->stack_aggregates && !fd->getFuncProto().isInputLocked()) {
-      vector<ParameterPieces> slots = stack_aggregate(fd);
+    if (!fd->getFuncProto().isInputLocked()) {
+      vector<ParameterPieces> slots = purged_slots(fd);
+      if (session->stack_aggregates) {
+        vector<ParameterPieces> aggregate = stack_aggregate(fd);
+        slots.insert(slots.end(), aggregate.begin(), aggregate.end());
+      }
       if (!slots.empty()) {
-        // The parameters recovered, then the slots, as the prototype it keeps: its callers pass
-        // what is in them, and its own C reads them as parameters.
+        // The parameters recovered and the slots, registers first and then the stack in order,
+        // as the prototype it keeps: its callers pass what is in them, and its own C reads them
+        // as parameters.
         vector<ParameterPieces> params;
         const FuncProto &recovered = fd->getFuncProto();
         for (int4 i = 0; i < recovered.numParams(); ++i) {
@@ -2358,6 +2404,11 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
           params.push_back(piece);
         }
         params.insert(params.end(), slots.begin(), slots.end());
+        AddrSpace *stack = arch->getStackSpace();
+        stable_sort(params.begin(), params.end(), [stack](const ParameterPieces &a, const ParameterPieces &b) {
+          bool a_stack = a.addr.getSpace() == stack, b_stack = b.addr.getSpace() == stack;
+          return a_stack != b_stack ? b_stack : a_stack && a.addr.getOffset() < b.addr.getOffset();
+        });
         arch->clearAnalysis(fd);
         FuncProto &proto = fd->getFuncProto();
         proto.clearInput();

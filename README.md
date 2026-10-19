@@ -133,12 +133,12 @@ Decompiled function signatures against PDB records, 8 binaries per corpus:
 
 | Corpus | | Functions decompiled | Parameters exact | Returns a value or not |
 |---|---|---|---|---|
-| Windows x86-64 | recore | 99.7% | 89.8% | 93.2% |
+| Windows x86-64 | recore | 99.7% | 89.8% | 93.3% |
 | | Ghidra | 91.9% | 82.6% | 92.7% |
-| Windows x86 | recore | 98.8% | 85.8% | 91.0% |
+| Windows x86 | recore | 98.8% | 86.3% | 91.0% |
 | | Ghidra | 85.4% | 86.1% | 90.5% |
 
-Each tool's percentages are over the functions it decompiled, and recore decompiles more of them. On the 8,523 32-bit functions both decompiled, recore gets the parameters of 86.5% right and Ghidra 86.1%.
+Each tool's percentages are over the functions it decompiled, and recore decompiles more of them. On the 8,523 32-bit functions both decompiled, recore gets the parameters of 87.1% right and Ghidra 86.1%.
 
 Against DWARF, on six programs of each Linux ARM corpus, recore gets the parameter count right for 72.3% of armhf functions and 72.7% of armel ones, and for 75.8% of arm64 ones on the same programs. In C code that is 85.2%, 85.0% and 92.7%. A 64-bit argument takes two registers on 32-bit ARM, which is part of the gap.
 

@@ -83,6 +83,34 @@ fn stdcall_callee_cleanup_gives_stack_parameters() {
     assert!(function.c_text.contains("param_1 + param_2"), "{}", function.c_text);
 }
 
+/// A callee that reads one of its two arguments still pops both, with `RET 8`, and the caller's
+/// stack is where the callee left it.
+#[test]
+fn a_callee_takes_every_argument_it_pops() {
+    use recore::image::{Format, Machine};
+    #[rustfmt::skip]
+    let code = [
+        // 0x1000: sub esp, 8; mov dword [esp+4], 0x2a; push 0; push 7; call 0x1020;
+        // mov eax, [esp+4]; add esp, 8; ret
+        0x83, 0xec, 0x08, 0xc7, 0x44, 0x24, 0x04, 0x2a, 0x00, 0x00, 0x00, 0x6a, 0x00, 0x6a, 0x07,
+        0xe8, 0x0c, 0x00, 0x00, 0x00, 0x8b, 0x44, 0x24, 0x04, 0x83, 0xc4, 0x08, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc,
+        // 0x1020: mov eax, [esp+4]; ret 8
+        0x8b, 0x44, 0x24, 0x04, 0xc2, 0x08, 0x00,
+    ];
+    let section = recore::image::Section { name: ".text".into(), addr: 0x1000, data: code.to_vec(), file_offset: None, executable: true, writable: false };
+    let image = recore::Image::bare("test".into(), Format::Pe, Machine::X86, 0x1000, vec![section]);
+    let analysis = recore::analyze(&image);
+    let mut session = Session::from_image(&image, &analysis).unwrap();
+    session.add_functions(&Facts::derive(&image, &analysis)).unwrap();
+
+    let callee = session.decompile(0x1020).unwrap();
+    let storage: Vec<&str> = callee.params.iter().map(|p| p.storage.as_str()).collect();
+    assert_eq!(storage, ["stack:0x4", "stack:0x8"], "{}", callee.c_text);
+    // The local the caller set before the call, not the argument it pushed.
+    let caller = session.decompile(0x1000).unwrap();
+    assert!(caller.c_text.contains("return 0x2a;"), "{}", caller.c_text);
+}
+
 /// The engine's C parser accepts the exported prototypes of every archive, bar a few.
 #[test]
 fn archive_prototypes_parse() {
