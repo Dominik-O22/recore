@@ -193,7 +193,8 @@ impl Target {
     /// Whether code that runs from the end of one function into the start of the next is meant
     /// to, and the first function ends by calling the second. 8051 code shares the end of a
     /// function this way, and what recore makes of it is two functions. Elsewhere such code
-    /// follows a call that never returns, and is none of the function's.
+    /// follows a call that never returns, and is none of the function's, unless the analysis
+    /// says the function runs on: see [`Facts::runs_on`].
     fn functions_run_on(self) -> bool {
         matches!(self, Target::I8051 | Target::I8051Sdcc)
     }
@@ -544,6 +545,9 @@ impl Session {
         }
         for &(function, noreturn) in &facts.functions {
             self.add_function(function, noreturn)?;
+        }
+        for &function in &facts.runs_on {
+            unsafe { ffi::rd_runs_on(self.raw.as_ptr(), function) };
         }
         for &function in &facts.returns_nothing {
             check(|err, len| unsafe { ffi::rd_returns_nothing(self.raw.as_ptr(), function, err, len) != 0 })?;

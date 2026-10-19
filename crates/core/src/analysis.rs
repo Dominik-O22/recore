@@ -171,6 +171,14 @@ impl Program<'_> {
     fn next_start(&self, addr: u64) -> u64 {
         self.starts.get(self.starts.partition_point(|&start| start <= addr)).copied().unwrap_or(u64::MAX)
     }
+
+    /// Whether the function at `entry` has a return in its extent. One that its compiler knew
+    /// never returns has none.
+    fn has_return(&self, entry: u64) -> bool {
+        let Ok(index) = self.extents.binary_search_by_key(&entry, |&(start, _)| start) else { return false };
+        let end = self.extents[index].1;
+        self.controls[self.controls.partition_point(|c| c.addr < entry)..].iter().take_while(|c| c.addr < end).any(|c| c.flow == Flow::Return)
+    }
 }
 
 /// Follows every path from the function's entry until it returns, stops, or reaches another
@@ -223,6 +231,8 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program, mut r
         let mut index = first_control_from(addr);
         let boundary = next_start(addr);
         let mut run_start = addr;
+        // Whether the last control passed was a direct call to a function with a return in it.
+        let mut called = false;
         loop {
             let Some(control) = controls.get(index).filter(|c| c.addr < boundary) else {
                 // Ran off the end of a function, which only code that never returns does, or
@@ -238,8 +248,12 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program, mut r
                     result.may_return = true;
                 }
                 // Running on into the next function is a tail call of it, when code leads
-                // right up to its entry.
-                if program.runs_on && program.is_start(boundary) && program.is_covered(boundary - 1) && target_returns(boundary) {
+                // right up to its entry. Elsewhere than where functions run on, only a call that
+                // comes back right at the entry does so: hand-written code such as MSVC's `cos`
+                // calls a loader and comes back into the routine it shares. A compiler emits
+                // nothing after a call it knows never returns, so the callee must have a return.
+                let came_back = called && run_start == boundary;
+                if (program.runs_on || came_back) && program.is_start(boundary) && program.is_covered(boundary - 1) && target_returns(boundary) {
                     result.may_return = true;
                 }
                 break;
@@ -250,6 +264,7 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program, mut r
             }
             reached(run_start, control.next);
             run_start = control.next;
+            called = matches!(control.flow, Flow::Call(target) if program.has_return(target));
             if in_extent(control.addr) {
                 result.reach_end = result.reach_end.max(control.next);
             } else {
@@ -951,15 +966,20 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     data_refs.sort_unstable();
     data_refs.dedup();
     // A body that ends where another function begins runs on into it, unless its last
-    // instruction sends control elsewhere.
+    // instruction sends control elsewhere. Elsewhere than where functions run on, only one
+    // whose last instruction is a call that returns, to a function with a return, does, as
+    // `walk` has it.
+    let has_return = |entry: u64| functions.binary_search_by_key(&entry, |f| f.start).is_ok_and(|index| functions[index].controls.iter().any(|c| c.flow == Flow::Return));
     let runs_on = |f: &Function| {
-        let stops = f.controls.last().filter(|control| control.next == f.end).is_some_and(|control| match control.flow {
+        let last = f.controls.last().filter(|control| control.next == f.end);
+        let stops = last.is_some_and(|control| match control.flow {
             Flow::Jump(_) | Flow::JumpIndirect(_) | Flow::Return | Flow::Halt => true,
             Flow::Call(target) => noreturn.contains(&target),
             Flow::Branch(_) | Flow::CallIndirect(_) => false,
         });
+        let comes_back = !stops && last.is_some_and(|control| matches!(control.flow, Flow::Call(target) if has_return(target)));
         let code_to_end = code_pieces(f.start, f.end, inline_tables).last().is_some_and(|(from, to)| from < to && to == f.end);
-        (A::RUNS_ON && is_start(f.end) && code_to_end && !stops).then_some(f.end)
+        ((A::RUNS_ON && !stops) || comes_back).then_some(f.end).filter(|&end| is_start(end) && code_to_end)
     };
     Analysis {
         sends,
