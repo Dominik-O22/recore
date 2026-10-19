@@ -3,8 +3,6 @@
 //! keep their state where Windows does, in the block, so a run on a snapshot's thread reads
 //! that thread's last error and TLS slots.
 
-use std::collections::BTreeMap;
-
 use super::{Emulator, Return};
 
 /// The register that holds where `FS` begins, as the processor specification names it.
@@ -30,6 +28,7 @@ const EXPANSION_SLOTS: u64 = 1024;
 const FRESH_PROCESS: u64 = 0x100;
 const FRESH_THREAD: u64 = 0x104;
 
+const ERROR_INVALID_PARAMETER: u64 = 87;
 const TLS_OUT_OF_INDEXES: u64 = 0xffff_ffff;
 /// `HEAP_ZERO_MEMORY`, which asks `HeapAlloc` for a block of zeros.
 const HEAP_ZERO_MEMORY: u64 = 8;
@@ -41,9 +40,6 @@ pub(super) struct Thread {
     pub teb: Option<u64>,
     /// The TLS slots `TlsAlloc` gave out, a bit each.
     taken: u64,
-    /// Values for TLS indices the thread has no slot for. A C runtime whose startup did not run
-    /// passes the index it never got, `TLS_OUT_OF_INDEXES`, and the run keeps a slot for it.
-    unallocated: BTreeMap<u64, u64>,
 }
 
 impl Emulator<'_> {
@@ -57,7 +53,7 @@ impl Emulator<'_> {
             (Some(teb), _) => teb,
             (None, Some(&teb)) => {
                 let others = if listed.len() > 1 { format!(", the first of the {} it lists", listed.len()) } else { String::new() };
-                self.notes.push(format!("the run is on the snapshot's thread whose TEB is at {teb:#x}{others}: set FS_OFFSET to choose another"));
+                self.note_once(format!("the run is on the snapshot's thread whose TEB is at {teb:#x}{others}: set FS_OFFSET to choose another"));
                 teb
             }
             (None, None) => {
@@ -67,11 +63,12 @@ impl Emulator<'_> {
                     self.write_word(teb + offset, value, false);
                 }
                 if snapshot.is_some() {
-                    self.notes.push("the snapshot lists no thread, so the run is on a fresh one, whose TLS slots are empty".into());
+                    self.note_once("the snapshot lists no thread, so the run is on a fresh one, whose TLS slots are empty".into());
                 }
                 teb
             }
         };
+        self.thread.teb = Some(teb);
         self.write_register(SEGMENT, u128::from(teb))
     }
 
@@ -102,6 +99,9 @@ impl Emulator<'_> {
                 (1, None)
             }
             "GetCurrentThreadId" => (0, Some(self.read_pointer(teb + THREAD_ID))),
+            // A slot is free if this thread's value is zero and the run gave it out to no one. On
+            // a snapshot's thread that may be a slot another module of the process owns, which
+            // the PEB's TLS bitmap would tell.
             "TlsAlloc" => {
                 let mut free = None;
                 for index in 0..SLOTS {
@@ -115,27 +115,24 @@ impl Emulator<'_> {
                 }
                 (0, Some(free.unwrap_or(TLS_OUT_OF_INDEXES)))
             }
-            // A value found is success, which the last error says.
+            // Both say in the last error whether the thread has the slot.
             "TlsGetValue" => {
                 let index = self.argument(0, tail)?;
-                let value = match self.tls_slot(teb, index) {
-                    Some(slot) => self.read_pointer(slot),
-                    None => self.thread.unallocated.get(&index).copied().unwrap_or(0),
-                };
-                self.write_word(teb + LAST_ERROR, 0, true);
-                (1, Some(value))
+                let slot = self.tls_slot(teb, index);
+                self.write_word(teb + LAST_ERROR, if slot.is_some() { 0 } else { ERROR_INVALID_PARAMETER }, true);
+                (1, Some(slot.map_or(0, |slot| self.read_pointer(slot))))
             }
             "TlsSetValue" => {
                 let (index, value) = (self.argument(0, tail)?, self.argument(1, tail)?);
-                match self.tls_slot(teb, index) {
+                let slot = self.tls_slot(teb, index);
+                match slot {
                     Some(slot) => self.write_word(slot, value, true),
                     None => {
-                        if self.thread.unallocated.insert(index, value).is_none() {
-                            self.notes.push(format!("TlsSetValue was given TLS index {index:#x}, which the thread has no slot for, as a C runtime whose startup did not run passes: the run kept the value itself. A runtime that fails after this needs its startup run first, with `before`"));
-                        }
+                        self.write_word(teb + LAST_ERROR, ERROR_INVALID_PARAMETER, true);
+                        self.note_once(format!("TlsSetValue failed for TLS index {index:#x}, which the thread has no slot for. A C runtime whose startup did not run passes 0xffffffff: run the startup first with `before`"));
                     }
                 }
-                (2, Some(1))
+                (2, Some(u64::from(slot.is_some())))
             }
             "HeapAlloc" => {
                 let (flags, size) = (self.argument(1, tail)?, self.argument(2, tail)?);
@@ -154,7 +151,7 @@ impl Emulator<'_> {
                 let named = self.argument(0, tail)?;
                 if named != 0 {
                     let named = self.text_at(named, false);
-                    self.notes.push(format!("GetModuleHandleA asked for {named}, which the run does not load, and was answered NULL"));
+                    self.note_once(format!("GetModuleHandleA asked for {named}, which the run does not load, and was answered NULL"));
                 }
                 (1, Some(if named == 0 { self.binary.program.image.base } else { 0 }))
             }
@@ -208,10 +205,7 @@ impl Emulator<'_> {
     fn version_resource(&mut self, function: &str, file: u64) -> Result<(u64, u64), String> {
         let named = self.text_at(file, false);
         let found = self.binary.program.image.version_resource.ok_or_else(|| format!("{function} asked for the version of {named}, and the binary has no version resource to answer from"))?;
-        let note = format!("{function} asked for the version of {named}, and the binary's own version resource answered");
-        if !self.notes.contains(&note) {
-            self.notes.push(note);
-        }
+        self.note_once(format!("{function} asked for the version of {named}, and the binary's own version resource answered"));
         Ok(found)
     }
 

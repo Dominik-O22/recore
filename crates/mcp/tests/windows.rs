@@ -16,7 +16,13 @@ const IDATA: u64 = BASE + 0x3000;
 const RSRC: u64 = BASE + 0x4000;
 
 const IMPORTS: [(&str, &[&str]); 2] = [
-    ("KERNEL32.dll", &["GetLastError", "SetLastError", "TlsAlloc", "TlsGetValue", "TlsSetValue"]),
+    (
+        "KERNEL32.dll",
+        &[
+            "GetLastError", "SetLastError", "TlsAlloc", "TlsGetValue", "TlsSetValue", "GetCurrentThreadId", "HeapAlloc", "HeapFree", "InitializeCriticalSection", "EnterCriticalSection",
+            "LeaveCriticalSection", "DeleteCriticalSection", "GetModuleHandleA",
+        ],
+    ),
     ("VERSION.dll", &["GetFileVersionInfoSizeA", "GetFileVersionInfoA", "VerQueryValueA"]),
 ];
 
@@ -28,6 +34,7 @@ const VALUE: u64 = DATA + 0x40;
 const VALUE_LEN: u64 = DATA + 0x44;
 const GLOBAL: u64 = DATA + 0x48;
 const SAVED_INDEX: u64 = DATA + 0x4c;
+const CRITICAL_SECTION: u64 = DATA + 0x50;
 const VERSION_BUFFER: u64 = DATA + 0x100;
 
 /// The address of the import address table slot of `function`.
@@ -76,8 +83,23 @@ fn functions() -> Vec<(&'static str, Vec<u8>)> {
         // TlsAlloc, TlsSetValue(index, 0x55aa), TlsGetValue(index), which pop their arguments.
         ("tls", [vec![0x56], call("TlsAlloc"), vec![0x8b, 0xf0], push(0x55aa), vec![0x56], call("TlsSetValue"), vec![0x56], call("TlsGetValue"), vec![0x5e, RET]].concat()),
         ("last_error", [push(5), call("SetLastError"), call("GetLastError"), vec![RET]].concat()),
-        // The TLS index of a C runtime whose startup did not run, TLS_OUT_OF_INDEXES.
-        ("unallocated", [push(7), push(0xffff_ffff), call("TlsSetValue"), push(0xffff_ffff), call("TlsGetValue"), vec![RET]].concat()),
+        // The TLS index of a C runtime whose startup did not run, TLS_OUT_OF_INDEXES, then the
+        // last error the failure left.
+        ("unallocated", [push(7), push(0xffff_ffff), call("TlsSetValue"), call("GetLastError"), vec![RET]].concat()),
+        // A zeroed block, a critical section's life, and the thread id plus the image's base
+        // plus the block's word at 0x3c.
+        (
+            "system",
+            [
+                vec![0x56, 0x57], push(0x40), push(8), push(0), call("HeapAlloc"), vec![0x8b, 0xf0],
+                push(CRITICAL_SECTION), call("InitializeCriticalSection"), push(CRITICAL_SECTION), call("EnterCriticalSection"), push(CRITICAL_SECTION), call("LeaveCriticalSection"), push(CRITICAL_SECTION), call("DeleteCriticalSection"),
+                call("GetCurrentThreadId"), vec![0x8b, 0xf8, 0x03, 0x7e, 0x3c], push(0), call("GetModuleHandleA"), vec![0x03, 0xf8],
+                vec![0x56], push(0), push(0), call("HeapFree"), vec![0x8b, 0xc7, 0x5f, 0x5e, RET],
+            ]
+            .concat(),
+        ),
+        // SUB ESP, 0x200000; MOV [ESP], EAX: a frame larger than the stack.
+        ("overflow", vec![0x81, 0xec, 0, 0, 0x20, 0, 0x89, 0x04, 0x24, RET]),
         // MOV EAX, FS:[0x18], the block's own address.
         ("teb", vec![0x64, 0xa1, 0x18, 0, 0, 0, RET]),
         // dwFileVersionMS of the fixed file information.
@@ -86,7 +108,8 @@ fn functions() -> Vec<(&'static str, Vec<u8>)> {
         ("globals", [load_eax(0x1000_0000), add_eax(GLOBAL), add_eax(0x1000_0004), vec![RET]].concat()),
         ("slot_3", [push(3), call("TlsGetValue"), vec![RET]].concat()),
         // Setup and the function it is for: a TLS index kept in a global, and its value.
-        ("init", [call("TlsAlloc"), store_eax(SAVED_INDEX), push(0x77), vec![0x50], call("TlsSetValue"), vec![RET]].concat()),
+        // Asking for a module the run does not load leaves a note, which is setup's too.
+        ("init", [push(NAME), call("GetModuleHandleA"), call("TlsAlloc"), store_eax(SAVED_INDEX), push(0x77), vec![0x50], call("TlsSetValue"), vec![RET]].concat()),
         ("saved", [push_from(SAVED_INDEX), call("TlsGetValue"), vec![RET]].concat()),
     ]
 }
@@ -144,10 +167,10 @@ fn resources() -> Vec<u8> {
 }
 
 /// The import directory at `IDATA`: descriptors, then names at 0x40, then the address table at
-/// 0x100, which the lookup table at 0x80 repeats, and the functions' names at 0x130.
+/// 0x100, which the lookup table at 0x80 repeats, and the functions' names at 0x180.
 fn imports() -> Vec<u8> {
-    let mut idata = vec![0; 0x200];
-    let (mut names, mut slot) = (0x130usize, 0usize);
+    let mut idata = vec![0; 0x400];
+    let (mut names, mut slot) = (0x180usize, 0usize);
     for (index, (dll, functions)) in IMPORTS.iter().enumerate() {
         let descriptor = 20 * index;
         let first = slot;
@@ -201,21 +224,21 @@ fn program() -> (Vec<u8>, Vec<(&'static str, u64)>) {
     directories[1] = [(IDATA - BASE) as u32, 60];
     directories[2] = [(RSRC - BASE) as u32, sections[3].1.len() as u32];
     headers.extend(directories.iter().flat_map(|pair| words(pair)));
+    let mut offset = 0x200;
     for (index, (name, contents, size, characteristics)) in sections.iter().enumerate() {
+        assert!(contents.len() <= *size as usize, "{name} of the test program outgrew its page");
         let mut header = [0u8; 40];
         header[..name.len()].copy_from_slice(name.as_bytes());
         let raw = contents.len().next_multiple_of(0x200) as u32;
-        let offset = 0x200 * (1 + index as u32);
         header[8..24].copy_from_slice(&words(&[*size, 0x1000 * (1 + index as u32), raw, offset]));
         header[36..].copy_from_slice(&characteristics.to_le_bytes());
         headers.extend(header);
+        offset += raw;
     }
     file[0x40..0x40 + headers.len()].copy_from_slice(&headers);
-    for (_, contents, _, _) in sections {
-        assert!(contents.len() <= 0x200, "a section of the test program outgrew its 0x200 bytes");
-        let mut raw = contents;
-        raw.resize(0x200, 0);
-        file.extend(raw);
+    for (_, mut contents, _, _) in sections {
+        contents.resize(contents.len().next_multiple_of(0x200), 0);
+        file.extend(contents);
     }
     (file, placed)
 }
@@ -282,9 +305,14 @@ fn the_c_runtimes_system_functions_run_and_take_their_arguments_off_the_stack() 
     assert_eq!(returned(&tls), "0x55aa", "{tls}");
     assert!(tls.contains("ran stand-ins for: TlsAlloc x1, TlsGetValue x1, TlsSetValue x1\n"), "{tls}");
     assert_eq!(returned(&program.run("last_error", json!({}))), "0x5");
+    // Windows fails TLS_OUT_OF_INDEXES with ERROR_INVALID_PARAMETER, and the answer says why a
+    // program passes it.
     let unallocated = program.run("unallocated", json!({}));
-    assert_eq!(returned(&unallocated), "0x7");
-    assert!(unallocated.contains("TlsSetValue was given TLS index 0xffffffff, which the thread has no slot for"), "{unallocated}");
+    assert_eq!(returned(&unallocated), "0x57");
+    assert!(unallocated.contains("TlsSetValue failed for TLS index 0xffffffff, which the thread has no slot for. A C runtime whose startup did not run passes 0xffffffff: run the startup first with `before`\n"), "{unallocated}");
+    let system = program.run("system", json!({}));
+    assert_eq!(returned(&system), "0x400104", "{system}");
+    assert!(system.contains("ran stand-ins for: DeleteCriticalSection x1, EnterCriticalSection x1, GetCurrentThreadId x1, GetModuleHandleA x1, HeapAlloc x1, HeapFree x1, InitializeCriticalSection x1, LeaveCriticalSection x1\n") && !system.contains("nothing had written"), "{system}");
     // FS is a block of the run's own, below its scratch memory, whose writes are not listed.
     let teb = program.run("teb", json!({}));
     assert_eq!(teb, format!("{} returned EAX = 0x7edff000 (2128605184) after 2 instructions\n", program.addr("teb")));
@@ -321,6 +349,18 @@ fn a_run_starts_from_the_memory_of_a_snapshot() {
     let slot = program.run("slot_3", json!({ "snapshot": snapshot }));
     assert_eq!(returned(&slot), "0xabcd", "{slot}");
     assert!(slot.contains("the run is on the snapshot's thread whose TEB is at 0x7ffd0000: set FS_OFFSET to choose another\n"), "{slot}");
+    // A snapshot that leaves the run no room for its own memory is refused.
+    let full = program.dir.join("full");
+    write_snapshot(&full, &[(0x1000, 0x7fff_0000, &[])], &[]);
+    let refused = program.client.tool("run", json!({ "path": program.path, "function": program.addr("teb"), "snapshot": full })).unwrap_err();
+    assert!(refused.contains("no 1024 KB below 0x7ff00000 are free of the image and the snapshot, for the run's own memory"), "{refused}");
+}
+
+#[test]
+fn a_stack_that_overflows_stops_the_run_before_it_writes() {
+    let mut program = Program::new();
+    let overflow = program.run("overflow", json!({}));
+    assert_eq!(overflow, format!("{0} stopped after 1 instructions: the stack overflowed the 1024 KB the run gives it at {0}\n", program.addr("overflow")));
 }
 
 #[test]
@@ -328,6 +368,6 @@ fn functions_run_before_set_up_the_state_the_function_reads() {
     let mut program = Program::new();
     let init = program.addr("init");
     let saved = program.run("saved", json!({ "before": [init] }));
-    // What `init` wrote and the stand-ins it ran are setup, not the function's.
+    // What `init` wrote, the stand-ins it ran and its notes are setup, not the function's.
     assert_eq!(saved, format!("{} returned EAX = 0x77 (119) after 3 instructions\nran stand-ins for: TlsGetValue x1\n", program.addr("saved")), "{saved}");
 }

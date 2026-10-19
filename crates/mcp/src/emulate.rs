@@ -408,9 +408,14 @@ struct Memory<'a> {
     /// The space the image's bytes are in.
     code: Space,
     big_endian: bool,
-    /// How many reads touched memory that nothing had written, and the first few addresses.
-    unwritten: u64,
-    unwritten_first: Vec<(Space, u64)>,
+    unwritten: Unwritten,
+}
+
+/// How many reads touched memory that nothing had written, and the first few addresses.
+#[derive(Default)]
+struct Unwritten {
+    count: u64,
+    first: Vec<(Space, u64)>,
 }
 
 impl Memory<'_> {
@@ -466,9 +471,9 @@ impl Memory<'_> {
             value |= if self.big_endian { byte << (8 * (size - 1 - index)) } else { byte << (8 * index) };
         }
         if !known {
-            self.unwritten += 1;
-            if self.unwritten_first.len() < UNWRITTEN_SHOWN {
-                self.unwritten_first.push((space, addr));
+            self.unwritten.count += 1;
+            if self.unwritten.first.len() < UNWRITTEN_SHOWN {
+                self.unwritten.first.push((space, addr));
             }
         }
         value
@@ -595,18 +600,26 @@ struct Emulator<'a> {
     register_banks: Option<Space>,
     /// The blocks of scratch memory given out, as address and size.
     blocks: Vec<(u64, u64)>,
-    /// Instructions run, and what the stand-ins charge for the bytes they move.
-    steps: u64,
-    notes: Vec<String>,
     /// Where the next allocation in scratch memory goes.
     heap: u64,
-    stand_ins: BTreeMap<String, u64>,
-    /// Whether the run did x87 arithmetic, which the control word rounds.
-    x87: bool,
+    tally: Tally,
+    /// The place of the stack pointer, whose value may not go below the run's stack.
+    stack_pointer: Option<Varnode>,
     /// Where a fresh thread environment block goes, for a Windows thread the snapshot does not
     /// hold.
     fresh_teb: u64,
     thread: windows::Thread,
+}
+
+/// What the answer says the run did, which a function run before it as setup leaves out.
+#[derive(Default)]
+struct Tally {
+    /// Instructions run, and what the stand-ins charge for the bytes they move.
+    steps: u64,
+    notes: Vec<String>,
+    stand_ins: BTreeMap<String, u64>,
+    /// Whether the run did x87 arithmetic, which the control word rounds.
+    x87: bool,
 }
 
 /// What a stand-in gives back: the value it returns, if it returns one, and the bytes of
@@ -617,13 +630,13 @@ struct Return {
 }
 
 /// A region of `size` bytes below `top` that none of the `[start, end)` ranges of `taken` is in.
-fn free_region(taken: &[(u64, u64)], top: u64, size: u64) -> (u64, u64) {
-    let mut top = top;
+fn free_region(taken: &[(u64, u64)], top: u64, size: u64) -> Result<(u64, u64)> {
+    let mut below = top;
     loop {
-        let start = top - size;
-        match taken.iter().filter(|&&(from, to)| to > start && from < top).map(|&(from, _)| from).min() {
-            None => return (start, top),
-            Some(from) => top = from,
+        let start = below.checked_sub(size).with_context(|| format!("no {} KB below {top:#x} are free of the image and the snapshot, for the run's own memory", size >> 10))?;
+        match taken.iter().filter(|&&(from, to)| to > start && from < below).map(|&(from, _)| from).min() {
+            None => return Ok((start, below)),
+            Some(from) => below = from,
         }
     }
 }
@@ -643,9 +656,9 @@ impl<'a> Emulator<'a> {
             })
             .collect();
         let taken: Vec<(u64, u64)> = image.sections.iter().map(|section| (section.addr, section.end())).chain(snapshot.into_iter().flat_map(Snapshot::ranges)).collect();
-        let stack = free_region(&taken, 0x7ff0_0000, STACK);
-        let scratch = free_region(&taken, stack.0, SCRATCH);
-        let fresh_teb = free_region(&taken, scratch.0, PAGE as u64).0;
+        let stack = free_region(&taken, 0x7ff0_0000, STACK)?;
+        let scratch = free_region(&taken, stack.0, SCRATCH)?;
+        let fresh_teb = free_region(&taken, scratch.0, PAGE as u64)?.0;
         // The first page of scratch memory is where the function returns to. An 8051 has 16-bit
         // code addresses, and the last that no section holds will do.
         let sentinel = match image.machine {
@@ -657,10 +670,10 @@ impl<'a> Emulator<'a> {
             spaces.intern(name);
         }
         let register_banks = (image.machine == Machine::I8051).then(|| spaces.intern("INTMEM"));
-        let memory = Memory { pages: FxHashMap::default(), snapshot, code: spaces.intern(abi.code), big_endian: abi.big_endian, unwritten: 0, unwritten_first: Vec::new() };
+        let memory = Memory { pages: FxHashMap::default(), snapshot, code: spaces.intern(abi.code), big_endian: abi.big_endian, unwritten: Unwritten::default() };
         Ok(Emulator {
-            binary, abi, spaces, memory, lifted: FxHashMap::default(), registers: FxHashMap::default(), imports, stack, scratch, sentinel, internal_stack: None, stack_high: 0, register_banks, blocks: Vec::new(), steps: 0, notes: Vec::new(),
-            heap: scratch.0 + PAGE as u64, stand_ins: BTreeMap::new(), x87: false, fresh_teb, thread: windows::Thread::default(),
+            binary, abi, spaces, memory, lifted: FxHashMap::default(), registers: FxHashMap::default(), imports, stack, scratch, sentinel, internal_stack: None, stack_high: 0, register_banks, blocks: Vec::new(),
+            heap: scratch.0 + PAGE as u64, tally: Tally::default(), stack_pointer: None, fresh_teb, thread: windows::Thread::default(),
         })
     }
 
@@ -705,6 +718,10 @@ impl<'a> Emulator<'a> {
         if self.internal_stack.is_some_and(|(_, sp)| place.space == sp.space && place.offset == sp.offset) {
             self.stack_high = self.stack_high.max(value as u64);
         }
+        // Below its stack a run would write over its scratch memory.
+        if self.stack_pointer.is_some_and(|sp| place.space == sp.space && place.offset == sp.offset) && (value as u64) < self.stack.0 {
+            return Err(format!("the stack overflowed the {} KB the run gives it", STACK >> 10));
+        }
         self.memory.write(&self.binary.program.image, place.space, place.offset, place.size, value, true);
         Ok(())
     }
@@ -737,7 +754,7 @@ impl<'a> Emulator<'a> {
     /// Runs an x87 instruction on the register stack, and sets the condition bits it defines in
     /// their registers and in the status word, which the specification keeps apart.
     fn x87_instruction(&mut self, instruction: x87::Instruction) -> Result<(), String> {
-        self.x87 = true;
+        self.tally.x87 = true;
         let control = self.control()?;
         let outcome = x87::execute(instruction, self.read_register("ST0")?, self.read_register("ST1")?, control);
         let mut stack = [0; 8];
@@ -781,6 +798,13 @@ impl<'a> Emulator<'a> {
     fn write_memory(&mut self, addr: u64, bytes: &[u8], mark: bool) {
         for (index, &byte) in bytes.iter().enumerate() {
             self.memory.write_byte(&self.binary.program.image, self.memory.code, addr + index as u64, byte, mark);
+        }
+    }
+
+    /// Adds `note` to the answer unless it is there already.
+    fn note_once(&mut self, note: String) {
+        if !self.tally.notes.contains(&note) {
+            self.tally.notes.push(note);
         }
     }
 
@@ -869,7 +893,7 @@ impl<'a> Emulator<'a> {
                     }
                     let out = op.out.ok_or_else(|| format!("{code:?} with no output"))?;
                     let value = if x87::applies(code, out.size, &inputs) {
-                        self.x87 = true;
+                        self.tally.x87 = true;
                         let control = self.control()?;
                         x87::compute(code, out.size, &inputs, control)?
                     } else {
@@ -923,7 +947,7 @@ impl<'a> Emulator<'a> {
         if len > LARGEST_BLOCK {
             return Err(format!("the run asked a stand-in to move {len} bytes, more than the {LARGEST_BLOCK} the oracle gives a block"));
         }
-        self.steps += len / 16;
+        self.tally.steps += len / 16;
         Ok(len)
     }
 
@@ -1053,9 +1077,6 @@ impl<'a> Emulator<'a> {
                 self.write_scalar(name, *value)?;
             }
         }
-        if self.abi.windows {
-            self.thread.teb = Some(self.read_register(windows::SEGMENT)? as u64);
-        }
         for (space, _, _) in &call.dump {
             self.space_named(space.as_deref())?;
         }
@@ -1080,10 +1101,10 @@ impl<'a> Emulator<'a> {
             Stop::Steps => return Err(format!("{label}, run before, did not return in {steps} instructions")),
             Stop::Fault(fault) => return Err(format!("{label}, run before, stopped: {fault}")),
         }
-        self.steps = 0;
-        self.stand_ins.clear();
-        self.memory.unwritten = 0;
-        self.memory.unwritten_first.clear();
+        // The caller may put the stack pointer anywhere before the run.
+        self.stack_pointer = None;
+        self.tally = Tally::default();
+        self.memory.unwritten = Unwritten::default();
         Ok(())
     }
 
@@ -1150,13 +1171,13 @@ impl<'a> Emulator<'a> {
             self.write_scalar(name, *value)?;
         }
         if call.registers.iter().any(|(name, _)| name.eq_ignore_ascii_case(self.abi.stack)) {
-            self.notes.push("the internal stack began where the caller set SP".into());
+            self.tally.notes.push("the internal stack began where the caller set SP".into());
         } else if let Some(found) = self.startup_stack_pointer() {
             self.write_register(self.abi.stack, u128::from(found))?;
-            self.notes.push(format!("the internal stack began at SP = {found:#x}, as the startup code sets it"));
+            self.tally.notes.push(format!("the internal stack began at SP = {found:#x}, as the startup code sets it"));
         } else {
             self.write_register(self.abi.stack, INITIAL_SP)?;
-            self.notes.push(format!("the internal stack began at SP = {INITIAL_SP:#x}, which the oracle chose: set SP to put it elsewhere"));
+            self.tally.notes.push(format!("the internal stack began at SP = {INITIAL_SP:#x}, which the oracle chose: set SP to put it elsewhere"));
         }
         let internal = self.space_named(Some("INTMEM"))?;
         let place = self.register(self.abi.stack)?;
@@ -1171,6 +1192,12 @@ impl<'a> Emulator<'a> {
     }
 
     fn run(&mut self, entry: u64, steps: u64) -> Stop {
+        if self.internal_stack.is_none() {
+            match self.register(self.abi.stack) {
+                Ok(place) => self.stack_pointer = Some(place),
+                Err(fault) => return Stop::Fault(fault),
+            }
+        }
         let mut pc = entry;
         let started = Instant::now();
         let mut turns = 0u64;
@@ -1178,27 +1205,21 @@ impl<'a> Emulator<'a> {
             if pc == self.sentinel {
                 return Stop::Returned;
             }
-            if self.steps >= steps {
+            if self.tally.steps >= steps {
                 return Stop::Steps;
             }
             turns += 1;
-            if turns.is_multiple_of(4096) {
-                if started.elapsed() > TIMEOUT {
-                    return Stop::Fault(format!("the run took more than {} seconds", TIMEOUT.as_secs()));
-                }
-                // Below its stack a run would write over its scratch memory.
-                if self.internal_stack.is_none() && self.read_register(self.abi.stack).is_ok_and(|sp| (sp as u64) < self.stack.0) {
-                    return Stop::Fault(format!("the stack overflowed the {} KB the run gives it, at {pc:#x}", STACK >> 10));
-                }
+            if turns.is_multiple_of(4096) && started.elapsed() > TIMEOUT {
+                return Stop::Fault(format!("the run took more than {} seconds", TIMEOUT.as_secs()));
             }
-            self.steps += 1;
+            self.tally.steps += 1;
             let lifted = match self.fetch(pc) {
                 Ok(lifted) => lifted,
                 Err(fault) => return Stop::Fault(fault),
             };
             let next = if let Some((name, tail)) = self.imports.get(&pc).cloned() {
                 self.stand_in(&name, tail).and_then(|Return { value, pops }| {
-                    *self.stand_ins.entry(name).or_default() += 1;
+                    *self.tally.stand_ins.entry(name).or_default() += 1;
                     if let Some(value) = value {
                         self.write_register(self.abi.result, u128::from(value))?;
                     }
@@ -1292,9 +1313,9 @@ impl<'a> Emulator<'a> {
         for name in self.abi.result_rest.iter().map(|name| name.to_string()).chain(call.read.iter().cloned()) {
             registers.push(self.reading(name)?);
         }
-        if let Some((word, system)) = self.abi.control_word.filter(|_| self.x87 && !call.registers.iter().any(|(name, _)| name.eq_ignore_ascii_case("FPUControlWord"))) {
+        if let Some((word, system)) = self.abi.control_word.filter(|_| self.tally.x87 && !call.registers.iter().any(|(name, _)| name.eq_ignore_ascii_case("FPUControlWord"))) {
             let x87::Control { precision, .. } = x87::Control::from_word(word);
-            self.notes.push(format!("the x87 began with control word {word:#x}, which a thread starts with on {system}: {precision}-bit precision, rounding to nearest. Set FPUControlWord to change it"));
+            self.tally.notes.push(format!("the x87 began with control word {word:#x}, which a thread starts with on {system}: {precision}-bit precision, rounding to nearest. Set FPUControlWord to change it"));
         }
         let mut dumps = Vec::new();
         for (space, addr, len) in &call.dump {
@@ -1302,8 +1323,9 @@ impl<'a> Emulator<'a> {
             dumps.push((self.space_label(space), *addr, self.memory.peek(&self.binary.program.image, space, *addr, *len)));
         }
         let result = self.reading(self.abi.result.to_string())?;
-        let unwritten = (self.memory.unwritten, self.memory.unwritten_first.iter().map(|&(space, addr)| (self.space_label(space), addr)).collect());
-        Ok(Outcome { stop, steps: self.steps, notes: std::mem::take(&mut self.notes), result, registers, dumps, buffers, writes: self.writes(), unwritten, stand_ins: std::mem::take(&mut self.stand_ins) })
+        let unwritten = (self.memory.unwritten.count, self.memory.unwritten.first.iter().map(|&(space, addr)| (self.space_label(space), addr)).collect());
+        let Tally { steps, notes, stand_ins, .. } = std::mem::take(&mut self.tally);
+        Ok(Outcome { stop, steps, notes, result, registers, dumps, buffers, writes: self.writes(), unwritten, stand_ins })
     }
 }
 
