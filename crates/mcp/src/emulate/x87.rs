@@ -8,11 +8,17 @@
 //!
 //! The processor specification lifts each x87 instruction to the float operations of p-code on
 //! the 10-byte registers `ST0` to `ST7`, and moves the registers to push and pop, so the stack needs
-//! no top pointer here. What is computed here is any float operation with a 10-byte operand.
+//! no top pointer here. What is computed here is any float operation with a 10-byte operand, and
+//! in `instructions` the x87 instructions the specification leaves opaque or approximate.
 
 use std::cmp::Ordering;
 
 use super::{Code, fits, mask, signed, signed_min};
+
+mod instructions;
+mod wide;
+
+pub use instructions::{Instruction, Stack, execute};
 
 /// How results are rounded, as the control word says: to how many bits of significand, and which
 /// way.
@@ -126,6 +132,13 @@ impl Value {
     }
 }
 
+/// Whether an extended float is one the processor no longer supports, which the format can hold
+/// because it writes its integer bit: one whose integer bit contradicts its exponent. An
+/// operation on it is invalid.
+fn unsupported(bits: u128) -> bool {
+    bits >> 64 & 0x7fff != 0 && bits & u128::from(INTEGER_BIT) == 0
+}
+
 fn decode(bits: u128, format: &Format) -> Value {
     let negative = bits >> (8 * format.size - 1) & 1 == 1;
     let exponent = bits >> format.field() & format.exponent_mask();
@@ -134,10 +147,7 @@ fn decode(bits: u128, format: &Format) -> Value {
     // As the extended format holds it, with the integer bit at the top.
     let significand = if extended { field as u64 } else { (field as u64) << (64 - format.precision) | u64::from(exponent != 0) << 63 };
     let bias = format.max_exp as u128;
-    // The extended format writes its integer bit, and a value whose integer bit contradicts its
-    // exponent is one the processor no longer supports: an operation on it is invalid.
-    let unsupported = extended && exponent != 0 && significand & INTEGER_BIT == 0;
-    if unsupported {
+    if extended && unsupported(bits) {
         INDEFINITE
     } else if exponent == format.exponent_mask() {
         if significand << 1 == 0 { Infinite { negative } } else { Nan { negative, significand: significand | INTEGER_BIT } }
@@ -217,6 +227,7 @@ fn round(negative: bool, exp: i32, significand: u128, sticky: bool, format: &For
 }
 
 /// A result before it is rounded.
+#[derive(Clone, Copy, Debug)]
 enum Exact {
     /// One the format holds as it is.
     Special(Value),
@@ -755,6 +766,20 @@ mod tests {
 
         type Operation = (&'static str, Code, usize, fn(u128, u128, u16) -> u128);
 
+        /// Inputs tried on each instruction under each control word.
+        const CASES: usize = 2000;
+
+        /// How far apart two extended floats of the same sign are, in units in the last place of
+        /// the 64-bit significand. The format writes its integer bit, so the count goes by value
+        /// and not by the bits: a normal number's exponent field counts from 1.
+        fn ulps(a: u128, b: u128) -> u128 {
+            let magnitude = |bits: u128| match bits >> 64 & 0x7fff {
+                0 => bits & u128::from(u64::MAX),
+                exponent => (exponent - 1) << 63 | bits & ((1 << 63) - 1),
+            };
+            if a >> 79 != b >> 79 { u128::MAX } else { magnitude(a).abs_diff(magnitude(b)) }
+        }
+
         #[test]
         fn every_rounding_is_the_processors() {
             let operations: [Operation; 10] = [
@@ -863,6 +888,209 @@ mod tests {
                 let integer = signed(u128::from(rng.next()) & mask(size), size) as u64;
                 assert_eq!(compute(Code::Int2Float, 10, &[(u128::from(integer), 8)], control).unwrap(), load(integer, 8, true), "{integer:#x}");
             }
+        }
+
+        /// Runs `$op` with `a` in ST0 and `b` in ST1 under the control word, from a stack and
+        /// status word that are otherwise clear, and gives ST0, ST1 and the status word after it.
+        macro_rules! whole {
+            ($op:literal) => {
+                |a: u128, b: u128, word: u16| -> (u128, u128, u16) {
+                    let (a, b, mut st0, mut st1, mut status, mut saved) = (a.to_le_bytes(), b.to_le_bytes(), [0u8; 16], [0u8; 16], 0u16, 0u16);
+                    // SAFETY: as in `x87!`. FNINIT empties the stack, and the control word it sets
+                    // is set back.
+                    unsafe {
+                        asm!(
+                            "fnstcw word ptr [{saved}]",
+                            "fninit",
+                            "fldcw word ptr [{word}]",
+                            "fld tbyte ptr [{b}]",
+                            "fld tbyte ptr [{a}]",
+                            $op,
+                            "fnstsw word ptr [{status}]",
+                            "fstp tbyte ptr [{st0}]",
+                            "fstp tbyte ptr [{st1}]",
+                            "fninit",
+                            "fldcw word ptr [{saved}]",
+                            saved = in(reg) &raw mut saved,
+                            word = in(reg) &raw const word,
+                            status = in(reg) &raw mut status,
+                            a = in(reg) a.as_ptr(),
+                            b = in(reg) b.as_ptr(),
+                            st0 = in(reg) st0.as_mut_ptr(),
+                            st1 = in(reg) st1.as_mut_ptr(),
+                            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+                            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+                            options(nostack),
+                        );
+                    }
+                    (u128::from_le_bytes(st0) & mask(10), u128::from_le_bytes(st1) & mask(10), status)
+                }
+            };
+        }
+
+        /// An extended float from 2^`low` up to 2^(`high` + 1), of either sign.
+        fn between(rng: &mut Rng, low: i32, high: i32) -> u128 {
+            let exponent = (16383 + low + (rng.next() % (high - low + 1) as u64) as i32) as u128;
+            u128::from(rng.next() & 1) << 79 | exponent << 64 | u128::from(rng.next() | 1 << 63)
+        }
+
+        fn positive(bits: u128) -> u128 {
+            bits & !(1 << 79)
+        }
+
+        /// A float a few units in the last place from `bits`, which is finite.
+        fn nudge(rng: &mut Rng, bits: u128) -> u128 {
+            let line = bits as i128 + (rng.next() % 9) as i128 - 4;
+            line as u128 & mask(10)
+        }
+
+        /// A float near a multiple of half the processor's pi, where the sine or the cosine
+        /// cancels.
+        fn near_half_pi(rng: &mut Rng) -> u128 {
+            let multiple = u128::from(rng.next() >> (rng.next() % 64)) | 1;
+            let x = multiple.saturating_mul(instructions::HALF_PI);
+            let shift = 128 - x.leading_zeros().min(127);
+            let exponent = 16383 + shift as i32 - 1 - 65;
+            let significand = if shift >= 64 { x >> (shift - 64) } else { x << (64 - shift) };
+            let sign = u128::from(rng.next() & 1) << 79;
+            nudge(rng, sign | (exponent as u128) << 64 | significand)
+        }
+
+        /// Whether this machine is AMD's, whose way with what the processor leaves undefined is
+        /// what this computes.
+        fn amd() -> bool {
+            let vendor = std::arch::x86_64::__cpuid(0);
+            [vendor.ebx, vendor.edx, vendor.ecx].map(u32::to_le_bytes).concat() == b"AuthenticAMD"
+        }
+
+        type Whole = (&'static str, Instruction, fn(u128, u128, u16) -> (u128, u128, u16), fn(&mut Rng) -> (u128, u128));
+
+        #[test]
+        fn whole_instructions_are_the_processors() {
+            let instructions: [Whole; 18] = [
+                ("f2xm1", Instruction::F2xm1, whole!("f2xm1"), |rng| (if rng.next().is_multiple_of(4) { generate(rng, None) } else { between(rng, -70, -1) }, 0)),
+                ("fyl2x", Instruction::Fyl2x, whole!("fyl2x"), |rng| {
+                    let one = 0x3fff_8000_0000_0000_0000u128;
+                    let x = match rng.next() % 4 {
+                        0 => generate(rng, None),
+                        1 => nudge(rng, one) + u128::from(rng.next().is_multiple_of(3)) * 0x7fff_ffff,
+                        _ => positive(between(rng, -16000, 16000)),
+                    };
+                    (x, if rng.next().is_multiple_of(4) { generate(rng, None) } else { between(rng, -8, 8) })
+                }),
+                ("fyl2xp1", Instruction::Fyl2xp1, whole!("fyl2xp1"), |rng| {
+                    let x = if rng.next().is_multiple_of(4) { generate(rng, None) } else { between(rng, -70, -2) };
+                    (x, if rng.next().is_multiple_of(4) { generate(rng, None) } else { between(rng, -8, 8) })
+                }),
+                ("fscale", Instruction::Fscale, whole!("fscale"), |rng| {
+                    let power = if rng.next().is_multiple_of(4) { generate(rng, None) } else { between(rng, -1, 15) };
+                    (generate(rng, None), power)
+                }),
+                ("fsin", Instruction::Fsin, whole!("fsin"), trigonometric),
+                ("fcos", Instruction::Fcos, whole!("fcos"), trigonometric),
+                ("fsincos", Instruction::Fsincos, whole!("fsincos"), trigonometric),
+                ("fptan", Instruction::Fptan, whole!("fptan"), trigonometric),
+                ("fpatan", Instruction::Fpatan, whole!("fpatan"), |rng| match rng.next() % 3 {
+                    0 => operands(rng),
+                    _ => (between(rng, -70, 70), between(rng, -70, 70)),
+                }),
+                ("fxtract", Instruction::Fxtract, whole!("fxtract"), operands),
+                ("fprem", Instruction::Fprem, whole!("fprem"), dividend_divisor),
+                ("fprem1", Instruction::Fprem1, whole!("fprem1"), dividend_divisor),
+                ("fxam", Instruction::Fxam, whole!("fxam"), |rng| (generate(rng, None) & !(u128::from(rng.next().is_multiple_of(4)) << 63), 0)),
+                ("fldpi", Instruction::Fldpi, whole!("fldpi"), operands),
+                ("fldl2e", Instruction::Fldl2e, whole!("fldl2e"), operands),
+                ("fldl2t", Instruction::Fldl2t, whole!("fldl2t"), operands),
+                ("fldlg2", Instruction::Fldlg2, whole!("fldlg2"), operands),
+                ("fldln2", Instruction::Fldln2, whole!("fldln2"), operands),
+            ];
+            fn operands(rng: &mut Rng) -> (u128, u128) {
+                (generate(rng, None), generate(rng, None))
+            }
+            fn trigonometric(rng: &mut Rng) -> (u128, u128) {
+                let x = match rng.next() % 6 {
+                    0 => generate(rng, None),
+                    1 => near_half_pi(rng),
+                    2 => between(rng, 50, 64),
+                    _ => between(rng, -70, 62),
+                };
+                (x, 0)
+            }
+            fn dividend_divisor(rng: &mut Rng) -> (u128, u128) {
+                if rng.next().is_multiple_of(4) {
+                    return (generate(rng, None), generate(rng, None));
+                }
+                let divisor = between(rng, -16000, 16000);
+                let apart = match rng.next() % 3 {
+                    0 => (rng.next() % 8) as i32 - 2,
+                    1 => (rng.next() % 140) as i32,
+                    _ => (rng.next() % 16000) as i32,
+                };
+                let exponent = ((divisor >> 64 & 0x7fff) as i32 + apart).clamp(1, 0x7ffe) as u128;
+                (between(rng, 0, 0) & !(0x7fff << 64) | exponent << 64, divisor)
+            }
+            let amd = amd();
+            // Intel's bound is under 1.5 units in the last place for a directed rounding, so 2 from
+            // a correct one; this machine's is within 1.
+            let tolerance = |control: Control| if amd || control.rounding == Rounding::Nearest { 1 } else { 2 };
+            let exact = |instruction: Instruction| !matches!(instruction, Instruction::F2xm1 | Instruction::Fyl2x | Instruction::Fyl2xp1 | Instruction::Fsin | Instruction::Fcos | Instruction::Fsincos | Instruction::Fptan | Instruction::Fpatan);
+            let mut rng = Rng(0x6a09_e667_f3bc_c908);
+            let mut wrong = Vec::new();
+            let mut report = Vec::new();
+            for &(name, instruction, hardware, operands) in &instructions {
+                let (mut tried, mut apart, mut largest) = (0, 0, 0);
+                for word in (0..16u16).map(|control| 0x7f | control << 8) {
+                    let control = Control::from_word(u128::from(word));
+                    for _ in 0..CASES {
+                        let (a, b) = operands(&mut rng);
+                        // What the processor leaves undefined, which only AMD's does as this does.
+                        let undefined = match (instruction, decode(a, &EXTENDED), decode(b, &EXTENDED)) {
+                            (Instruction::F2xm1, Finite { exp, significand, .. }, _) => exp > 0 || exp == 0 && significand != INTEGER_BIT,
+                            (Instruction::F2xm1, Infinite { .. }, _) => true,
+                            (Instruction::Fprem | Instruction::Fprem1, Finite { exp: ea, .. }, Finite { exp: eb, .. }) => ea - eb >= 64,
+                            // What FPTAN pushes and FPREM's condition bits for a not-a-number.
+                            (Instruction::Fptan, Nan { .. } | Infinite { .. }, _) => true,
+                            (Instruction::Fprem | Instruction::Fprem1, Nan { .. }, _) | (Instruction::Fprem | Instruction::Fprem1, _, Nan { .. }) => true,
+                            // Out of the domain, from 1 - sqrt(2) / 2 on, about 0.29.
+                            (Instruction::Fyl2xp1, x, _) => compare(x, decode(0x3ffd_95f6_1998_0c43_3812, &EXTENDED)) != Some(Ordering::Less) || compare(x, decode(0xbffd_95f6_1998_0c43_3812, &EXTENDED)) != Some(Ordering::Greater),
+                            _ => false,
+                        };
+                        if undefined && !amd {
+                            continue;
+                        }
+                        let (st0, st1, status) = hardware(a, b, word);
+                        let outcome = execute(instruction, a, b, control);
+                        let (got0, got1, top) = match outcome.stack {
+                            Stack::Replace(value) => (value, Some(b), 6),
+                            Stack::Pop(value) => (value, None, 7),
+                            Stack::ReplacePush(value, pushed) => (pushed, Some(value), 5),
+                            Stack::Push(pushed) => (pushed, Some(a), 5),
+                        };
+                        tried += 1;
+                        let conditions = outcome.conditions.iter().zip([8, 9, 10, 14]).all(|(&condition, bit)| condition.is_none_or(|set| set == (status >> bit & 1 == 1)));
+                        let mut same = conditions && status >> 11 & 7 == top;
+                        let mut differs = false;
+                        for (got, want) in [(Some(got0), st0), (got1, st1)] {
+                            let Some(got) = got.filter(|&got| got != want) else { continue };
+                            let units = ulps(got, want);
+                            let nan = |bits: u128| bits >> 64 & 0x7fff == 0x7fff;
+                            if exact(instruction) || units > tolerance(control) || nan(got) || nan(want) {
+                                same = false;
+                            }
+                            differs = true;
+                            largest = largest.max(units);
+                        }
+                        apart += usize::from(differs);
+                        if !same {
+                            wrong.push(format!("{name} {a:#x} {b:#x} under {word:#x}: the processor gives {st0:#x} {st1:#x} with status {status:#x}, this {outcome:x?}"));
+                        }
+                    }
+                }
+                report.push(format!("{name}: {apart} of {tried} differ, by {largest} units in the last place at most"));
+            }
+            eprintln!("{}", report.join("\n"));
+            let first: Vec<&String> = instructions.iter().flat_map(|(name, ..)| wrong.iter().filter(move |line| line.split(' ').next() == Some(name)).take(3)).collect();
+            assert!(wrong.is_empty(), "{} differ, the first of each instruction:\n{}", wrong.len(), first.iter().map(|line| line.as_str()).collect::<Vec<_>>().join("\n"));
         }
     }
 }
