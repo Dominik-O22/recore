@@ -176,6 +176,8 @@ pub struct Image {
     /// load only at its base. `relative_targets` is then the words of its data that land in
     /// it, and any value in its code that lands in it may be an address.
     pub relocations_stripped: bool,
+    /// The address and size of a PE image's version resource, a `VS_VERSIONINFO`.
+    pub version_resource: Option<(u64, u64)>,
     /// Compilers for this format place jump tables and other data among the code, so bytes
     /// that control flow never reaches cannot be assumed to be instructions.
     pub data_in_code: bool,
@@ -207,6 +209,7 @@ impl Image {
             frames: Vec::new(),
             relative_targets: Vec::new(),
             relocations_stripped: false,
+            version_resource: None,
             data_in_code: matches!(format, Format::Pe | Format::Raw),
             frames_merge: false,
             banking: Banking::default(),
@@ -256,16 +259,16 @@ impl Image {
         zero_filled.sort_unstable();
 
         let is_pe = file.format() == object::BinaryFormat::Pe;
-        let (import_slots, relative_targets, relocations_stripped, exports, frames) = if is_pe {
+        let (import_slots, relative_targets, relocations_stripped, exports, frames, version_resource) = if is_pe {
             let pe = if file.is_64() {
                 crate::pe::load::<object::pe::ImageNtHeaders64>(&data, &sections)?
             } else {
                 crate::pe::load::<object::pe::ImageNtHeaders32>(&data, &sections)?
             };
-            (pe.import_slots, pe.relative_targets, pe.relocations_stripped, pe.exports, pe.frames)
+            (pe.import_slots, pe.relative_targets, pe.relocations_stripped, pe.exports, pe.frames, pe.version_resource)
         } else {
             let (import_slots, relative_targets, exports, frames) = elf_metadata(&file, &sections);
-            (import_slots, relative_targets, false, exports, frames)
+            (import_slots, relative_targets, false, exports, frames, None)
         };
 
         let machine = match file.architecture() {
@@ -309,6 +312,7 @@ impl Image {
             frames,
             relative_targets,
             relocations_stripped,
+            version_resource,
             // ARM code reads its constants from pools among it.
             data_in_code: is_pe || machine == Machine::Arm,
             frames_merge: false,
