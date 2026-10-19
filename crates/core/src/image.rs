@@ -224,6 +224,8 @@ impl Image {
         if crate::macho::is_macho(&data) {
             return crate::macho::load(path.file_name().unwrap().to_string_lossy().into_owned(), &data);
         }
+        // OpenWrt and other firmware strip the section headers; read them back from the segments.
+        let data = if crate::sectionless::is_sectionless(&data) { crate::sectionless::restore(&data).unwrap_or(data) } else { data };
         let file = object::File::parse(&*data)?;
 
         let mut sections: Vec<Section> = file
