@@ -603,7 +603,8 @@ struct Emulator<'a> {
     /// Where the next allocation in scratch memory goes.
     heap: u64,
     tally: Tally,
-    /// The place of the stack pointer, whose value may not go below the run's stack.
+    /// The place of the stack pointer, whose value may not go below the run's stack, while the
+    /// run is on that stack.
     stack_pointer: Option<Varnode>,
     /// Where a fresh thread environment block goes, for a Windows thread the snapshot does not
     /// hold.
@@ -1095,15 +1096,17 @@ impl<'a> Emulator<'a> {
             return Err("an 8051 function runs on its own: there is nothing to run before it".into());
         }
         self.start_on_stack(&[])?;
+        let kept = std::mem::take(&mut self.tally.notes);
         let label = self.binary.program.label(entry);
         match self.run(entry, steps) {
             Stop::Returned => {}
             Stop::Steps => return Err(format!("{label}, run before, did not return in {steps} instructions")),
             Stop::Fault(fault) => return Err(format!("{label}, run before, stopped: {fault}")),
         }
-        // The caller may put the stack pointer anywhere before the run.
+        // The caller may put the stack pointer anywhere before the run. The notes made before
+        // setup, such as which thread the run is on, are the run's.
         self.stack_pointer = None;
-        self.tally = Tally::default();
+        self.tally = Tally { notes: kept, ..Tally::default() };
         self.memory.unwritten = Unwritten::default();
         Ok(())
     }
@@ -1192,9 +1195,10 @@ impl<'a> Emulator<'a> {
     }
 
     fn run(&mut self, entry: u64, steps: u64) -> Stop {
+        // The run guards its own stack, not one the caller put elsewhere with `set`.
         if self.internal_stack.is_none() {
-            match self.register(self.abi.stack) {
-                Ok(place) => self.stack_pointer = Some(place),
+            match self.register(self.abi.stack).and_then(|place| Ok((place, self.get(place)? as u64))) {
+                Ok((place, sp)) => self.stack_pointer = (self.stack.0..=self.stack.1).contains(&sp).then_some(place),
                 Err(fault) => return Stop::Fault(fault),
             }
         }

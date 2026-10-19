@@ -349,6 +349,12 @@ fn a_run_starts_from_the_memory_of_a_snapshot() {
     let slot = program.run("slot_3", json!({ "snapshot": snapshot }));
     assert_eq!(returned(&slot), "0xabcd", "{slot}");
     assert!(slot.contains("the run is on the snapshot's thread whose TEB is at 0x7ffd0000: set FS_OFFSET to choose another\n"), "{slot}");
+    // FS_OFFSET picks the thread over the snapshot's list.
+    let chosen = program.run("teb", json!({ "snapshot": snapshot, "set": ["FS_OFFSET=0xfffffe8"] }));
+    assert_eq!(chosen, format!("{} returned EAX = 0x11220000 (287440896) after 2 instructions\n", program.addr("teb")));
+    // Setup leaves out its own notes, not the one saying which thread the run is on.
+    let saved = program.run("saved", json!({ "snapshot": snapshot, "before": [program.addr("init")] }));
+    assert_eq!(saved, format!("{} returned EAX = 0x77 (119) after 3 instructions\nthe run is on the snapshot's thread whose TEB is at 0x7ffd0000: set FS_OFFSET to choose another\nran stand-ins for: TlsGetValue x1\n", program.addr("saved")));
     // A snapshot that leaves the run no room for its own memory is refused.
     let full = program.dir.join("full");
     write_snapshot(&full, &[(0x1000, 0x7fff_0000, &[])], &[]);

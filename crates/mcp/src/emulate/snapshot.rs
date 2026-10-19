@@ -5,8 +5,9 @@
 //!
 //! - `region START END PERMISSIONS NAME`: the bytes from START up to END, as a line of
 //!   `/proc/<pid>/maps` gives them. Its bytes are the file `START.bin` beside `snapshot.tsv`,
-//!   named by START as the row writes it. A file shorter than its region holds the start of
-//!   it, for a region that could be read only in part. PERMISSIONS and NAME are for people;
+//!   with START spelled exactly as the row spells it: a row of `00400000` names
+//!   `00400000.bin`, and a row of `400000` names `400000.bin`. A file shorter than its region
+//!   holds the start of it, for a region that could be read only in part. PERMISSIONS and NAME are for people;
 //!   `run` does not read them, and NAME may be empty.
 //! - `teb ADDRESS`: the thread environment block of a Windows thread, which `FS` points to
 //!   in 32-bit code. The first one listed is the thread a run is on, unless the caller sets
@@ -57,7 +58,7 @@ impl Snapshot {
                     let (start, end) = (hex(start_text).with_context(row)?, hex(end).with_context(row)?);
                     ensure!(start < end, "{}: the region ends before it starts", row());
                     let path = dir.join(format!("{start_text}.bin"));
-                    let file = File::open(&path).with_context(|| format!("{}: opening {}", row(), path.display()))?;
+                    let file = File::open(&path).with_context(|| format!("{}: opening {}, which the row's START names as it is spelled", row(), path.display()))?;
                     let held = file.metadata()?.len();
                     ensure!(held <= end - start, "{}: {} holds {held} bytes, more than the region's {}", row(), path.display(), end - start);
                     regions.push(Region { start, end, file, held, path });
