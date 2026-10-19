@@ -233,6 +233,24 @@ impl<A: Arch> Pending<A> {
     }
 }
 
+/// How strongly an origin says that a function starts at its address, weakest first. Each pass
+/// that weighs entry points against the code around them reads it from [`Explorer::evidence`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Evidence {
+    /// How the code is laid out: unreached code after padding, or where a jump lands.
+    Layout,
+    /// An address the code takes, or a word in data, where either may just be a number: see
+    /// [`Arch::TAKEN_IS_WEAK`].
+    MaybeNumber,
+    /// A pointer in data that may be a label inside a function: a computed-goto target, or an
+    /// exception filter or handler block. A jump across it within one function shows which.
+    MaybeLabel,
+    /// An address the code takes, or a pointer in data.
+    Pointer,
+    /// What only a function explains: an unwind entry, an export, a call, a thunk's target.
+    Sure,
+}
+
 struct Explorer<'a, A: Arch> {
     image: &'a Image,
     regions: Vec<Region<'a>>,
@@ -335,7 +353,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
 
     fn add_start(&mut self, addr: u64, origin: Origin) {
         let referenced = matches!(origin, Origin::Call | Origin::AddressTaken | Origin::DataPointer | Origin::Export | Origin::Thunk);
-        let weak = self.taken_is_weak() && matches!(origin, Origin::AddressTaken | Origin::DataPointer);
+        let weak = self.evidence(addr, origin) == Evidence::MaybeNumber;
         let Some(index) = self.region_index(addr) else {
             if referenced {
                 self.referenced.insert(addr);
@@ -600,6 +618,19 @@ impl<'a, A: Arch> Explorer<'a, A> {
         A::TAKEN_IS_WEAK || self.image.relocations_stripped
     }
 
+    /// How strongly `origin` says that a function starts at `addr`.
+    fn evidence(&self, addr: u64, origin: Origin) -> Evidence {
+        match origin {
+            Origin::TailCall | Origin::GapAligned | Origin::GapEndbr => Evidence::Layout,
+            Origin::AddressTaken | Origin::DataPointer if self.taken_is_weak() => Evidence::MaybeNumber,
+            // Where the format puts labels among the code, any pointer may be one. Elsewhere
+            // only one off the alignment functions have.
+            Origin::DataPointer if self.image.data_in_code || addr % A::FUNCTION_ALIGN != 0 => Evidence::MaybeLabel,
+            Origin::AddressTaken | Origin::DataPointer => Evidence::Pointer,
+            Origin::Unknown | Origin::Frame | Origin::Export | Origin::Call | Origin::Unreachable | Origin::Thunk => Evidence::Sure,
+        }
+    }
+
     /// Whether a value the code holds may be an address. Where the loader relocates the
     /// addresses in code, only a value some relocation carries is one. Where the relocations
     /// are stripped, nothing tells them apart, so any value the image maps may be one: not the
@@ -804,15 +835,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// and its target. Entry points that were themselves inferred from jumps or gaps do not
     /// count, otherwise one wrong guess would promote every jump that crosses it.
     fn promote_tail_calls(&mut self) -> bool {
-        let strong = AddrSet::new(
-            self.starts
-                .iter()
-                .filter(|(_, origin)| {
-                    !matches!(origin, Origin::TailCall | Origin::GapAligned | Origin::GapEndbr)
-                        && !(self.taken_is_weak() && matches!(origin, Origin::AddressTaken | Origin::DataPointer))
-                })
-                .map(|(&addr, _)| addr),
-        );
+        let strong = AddrSet::new(self.starts.iter().filter(|&(&addr, &origin)| self.evidence(addr, origin) > Evidence::MaybeNumber).map(|(&addr, _)| addr));
         let starts = AddrSet::new(self.starts.keys().copied());
         let mut promoted = Vec::new();
         for &(from, to) in &self.jumps {
@@ -834,18 +857,6 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// something that is not itself an entry point stays within one function, so every weak
     /// entry point it crosses is not real. Typical case: an aligned loop head that follows a call.
     fn demote_crossed_starts(&mut self) -> bool {
-        // A code pointer in data may be a label and not a function: a computed-goto target, or
-        // an exception filter or handler block, which Windows scope tables point at. A jump
-        // across it within one function shows which.
-        // Where the format is known to do that, any such pointer is weak evidence; elsewhere
-        // only one that is not function-aligned.
-        let labels_in_data = self.image.data_in_code;
-        let is_weak = |addr: u64, origin: &Origin| match origin {
-            Origin::TailCall | Origin::GapAligned | Origin::GapEndbr => true,
-            Origin::AddressTaken => self.taken_is_weak(),
-            Origin::DataPointer => labels_in_data || addr % A::FUNCTION_ALIGN != 0,
-            _ => false,
-        };
         let starts = AddrSet::new(self.starts.keys().copied());
         let mut demoted = BTreeSet::new();
         for &(from, to) in &self.jumps {
@@ -859,7 +870,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 continue;
             }
             let mut crossed = self.starts.range(low + 1..=high);
-            if crossed.clone().all(|(&addr, origin)| is_weak(addr, origin)) {
+            if crossed.clone().all(|(&addr, &origin)| self.evidence(addr, origin) < Evidence::Pointer) {
                 demoted.extend(crossed.by_ref().map(|(&addr, _)| addr));
             }
         }
@@ -940,8 +951,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// that is weak evidence, when code runs on into them: a number that lands inside a
     /// function.
     fn demote_taken_inside_code(&mut self) {
-        let weak = |origin: &Origin| matches!(origin, Origin::AddressTaken | Origin::DataPointer);
-        let inside: Vec<u64> = self.starts.iter().filter(|&(&addr, origin)| weak(origin) && self.falls_into(addr)).map(|(&addr, _)| addr).collect();
+        let inside: Vec<u64> =
+            self.starts.iter().filter(|&(&addr, &origin)| self.evidence(addr, origin) == Evidence::MaybeNumber && self.falls_into(addr)).map(|(&addr, _)| addr).collect();
         for addr in inside {
             self.demote_run_into(addr);
         }
@@ -964,8 +975,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         calls_to.retain(|&to, _| self.starts.get(&to) == Some(&Origin::Call) && self.falls_into(to));
         // Far jumps within one function lead to each other, and a guessed entry point between
         // them may be a guess they led to.
-        let strong = |origin: &Origin| !matches!(origin, Origin::TailCall | Origin::GapAligned | Origin::GapEndbr | Origin::AddressTaken | Origin::DataPointer);
-        let starts = AddrSet::new(self.starts.iter().filter(|&(start, origin)| strong(origin) && !calls_to.contains_key(start)).map(|(&start, _)| start));
+        let starts = AddrSet::new(self.starts.iter().filter(|&(&start, &origin)| self.evidence(start, origin) == Evidence::Sure && !calls_to.contains_key(&start)).map(|(&start, _)| start));
         let jumps: Vec<u64> = calls_to
             .into_iter()
             .filter(|(to, sites)| sites.iter().all(|&from| if from < *to { !starts.any_in(from + 1, to - 1) } else { !starts.any_in(to + 1, from) }))
