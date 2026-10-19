@@ -6,10 +6,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 # Only the crates the loop needs; other crates may be mid-change.
 cargo build --release -q -p recore -p recore-corpus
-# Game-specific work stays in the tests, which may name the program whose binary they need.
-# The scan the tests of crates/*/tests carry would be theirs to fail, and CI's suite runs it
-# with everything else; this loop runs it once more before the corpora blind it to all but
-# the score. See crates/core/tests/general_naming.rs.
+# Only crates/*/tests may name the program a test needs. CI runs this scan with the other
+# tests; the loop runs it first, so a leaked name fails before the corpora are scored.
 cargo test --release -q -p recore --test general_naming
 corpora="${RECORE_CORPORA:-$HOME/recore-corpora}"
 for corpus in corpus corpus-arm64 corpus-armhf corpus-armel corpus-pe32 corpus-pe corpus-macho corpus-macho-x86 corpus-8051 corpus-thumb; do

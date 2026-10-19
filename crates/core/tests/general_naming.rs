@@ -1,24 +1,22 @@
-//! The names of the program the RT3 work ran on stay in the tests, where the binary they need
-//! may live (`crates/*/tests`, which this scan does not enter): code and docs everywhere else
-//! keep them out. Each checked-out tree carries the same source, so the scan looks for the
-//! words in content and in file and directory names alike. `WORDS` is the list; matching is
-//! case-insensitive, and a word counts where no alphanumeric character sits just before it,
-//! which keeps identifiers such as `part3` and `sort31` out of the report.
+//! The names of the program the RT3 work ran on stay in the tests that need its binary, under
+//! `crates/*/tests`, which this scan does not enter. Everywhere else in the checkout, the scan
+//! fails on a word of `WORDS` in a file's contents or in a file or directory name. Matching
+//! ignores case, and a word counts only when no letter or digit comes just before it, so
+//! identifiers such as `sort31` do not count.
 //!
-//! The scan runs with every `cargo test --release --workspace`, CI's suite, and `./check.sh`
-//! runs it once more before it scores.
+//! CI runs the scan with `cargo test --release --workspace`, and `./check.sh` runs it before
+//! it scores the corpora.
 
 use std::fs;
 use std::path::Path;
 
 const WORDS: [&str; 2] = ["rt3", "railroad"];
 
-/// Directories of these names the scan does not enter, wherever in the tree they stand: git's
-/// data, build output, and the output of `mise run dist`, whose README copy would read as a
-/// mention. Four of the names are from the rules of .gitignore, which have no slash in them
-/// and so match at any depth — the checkout carries one of the four deeper already, the
-/// `__pycache__` of the corpus scripts — and git's data is the fifth.
-const UNREADABLE: [&str; 5] = [".git", "target", "__pycache__", "untrusted", "dist"];
+/// Directories the scan does not enter, at any depth: git's data, and the four names
+/// .gitignore ignores at any depth (build output, Python's caches such as
+/// `corpus/__pycache__`, downloads, and the output of `mise run dist`, whose README copy would
+/// count as a mention).
+const SKIPPED: [&str; 5] = [".git", "target", "__pycache__", "untrusted", "dist"];
 
 /// Every byte offset in `bytes` where a word of `WORDS` stands apart, in order. A word stands
 /// apart when no alphanumeric character sits just before it, so that what an identifier could
@@ -53,7 +51,7 @@ fn walk(dir: &Path, parts: &mut Vec<String>, hits: &mut Vec<String>) {
     entries.sort_unstable_by_key(|entry| entry.file_name());
     for entry in entries {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if UNREADABLE.contains(&name.as_str()) {
+        if SKIPPED.contains(&name.as_str()) {
             continue;
         }
         parts.push(name);
@@ -79,11 +77,9 @@ fn walk(dir: &Path, parts: &mut Vec<String>, hits: &mut Vec<String>) {
                         let ends = bytes[at..].iter().position(|&b| b == b'\n').map_or(bytes.len(), |i| i + at);
                         let begins = bytes[..at].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
                         let mut text = String::from_utf8_lossy(&bytes[begins..ends]).trim().to_string();
-                        // A file without a line break can hold a whole binary in one line; the
-                        // report keeps the words in their surroundings, not all of them. The cut
-                        // stays on a character boundary: what lossy decoding made of the file
-                        // has three-byte stands-in characters often enough to land mid-after
-                        // 200 bytes.
+                        // A file with no line breaks is one long line, so the report keeps 200
+                        // bytes of it. The cut moves back to a character boundary, since lossy
+                        // decoding gives 3-byte replacement characters.
                         if text.len() > 200 {
                             let mut cut = 200;
                             while !text.is_char_boundary(cut) {
@@ -116,4 +112,9 @@ fn names_stay_in_the_tests() {
         "game-specific code and docs belong in tests only, under crates/*/tests. Found:\n{}",
         hits.join("\n")
     );
+}
+
+#[test]
+fn a_word_inside_an_identifier_is_not_a_name() {
+    assert_eq!(word_starts(b"RECORE_RT3 sort31 chart3x partsort3 Railroad"), [7, 36]);
 }
