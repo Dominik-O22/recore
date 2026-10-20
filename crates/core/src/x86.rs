@@ -43,8 +43,9 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
     const FUNCTION_ALIGN: u64 = 16;
     const ALIGNMENT_IS_EVIDENCE: bool = true;
     const ADDRESSES_ARE_RELOCATED: bool = BITS == 32;
-    /// An operand names the slot outright, except in a call through a register, which
-    /// discovery resolves on its way to the call.
+    /// An operand names the slot outright, except in a call through a register. Discovery
+    /// follows the paths to those with the registers tracked, and the decoding of a function
+    /// takes where they go from it, so it need not track registers itself.
     const FLOW_READS_STATE: bool = false;
 
     fn decode<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> impl Iterator<Item = Decoded<Instruction>> + 'a {
@@ -77,11 +78,14 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         })
     }
 
-    /// A call through a register goes through the slot the register was loaded from: MSVC
-    /// loads an import it calls more than once into a register a call preserves.
-    fn flow(insn: &Instruction, state: &State, _: &Image) -> Option<Flow> {
+    /// A call through a register loaded from an import's slot calls the import: MSVC loads an
+    /// import it calls more than once into a register a call preserves. A register loaded from
+    /// any other global holds whatever the program put there last, not what the file holds.
+    fn flow(insn: &Instruction, state: &State, image: &Image) -> Option<Flow> {
         match classify(insn) {
-            Some(Flow::CallIndirect(None)) if insn.op0_kind() == OpKind::Register => Some(Flow::CallIndirect(state.loaded_from(insn.op0_register()))),
+            Some(Flow::CallIndirect(None)) if insn.op0_kind() == OpKind::Register => {
+                Some(Flow::CallIndirect(state.loaded_from(insn.op0_register()).filter(|slot| image.import_slots.contains_key(slot))))
+            }
             flow => flow,
         }
     }

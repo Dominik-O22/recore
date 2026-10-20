@@ -49,8 +49,9 @@ fn code_pieces(start: u64, end: u64, tables: &[(u64, u64)]) -> impl Iterator<Ite
 
 /// Decodes `[start, end)` linearly, stepping over `tables`, and keeps its control-flow
 /// instructions. With `trim`, `end` is only an upper bound and the function ends before any
-/// trailing padding.
-fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool, tables: &[(u64, u64)]) -> Function {
+/// trailing padding. A call through a register goes where `register_calls` says, which
+/// discovery learned on its way there.
+fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool, tables: &[(u64, u64)], register_calls: &FxHashMap<u64, u64>) -> Function {
     let mut function = Function { start, end, controls: Vec::new(), instructions: 0 };
     let mut body_end = start;
     for (from, to) in code_pieces(start, end, tables) {
@@ -67,6 +68,10 @@ fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool, tables: &[(u
             }
             match A::flow(&insn, &state, image) {
                 Some(flow) => {
+                    let flow = match flow {
+                        Flow::CallIndirect(None) => Flow::CallIndirect(register_calls.get(&decoded.addr).copied()),
+                        flow => flow,
+                    };
                     function.controls.push(Control { addr: decoded.addr, next: decoded.next_addr(), flow });
                     // The state only matters for resolving slots, so a fresh one after any control
                     // transfer is enough for a linear pass.
@@ -498,6 +503,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     let inline_tables = inline_tables.as_slice();
     let after_calls = std::mem::take(&mut discovery.after_calls);
     let frame_ends = std::mem::take(&mut discovery.frame_ends);
+    let register_calls = std::mem::take(&mut discovery.register_calls);
+    let register_calls = &register_calls;
 
     // Functions by the entry and the bound they were decoded from. A round of the loop below
     // that adds entry points starts over, and all but the functions next to the new entry
@@ -525,9 +532,9 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .zip(reused)
             .map(|(&(start, bound), reused)| {
                 reused.unwrap_or_else(|| match frame_end.contains_key(&start) {
-                    true => decode::<A>(image, start, bound, false, inline_tables),
-                    false if image.data_in_code => decode::<A>(image, start, code_end::<A>(image, start, bound, &tables, inline_tables), true, inline_tables),
-                    false => decode::<A>(image, start, bound, true, inline_tables),
+                    true => decode::<A>(image, start, bound, false, inline_tables, register_calls),
+                    false if image.data_in_code => decode::<A>(image, start, code_end::<A>(image, start, bound, &tables, inline_tables), true, inline_tables, register_calls),
+                    false => decode::<A>(image, start, bound, true, inline_tables, register_calls),
                 })
             })
             .collect();
@@ -538,7 +545,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         _phase = phase::scope("decode chunks");
         let chunks: Vec<Function> = if image.data_in_code {
             let covered: Vec<(u64, u64)> = functions.iter().map(|f| (f.start, f.end)).collect();
-            uncovered(&discovery.code, &covered).into_iter().map(|(start, end)| decode::<A>(image, start, end, false, inline_tables)).collect()
+            uncovered(&discovery.code, &covered).into_iter().map(|(start, end)| decode::<A>(image, start, end, false, inline_tables, register_calls)).collect()
         } else {
             Vec::new()
         };
@@ -766,7 +773,6 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             let noreturn = &noreturn;
             let imports = &imports;
             let pointer_slots = &pointer_slots;
-            let register_calls = &discovery.register_calls;
             function.controls.iter().filter_map(move |control| {
                 let local = |target: u64, tail: bool| {
                     // Moving between a function and its own fragment is ordinary control flow.
@@ -784,7 +790,6 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                 let (target, noreturn, tail) = match control.flow {
                     Flow::Call(target) => imports.stub_slot(target).and_then(|slot| import(slot, false)).or_else(|| local(target, false)),
                     Flow::CallIndirect(Some(slot)) => through_slot(slot, false),
-                    Flow::CallIndirect(None) => through_slot(*register_calls.get(&control.addr)?, false),
                     Flow::Jump(target) | Flow::Branch(target) if leaves(function, target) => {
                         imports.stub_slot(target).and_then(|slot| import(slot, true)).or_else(|| local(target, true))
                     }

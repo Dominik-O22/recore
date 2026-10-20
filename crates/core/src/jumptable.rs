@@ -139,10 +139,12 @@ impl State {
             Mnemonic::Mov if instr.op1_kind() == OpKind::Memory && instr.is_ip_rel_memory_operand() && instr.op0_register().is_gpr64() => {
                 Value::Slot(instr.ip_rel_memory_address())
             }
-            // 32-bit code names the slot by its absolute address.
+            // 32-bit code names the slot by its absolute address, in the data segment: `fs:[0]` is
+            // the thread's own.
             Mnemonic::Mov
                 if instr.op1_kind() == OpKind::Memory
                     && instr.code_size() == iced_x86::CodeSize::Code32
+                    && instr.segment_prefix() == Register::None
                     && instr.memory_base() == Register::None
                     && instr.memory_index() == Register::None
                     && instr.op0_register().is_gpr32() =>
