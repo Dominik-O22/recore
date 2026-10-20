@@ -99,6 +99,11 @@ impl Emulator<'_> {
                 (1, None)
             }
             "GetCurrentThreadId" => (0, Some(self.read_pointer(teb + THREAD_ID))),
+            // A clock a run reads gives a different answer each time, unless the caller fixes it.
+            "GetTickCount" => match self.ticks {
+                Some(ticks) => (0, Some(ticks)),
+                None => return Ok(None),
+            },
             // A slot is free if this thread's value is zero and the run gave it out to no one. On
             // a snapshot's thread that may be a slot another module of the process owns, which
             // the PEB's TLS bitmap would tell.
