@@ -62,7 +62,7 @@ static bool readOnlyByLockedParams(Funcdata &data,Varnode *vn)
     PcodeOp *op = *iter;
     if (!op->isCall() || op->getSlot(vn) == 0) return false;
     FuncCallSpecs *fc = data.getCallSpecs(op);
-    if (fc == (FuncCallSpecs *)0 || !fc->isInputLocked() || fc->isDotdotdot()) return false;
+    if (fc == (FuncCallSpecs *)0 || fc->isInputActive() || !fc->isInputLocked() || fc->isDotdotdot()) return false;
   }
   return true;
 }
@@ -125,9 +125,9 @@ SubvariableFlow::ReplaceVarnode *SubvariableFlow::setReplacement(Varnode *vn,uin
       // If the logical variable is not a flag, don't consider the case where multiple variables
       // are packed into a single location, i.e. always consider it a single variable
       // recore: except bits that are zero and read only as a locked parameter, which takes the
-      // logical value zero extended
+      // logical value zero extended. A varnode kept alive for reasons no read shows keeps them.
       if ((!aggressive)&&((vn->getConsume()&~mask)!=0) &&
-	  !((vn->getNZMask()&~mask)==0 && readOnlyByLockedParams(*fd,vn))) // If there is any use of value outside of the logical variable
+	  !((vn->getNZMask()&~mask)==0 && !vn->isAutoLive() && readOnlyByLockedParams(*fd,vn))) // If there is any use of value outside of the logical variable
 	return (ReplaceVarnode *)0; // This probably means the whole thing is a variable, i.e. quit
       if (vn->isTypeLock() && vn->getType()->getMetatype() != TYPE_PARTIALSTRUCT) {
 	int4 sz = vn->getType()->getSize();
@@ -235,15 +235,17 @@ bool SubvariableFlow::tryCallPull(PcodeOp *op,ReplaceVarnode *rvn,int4 slot)
   // and the whole container stays live back to wherever the value came from.
   if (fc->isInputLocked() && (!fc->isDotdotdot())) {
     if ((rvn->mask & 1) == 0 || (rvn->vn->getNZMask() & ~rvn->mask) != 0) return false;
-    // Already a zero extension, as this patch leaves it: another would only trade it for a
-    // new one, and RuleSubvarZext would come back to that one without end.
-    if (rvn->vn->isWritten() && rvn->vn->getDef()->code() == CPUI_INT_ZEXT) return false;
+    if (rvn->vn->getSize() == flowsize) return false;	// There must be some (zero) extension
     patchlist.emplace_back();
     patchlist.back().type = PatchRecord::zext_parameter_patch;
     patchlist.back().patchOp = op;
     patchlist.back().in1 = rvn;
     patchlist.back().slot = slot;
-    pullcount += 1;
+    // A zero extension that feeds only this call already has the form the patch gives it, as in
+    // tryInt2FloatPull. Counting it would let RuleSubvarZext and this patch remake it forever.
+    bool extended = rvn->vn->isWritten() && rvn->vn->getDef()->code() == CPUI_INT_ZEXT && rvn->vn->loneDescend() == op;
+    if (!extended)
+      pullcount += 1;
     return true;
   }
   if (!aggressive) {
