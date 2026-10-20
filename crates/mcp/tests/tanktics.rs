@@ -53,7 +53,7 @@ fn the_window_goes_back_to_the_rectangle_read_before_the_calls() {
     let enumerate = calls(&c, "DirectDrawEnumerateA");
     assert!(enumerate.len() == 1 && enumerate[0].len() == 2 && enumerate[0][0] == "func_0x0045c340", "{enumerate:?} in\n{c}");
     let rect = calls(&c, "GetWindowRect");
-    let left = rect[0][1].strip_prefix('&').unwrap_or_else(|| panic!("{rect:?} in\n{c}"));
+    let left = rect.first().and_then(|arguments| arguments.get(1)?.strip_prefix('&')).unwrap_or_else(|| panic!("{rect:?} in\n{c}"));
     let moved = calls(&c, "SetWindowPos");
     assert!(moved.len() == 1 && moved[0].len() == 7 && moved[0][0] == window && moved[0][2] == left, "{moved:?} in\n{c}");
     assert!(!c.contains("unaff_"), "{c}");
