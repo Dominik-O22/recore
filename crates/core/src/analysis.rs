@@ -766,6 +766,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             let noreturn = &noreturn;
             let imports = &imports;
             let pointer_slots = &pointer_slots;
+            let register_calls = &discovery.register_calls;
             function.controls.iter().filter_map(move |control| {
                 let local = |target: u64, tail: bool| {
                     // Moving between a function and its own fragment is ordinary control flow.
@@ -783,6 +784,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                 let (target, noreturn, tail) = match control.flow {
                     Flow::Call(target) => imports.stub_slot(target).and_then(|slot| import(slot, false)).or_else(|| local(target, false)),
                     Flow::CallIndirect(Some(slot)) => through_slot(slot, false),
+                    Flow::CallIndirect(None) => through_slot(*register_calls.get(&control.addr)?, false),
                     Flow::Jump(target) | Flow::Branch(target) if leaves(function, target) => {
                         imports.stub_slot(target).and_then(|slot| import(slot, true)).or_else(|| local(target, true))
                     }

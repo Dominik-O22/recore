@@ -43,7 +43,8 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
     const FUNCTION_ALIGN: u64 = 16;
     const ALIGNMENT_IS_EVIDENCE: bool = true;
     const ADDRESSES_ARE_RELOCATED: bool = BITS == 32;
-    /// An operand names the slot outright or not at all.
+    /// An operand names the slot outright, except in a call through a register, which
+    /// discovery resolves on its way to the call.
     const FLOW_READS_STATE: bool = false;
 
     fn decode<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> impl Iterator<Item = Decoded<Instruction>> + 'a {
@@ -76,8 +77,13 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         })
     }
 
-    fn flow(insn: &Instruction, _: &State, _: &Image) -> Option<Flow> {
-        classify(insn)
+    /// A call through a register goes through the slot the register was loaded from: MSVC
+    /// loads an import it calls more than once into a register a call preserves.
+    fn flow(insn: &Instruction, state: &State, _: &Image) -> Option<Flow> {
+        match classify(insn) {
+            Some(Flow::CallIndirect(None)) if insn.op0_kind() == OpKind::Register => Some(Flow::CallIndirect(state.loaded_from(insn.op0_register()))),
+            flow => flow,
+        }
     }
 
     fn address_taken(insn: &Instruction, _: &State, _: &Image) -> Option<u64> {
@@ -105,9 +111,10 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
 
     fn through_pointer(insn: &Instruction, state: &State) -> Option<(u64, u64, bool)> {
         // `[register + offset]` with nothing else in the operand. Few registers hold a loaded
-        // pointer, so that is asked first.
+        // pointer, so that is asked first. A 32-bit slot is a global that the program may point
+        // elsewhere as it runs, not an entry of a global offset table.
         let base = insn.memory_base();
-        if base == Register::None || insn.memory_index() != Register::None {
+        if BITS == 32 || base == Register::None || insn.memory_index() != Register::None {
             return None;
         }
         let slot = state.loaded_from(base).filter(|_| insn.op_kinds().any(|kind| kind == OpKind::Memory))?;

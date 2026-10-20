@@ -63,11 +63,19 @@ fn message_sends_carry_their_selector() {
 #[test]
 fn message_sends_resolve_on_x86_64() {
     let analysis = analyze("shapes-x86_64");
-    // The sends this leaves out call the dispatcher through a register the function loaded
-    // it into, which is not a call to a known target.
     assert_eq!(
         sends(&analysis),
-        [(0x100000a4f, "area", None), (0x100000a8e, "area", None), (0x100000af4, "setSide:", Some(0x100000b20)), (0x100000b99, "area", None)]
+        [
+            (0x100000a4f, "area", None),
+            (0x100000a8e, "area", None),
+            // The dispatcher was loaded into a register, which these call.
+            (0x100000aaa, "side", Some(0x100000b10)),
+            (0x100000ab6, "side", Some(0x100000b10)),
+            (0x100000af4, "setSide:", Some(0x100000b20)),
+            (0x100000b5e, "withSide:", Some(0x100000ad0)),
+            (0x100000b73, "scaledBy:", Some(0x100000a40)),
+            (0x100000b99, "area", None),
+        ]
     );
 }
 
