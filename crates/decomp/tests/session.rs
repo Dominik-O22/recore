@@ -420,18 +420,23 @@ fn an_8051_table_is_read_in_the_bank_of_the_code_that_reads_it() {
     assert!(function.c_text.contains("+ 0x29000)"), "{}", function.c_text);
 }
 
-/// The C of the function at 0x1000 in `code`, which may call the import `name` through its slot
-/// at 0x2000.
-fn decompile_calling_import(name: &str, code: &[u8]) -> String {
+/// A session over `code` at 0x1000, which may call the import `name` through its slot at 0x2000
+/// and read the global at 0x2004.
+fn session_calling_import(name: &str, code: &[u8]) -> Session {
     use recore::image::{Format, Machine};
     let text = recore::image::Section { name: ".text".into(), addr: 0x1000, data: code.to_vec(), file_offset: None, executable: true, writable: false };
-    let idata = recore::image::Section { name: ".idata".into(), addr: 0x2000, data: vec![0; 4], file_offset: None, executable: false, writable: false };
-    let mut image = recore::Image::bare("test".into(), Format::Pe, Machine::X86, 0x1000, vec![text, idata]);
+    let data = recore::image::Section { name: ".data".into(), addr: 0x2000, data: vec![0; 8], file_offset: None, executable: false, writable: true };
+    let mut image = recore::Image::bare("test".into(), Format::Pe, Machine::X86, 0x1000, vec![text, data]);
     image.import_slots.insert(0x2000, name.into());
     let analysis = recore::analyze(&image);
     let mut session = Session::from_image(&image, &analysis).unwrap();
     session.add_functions(&Facts::derive(&image, &analysis)).unwrap();
-    session.decompile(0x1000).unwrap().c_text
+    session
+}
+
+/// The C of the function at 0x1000 in `code`, which may call the import `name`.
+fn decompile_calling_import(name: &str, code: &[u8]) -> String {
+    session_calling_import(name, code).decompile(0x1000).unwrap().c_text
 }
 
 /// MSVC calls an import it calls more than once through a register it loads from the slot. Each
@@ -504,4 +509,39 @@ fn an_import_declared_without_a_convention_leaves_its_arguments_to_the_caller() 
     ];
     let c = decompile_calling_import("_Znwj", &code);
     assert!(c.contains("return 0x2a;"), "{c}");
+}
+
+/// A function that masks its argument to a byte before it passes it on as a word takes a byte,
+/// even where the callee's word is locked by its prototype. Its caller, which sets only the low
+/// byte of the register it pushes, then passes that byte and nothing in other registers.
+#[test]
+fn a_byte_masked_into_a_locked_word_stays_a_byte() {
+    #[rustfmt::skip]
+    let code = [
+        0xb2, 0x7f,                          // 0x1000  mov dl, 0x7f
+        0x52,                                // 0x1002  push edx
+        0xe8, 0x18, 0x00, 0x00, 0x00,        // 0x1003  call 0x1020
+        0x83, 0xc4, 0x04,                    // 0x1008  add esp, 4
+        0xc3,                                // 0x100b  ret
+        0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+        0xcc, 0xcc, 0xcc, 0xcc,
+        0x8b, 0x44, 0x24, 0x04,              // 0x1020  mov eax, [esp+4]
+        0x8b, 0x0d, 0x04, 0x20, 0x00, 0x00,  // 0x1024  mov ecx, [0x2004]
+        0x25, 0xff, 0x00, 0x00, 0x00,        // 0x102a  and eax, 0xff
+        0x50,                                // 0x102f  push eax
+        0x51,                                // 0x1030  push ecx
+        0xff, 0x15, 0x00, 0x20, 0x00, 0x00,  // 0x1031  call [0x2000]
+        0xc3,                                // 0x1037  ret
+    ];
+    let mut session = session_calling_import("_AIL_set_digital_master_volume@8", &code);
+    session.keep_prototypes(true);
+
+    let callee = session.decompile(0x1020).unwrap();
+    let types: Vec<&str> = callee.params.iter().map(|param| param.type_name.as_str()).collect();
+    assert!(types.len() == 1 && types[0].ends_with('1'), "{}", callee.c_text);
+    // The import gets the byte itself, widened, and nothing masks it again.
+    let call = callee.c_text.lines().find(|line| line.contains("_AIL_set_digital_master_volume@8(")).unwrap_or_else(|| panic!("{}", callee.c_text));
+    assert!(call.contains("param_1") && !call.contains("0xff"), "{}", callee.c_text);
+    let caller = session.decompile(0x1000).unwrap();
+    assert!(caller.params.is_empty() && caller.c_text.contains("func_0x00001020(0x7f);"), "{}", caller.c_text);
 }
