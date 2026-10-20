@@ -419,3 +419,35 @@ fn an_8051_table_is_read_in_the_bank_of_the_code_that_reads_it() {
     let function = session_8051(&[0x90, 0x90, 0x00, 0xef, 0x93, 0xff, 0x22], 0x02_8000).decompile(0x02_8000).unwrap();
     assert!(function.c_text.contains("+ 0x29000)"), "{}", function.c_text);
 }
+
+/// MSVC calls an import it calls more than once through a register it loads from the slot. Each
+/// call pops the argument pushed for it, so the local read after them is the one the function
+/// set and not an argument.
+#[test]
+fn a_stdcall_import_called_through_a_register_pops_its_arguments() {
+    use recore::image::{Format, Machine};
+    #[rustfmt::skip]
+    let code = [
+        0x83, 0xec, 0x08,                                // 0x1000  sub esp, 8
+        0xc7, 0x44, 0x24, 0x04, 0x2a, 0x00, 0x00, 0x00,  // 0x1003  mov dword [esp+4], 0x2a
+        0x8b, 0x35, 0x00, 0x20, 0x00, 0x00,              // 0x100b  mov esi, [0x2000]
+        0x6a, 0x00,                                      // 0x1011  push 0
+        0xff, 0xd6,                                      // 0x1013  call esi
+        0x6a, 0x01,                                      // 0x1015  push 1
+        0xff, 0xd6,                                      // 0x1017  call esi
+        0x8b, 0x44, 0x24, 0x04,                          // 0x1019  mov eax, [esp+4]
+        0x83, 0xc4, 0x08,                                // 0x101d  add esp, 8
+        0xc3,                                            // 0x1020  ret
+    ];
+    let text = recore::image::Section { name: ".text".into(), addr: 0x1000, data: code.to_vec(), file_offset: None, executable: true, writable: false };
+    let idata = recore::image::Section { name: ".idata".into(), addr: 0x2000, data: vec![0; 4], file_offset: None, executable: false, writable: false };
+    let mut image = recore::Image::bare("test".into(), Format::Pe, Machine::X86, 0x1000, vec![text, idata]);
+    image.import_slots.insert(0x2000, "LockWindowUpdate".into());
+    let analysis = recore::analyze(&image);
+    let mut session = Session::from_image(&image, &analysis).unwrap();
+    session.add_functions(&Facts::derive(&image, &analysis)).unwrap();
+
+    let function = session.decompile(0x1000).unwrap();
+    assert!(function.c_text.contains("LockWindowUpdate((void *)0x0);") && function.c_text.contains("LockWindowUpdate((void *)0x1);"), "{}", function.c_text);
+    assert!(function.c_text.contains("return 0x2a;"), "{}", function.c_text);
+}
