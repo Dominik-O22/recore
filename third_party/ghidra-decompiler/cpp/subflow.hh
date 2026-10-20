@@ -73,7 +73,8 @@ class SubvariableFlow {
       parameter_patch,		///< Convert a CALL/CALLIND/RETURN/BRANCHIND parameter into logical value
       extension_patch,		///< Convert op into something that copies/extends logical value, adding zero bits
       push_patch,		///< Convert an operator output to the logical value
-      int2float_patch		///< Zero extend logical value into FLOAT_INT2FLOAT operator
+      int2float_patch,		///< Zero extend logical value into FLOAT_INT2FLOAT operator
+      zext_parameter_patch	///< recore: zero extend logical value into a locked CALL/CALLIND parameter
     };
     patchtype type;		///< The type of \b this patch
     PcodeOp *patchOp;		///< Op being affected

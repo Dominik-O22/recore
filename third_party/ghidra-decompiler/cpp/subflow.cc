@@ -52,6 +52,21 @@ int4 SubvariableFlow::doesAndClear(PcodeOp *andop,uintb mask)
   return -1;
 }
 
+// recore: whether every read of \b vn is as a parameter that a locked prototype fixes in size, so
+// that a value in its low bits can flow in through a zero extension.
+static bool readOnlyByLockedParams(Funcdata &data,Varnode *vn)
+
+{
+  if (vn->hasNoDescend()) return false;
+  for(list<PcodeOp *>::const_iterator iter=vn->beginDescend();iter!=vn->endDescend();++iter) {
+    PcodeOp *op = *iter;
+    if (!op->isCall() || op->getSlot(vn) == 0) return false;
+    FuncCallSpecs *fc = data.getCallSpecs(op);
+    if (fc == (FuncCallSpecs *)0 || fc->isInputActive() || !fc->isInputLocked() || fc->isDotdotdot()) return false;
+  }
+  return true;
+}
+
 /// \brief Add the given Varnode as a new node in the logical subgraph
 ///
 /// A new ReplaceVarnode object is created, representing the given Varnode within
@@ -109,7 +124,10 @@ SubvariableFlow::ReplaceVarnode *SubvariableFlow::setReplacement(Varnode *vn,uin
     if (bitsize >= 8) {		// Not a flag
       // If the logical variable is not a flag, don't consider the case where multiple variables
       // are packed into a single location, i.e. always consider it a single variable
-      if ((!aggressive)&&((vn->getConsume()&~mask)!=0)) // If there is any use of value outside of the logical variable
+      // recore: except bits that are zero and read only as a locked parameter, which takes the
+      // logical value zero extended. A varnode kept alive for reasons no read shows keeps them.
+      if ((!aggressive)&&((vn->getConsume()&~mask)!=0) &&
+	  !((vn->getNZMask()&~mask)==0 && !vn->isAutoLive() && readOnlyByLockedParams(*fd,vn))) // If there is any use of value outside of the logical variable
 	return (ReplaceVarnode *)0; // This probably means the whole thing is a variable, i.e. quit
       if (vn->isTypeLock() && vn->getType()->getMetatype() != TYPE_PARTIALSTRUCT) {
 	int4 sz = vn->getType()->getSize();
@@ -209,14 +227,31 @@ bool SubvariableFlow::tryCallPull(PcodeOp *op,ReplaceVarnode *rvn,int4 slot)
 
 {
   if (slot == 0) return false;
+  FuncCallSpecs *fc = fd->getCallSpecs(op);
+  if (fc == (FuncCallSpecs *)0) return false;
+  if (fc->isInputActive()) return false; // Don't trim while in the middle of figuring out params
+  // recore: a locked parameter keeps its size, but a logical value in its low bits with zeros
+  // above, as `x & 0xff` is, still flows into it through a zero extension. Upstream stops here,
+  // and the whole container stays live back to wherever the value came from.
+  if (fc->isInputLocked() && (!fc->isDotdotdot())) {
+    if ((rvn->mask & 1) == 0 || (rvn->vn->getNZMask() & ~rvn->mask) != 0) return false;
+    if (rvn->vn->getSize() == flowsize) return false;	// There must be some (zero) extension
+    patchlist.emplace_back();
+    patchlist.back().type = PatchRecord::zext_parameter_patch;
+    patchlist.back().patchOp = op;
+    patchlist.back().in1 = rvn;
+    patchlist.back().slot = slot;
+    // A zero extension that feeds only this call already has the form the patch gives it, as in
+    // tryInt2FloatPull. Counting it would let RuleSubvarZext and this patch remake it forever.
+    bool extended = rvn->vn->isWritten() && rvn->vn->getDef()->code() == CPUI_INT_ZEXT && rvn->vn->loneDescend() == op;
+    if (!extended)
+      pullcount += 1;
+    return true;
+  }
   if (!aggressive) {
     if ((rvn->vn->getConsume()&~rvn->mask)!=0)	// If there's something outside the mask being consumed
       return false;				// Don't truncate
   }
-  FuncCallSpecs *fc = fd->getCallSpecs(op);
-  if (fc == (FuncCallSpecs *)0) return false;
-  if (fc->isInputActive()) return false; // Don't trim while in the middle of figuring out params
-  if (fc->isInputLocked() && (!fc->isDotdotdot())) return false;
 
   patchlist.emplace_back();
   patchlist.back().type = PatchRecord::parameter_patch;
@@ -1528,6 +1563,16 @@ void SubvariableFlow::doReplacement(void)
       }
     case PatchRecord::push_patch:
       break;	// Shouldn't see these here, handled earlier
+    case PatchRecord::zext_parameter_patch:
+      {
+	PcodeOp *zextOp = fd->newOp(1, pullop->getAddr());
+	fd->opSetOpcode(zextOp, CPUI_INT_ZEXT);
+	fd->opSetInput(zextOp, getReplaceVarnode((*piter).in1), 0);
+	Varnode *outvn = fd->newUniqueOut(pullop->getIn((*piter).slot)->getSize(), zextOp);
+	fd->opInsertBefore(zextOp, pullop);
+	fd->opSetInput(pullop, outvn, (*piter).slot);
+	break;
+      }
     case PatchRecord::int2float_patch:
       {
 	PcodeOp *zextOp = fd->newOp(1, pullop->getAddr());
@@ -1556,6 +1601,16 @@ int4 RuleSubvarAnd::applyOp(PcodeOp *op,Funcdata &data)
   if (!op->getIn(1)->isConstant()) return 0;
   Varnode *vn = op->getIn(0);
   Varnode *outvn = op->getOut();
+  // recore: a byte or a short masked out of a word and passed as a locked parameter, which
+  // consumes the whole word. The logical value starts at the mask and runs into the call.
+  uintb mask = op->getIn(1)->getOffset();
+  if (outvn->getConsume() != mask && (mask == 0xff || mask == 0xffff) && outvn->getSize() > 2 &&
+      readOnlyByLockedParams(data,outvn)) {
+    SubvariableFlow subflow(&data,outvn,mask,false,false,false);
+    if (!subflow.doTrace()) return 0;
+    subflow.doReplacement();
+    return 1;
+  }
   //  if (vn->getSize() != 1) return 0; // Only for bitsize variables
   if (outvn->getConsume() != op->getIn(1)->getOffset()) return 0;
   if ((outvn->getConsume() & 1)==0) return 0;
