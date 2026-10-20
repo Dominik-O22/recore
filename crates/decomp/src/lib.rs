@@ -469,7 +469,15 @@ impl Session {
         for import in &analysis.imports {
             self.add_import(import.slot, &import.name, import.noreturn)?;
         }
-        prototypes::declare(self, Target::of(image), image.format, analysis.imports.iter().map(|i| i.name.as_str()))
+        prototypes::declare(self, Target::of(image), image.format, analysis.imports.iter().map(|i| i.name.as_str()))?;
+        if Target::of(image) == Target::X86Windows {
+            for import in &analysis.imports {
+                if let Some(words) = prototypes::stdcall_words(&import.name) {
+                    check(|err, len| unsafe { ffi::rd_set_import_stdcall_words(self.raw.as_ptr(), import.slot, words, err, len) != 0 })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Declares that the GOT entry at `slot` points to the imported function `name`. Indirect
