@@ -104,6 +104,11 @@ impl Region<'_> {
         last + usize::from(self.insn_len[last])
     }
 
+    /// Where the decoded instruction that ends at `end` begins.
+    fn insn_ending_at(&self, end: usize) -> Option<usize> {
+        (1..=end.min(LONGEST_INSN)).map(|len| end - len).find(|&at| usize::from(self.insn_len[at]) == end - at)
+    }
+
     fn follows_break(&self, offset: usize) -> bool {
         self.flags[offset] & FOLLOWS_BREAK != 0
     }
@@ -210,6 +215,9 @@ impl AddrSet {
         self.bits[first_word] & from != 0 || self.bits[end_word] & upto != 0 || self.before[end_word] != self.before[first_word + 1]
     }
 }
+
+/// The longest instruction of any machine, x86's.
+const LONGEST_INSN: usize = 15;
 
 /// How many functions after a whole one, none of them reached, are decoded to show that it ends
 /// where the next begins, where nothing else between functions does.
@@ -468,8 +476,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
             A::seek(decoder, (start - section.addr) as usize);
             while let Some(decoded) = A::decode_next(decoder) {
                 let offset = (decoded.addr - section.addr) as usize;
-                // Code does not run on into its constants.
-                if A::LITERAL_POOLS && self.regions[index].flags[offset] & IN_TABLE != 0 {
+                // Code does not run on into its constants, nor into a table.
+                if self.regions[index].flags[offset] & IN_TABLE != 0 {
                     break;
                 }
                 if std::mem::replace(&mut self.regions[index].insn_len[offset], decoded.len.max(1)) != 0 {
@@ -701,6 +709,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         if let (false, Some(&length)) = (table.bounded, self.known_lengths.get(&table.address)) {
             table.entries.truncate(length);
             table.bounded = true;
+            table.inline_end = table.inline_end.map(|_| table.address + table.entry_size * length as u64);
         }
         table
     }
@@ -928,24 +937,24 @@ impl<'a, A: Arch> Explorer<'a, A> {
 
     /// The function called by the call that ends where `addr` begins, past any padding: the call
     /// may be the last of a function that calls one that never returns, which while discovering
-    /// only an import's name tells.
+    /// only an import's name tells. The padding need not have been decoded: decoding stops at
+    /// padding after a call.
     fn call_before(&self, addr: u64) -> Option<u64> {
-        /// The longest instruction of any machine, x86's.
-        const LONGEST_INSN: usize = 15;
         let region = &self.regions[self.region_index(addr)?];
-        let mut offset = (addr - region.section.addr) as usize;
+        let offset = (addr - region.section.addr) as usize;
         let earliest = offset.saturating_sub(A::LONGEST_PADDING as usize);
-        loop {
-            let before = (1..=offset.min(LONGEST_INSN)).map(|len| offset - len).find(|&at| usize::from(region.insn_len[at]) == offset - at)?;
-            let insn = A::decode(self.image, &region.section.data[before..], region.section.addr + before as u64).next()?.insn?;
-            if !A::is_padding(&insn) {
-                let Some(Flow::Call(callee)) = A::flow(&insn, &A::State::default(), self.image) else { return None };
-                return Some(callee);
-            }
-            if before < earliest {
-                return None;
-            }
-            offset = before;
+        let padding_to = |from: usize| {
+            A::decode(self.image, &region.section.data[from..offset], region.section.addr + from as u64).all(|decoded| decoded.insn.is_some_and(|insn| A::is_padding(&insn)))
+        };
+        // The last instruction before the padding, nearest first.
+        let before = (earliest..=offset).rev().filter(|&end| padding_to(end)).find_map(|end| {
+            let at = region.insn_ending_at(end)?;
+            let insn = A::decode(self.image, &region.section.data[at..], region.section.addr + at as u64).next()?.insn?;
+            (!A::is_padding(&insn)).then_some(insn)
+        })?;
+        match A::flow(&before, &A::State::default(), self.image) {
+            Some(Flow::Call(callee)) => Some(callee),
+            _ => None,
         }
     }
 
@@ -958,15 +967,52 @@ impl<'a, A: Arch> Explorer<'a, A> {
         }
     }
 
+    /// Whether the instruction that ends where `addr` begins is padding.
+    fn after_padding(&self, addr: u64) -> bool {
+        let Some(index) = self.region_index(addr) else { return false };
+        let region = &self.regions[index];
+        let before = region.insn_ending_at((addr - region.section.addr) as usize);
+        before.is_some_and(|before| self.is_padding_at(region.section.addr + before as u64))
+    }
+
     /// Removes the entry points that only an address taken or a word in data speaks for, where
     /// that is weak evidence, when code runs on into them: a number that lands inside a
-    /// function.
+    /// function. Not where padding runs on into one: compilers pad between functions, and the
+    /// code before the padding may be data decoded as code, or follow a call that never returns.
+    /// Nor is a number that lands in the padding itself a function.
     fn demote_taken_inside_code(&mut self) {
-        let inside: Vec<u64> =
-            self.starts.iter().filter(|&(&addr, &origin)| self.evidence(addr, origin) == Evidence::MaybeNumber && self.falls_into(addr)).map(|(&addr, _)| addr).collect();
-        for addr in inside {
-            self.demote_run_into(addr);
+        let weak: Vec<u64> = self.starts.iter().filter(|&(&addr, &origin)| self.evidence(addr, origin) == Evidence::MaybeNumber).map(|(&addr, _)| addr).collect();
+        for addr in weak {
+            if self.is_padding_at(addr) {
+                self.starts.remove(&addr);
+            } else if self.falls_into(addr) && !self.after_padding(addr) {
+                self.demote_run_into(addr);
+            }
         }
+    }
+
+    /// Removes the entry points that only the layout speaks for, after a call and padding, that
+    /// code after them jumps back to: a loop head that the compiler aligned after a call that
+    /// returns, as MSVC does. A jump across an entry point shows the same, but one back to the
+    /// head itself crosses none.
+    fn demote_loop_heads(&mut self) {
+        let heads: Vec<u64> = self
+            .jumps
+            .iter()
+            .filter(|&&(from, to)| from > to && self.starts.get(&to) == Some(&Origin::GapAligned))
+            .map(|&(_, to)| to)
+            .collect::<BTreeSet<u64>>()
+            .into_iter()
+            .filter(|&head| !self.is_referenced(head) && self.call_before(head).is_some())
+            .collect();
+        for head in heads {
+            self.demote_run_into(head);
+        }
+    }
+
+    /// Whether something calls `addr`, takes it, exports it or points to it from data.
+    fn is_referenced(&self, addr: u64) -> bool {
+        self.region_index(addr).is_some_and(|index| self.regions[index].flags[(addr - self.regions[index].section.addr) as usize] & REFERENCED != 0)
     }
 
     /// Removes the entry points that only calls reach which are jumps within a function: in code
@@ -997,19 +1043,27 @@ impl<'a, A: Arch> Explorer<'a, A> {
         }
     }
 
-    /// Removes entry points that are targets of a resolved jump table. A switch case or a
-    /// computed-goto label is inside its function even when a pointer to it is stored in data.
     /// Removes entry points that are the address of a resolved jump table. Mach-O compilers put
     /// a function's tables after its code, and the dispatch takes a table's address just as
-    /// other code takes a function's.
+    /// other code takes a function's. Removes too what only a pointer or the layout puts inside
+    /// a table among the code, which may have been decoded before the table was found.
     fn demote_table_addresses(&mut self) {
+        let mut inside = Vec::new();
         for (_, table) in &self.tables {
             if self.starts.get(&table.address) == Some(&Origin::AddressTaken) {
-                self.starts.remove(&table.address);
+                inside.push(table.address);
             }
+            if let Some(end) = table.inline_end {
+                inside.extend(self.starts.range(table.address..end).filter(|&(&addr, &origin)| self.evidence(addr, origin) < Evidence::Sure).map(|(&addr, _)| addr));
+            }
+        }
+        for addr in inside {
+            self.starts.remove(&addr);
         }
     }
 
+    /// Removes entry points that are targets of a resolved jump table. A switch case or a
+    /// computed-goto label is inside its function even when a pointer to it is stored in data.
     fn demote_case_targets(&mut self) {
         // Only tables of known length: an unbounded read may run into the next table.
         for (jump, table) in self.tables.iter().filter(|(_, table)| table.bounded) {
@@ -1429,12 +1483,17 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     A::seek(decoder, offset);
                     while let Some(decoded) = A::decode_next(decoder) {
                         let at = (decoded.addr - section.addr) as usize;
-                        if self.regions[index].insn_len[at] != 0 || A::LITERAL_POOLS && self.regions[index].flags[at] & IN_TABLE != 0 {
+                        if self.regions[index].insn_len[at] != 0 || self.regions[index].flags[at] & IN_TABLE != 0 {
                             break;
                         }
                         scanned_to = decoded.next_addr();
                         let Some(insn) = decoded.insn else { break };
-                        if A::is_padding(insn) {
+                        // What aligns a table, as MSVC's `mov edi, edi` does, is filler too. Not
+                        // so before a literal pool, which follows the end of a function's code.
+                        let before_table = || {
+                            !A::LITERAL_POOLS && self.regions[index].flags.get((scanned_to - section.addr) as usize).is_some_and(|flags| flags & IN_TABLE != 0)
+                        };
+                        if A::is_padding(insn) || before_table() {
                             skipped_padding = true;
                             continue;
                         }
@@ -1581,17 +1640,16 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
     let mut inline_tables: Vec<(u64, u64)> = explorer.tables.iter().filter_map(|(_, table)| Some((table.address, table.inline_end?))).collect();
     inline_tables.extend(explorer.literals.iter().copied());
     inline_tables.sort_unstable();
-    inline_tables.dedup();
-    if A::LITERAL_POOLS {
-        inline_tables = merge_touching(inline_tables);
-    }
+    // Literals back to back make one pool, and a table read without a bounds check may run on
+    // into the next table.
+    let inline_tables = merge_touching(inline_tables);
     let after_calls = std::mem::take(&mut explorer.after_calls);
     let frame_ends = std::mem::take(&mut explorer.frame_ends);
     let register_calls = std::mem::take(&mut explorer.register_calls);
     Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code, inline_tables, after_calls, frame_ends, register_calls }
 }
 
-/// Sorted ranges with those that overlap or touch joined, as literals back to back make one pool.
+/// Sorted ranges with those that overlap or touch joined.
 fn merge_touching(ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
     for (start, end) in ranges {
@@ -1731,6 +1789,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
     explorer.demote_table_addresses();
     explorer.demote_case_targets();
     while explorer.demote_crossed_starts() {}
+    explorer.demote_loop_heads();
     explorer.demote_frame_borrowers();
     // What these remove may have been all that kept a jump across an entry point from
     // showing it as a guess.

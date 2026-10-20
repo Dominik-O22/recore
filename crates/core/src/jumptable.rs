@@ -376,7 +376,7 @@ impl State {
             }
             _ => Value::Unknown,
         };
-        match value {
+        let table = match value {
             // Only images that have a base to be relative to.
             Value::BasedTarget { table_offset, limit } if image.base != 0 => {
                 read_relative(image, image.base.wrapping_add(table_offset), image.base, limit, is_target)
@@ -424,7 +424,15 @@ impl State {
                 })
             }
             _ => None,
-        }
+        };
+        // MSVC keeps its tables among the code, after the function that jumps through them, and
+        // where no relocation marks their entries nothing else tells their bytes from code.
+        table.map(|mut table| {
+            if image.section_at(table.address).is_some_and(|section| section.executable) {
+                table.inline_end = Some(table.address + table.entry_size * table.entries.len() as u64);
+            }
+            table
+        })
     }
 }
 
