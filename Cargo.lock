@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "recore"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -755,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "recore-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "recore-corpus"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "recore-decomp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "recore-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "recore",
