@@ -420,12 +420,25 @@ fn an_8051_table_is_read_in_the_bank_of_the_code_that_reads_it() {
     assert!(function.c_text.contains("+ 0x29000)"), "{}", function.c_text);
 }
 
+/// The C of the function at 0x1000 in `code`, which may call the import `name` through its slot
+/// at 0x2000.
+fn decompile_calling_import(name: &str, code: &[u8]) -> String {
+    use recore::image::{Format, Machine};
+    let text = recore::image::Section { name: ".text".into(), addr: 0x1000, data: code.to_vec(), file_offset: None, executable: true, writable: false };
+    let idata = recore::image::Section { name: ".idata".into(), addr: 0x2000, data: vec![0; 4], file_offset: None, executable: false, writable: false };
+    let mut image = recore::Image::bare("test".into(), Format::Pe, Machine::X86, 0x1000, vec![text, idata]);
+    image.import_slots.insert(0x2000, name.into());
+    let analysis = recore::analyze(&image);
+    let mut session = Session::from_image(&image, &analysis).unwrap();
+    session.add_functions(&Facts::derive(&image, &analysis)).unwrap();
+    session.decompile(0x1000).unwrap().c_text
+}
+
 /// MSVC calls an import it calls more than once through a register it loads from the slot. Each
 /// call pops the argument pushed for it, so the local read after them is the one the function
 /// set and not an argument.
 #[test]
 fn a_stdcall_import_called_through_a_register_pops_its_arguments() {
-    use recore::image::{Format, Machine};
     #[rustfmt::skip]
     let code = [
         0x83, 0xec, 0x08,                                // 0x1000  sub esp, 8
@@ -439,15 +452,36 @@ fn a_stdcall_import_called_through_a_register_pops_its_arguments() {
         0x83, 0xc4, 0x08,                                // 0x101d  add esp, 8
         0xc3,                                            // 0x1020  ret
     ];
-    let text = recore::image::Section { name: ".text".into(), addr: 0x1000, data: code.to_vec(), file_offset: None, executable: true, writable: false };
-    let idata = recore::image::Section { name: ".idata".into(), addr: 0x2000, data: vec![0; 4], file_offset: None, executable: false, writable: false };
-    let mut image = recore::Image::bare("test".into(), Format::Pe, Machine::X86, 0x1000, vec![text, idata]);
-    image.import_slots.insert(0x2000, "LockWindowUpdate".into());
-    let analysis = recore::analyze(&image);
-    let mut session = Session::from_image(&image, &analysis).unwrap();
-    session.add_functions(&Facts::derive(&image, &analysis)).unwrap();
+    let c = decompile_calling_import("LockWindowUpdate", &code);
+    assert!(c.contains("LockWindowUpdate((void *)0x0);") && c.contains("LockWindowUpdate((void *)0x1);"), "{c}");
+    assert!(c.contains("return 0x2a;"), "{c}");
+}
 
-    let function = session.decompile(0x1000).unwrap();
-    assert!(function.c_text.contains("LockWindowUpdate((void *)0x0);") && function.c_text.contains("LockWindowUpdate((void *)0x1);"), "{}", function.c_text);
-    assert!(function.c_text.contains("return 0x2a;"), "{}", function.c_text);
+/// Two arguments pushed for an import, which pops them, and a local read after the call.
+#[rustfmt::skip]
+const TWO_ARGUMENTS: [u8; 29] = [
+    0x83, 0xec, 0x08,                                // 0x1000  sub esp, 8
+    0xc7, 0x44, 0x24, 0x04, 0x2a, 0x00, 0x00, 0x00,  // 0x1003  mov dword [esp+4], 0x2a
+    0x6a, 0x02,                                      // 0x100b  push 2
+    0x6a, 0x01,                                      // 0x100d  push 1
+    0xff, 0x15, 0x00, 0x20, 0x00, 0x00,              // 0x100f  call [0x2000]
+    0x8b, 0x44, 0x24, 0x04,                          // 0x1015  mov eax, [esp+4]
+    0x83, 0xc4, 0x08,                                // 0x1019  add esp, 8
+    0xc3,                                            // 0x101c  ret
+];
+
+/// A stdcall export's decorated name ends in the bytes of arguments it pops, as `@8`.
+#[test]
+fn a_decorated_stdcall_import_pops_the_bytes_its_name_gives() {
+    let c = decompile_calling_import("_AIL_set_sample_volume@8", &TWO_ARGUMENTS);
+    assert!(c.contains("_AIL_set_sample_volume@8(1,2);"), "{c}");
+    assert!(c.contains("return 0x2a;"), "{c}");
+}
+
+/// DirectX's entry points are undecorated, so they take a prototype of their own.
+#[test]
+fn a_directx_entry_point_pops_its_arguments() {
+    let c = decompile_calling_import("DirectDrawEnumerateA", &TWO_ARGUMENTS);
+    assert!(c.contains("DirectDrawEnumerateA((void *)0x1,(void *)0x2);"), "{c}");
+    assert!(c.contains("return 0x2a;"), "{c}");
 }
