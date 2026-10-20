@@ -1,4 +1,4 @@
-//! The names of the program the RT3 work ran on stay in the tests that need its binary, under
+//! The names of the games recore's work ran on stay in the tests that need their binaries, under
 //! `crates/*/tests`, which this scan does not enter. Everywhere else in the checkout, the scan
 //! fails on a word of `WORDS` in a file's contents or in a file or directory name. Matching
 //! ignores case, and a word counts only when no letter or digit comes just before it, so
@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::Path;
 
-const WORDS: [&str; 2] = ["rt3", "railroad"];
+const WORDS: [&str; 3] = ["rt3", "railroad", "tanktics"];
 
 /// Directories the scan does not enter, at any depth: git's data, and the four names
 /// .gitignore ignores at any depth (build output, Python's caches such as
