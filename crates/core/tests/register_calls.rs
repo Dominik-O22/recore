@@ -42,3 +42,30 @@ fn a_call_through_a_register_loaded_from_an_import_slot_calls_the_import() {
         ]
     );
 }
+
+/// A function that ends by calling `ExitProcess` through a register never returns, though other
+/// code follows the call, as MSVC packs code in without padding.
+#[test]
+fn a_function_that_calls_an_import_that_never_returns_through_a_register_never_returns() {
+    #[rustfmt::skip]
+    let code = [
+        0xe8, 0x0b, 0x00, 0x00, 0x00,        // 0x401000  call 0x401010
+        0x90, 0x90, 0x90, 0x90, 0x90,        // 0x401005  nop, as nothing calls what follows the exit
+        0xc3,                                // 0x40100a  ret
+        0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+        0x8b, 0x35, 0x00, 0x20, 0x40, 0x00,  // 0x401010  mov esi, [0x402000]
+        0x6a, 0x00,                          // 0x401016  push 0
+        0xff, 0xd6,                          // 0x401018  call esi
+        0xb8, 0x01, 0x00, 0x00, 0x00,        // 0x40101a  mov eax, 1
+        0xc3,                                // 0x40101f  ret
+    ];
+    let text = Section { name: ".text".into(), addr: 0x401000, data: code.to_vec(), file_offset: None, executable: true, writable: false };
+    let idata = Section { name: ".idata".into(), addr: 0x402000, data: vec![0; 4], file_offset: None, executable: false, writable: false };
+    let mut image = Image { base: 0x400000, ..Image::bare("exits".into(), Format::Pe, Machine::X86, 0x401000, vec![text, idata]) };
+    image.import_slots.insert(0x402000, "ExitProcess".into());
+
+    let analysis = recore::analyze(&image);
+
+    let exits = analysis.functions.iter().find(|function| function.addr == 0x401010).unwrap();
+    assert!(exits.noreturn);
+}
