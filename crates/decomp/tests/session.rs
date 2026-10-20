@@ -485,3 +485,23 @@ fn a_directx_entry_point_pops_its_arguments() {
     assert!(c.contains("DirectDrawEnumerateA((void *)0x1,(void *)0x2);"), "{c}");
     assert!(c.contains("return 0x2a;"), "{c}");
 }
+
+/// A runtime import that the tables declare with no convention is cdecl: the caller cleans up its
+/// arguments. On 32-bit Windows the engine's default convention is stdcall's, which would have the
+/// callee pop them as well.
+#[test]
+fn an_import_declared_without_a_convention_leaves_its_arguments_to_the_caller() {
+    #[rustfmt::skip]
+    let code = [
+        0x83, 0xec, 0x08,                                // 0x1000  sub esp, 8
+        0xc7, 0x44, 0x24, 0x04, 0x2a, 0x00, 0x00, 0x00,  // 0x1003  mov dword [esp+4], 0x2a
+        0x6a, 0x04,                                      // 0x100b  push 4
+        0xff, 0x15, 0x00, 0x20, 0x00, 0x00,              // 0x100d  call [0x2000]
+        0x83, 0xc4, 0x04,                                // 0x1013  add esp, 4
+        0x8b, 0x44, 0x24, 0x04,                          // 0x1016  mov eax, [esp+4]
+        0x83, 0xc4, 0x08,                                // 0x101a  add esp, 8
+        0xc3,                                            // 0x101d  ret
+    ];
+    let c = decompile_calling_import("_Znwj", &code);
+    assert!(c.contains("return 0x2a;"), "{c}");
+}
