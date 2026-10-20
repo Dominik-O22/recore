@@ -246,6 +246,9 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program, mut r
                 if in_extent(run_start) {
                     result.reach_end = function.end;
                     reached(run_start, function.end);
+                } else if program.frame_ends.binary_search(&run_start).is_ok() {
+                    // A block a call goes on into, which runs on into a routine it shares.
+                    reached(run_start, boundary);
                 }
                 // `run_start == addr` means nothing was decoded on the way: the jump itself
                 // landed outside known code.
@@ -313,8 +316,8 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program, mut r
                     break;
                 }
                 Flow::Call(target) => {
-                    // A call to a block that gives back this function's frame jumps into more
-                    // of its own code.
+                    // A call to a block that gives back this function's frame, or works in it,
+                    // goes on in more of its own code.
                     if program.frame_ends.binary_search(&target).is_ok() {
                         pending.push(target);
                     }

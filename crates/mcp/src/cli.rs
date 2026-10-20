@@ -8,9 +8,9 @@ use crate::binary::Cache;
 use crate::tools;
 
 /// Options whose value is a number. Everything else, addresses included, stays text.
-const NUMERIC: [&str; 9] = ["limit", "len", "timeout", "count", "param", "arg", "depth", "bits", "steps"];
+const NUMERIC: [&str; 10] = ["limit", "len", "timeout", "count", "param", "arg", "depth", "bits", "steps", "ticks"];
 /// Options that may be given again and again, and reach the tool as a list.
-const REPEATED: [&str; 5] = ["args", "set", "read", "dump", "before"];
+const REPEATED: [&str; 6] = ["args", "set", "read", "dump", "before", "skip"];
 /// Options that are on or off.
 const FLAGS: [&str; 5] = ["pcode", "returns", "full", "addresses", "refused"];
 

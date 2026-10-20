@@ -20,7 +20,7 @@ const IMPORTS: [(&str, &[&str]); 2] = [
         "KERNEL32.dll",
         &[
             "GetLastError", "SetLastError", "TlsAlloc", "TlsGetValue", "TlsSetValue", "GetCurrentThreadId", "HeapAlloc", "HeapFree", "InitializeCriticalSection", "EnterCriticalSection",
-            "LeaveCriticalSection", "DeleteCriticalSection", "GetModuleHandleA",
+            "LeaveCriticalSection", "DeleteCriticalSection", "GetModuleHandleA", "GetTickCount",
         ],
     ),
     ("VERSION.dll", &["GetFileVersionInfoSizeA", "GetFileVersionInfoA", "VerQueryValueA"]),
@@ -111,6 +111,13 @@ fn functions() -> Vec<(&'static str, Vec<u8>)> {
         // Asking for a module the run does not load leaves a note, which is setup's too.
         ("init", [push(NAME), call("GetModuleHandleA"), call("TlsAlloc"), store_eax(SAVED_INDEX), push(0x77), vec![0x50], call("TlsSetValue"), vec![RET]].concat()),
         ("saved", [push_from(SAVED_INDEX), call("TlsGetValue"), vec![RET]].concat()),
+        ("clock", [call("GetTickCount"), vec![RET]].concat()),
+        // MOV EAX, 7; PUSH 1; CALL inner, which comes next; RET.
+        ("outer", vec![0xb8, 7, 0, 0, 0, 0x6a, 1, 0xe8, 1, 0, 0, 0, RET]),
+        // MOV [GLOBAL], 0x99; MOV EAX, 9; RET 4.
+        ("inner", [&[0xc7, 0x05][..], &le(GLOBAL), &le(0x99), &[0xb8, 9, 0, 0, 0, 0xc2, 4, 0]].concat()),
+        // JMP to itself.
+        ("spin", vec![0xeb, 0xfe]),
     ]
 }
 
@@ -376,4 +383,25 @@ fn functions_run_before_set_up_the_state_the_function_reads() {
     let saved = program.run("saved", json!({ "before": [init] }));
     // What `init` wrote, the stand-ins it ran and its notes are setup, not the function's.
     assert_eq!(saved, format!("{} returned EAX = 0x77 (119) after 3 instructions\nran stand-ins for: TlsGetValue x1\n", program.addr("saved")), "{saved}");
+}
+
+#[test]
+fn a_whole_run_is_written_out_and_steered_to_compare_with_another() {
+    let mut program = Program::new();
+    let (writes, entered) = (program.dir.join("writes"), program.dir.join("entered"));
+    let (outer, inner) = (program.addr("outer"), program.addr("inner"));
+    let whole = program.run("outer", json!({ "writes": writes, "entered": entered }));
+    assert_eq!(whole, format!("{outer} returned EAX = 0x9 (9) after 7 instructions\nwrote 4 bytes at 0x402048: 99 00 00 00\nevery range written, 1, is in {}\nevery function entered, 2, is in {}\n", writes.display(), entered.display()));
+    assert_eq!(std::fs::read_to_string(&writes).unwrap(), "0x402048 99000000\n");
+    assert_eq!(std::fs::read_to_string(&entered).unwrap(), format!("{outer}\n{inner}\n"));
+    // A skipped function returns at once, with its stdcall argument off the stack, and the
+    // result register as it was.
+    let skipped = program.run("outer", json!({ "skip": [format!("{inner}:4")] }));
+    assert_eq!(skipped, format!("{outer} returned EAX = 0x7 (7) after 4 instructions\nskipped: {inner} x1\n"));
+    // The clock answers only when it is given, and the same each time.
+    let clock = program.run("clock", json!({}));
+    assert!(clock.contains("the run called GetTickCount, an import with no stand-in"), "{clock}");
+    assert_eq!(returned(&program.run("clock", json!({ "ticks": 0x1234 }))), "0x1234");
+    let spin = program.run("spin", json!({ "timeout": 0.2, "steps": 1u64 << 40 }));
+    assert!(spin.ends_with("the run took more than 0.2 seconds\n"), "{spin}");
 }

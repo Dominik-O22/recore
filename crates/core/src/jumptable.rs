@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 
 use iced_x86::{ConditionCode, Instruction, Mnemonic, OpKind, Register};
 
-use crate::arch::{Limit, Table};
+use crate::arch::{Limit, MAX_ENTRIES, Table};
 use crate::image::Image;
 
 /// How many spilled values are tracked per path.
@@ -32,8 +32,9 @@ enum Value {
     Unknown,
     /// Address of a jump table.
     Base(u64),
-    /// An index proven to be at most this value by an unsigned bounds check.
-    Bounded(u64),
+    /// An index proven to lie in `first..=last`. An unsigned bounds check gives `0..=n`; code
+    /// that counts towards the end of a table, as MSVC's `memmove` does, makes it negative.
+    Bounded { first: i64, last: i64 },
     /// A sign-extended entry loaded from a table, with the limit on its index if known.
     /// `anchor` is the address the entry is an offset from: the table itself in GCC and Clang
     /// output, the image base in MSVC output.
@@ -61,8 +62,9 @@ pub struct State {
     registers: [Value; 16],
     /// Table values spilled to the stack, as `(offset from rsp, value)`.
     spills: [(u64, Value); SPILL_SLOTS],
-    /// Register and immediate of a `cmp` whose flags the next instruction may branch on.
-    compare: Option<(usize, u64)>,
+    /// Register and immediate of a `cmp` or `sub` whose flags the next instruction may branch
+    /// on, and whether it was a `sub`, which leaves the register that much lower.
+    compare: Option<(usize, u64, bool)>,
 }
 
 fn index_of(register: Register) -> Option<usize> {
@@ -118,10 +120,20 @@ impl State {
         let value = match instr.mnemonic() {
             Mnemonic::Cmp => {
                 if let (Some(register), true) = (dest.and_then(index_of), is_immediate(instr.op1_kind())) {
-                    self.compare = Some((register, instr.immediate(1)));
+                    self.compare = Some((register, instr.immediate(1), false));
                 }
                 return;
             }
+            Mnemonic::Sub => {
+                if let (Some(register), true) = (dest.and_then(index_of), is_immediate(instr.op1_kind())) {
+                    self.compare = Some((register, instr.immediate(1), true));
+                }
+                Value::Unknown
+            }
+            Mnemonic::Neg => match dest.map(|d| self.get(d)) {
+                Some(Value::Bounded { first, last }) => Value::Bounded { first: -last, last: -first },
+                _ => Value::Unknown,
+            },
             Mnemonic::Test | Mnemonic::Push | Mnemonic::Bt | Mnemonic::Nop | Mnemonic::Endbr64 => return,
             Mnemonic::Lea if instr.is_ip_rel_memory_operand() => Value::Base(instr.ip_rel_memory_address()),
             // A 32-bit move zero-extends, which keeps an unsigned bound intact.
@@ -264,11 +276,22 @@ impl State {
         based.filter(|_| instr.op_kinds().any(|kind| kind == OpKind::Memory))
     }
 
-    /// How many entries an index register can reach, when a bounds check established that.
+    /// How many entries an index register can reach, when a bounds check established that it
+    /// counts from 0.
     fn bound_of(&self, index: Register) -> Option<Limit> {
         match self.get(index) {
-            Value::Bounded(max) => Some(Limit::of(max)),
+            Value::Bounded { first: 0, last } => Some(Limit::of(last as u64)),
             _ => None,
+        }
+    }
+
+    /// The first entry an index register can reach, relative to the address the operand names,
+    /// and how many from there, for a table of absolute addresses that the code may index from
+    /// below its named address.
+    fn span_of(&self, index: Register) -> (i64, Option<Limit>) {
+        match self.get(index) {
+            Value::Bounded { first, last } => (first, Some(Limit::of((last - first) as u64))),
+            _ => (0, None),
         }
     }
 
@@ -288,14 +311,21 @@ impl State {
     pub fn branch(&mut self, instr: &Instruction) -> State {
         let compare = self.compare.take();
         let mut taken = *self;
-        if let Some((register, immediate)) = compare {
+        if let Some((register, immediate, subtracted)) = compare {
+            // The bound is on the value compared, which a `sub` has since lowered.
+            let lowered = match subtracted {
+                false => 0,
+                true if immediate <= MAX_ENTRIES as u64 => immediate as i64,
+                true => return taken,
+            };
+            let bounded = |max: u64| Value::Bounded { first: -lowered, last: max.min(MAX_ENTRIES as u64) as i64 - lowered };
             match instr.condition_code() {
                 // `ja default`: falling through means index <= immediate.
-                ConditionCode::a => self.registers[register] = Value::Bounded(immediate),
+                ConditionCode::a => self.registers[register] = bounded(immediate),
                 // `jae default`: falling through means index < immediate.
-                ConditionCode::ae if immediate > 0 => self.registers[register] = Value::Bounded(immediate - 1),
-                ConditionCode::be => taken.registers[register] = Value::Bounded(immediate),
-                ConditionCode::b if immediate > 0 => taken.registers[register] = Value::Bounded(immediate - 1),
+                ConditionCode::ae if immediate > 0 => self.registers[register] = bounded(immediate - 1),
+                ConditionCode::be => taken.registers[register] = bounded(immediate),
+                ConditionCode::b if immediate > 0 => taken.registers[register] = bounded(immediate - 1),
                 _ => {}
             }
         }
@@ -335,7 +365,8 @@ impl State {
                     && u64::from(jump.memory_index_scale()) == pointer_size
                     && jump.memory_displacement64() != 0 =>
             {
-                Value::Pointer { table: jump.memory_displacement64(), limit: self.bound_of(jump.memory_index()) }
+                let (first, limit) = self.span_of(jump.memory_index());
+                Value::Pointer { table: jump.memory_displacement64().wrapping_add_signed(first * pointer_size as i64), limit }
             }
             // `jmp [base + index*8]` dispatches through absolute pointers directly.
             OpKind::Memory if stack_slot(jump, 0).is_some() => stack_slot(jump, 0).map_or(Value::Unknown, |at| self.spilled(at)),
@@ -356,7 +387,7 @@ impl State {
             Value::Pointer { table, limit: bound } => {
                 // Without a bounds check, the table runs for as long as consecutive slots hold
                 // relocated code pointers. An image without relocations holds them as they are.
-                let limit = Limit::entries(bound);
+                let mut limit = Limit::entries(bound);
                 let entry = |slot: u64| {
                     if image.relocations_stripped {
                         let word = image.bytes_from(slot)?.get(..pointer_size as usize)?;
@@ -365,10 +396,23 @@ impl State {
                         pointer_slots.get(&slot).copied()
                     }
                 };
-                let entries: Vec<u64> = (0..limit as u64)
-                    .map_while(|i| entry(table + pointer_size * i))
-                    .take_while(|&target| if bound.is_some() { is_code(target) } else { is_target(target) })
-                    .collect();
+                let read = |table: u64, limit: usize| -> Vec<u64> {
+                    (0..limit as u64)
+                        .map_while(|i| entry(table + pointer_size * i))
+                        .take_while(|&target| if bound.is_some() { is_code(target) } else { is_target(target) })
+                        .collect()
+                };
+                let mut table = table;
+                let mut entries = read(table, limit);
+                // MSVC names a table one entry early where its index starts at 1, as `memmove`
+                // jumps through `LeadUpVec[eax*4-4]` with `eax` 1, 2 or 3. The word before the
+                // table is then no entry.
+                if entries.is_empty() && limit > 1 {
+                    let rest = read(table + pointer_size, limit - 1);
+                    if bound.is_none() || rest.len() == limit - 1 {
+                        (table, entries, limit) = (table + pointer_size, rest, limit - 1);
+                    }
+                }
                 // A bounded table that stops short was misread.
                 let complete = bound.is_none() || entries.len() == limit;
                 (!entries.is_empty() && complete).then_some(Table {
@@ -421,4 +465,56 @@ fn is_immediate(kind: OpKind) -> bool {
             | OpKind::Immediate8to64
             | OpKind::Immediate32to64
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl};
+
+    use super::*;
+    use crate::image::{Format, Machine, Section};
+
+    /// Steps a state through 32-bit `code` at 0x401000, taking every conditional branch, and
+    /// reads the table its last instruction jumps through from a relocation-free image that holds
+    /// `words` at 0x402000. Code is anything in 0x401000..0x401100.
+    fn targets(code: &[u8], words: &[u32]) -> Option<(u64, Vec<u64>)> {
+        let text = Section { name: ".text".into(), addr: 0x401000, data: vec![0x90; 0x100], file_offset: None, executable: true, writable: false };
+        let data = Section { name: ".rdata".into(), addr: 0x402000, data: words.iter().flat_map(|word| word.to_le_bytes()).collect(), file_offset: None, executable: false, writable: false };
+        let image = Image { base: 0x400000, relocations_stripped: true, ..Image::bare("table".into(), Format::Pe, Machine::X86, 0x401000, vec![text, data]) };
+        let mut state = State::default();
+        let instrs: Vec<Instruction> = Decoder::with_ip(32, code, 0x401000, DecoderOptions::NONE).into_iter().collect();
+        let (jump, before) = instrs.split_last()?;
+        for instr in before {
+            match instr.flow_control() {
+                FlowControl::ConditionalBranch => state = state.branch(instr),
+                _ => state.step(instr, &[]),
+            }
+        }
+        let is_code = |target: u64| (0x401000..0x401100).contains(&target);
+        let table = state.resolve(&image, &FxHashMap::default(), jump, &is_code, &is_code, 4)?;
+        Some((table.address, table.entries))
+    }
+
+    const CODE: [u32; 8] = [0x401080, 0x401088, 0x401090, 0x401098, 0x4010a0, 0x4010a8, 0x4010b0, 0x4010b8];
+
+    #[test]
+    fn an_index_lowered_below_zero_reads_below_the_named_address() {
+        // sub ecx, 4; jb next; jmp [ecx*4 + 0x402010]: a count under 4 leaves ecx at -4 to -1.
+        let code = [0x83, 0xe9, 0x04, 0x72, 0x00, 0xff, 0x24, 0x8d, 0x10, 0x20, 0x40, 0x00];
+        assert_eq!(targets(&code, &CODE[..4]), Some((0x402000, vec![0x401080, 0x401088, 0x401090, 0x401098])));
+    }
+
+    #[test]
+    fn a_negated_index_counts_down_to_the_named_address() {
+        // cmp ecx, 8; jb next; neg ecx; jmp [ecx*4 + 0x40201c]: ecx from -7 to 0.
+        let code = [0x83, 0xf9, 0x08, 0x72, 0x00, 0xf7, 0xd9, 0xff, 0x24, 0x8d, 0x1c, 0x20, 0x40, 0x00];
+        assert_eq!(targets(&code, &CODE), Some((0x402000, CODE.iter().map(|&target| u64::from(target)).collect())));
+    }
+
+    #[test]
+    fn an_index_from_one_skips_the_word_before_the_table() {
+        // and eax, 3; jmp [eax*4 + 0x402000], where only 1, 2 and 3 reach code.
+        let code = [0x83, 0xe0, 0x03, 0xff, 0x24, 0x85, 0x00, 0x20, 0x40, 0x00];
+        assert_eq!(targets(&code, &[0x90c3_c95f, 0x401080, 0x401088, 0x401090]), Some((0x402004, vec![0x401080, 0x401088, 0x401090])));
+    }
 }

@@ -148,6 +148,8 @@ pub struct Discovery {
     pub after_calls: Vec<(u64, u64)>,
     /// Entry points taken away because the code there gives back a frame it did not set up,
     /// sorted: see [`Arch::gives_back_frame`]. A call there jumps into the end of the caller.
+    /// So are blocks that one call reaches and that work in the caller's frame: a call there
+    /// goes on in the caller's own code.
     pub frame_ends: Vec<u64>,
     /// Calls through a register that the code on the way to them loaded from a slot, as call
     /// address to slot. Decoding the call on its own cannot tell where it goes.
@@ -303,7 +305,8 @@ struct Explorer<'a, A: Arch> {
     literals: Vec<(u64, u64)>,
     /// See [`Discovery::register_calls`].
     register_calls: FxHashMap<u64, u64>,
-    /// Calls as `(from, to)`, kept where a call may be a jump: see [`Arch::CALL_MAY_BE_FAR_JUMP`].
+    /// Direct calls as `(from, to)`: to count those that reach a block borrowing a frame, and,
+    /// where a call may be a jump, to find the ones that are: see [`Arch::CALL_MAY_BE_FAR_JUMP`].
     calls: Vec<(u64, u64)>,
     /// Whether the code has an instruction that rules out a call being a jump: see
     /// [`Arch::branches_reach_far`].
@@ -553,10 +556,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 }
                 let ends_flow = match flow {
                     Flow::Call(target) => {
-                        if A::CALL_MAY_BE_FAR_JUMP && !speculative {
-                            self.calls.push((decoded.addr, target));
-                        }
                         if !speculative {
+                            self.calls.push((decoded.addr, target));
                             self.add_start(target, Origin::Call);
                         }
                         false
@@ -1023,6 +1024,23 @@ impl<'a, A: Arch> Explorer<'a, A> {
         }
     }
 
+    /// Whether the code at `addr` runs on into another entry point before any branch or return.
+    fn runs_into_start(&self, addr: u64) -> bool {
+        /// How many instructions decide it.
+        const PROBE: usize = 64;
+        let Some(bytes) = self.image.bytes_from(addr) else { return false };
+        for decoded in A::decode(self.image, bytes, addr).take(PROBE) {
+            let Some(insn) = decoded.insn else { return false };
+            if decoded.addr != addr && self.starts.contains_key(&decoded.addr) {
+                return true;
+            }
+            if !matches!(A::flow(&insn, &A::State::default(), self.image), None | Some(Flow::Call(_) | Flow::CallIndirect(_))) {
+                return false;
+            }
+        }
+        false
+    }
+
     /// Removes entry points whose code runs in another function's stack frame. Windows scope
     /// tables point at exception filters and handlers, and functions call their own `finally`
     /// blocks; all of these sit inside the function they belong to. Hand-written routines jump
@@ -1044,10 +1062,27 @@ impl<'a, A: Arch> Explorer<'a, A> {
             })
             .collect();
         let past_calls = A::CALL_MAY_BE_FAR_JUMP && !self.branches_reach_far;
-        let frame_ends: Vec<u64> = candidates.into_iter().filter(|&addr| A::gives_back_frame(self.image, addr, past_calls)).collect();
-        for &addr in borrowers.iter().chain(&frame_ends) {
+        let mut frame_ends: Vec<u64> = candidates.into_iter().filter(|&addr| A::gives_back_frame(self.image, addr, past_calls)).collect();
+        // A block that one call reaches is its caller's own, as MSVC calls a `__finally` block
+        // on the way out of its `__try`. One that several calls reach is a routine of its own
+        // that works in whichever frame it is called in, such as the runtime's `__SEH_epilog`,
+        // unless it runs on into another entry point, as labels of one hand-written routine do.
+        let mut sites: FxHashMap<u64, usize> = FxHashMap::default();
+        for &(_, to) in &self.calls {
+            *sites.entry(to).or_default() += 1;
+        }
+        for &addr in &borrowers {
+            match sites.get(&addr) {
+                Some(&count) if count > 1 && !self.runs_into_start(addr) => continue,
+                Some(_) => frame_ends.push(addr),
+                None => {}
+            }
             self.starts.remove(&addr);
         }
+        for addr in &frame_ends {
+            self.starts.remove(addr);
+        }
+        frame_ends.sort_unstable();
         self.frame_ends = frame_ends;
     }
 

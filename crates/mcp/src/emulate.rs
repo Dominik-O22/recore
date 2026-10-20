@@ -11,13 +11,13 @@
 //! a live process gives the run that process's memory instead (see [`snapshot`]), so a function
 //! can run on the state a program had.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use recore::FxHashMap;
+use recore::{FxHashMap, FxHashSet};
 use recore::image::{Compiler, Format, Image, Machine};
 use recore::program::parse_addr;
 use recore::report::CallTarget;
@@ -49,7 +49,8 @@ const RANGES_SHOWN: usize = 16;
 /// The stack pointer of an 8051 function unless the caller sets it and the startup code does not
 /// say: above the register banks and the bits.
 const INITIAL_SP: u128 = 0x40;
-/// The longest a run goes before it stops, whatever `steps` allows.
+/// The longest a run goes before it stops, whatever `steps` allows, unless the caller sets
+/// `timeout`.
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// The most memory a buffer, a dump or a stand-in moves at once.
 const LARGEST_BLOCK: u64 = SCRATCH;
@@ -539,6 +540,15 @@ pub struct Call {
     /// Functions run first, in order and with no arguments, whose work is setup: what they
     /// write is not listed and their instructions are not counted.
     pub before: Vec<u64>,
+    /// Functions that return as soon as they are entered, by entry, with the bytes of arguments
+    /// each takes off the stack as it does.
+    pub skip: FxHashMap<u64, u64>,
+    /// What `GetTickCount` answers, which has no stand-in otherwise.
+    pub ticks: Option<u64>,
+    /// The longest the run may take.
+    pub timeout: Duration,
+    /// Whether to keep the entry of every function the run enters.
+    pub track_entered: bool,
 }
 
 /// A buffer passed in, and how it was left.
@@ -577,6 +587,10 @@ pub struct Outcome {
     pub unwritten: (u64, Vec<(Option<String>, u64)>),
     /// Imports whose stand-in ran, with how often.
     pub stand_ins: BTreeMap<String, u64>,
+    /// Functions skipped as the caller asked, with how often.
+    pub skipped: BTreeMap<u64, u64>,
+    /// The entry of every function the run entered, when the caller asked for them.
+    pub entered: BTreeSet<u64>,
 }
 
 struct Emulator<'a> {
@@ -610,6 +624,11 @@ struct Emulator<'a> {
     /// hold.
     fresh_teb: u64,
     thread: windows::Thread,
+    skip: FxHashMap<u64, u64>,
+    ticks: Option<u64>,
+    timeout: Duration,
+    /// The entries of the binary's functions, when the run keeps which it entered.
+    entries: Option<FxHashSet<u64>>,
 }
 
 /// What the answer says the run did, which a function run before it as setup leaves out.
@@ -619,6 +638,8 @@ struct Tally {
     steps: u64,
     notes: Vec<String>,
     stand_ins: BTreeMap<String, u64>,
+    skipped: BTreeMap<u64, u64>,
+    entered: BTreeSet<u64>,
     /// Whether the run did x87 arithmetic, which the control word rounds.
     x87: bool,
 }
@@ -643,7 +664,8 @@ fn free_region(taken: &[(u64, u64)], top: u64, size: u64) -> Result<(u64, u64)> 
 }
 
 impl<'a> Emulator<'a> {
-    fn new(binary: &'a mut Binary, snapshot: Option<&'a Snapshot>) -> Result<Emulator<'a>> {
+    fn new(binary: &'a mut Binary, call: &'a Call) -> Result<Emulator<'a>> {
+        let snapshot = call.snapshot.as_ref();
         let image = &binary.program.image;
         let abi = abi(image)?;
         let imports = binary
@@ -656,6 +678,7 @@ impl<'a> Emulator<'a> {
                 CallTarget::Function(_) => None,
             })
             .collect();
+        let entries = call.track_entered.then(|| binary.program.analysis.functions.iter().map(|function| function.addr).collect());
         let taken: Vec<(u64, u64)> = image.sections.iter().map(|section| (section.addr, section.end())).chain(snapshot.into_iter().flat_map(Snapshot::ranges)).collect();
         let stack = free_region(&taken, 0x7ff0_0000, STACK)?;
         let scratch = free_region(&taken, stack.0, SCRATCH)?;
@@ -675,6 +698,7 @@ impl<'a> Emulator<'a> {
         Ok(Emulator {
             binary, abi, spaces, memory, lifted: FxHashMap::default(), registers: FxHashMap::default(), imports, stack, scratch, sentinel, internal_stack: None, stack_high: 0, register_banks, blocks: Vec::new(),
             heap: scratch.0 + PAGE as u64, tally: Tally::default(), stack_pointer: None, fresh_teb, thread: windows::Thread::default(),
+            skip: call.skip.clone(), ticks: call.ticks, timeout: call.timeout, entries,
         })
     }
 
@@ -1213,8 +1237,25 @@ impl<'a> Emulator<'a> {
                 return Stop::Steps;
             }
             turns += 1;
-            if turns.is_multiple_of(4096) && started.elapsed() > TIMEOUT {
-                return Stop::Fault(format!("the run took more than {} seconds", TIMEOUT.as_secs()));
+            if turns.is_multiple_of(4096) && started.elapsed() > self.timeout {
+                return Stop::Fault(format!("the run took more than {} seconds", self.timeout.as_secs_f64()));
+            }
+            if self.entries.as_ref().is_some_and(|entries| entries.contains(&pc)) {
+                self.tally.entered.insert(pc);
+            }
+            // A function skipped runs none of its instructions, so they need not lift.
+            if let Some(&pops) = self.skip.get(&pc) {
+                *self.tally.skipped.entry(pc).or_default() += 1;
+                let returned = self.return_from_tail().and_then(|to| {
+                    let sp = self.read_register(self.abi.stack)?;
+                    self.write_register(self.abi.stack, sp + u128::from(pops))?;
+                    Ok(to)
+                });
+                match returned {
+                    Ok(to) => pc = to,
+                    Err(fault) => return Stop::Fault(format!("{fault} at {pc:#x}")),
+                }
+                continue;
             }
             self.tally.steps += 1;
             let lifted = match self.fetch(pc) {
@@ -1328,15 +1369,15 @@ impl<'a> Emulator<'a> {
         }
         let result = self.reading(self.abi.result.to_string())?;
         let unwritten = (self.memory.unwritten.count, self.memory.unwritten.first.iter().map(|&(space, addr)| (self.space_label(space), addr)).collect());
-        let Tally { steps, notes, stand_ins, .. } = std::mem::take(&mut self.tally);
-        Ok(Outcome { stop, steps, notes, result, registers, dumps, buffers, writes: self.writes(), unwritten, stand_ins })
+        let Tally { steps, notes, stand_ins, skipped, entered, .. } = std::mem::take(&mut self.tally);
+        Ok(Outcome { stop, steps, notes, result, registers, dumps, buffers, writes: self.writes(), unwritten, stand_ins, skipped, entered })
     }
 }
 
 /// Runs `call` on the binary. The run, not the call, can fail: see [`Stop`]; an `Err` is a call
 /// that cannot be set up.
 pub fn emulate(binary: &mut Binary, call: &Call) -> Result<Outcome> {
-    let mut emulator = Emulator::new(binary, call.snapshot.as_ref())?;
+    let mut emulator = Emulator::new(binary, call)?;
     let buffers = emulator.start(call).map_err(anyhow::Error::msg)?;
     // What the setup wrote is not the function's doing.
     for page in emulator.memory.pages.values_mut() {
@@ -1363,6 +1404,14 @@ pub struct Run {
     snapshot: Option<String>,
     #[serde(default)]
     before: Vec<String>,
+    /// A file for every range the run wrote.
+    writes: Option<String>,
+    /// A file for the entry of every function the run entered.
+    entered: Option<String>,
+    timeout: Option<f64>,
+    #[serde(default)]
+    skip: Vec<String>,
+    ticks: Option<u64>,
 }
 
 /// A number or a text, as JSON has it.
@@ -1485,7 +1534,19 @@ pub fn run(binary: &mut Binary, args: Run) -> Result<String> {
     }
     let snapshot = args.snapshot.as_deref().map(|dir| Snapshot::open(dir.as_ref())).transpose()?;
     let before = args.before.iter().map(|function| function_entry(binary, function)).collect::<Result<_>>()?;
-    let mut call = Call { entry, snapshot, before, args: args.args.iter().map(arg).collect::<Result<_>>()?, registers: Vec::new(), memory: Vec::new(), read: args.read, dump, steps: args.steps.unwrap_or(DEFAULT_STEPS) };
+    let mut skip = FxHashMap::default();
+    for skipped in &args.skip {
+        let (function, pops) = skipped.rsplit_once(':').with_context(|| format!("`{skipped}` is not FUNCTION:BYTES, the bytes of arguments it takes off the stack as it returns"))?;
+        skip.insert(function_entry(binary, function)?, number(pops)? as u64);
+    }
+    let timeout = match args.timeout {
+        Some(seconds) => Duration::try_from_secs_f64(seconds).ok().filter(|timeout| !timeout.is_zero()).with_context(|| format!("`timeout` is a number of seconds above 0, not {seconds}"))?,
+        None => TIMEOUT,
+    };
+    let mut call = Call {
+        entry, snapshot, before, args: args.args.iter().map(arg).collect::<Result<_>>()?, registers: Vec::new(), memory: Vec::new(), read: args.read, dump, steps: args.steps.unwrap_or(DEFAULT_STEPS),
+        skip, ticks: args.ticks, timeout, track_entered: args.entered.is_some(),
+    };
     for setting in &args.set {
         let (place, what) = setting.split_once('=').with_context(|| format!("`{setting}` is not REGISTER=number, 0xADDRESS=hex:bytes or SPACE:0xADDRESS=hex:bytes"))?;
         let (space, addr) = place.rsplit_once(':').map_or((None, place), |(space, addr)| (Some(space.to_string()), addr));
@@ -1521,12 +1582,26 @@ pub fn run(binary: &mut Binary, args: Run) -> Result<String> {
     if outcome.writes.len() > RANGES_SHOWN {
         writeln!(out, "... and {} more ranges", outcome.writes.len() - RANGES_SHOWN)?;
     }
+    if let Some(path) = &args.writes {
+        let lines: String = outcome.writes.iter().map(|(space, addr, bytes)| format!("{} {}\n", place(space, *addr), bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>())).collect();
+        std::fs::write(path, lines).with_context(|| format!("writing the ranges written to {path}"))?;
+        writeln!(out, "every range written, {}, is in {path}", outcome.writes.len())?;
+    }
+    if let Some(path) = &args.entered {
+        let lines: String = outcome.entered.iter().map(|entry| format!("{entry:#x}\n")).collect();
+        std::fs::write(path, lines).with_context(|| format!("writing the functions entered to {path}"))?;
+        writeln!(out, "every function entered, {}, is in {path}", outcome.entered.len())?;
+    }
     for note in &outcome.notes {
         writeln!(out, "{note}")?;
     }
     if !outcome.stand_ins.is_empty() {
         let used: Vec<String> = outcome.stand_ins.iter().map(|(name, count)| format!("{name} x{count}")).collect();
         writeln!(out, "ran stand-ins for: {}", used.join(", "))?;
+    }
+    if !outcome.skipped.is_empty() {
+        let skipped: Vec<String> = outcome.skipped.iter().map(|(&entry, count)| format!("{} x{count}", binary.program.label(entry))).collect();
+        writeln!(out, "skipped: {}", skipped.join(", "))?;
     }
     let (count, first) = &outcome.unwritten;
     if *count > 0 {
