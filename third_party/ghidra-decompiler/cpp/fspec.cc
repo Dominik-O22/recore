@@ -3846,11 +3846,6 @@ void FuncProto::setPieces(const PrototypePieces &pieces)
   setInputLock(true);
   setOutputLock(true);
   setModelLock(true);
-  // recore: a callee-cleanup convention such as __stdcall leaves extrapop to each prototype, and
-  // upstream works it out from the parameters only for a prototype it decodes. Without it a
-  // call pops just its return address, and the caller's stack is off after every call.
-  if (extrapop == ProtoModel::extrapop_unknown)
-    resolveExtraPop();
 }
 
 /// Copy out the raw pieces of \b this prototype as stand-alone objects,

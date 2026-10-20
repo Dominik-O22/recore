@@ -480,6 +480,13 @@ impl Session {
         Ok(())
     }
 
+    /// Says that the function `name`, whose prototype is declared, pops its stack arguments as it
+    /// returns, as a callee-cleanup convention such as `__stdcall` does.
+    pub fn pops_its_arguments(&mut self, name: &str) -> Result<()> {
+        let name = CString::new(name)?;
+        check(|err, len| unsafe { ffi::rd_pops_its_arguments(self.raw.as_ptr(), name.as_ptr(), err, len) != 0 })
+    }
+
     /// Declares that the GOT entry at `slot` points to the imported function `name`. Indirect
     /// calls through the slot then show up as calls to `name`, and end control flow if `noreturn`.
     pub fn add_import(&mut self, slot: u64, name: &str, noreturn: bool) -> Result<()> {

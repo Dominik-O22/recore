@@ -1242,6 +1242,21 @@ int rd_set_import_stdcall_words(RdSession *session, uint64_t slot, size_t count,
     }
     fd->getFuncProto().setPieces(pieces);
     fd->getFuncProto().setOutputLock(false);
+    fd->getFuncProto().resolveExtraPop();
+  });
+}
+
+// Says that the function `name`, whose prototype is declared, pops the stack arguments that
+// prototype gives it, as a callee-cleanup convention such as __stdcall does. The engine works
+// that out only for a prototype it decodes, and otherwise has a call pop just its return address.
+// A prototype declared with no convention gets the default one, __stdcall on 32-bit Windows, so
+// the engine cannot tell for itself which prototypes really are callee-cleanup.
+int rd_pops_its_arguments(RdSession *session, const char *name, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Funcdata *fd = session->arch->symboltab->getGlobalScope()->queryFunction(name);
+    if (fd == nullptr) throw LowlevelError("no function of this name");
+    FuncProto &proto = fd->getFuncProto();
+    if (proto.getExtraPop() == ProtoModel::extrapop_unknown) proto.resolveExtraPop();
   });
 }
 
@@ -1260,6 +1275,7 @@ int rd_alias_import(RdSession *session, uint64_t addr, uint64_t slot, char *err,
       proto.getPieces(pieces);
       pieces.name = alias->getName();
       alias->getFuncProto().setPieces(pieces);
+      if (proto.getExtraPop() != ProtoModel::extrapop_unknown) alias->getFuncProto().setExtraPop(proto.getExtraPop());
     }
     if (proto.isNoReturn()) alias->getFuncProto().setNoReturn(true);
   });

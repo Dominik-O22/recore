@@ -401,13 +401,18 @@ pub fn declare<'a>(session: &mut Session, target: Target, format: Format, import
     for (table, convention) in [C_RUNTIME, WIN32, GLIBC, RUNTIME].into_iter().zip([conventions[0], conventions[1], "", ""]) {
         for prototype in table.iter().filter(|p| wanted.remove(name_of(p))) {
             session.declare(&format!("extern {convention}{prototype};"))?;
+            if windows32 && convention == conventions[1] {
+                session.pops_its_arguments(name_of(prototype))?;
+            }
         }
     }
     let mut wanted: Vec<&str> = wanted.into_iter().collect();
     wanted.sort_unstable();
     for (convention, prototype) in wanted.into_iter().filter_map(|name| archived(format, name)) {
         // One prototype the parser rejects must not cost the session the rest.
-        let _ = session.declare(&declaration(target, convention, prototype));
+        if session.declare(&declaration(target, convention, prototype)).is_ok() && windows32 && matches!(convention, "stdcall" | "fastcall") {
+            session.pops_its_arguments(name_of(prototype))?;
+        }
     }
     Ok(())
 }
