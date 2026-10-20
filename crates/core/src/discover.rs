@@ -149,6 +149,9 @@ pub struct Discovery {
     /// Entry points taken away because the code there gives back a frame it did not set up,
     /// sorted: see [`Arch::gives_back_frame`]. A call there jumps into the end of the caller.
     pub frame_ends: Vec<u64>,
+    /// Calls through a register that the code on the way to them loaded from a slot, as call
+    /// address to slot. Decoding the call on its own cannot tell where it goes.
+    pub register_calls: FxHashMap<u64, u64>,
 }
 
 /// A set of addresses, for asking of very many ranges whether any member lies inside. Most
@@ -298,6 +301,8 @@ struct Explorer<'a, A: Arch> {
     unbounded: u32,
     /// `[start, end)` of the literals the code reads, in no order.
     literals: Vec<(u64, u64)>,
+    /// See [`Discovery::register_calls`].
+    register_calls: FxHashMap<u64, u64>,
     /// Calls as `(from, to)`, kept where a call may be a jump: see [`Arch::CALL_MAY_BE_FAR_JUMP`].
     calls: Vec<(u64, u64)>,
     /// Whether the code has an instruction that rules out a call being a jump: see
@@ -556,7 +561,12 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         }
                         false
                     }
-                    Flow::CallIndirect(_) => self.import_never_returns(flow),
+                    Flow::CallIndirect(slot) => {
+                        if let Some(slot) = slot.filter(|_| self.recording && A::flow(insn, &A::State::default(), self.image) == Some(Flow::CallIndirect(None))) {
+                            self.register_calls.insert(decoded.addr, slot);
+                        }
+                        self.import_never_returns(flow)
+                    }
                     // A function that is nothing but a jump forwards to another function.
                     // Not to padding: a jump the linker puts in to step over an area it keeps
                     // for patches lands on the filler after it.
@@ -1542,7 +1552,8 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
     }
     let after_calls = std::mem::take(&mut explorer.after_calls);
     let frame_ends = std::mem::take(&mut explorer.frame_ends);
-    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code, inline_tables, after_calls, frame_ends }
+    let register_calls = std::mem::take(&mut explorer.register_calls);
+    Discovery { starts, jump_tables: explorer.jump_tables(), referenced: explorer.referenced, data_refs, uncertain_refs, code, inline_tables, after_calls, frame_ends, register_calls }
 }
 
 /// Sorted ranges with those that overlap or touch joined, as literals back to back make one pool.
@@ -1618,6 +1629,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         recording: true,
         unbounded: 0,
         literals: Vec::new(),
+        register_calls: FxHashMap::default(),
         calls: Vec::new(),
         branches_reach_far: false,
         after_calls: Vec::new(),

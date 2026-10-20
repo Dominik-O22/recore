@@ -139,6 +139,18 @@ impl State {
             Mnemonic::Mov if instr.op1_kind() == OpKind::Memory && instr.is_ip_rel_memory_operand() && instr.op0_register().is_gpr64() => {
                 Value::Slot(instr.ip_rel_memory_address())
             }
+            // 32-bit code names the slot by its absolute address, in the data segment: `fs:[0]` is
+            // the thread's own.
+            Mnemonic::Mov
+                if instr.op1_kind() == OpKind::Memory
+                    && instr.code_size() == iced_x86::CodeSize::Code32
+                    && instr.segment_prefix() == Register::None
+                    && instr.memory_base() == Register::None
+                    && instr.memory_index() == Register::None
+                    && instr.op0_register().is_gpr32() =>
+            {
+                Value::Slot(instr.memory_displacement64())
+            }
             Mnemonic::Movsxd if instr.op1_kind() == OpKind::Memory => self.load(instr),
             Mnemonic::Add => match (dest.map(|d| self.get(d)), source.map(|s| self.get(s))) {
                 (Some(Value::BasedEntry { base_register, table_offset, limit }), _)

@@ -16,6 +16,17 @@ use recore::image::Format;
 
 use crate::{Session, Target};
 
+/// How many words of arguments a 32-bit `__stdcall` function pops, from its decorated name:
+/// `_name@n` pops `n` bytes. A DLL that exports its functions so names them, and no table needs
+/// to list them.
+pub fn stdcall_words(name: &str) -> Option<usize> {
+    let (base, bytes) = name.strip_prefix('_')?.rsplit_once('@')?;
+    let identifier = base.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let digits = !bytes.is_empty() && bytes.bytes().all(|b| b.is_ascii_digit());
+    let bytes: usize = bytes.parse().ok().filter(|_| identifier && digits)?;
+    (bytes % 4 == 0).then_some(bytes / 4)
+}
+
 /// Types the tables are written in. `{ptr}` is the pointer-sized unsigned integer, and `{long}`
 /// the size in bytes of C's `long`: 4 on Windows and on 32-bit targets, 8 elsewhere.
 const TYPES: &[&str] = &[
@@ -308,6 +319,32 @@ const WIN32: &[&str] = &[
     "BOOL CryptEncrypt(HANDLE key, HANDLE hash, BOOL final, DWORD flags, void *data, DWORD *size, DWORD capacity)",
     "BOOL CryptDecrypt(HANDLE key, HANDLE hash, BOOL final, DWORD flags, void *data, DWORD *size)",
     "BOOL CryptDestroyKey(HANDLE key)",
+    // DirectX's entry points. Everything else DirectX does goes through the objects these create.
+    "int4 DirectDrawCreate(void *guid, void *ddraw, void *outer)",
+    "int4 DirectDrawCreateEx(void *guid, void *ddraw, void *iid, void *outer)",
+    "int4 DirectDrawCreateClipper(DWORD flags, void *clipper, void *outer)",
+    "int4 DirectDrawEnumerateA(void *callback, void *context)",
+    "int4 DirectDrawEnumerateW(void *callback, void *context)",
+    "int4 DirectDrawEnumerateExA(void *callback, void *context, DWORD flags)",
+    "int4 DirectDrawEnumerateExW(void *callback, void *context, DWORD flags)",
+    "int4 DirectInputCreateA(HANDLE instance, DWORD version, void *input, void *outer)",
+    "int4 DirectInputCreateW(HANDLE instance, DWORD version, void *input, void *outer)",
+    "int4 DirectInputCreateEx(HANDLE instance, DWORD version, void *iid, void *input, void *outer)",
+    "int4 DirectInput8Create(HANDLE instance, DWORD version, void *iid, void *input, void *outer)",
+    "int4 DirectSoundCreate(void *guid, void *sound, void *outer)",
+    "int4 DirectSoundCreate8(void *guid, void *sound, void *outer)",
+    "int4 DirectSoundEnumerateA(void *callback, void *context)",
+    "int4 DirectSoundEnumerateW(void *callback, void *context)",
+    "int4 DirectSoundCaptureCreate(void *guid, void *capture, void *outer)",
+    "int4 DirectSoundCaptureCreate8(void *guid, void *capture, void *outer)",
+    "int4 DirectSoundCaptureEnumerateA(void *callback, void *context)",
+    "int4 DirectSoundCaptureEnumerateW(void *callback, void *context)",
+    "void *Direct3DCreate8(uint sdk)",
+    "void *Direct3DCreate9(uint sdk)",
+    "int4 Direct3DCreate9Ex(uint sdk, void *d3d)",
+    "int4 DirectPlayCreate(void *guid, void *play, void *outer)",
+    "int4 DirectPlayEnumerateA(void *callback, void *context)",
+    "int4 DirectPlayEnumerateW(void *callback, void *context)",
 ];
 
 /// The declaration [`declare`] makes on `target` for an archive entry.
@@ -364,13 +401,30 @@ pub fn declare<'a>(session: &mut Session, target: Target, format: Format, import
     for (table, convention) in [C_RUNTIME, WIN32, GLIBC, RUNTIME].into_iter().zip([conventions[0], conventions[1], "", ""]) {
         for prototype in table.iter().filter(|p| wanted.remove(name_of(p))) {
             session.declare(&format!("extern {convention}{prototype};"))?;
+            if windows32 && convention == conventions[1] {
+                session.pops_its_arguments(name_of(prototype))?;
+            }
         }
     }
     let mut wanted: Vec<&str> = wanted.into_iter().collect();
     wanted.sort_unstable();
     for (convention, prototype) in wanted.into_iter().filter_map(|name| archived(format, name)) {
         // One prototype the parser rejects must not cost the session the rest.
-        let _ = session.declare(&declaration(target, convention, prototype));
+        if session.declare(&declaration(target, convention, prototype)).is_ok() && windows32 && matches!(convention, "stdcall" | "fastcall") {
+            session.pops_its_arguments(name_of(prototype))?;
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stdcall_words;
+
+    #[test]
+    fn a_decorated_stdcall_name_gives_the_words_it_pops() {
+        let names = ["_AIL_startup@0", "_AIL_set_sample_volume@8", "?_Throw_C_error@std@@YAXH@Z", "@fastcall@8", "_odd@6", "_name@", "GetTickCount"];
+        let words: Vec<Option<usize>> = names.iter().map(|name| stdcall_words(name)).collect();
+        assert_eq!(words, [Some(0), Some(2), None, None, None, None, None]);
+    }
 }

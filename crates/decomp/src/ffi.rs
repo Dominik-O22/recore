@@ -156,6 +156,8 @@ unsafe extern "C" {
     pub fn rd_runs_on(session: *mut RdSession, function: u64);
     pub fn rd_add_function(session: *mut RdSession, addr: u64, name: *const c_char, noreturn: i32, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_add_import(session: *mut RdSession, slot: u64, name: *const c_char, noreturn: i32, err: *mut c_char, errlen: usize) -> i32;
+    pub fn rd_set_import_stdcall_words(session: *mut RdSession, slot: u64, count: usize, err: *mut c_char, errlen: usize) -> i32;
+    pub fn rd_pops_its_arguments(session: *mut RdSession, name: *const c_char, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_override_jump_table(
         session: *mut RdSession,
         function: u64,
