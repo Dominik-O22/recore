@@ -39,6 +39,16 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [] => {}
+        // `lift --config <lift.toml> [--out <dir>]`: the whole program as a cargo workspace.
+        [lift, config_flag, config, rest @ ..] if lift == "lift" && config_flag == "--config" => {
+            let out = match rest {
+                [] => None,
+                [flag, dir] if flag == "--out" => Some(Path::new(dir)),
+                _ => anyhow::bail!("usage: recore-mcp lift --config <lift.toml> [--out <dir>]"),
+            };
+            print!("{}", emulate::workspace::run(Path::new(config), out)?);
+            return Ok(());
+        }
         [worker, binary, options] if worker == WORKER_ARG => return recore_decomp::isolate::serve(Path::new(binary), options),
         [tool, binary, rest @ ..] if !tool.starts_with('-') => {
             // A reader such as `head` may stop before the answer is all written.
