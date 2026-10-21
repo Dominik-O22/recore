@@ -1,7 +1,7 @@
 //! Writes Rust source that does what the functions reachable from some roots do, one Rust
-//! function per function, each instruction's raw p-code as statements. The source runs on a
-//! machine crate the caller provides (`Cpu`, `dispatch` and their kin); [`super::workspace`]
-//! writes it out as a cargo workspace.
+//! function per function, each instruction's raw p-code as statements. The source runs on
+//! `recore-machine` (crates/machine): `Cpu`, `dispatch`, and the p-code and x87 semantics the
+//! emulator runs too. [`super::workspace`] writes it out as a cargo workspace.
 
 use std::{
     cell::RefCell,
@@ -521,7 +521,7 @@ fn folds(ops: &[Op], dead: &[bool], uniques: &BTreeMap<u64, usize>) -> BTreeSet<
 }
 
 /// The machine's own function for a common x87 operation with these operand and result sizes
-/// (`Cpu::f_add` and its kin), called in place of the generic `c.op`.
+/// (`recore_machine::Cpu::f_add` and its kin), called in place of the generic `c.op`.
 fn typed_float(code: Code, inputs: &[usize], out: usize) -> Option<&'static str> {
     Some(match (code, inputs, out) {
         (Code::FAdd, [10, 10], 10) => "f_add",

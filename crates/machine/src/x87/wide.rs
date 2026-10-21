@@ -100,20 +100,14 @@ impl Wide {
         self.add(other.negate())
     }
 
-    /// The quotient, one bit at a time. `other` is not zero.
+    /// The quotient, `self.significand * 2^127 / other.significand` cut toward zero. `other` is
+    /// not zero.
     pub fn divide(self, other: Wide) -> Wide {
         let negative = self.negative != other.negative;
-        let divisor = other.significand;
-        let (mut remainder, mut carry, mut quotient) = (self.significand, false, 0u128);
-        for _ in 0..128 {
-            let bit = carry || remainder >= divisor;
-            if bit {
-                remainder = remainder.wrapping_sub(divisor);
-            }
-            quotient = quotient << 1 | u128::from(bit);
-            carry = remainder >> 127 == 1;
-            remainder <<= 1;
-        }
+        let quotient = match other.significand.trailing_zeros() {
+            shift @ 64.. => divide_small(self.significand, 127 - shift, (other.significand >> shift) as u64),
+            _ => divide_bits(self.significand, other.significand),
+        };
         Wide::new(negative, self.exp - other.exp - 127, quotient)
     }
 
@@ -132,6 +126,37 @@ impl Wide {
     fn negligible(self, sum: Wide) -> bool {
         self.is_zero() || self.exp < sum.exp - 130
     }
+}
+
+/// `dividend * 2^shift / divisor` cut toward zero, by 64-bit digits, for a divisor of at most 64
+/// bits such as the integers the series divide by. The same bits as `divide_bits`.
+fn divide_small(dividend: u128, shift: u32, divisor: u64) -> u128 {
+    let (high, low) = if shift == 0 { (0, dividend) } else { (dividend >> (128 - shift), dividend << shift) };
+    let divisor = u128::from(divisor);
+    let mut remainder = 0u128;
+    let mut quotient = 0u128;
+    for digit in [high >> 64, high & u128::from(u64::MAX), low >> 64, low & u128::from(u64::MAX)] {
+        let current = remainder << 64 | digit;
+        quotient = (quotient << 64) | (current / divisor);
+        remainder = current % divisor;
+    }
+    quotient
+}
+
+/// `dividend * 2^127 / divisor` cut toward zero, one bit at a time, for significands with their
+/// top bit set.
+fn divide_bits(dividend: u128, divisor: u128) -> u128 {
+    let (mut remainder, mut carry, mut quotient) = (dividend, false, 0u128);
+    for _ in 0..128 {
+        let bit = carry || remainder >= divisor;
+        if bit {
+            remainder = remainder.wrapping_sub(divisor);
+        }
+        quotient = quotient << 1 | u128::from(bit);
+        carry = remainder >> 127 == 1;
+        remainder <<= 1;
+    }
+    quotient
 }
 
 /// `e^t - 1`, for `t` of at most about 1.
@@ -216,6 +241,24 @@ mod tests {
     fn approx(w: Wide) -> f64 {
         let value = (w.significand >> 64) as f64 * 2f64.powi(w.exp + 64);
         if w.negative { -value } else { value }
+    }
+
+    #[test]
+    fn dividing_by_a_small_integer_gives_the_bits_of_dividing_bit_by_bit() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..100_000 {
+            let dividend = u128::from(next()) << 64 | u128::from(next()) | 1 << 127;
+            let small = next() >> (next() % 63) | 1;
+            let divisor = Wide::new(false, 0, u128::from(small));
+            let shift = divisor.significand.trailing_zeros();
+            assert_eq!(divide_small(dividend, 127 - shift, small >> small.trailing_zeros()), divide_bits(dividend, divisor.significand), "{dividend:x} / {small}");
+        }
     }
 
     #[test]

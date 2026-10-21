@@ -9,6 +9,7 @@ regex = "1.13.1"
 anyhow = "1.0.104"
 recore = { version = "0.2.0", path = "../core" }
 recore-decomp = { version = "0.2.0", path = "../decomp" }
+recore-machine = { version = "0.2.0", path = "../machine" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = "1"
