@@ -39,7 +39,7 @@ const FOLLOWS_BREAK: u8 = 1;
 const ASKED_AS_START: u8 = 2;
 /// Something calls the address, takes it, exports it, or points to it from data.
 const REFERENCED: u8 = 4;
-/// The byte is part of a jump table that lies in the code after its jump, or of a literal pool.
+/// The byte is part of a jump table that lies among the code, or of a literal pool.
 const IN_TABLE: u8 = 8;
 
 /// The gap scan works through a section in pages of this many bytes.
@@ -145,8 +145,8 @@ pub struct Discovery {
     pub uncertain_refs: Vec<(u64, u64, bool)>,
     /// Every stretch of decoded instructions, as sorted `[start, end)` ranges.
     pub code: Vec<(u64, u64)>,
-    /// `[start, end)` of every jump table that lies in the code straight after its jump, and of
-    /// every literal pool, sorted. A function's code goes on after either.
+    /// `[start, end)` of every jump table that lies among the code, and of every literal pool,
+    /// sorted and joined where they touch. A function's code goes on after either.
     pub inline_tables: Vec<(u64, u64)>,
     /// Entry points taken away because the code before them comes back from a call and runs on
     /// into them, as `(entry, callee)`: entry points after all if the callee never returns.
@@ -709,7 +709,6 @@ impl<'a, A: Arch> Explorer<'a, A> {
         if let (false, Some(&length)) = (table.bounded, self.known_lengths.get(&table.address)) {
             table.entries.truncate(length);
             table.bounded = true;
-            table.inline_end = table.inline_end.map(|_| table.address + table.entry_size * length as u64);
         }
         table
     }
@@ -1488,7 +1487,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         }
                         scanned_to = decoded.next_addr();
                         let Some(insn) = decoded.insn else { break };
-                        // What aligns a table, as MSVC's `mov edi, edi` does, is filler too. Not
+                        // What sits right before a table aligns it, as MSVC's `mov edi, edi` does:
+                        // the code that jumps through the table was decoded from its function. Not
                         // so before a literal pool, which follows the end of a function's code.
                         let before_table = || {
                             !A::LITERAL_POOLS && self.regions[index].flags.get((scanned_to - section.addr) as usize).is_some_and(|flags| flags & IN_TABLE != 0)

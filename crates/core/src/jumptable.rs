@@ -426,7 +426,9 @@ impl State {
             _ => None,
         };
         // MSVC keeps its tables among the code, after the function that jumps through them, and
-        // where no relocation marks their entries nothing else tells their bytes from code.
+        // where no relocation marks their entries nothing else tells their bytes from code. A
+        // table read without a bounds check stops at the first word that is no code address,
+        // such as the padding after it, and only a function flush against it could look like one.
         table.map(|mut table| {
             if image.section_at(table.address).is_some_and(|section| section.executable) {
                 table.inline_end = Some(table.address + table.entry_size * table.entries.len() as u64);
