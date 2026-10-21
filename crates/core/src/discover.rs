@@ -709,6 +709,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
         if let (false, Some(&length)) = (table.bounded, self.known_lengths.get(&table.address)) {
             table.entries.truncate(length);
             table.bounded = true;
+            // What a read without a bound ran on into is no table after all. A table of bytes
+            // keeps the end its reader rounded up to where instructions may begin.
+            if table.entry_size % 2 == 0 {
+                table.inline_end = table.inline_end.map(|_| table.address + table.entry_size * length as u64);
+            }
         }
         table
     }
