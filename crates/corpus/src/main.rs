@@ -1,6 +1,7 @@
 //! Corpus tooling: extracts ground truth from debug files and scores analyzer output against it.
 
 mod classes;
+mod compare;
 mod jumptables;
 mod references;
 mod score;
@@ -76,6 +77,9 @@ enum Command {
         #[arg(long)]
         detail: bool,
     },
+    /// Scores two analyzer output directories binary by binary and prints each count that moved,
+    /// with the binaries it moved in. Fails when a total got worse or a binary lost its analysis.
+    Compare { base: PathBuf, head: PathBuf },
 }
 
 fn binaries(corpus: &Path) -> Result<Vec<PathBuf>> {
@@ -198,12 +202,13 @@ fn run_jumptables(corpus: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_score(corpus: &Path, dir: &Path, detail: bool) -> Result<()> {
+/// The score of each binary of `corpus` that `dir` has an analysis for, sorted by name.
+fn score_dir(corpus: &Path, dir: &Path) -> Result<Vec<(String, score::Score)>> {
     let mut names: Vec<String> = std::fs::read_dir(corpus.join("truth"))?
         .filter_map(|e| Some(e.ok()?.path().file_stem()?.to_string_lossy().into_owned()))
         .collect();
     names.sort();
-    let mut rows: Vec<(String, score::Score)> = names
+    Ok(names
         .par_iter()
         .filter_map(|name| {
             let analysis = std::fs::read(dir.join(format!("{name}.json"))).ok()?;
@@ -215,8 +220,26 @@ fn run_score(corpus: &Path, dir: &Path, detail: bool) -> Result<()> {
                 .and_then(|data| serde_json::from_slice(&data).ok());
             Some((name.clone(), score::score(&truth, jump_tables.as_ref(), &analysis)))
         })
-        .collect();
+        .collect())
+}
 
+fn run_compare(corpus: &Path, base: &Path, head: &Path) -> Result<()> {
+    let (changes, missing) = compare::compare(&score_dir(corpus, base)?, &score_dir(corpus, head)?);
+    println!("{} against {}", head.display(), base.display());
+    compare::print(&changes, &missing);
+    let worse = changes.iter().filter(|c| c.worse).count();
+    anyhow::ensure!(
+        worse == 0 && missing.is_empty(),
+        "{} is worse than its base: {worse} counts fell, {} binaries have no analysis",
+        head.display(),
+        missing.len()
+    );
+    Ok(())
+}
+
+fn run_score(corpus: &Path, dir: &Path, detail: bool) -> Result<()> {
+    let names = std::fs::read_dir(corpus.join("truth"))?.count();
+    let mut rows = score_dir(corpus, dir)?;
     let mut total = score::Score::default();
     rows.iter().for_each(|(_, s)| total += *s);
     let line = |label: &str, s: &score::Score| {
@@ -246,7 +269,7 @@ fn run_score(corpus: &Path, dir: &Path, detail: bool) -> Result<()> {
         rows.sort_by(|a, b| a.1.recall().total_cmp(&b.1.recall()));
         rows.iter().for_each(|(name, s)| line(name, s));
     }
-    line(&format!("{} ({} of {})", dir.display(), rows.len(), names.len()), &total);
+    line(&format!("{} ({} of {names})", dir.display(), rows.len()), &total);
     Ok(())
 }
 
@@ -274,6 +297,7 @@ fn main() -> Result<()> {
             println!("{}: {right} of {all} functions in the right instruction set ({:.2}%)", cli.corpus.display(), 100.0 * right as f64 / all.max(1) as f64);
             Ok(())
         }
+        Command::Compare { base, head } => run_compare(&cli.corpus, &base, &head),
         Command::Score { dirs, detail } => dirs.iter().try_for_each(|dir| run_score(&cli.corpus, dir, detail)),
     }
 }
