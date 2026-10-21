@@ -13,7 +13,7 @@
 
 use std::cmp::Ordering;
 
-use super::{Code, fits, mask, signed, signed_min};
+use crate::ops::{Code, fits, mask, signed, signed_min};
 
 mod instructions;
 mod wide;
@@ -414,7 +414,17 @@ pub fn applies(code: Code, size: usize, inputs: &[(u128, usize)]) -> bool {
 /// The result of a float operation of p-code with an extended operand, in a place `size` bytes
 /// wide. An integer of 10 bytes, which `ROUND` and `TRUNC` make for an x87 register, is held as a
 /// float there.
+#[inline(always)]
 pub fn compute(code: Code, size: usize, inputs: &[(u128, usize)], control: Control) -> Result<u128, String> {
+    match fast(code, size, inputs, control) {
+        Some(bits) => Ok(bits),
+        None => compute_exact(code, size, inputs, control),
+    }
+}
+
+/// `compute` in software for every case.
+#[inline(never)]
+fn compute_exact(code: Code, size: usize, inputs: &[(u128, usize)], control: Control) -> Result<u128, String> {
     use Code::*;
     let operand = |index: usize| -> Result<Value, String> {
         let (bits, size) = inputs.get(index).copied().ok_or_else(|| format!("{code:?} without its operand"))?;
@@ -472,6 +482,169 @@ pub fn compute(code: Code, size: usize, inputs: &[(u128, usize)], control: Contr
             converted(integral(operand(0)?, rounding))
         }
         _ => unreachable!("{code:?} is not a float operation"),
+    }
+}
+
+/// A float as this machine's `f64`, when it holds the value exactly and it is zero or normal.
+#[inline(always)]
+fn native(bits: u128, size: usize) -> Option<f64> {
+    let value = match size {
+        4 => f64::from(f32::from_bits(bits as u32)),
+        8 => f64::from_bits(bits as u64),
+        10 => {
+            let (negative, exponent, significand) = (
+                bits >> 79 & 1 == 1,
+                (bits >> 64 & 0x7fff) as i32,
+                bits as u64,
+            );
+            let sign = if negative { -1.0 } else { 1.0 };
+            if exponent == 0 && significand == 0 {
+                return Some(sign * 0.0);
+            }
+            let exp = exponent - 16383;
+            if significand & INTEGER_BIT == 0
+                || significand & 0x7ff != 0
+                || !(-1022..=1023).contains(&exp)
+            {
+                return None;
+            }
+            f64::from_bits(
+                u64::from(negative) << 63
+                    | ((exp + 1023) as u64) << 52
+                    | (significand >> 11) & ((1 << 52) - 1),
+            )
+        }
+        _ => return None,
+    };
+    (value == 0.0 || value.is_normal()).then_some(value)
+}
+
+/// A zero or normal `f64` in a float of `size` bytes, when it fits there without rounding.
+#[inline(always)]
+fn from_native(value: f64, size: usize) -> Option<u128> {
+    let bits = value.to_bits();
+    match size {
+        4 => {
+            let narrow = value as f32;
+            (f64::from(narrow) == value && (narrow == 0.0 || narrow.is_normal()))
+                .then_some(u128::from(narrow.to_bits()))
+        }
+        8 => Some(u128::from(bits)),
+        10 => {
+            let sign = u128::from(bits >> 63) << 79;
+            if value == 0.0 {
+                return Some(sign);
+            }
+            let exponent = u128::from((bits >> 52 & 0x7ff) + 16383 - 1023);
+            Some(sign | exponent << 64 | u128::from(INTEGER_BIT | (bits & ((1 << 52) - 1)) << 11))
+        }
+        _ => None,
+    }
+}
+
+/// An extended float as an `f64`, rounded to nearest. Lifted code that keeps the x87 registers
+/// as `f64` reads them so from memory and from the machine's registers.
+pub fn f80_to_f64(bits: u128) -> f64 {
+    match native(bits, 10) {
+        Some(value) => value,
+        None => f64::from_bits(compute_exact(Code::Float2Float, 8, &[(bits, 10)], Control { precision: 53, rounding: Rounding::Nearest }).expect("float2float") as u64),
+    }
+}
+
+/// An `f64` as an extended float, which holds it exactly.
+pub fn f64_to_f80(value: f64) -> u128 {
+    if value == 0.0 || value.is_normal() {
+        return from_native(value, 10).expect("a zero or normal f64 fits");
+    }
+    compute_exact(Code::Float2Float, 10, &[(u128::from(value.to_bits()), 8)], Control { precision: 64, rounding: Rounding::Nearest }).expect("float2float")
+}
+
+/// The common cases on this machine's own floats, with the same bits as the exact path: rounding
+/// to nearest at 24 or 53 bits, on zero or normal operands, with a zero or normal result. A sum,
+/// difference, product, quotient or square root that `f64` rounds to 53 bits and then to 24 is
+/// rounded as once to 24, since 53 is at least 2 * 24 + 2. Anything else gives `None` for the
+/// exact path.
+#[inline(always)]
+fn fast(code: Code, size: usize, inputs: &[(u128, usize)], control: Control) -> Option<u128> {
+    use Code::*;
+    let operand = |index: usize| {
+        inputs
+            .get(index)
+            .and_then(|&(bits, size)| native(bits, size))
+    };
+    let arithmetic = |result: f64, inexact_zero: bool| -> Option<u128> {
+        if control.rounding != Rounding::Nearest
+            || control.precision == 64
+            || !(result == 0.0 || result.is_normal())
+            || inexact_zero
+        {
+            return None;
+        }
+        let result = if control.precision == 24 {
+            let narrow = result as f32;
+            if !(narrow.is_normal() || result == 0.0) {
+                return None;
+            }
+            f64::from(narrow)
+        } else {
+            result
+        };
+        // A narrower place rounds once more, which `from_native` declines unless exact.
+        from_native(result, size)
+    };
+    match code {
+        FAdd | FSub | FMult | FDiv => {
+            let (a, b) = (operand(0)?, operand(1)?);
+            match code {
+                FAdd => arithmetic(a + b, false),
+                FSub => arithmetic(a - b, false),
+                FMult => {
+                    let r = a * b;
+                    arithmetic(r, r == 0.0 && a != 0.0 && b != 0.0)
+                }
+                _ => {
+                    let r = a / b;
+                    arithmetic(r, b == 0.0 || r == 0.0 && a != 0.0)
+                }
+            }
+        }
+        FSqrt => {
+            let a = operand(0)?;
+            if a < 0.0 {
+                return None;
+            }
+            arithmetic(a.sqrt(), false)
+        }
+        FEqual | FNotEqual | FLess | FLessEqual => {
+            let (a, b) = (operand(0)?, operand(1)?);
+            Some(u128::from(match code {
+                FEqual => a == b,
+                FNotEqual => a != b,
+                FLess => a < b,
+                _ => a <= b,
+            }))
+        }
+        FNan => operand(0).map(|_| 0),
+        // A conversion to a wider float is exact. To a 4-byte float, `f64` rounds the exact value
+        // once, to nearest.
+        Float2Float => {
+            let value = operand(0)?;
+            if size == 4 && control.rounding == Rounding::Nearest {
+                let narrow = value as f32;
+                return (narrow == 0.0 && value == 0.0 || narrow.is_normal())
+                    .then_some(u128::from(narrow.to_bits()));
+            }
+            from_native(value, size)
+        }
+        Int2Float => {
+            let (bits, from) = inputs[0];
+            let integer = signed(bits, from);
+            if integer.unsigned_abs() >= 1 << 53 {
+                return None;
+            }
+            from_native(integer as f64, size)
+        }
+        _ => None,
     }
 }
 
@@ -674,6 +847,64 @@ mod tests {
         assert_eq!(compute(Code::FNotEqual, 1, &[(nan, 10), (nan, 10)], NEAREST_64), Ok(1));
         assert_eq!(compute(Code::FEqual, 1, &[(ext(0.0), 10), (ext(-0.0), 10)], NEAREST_64), Ok(1));
         assert_eq!(compute(Code::FLess, 1, &[(ext(-2.0), 10), (ext(-1.0), 10)], NEAREST_64), Ok(1));
+    }
+
+    /// The native path gives the exact path's bits wherever it answers, on doubles and floats
+    /// near each other, near the ends of their ranges, and on integers.
+    #[test]
+    fn the_native_path_matches_the_exact_one() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut answered = 0;
+        for i in 0..200_000 {
+            let a = f64::from_bits(next());
+            let near = f64::from_bits(a.to_bits() ^ (next() % 64));
+            let b = match i % 4 {
+                0 => near,
+                1 => f64::from_bits(next() & !(0x7ff << 52) | (next() % 2046 + 1) << 52),
+                2 => f64::from(f32::from_bits(next() as u32)),
+                _ => -near,
+            };
+            let a = if i % 3 == 0 { f64::from(a as f32) } else { a };
+            let control = Control {
+                precision: [24, 53, 64][i % 3],
+                rounding: [Rounding::Nearest, Rounding::Nearest, Rounding::Zero][i / 3 % 3],
+            };
+            for (code, size, inputs) in [
+                (Code::FAdd, 10, vec![(ext(a), 10), (ext(b), 10)]),
+                (Code::FSub, 10, vec![(ext(a), 10), (ext(b), 10)]),
+                (Code::FMult, 10, vec![(ext(a), 10), (ext(b), 10)]),
+                (Code::FDiv, 10, vec![(ext(a), 10), (ext(b), 10)]),
+                (Code::FSqrt, 10, vec![(ext(a.abs()), 10)]),
+                (Code::FLess, 1, vec![(ext(a), 10), (ext(b), 10)]),
+                (Code::Float2Float, 4, vec![(ext(a), 10)]),
+                (Code::Float2Float, 8, vec![(ext(b), 10)]),
+                (
+                    Code::Float2Float,
+                    10,
+                    vec![(u128::from((b as f32).to_bits()), 4)],
+                ),
+                (Code::Int2Float, 10, vec![(u128::from(next() as u32), 4)]),
+            ] {
+                if let Some(bits) = fast(code, size, &inputs, control) {
+                    answered += 1;
+                    assert_eq!(
+                        bits,
+                        compute_exact(code, size, &inputs, control).unwrap(),
+                        "{code:?} {a:e} {b:e} {control:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            answered > 600_000,
+            "the native path answered {answered} times"
+        );
     }
 
     #[test]

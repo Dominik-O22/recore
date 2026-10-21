@@ -116,15 +116,18 @@ pub fn execute(instruction: Instruction, st0: u128, st1: u128, control: Control)
         }
         Fxam => return Outcome { stack: Stack::Replace(st0), conditions: examine(st0) },
         Fsin | Fcos | Fsincos | Fptan => {
-            let Some([sine, cosine, tangent]) = trigonometry(x) else {
+            let Some(trig) = trigonometry(x) else {
                 return Outcome { stack: Stack::Replace(st0), conditions: [None, None, Some(true), None] };
             };
             let stack = match instruction {
-                Fsin => Stack::Replace(round(sine)),
-                Fcos => Stack::Replace(round(cosine)),
-                Fsincos => Stack::ReplacePush(round(sine), round(cosine)),
+                Fsin => Stack::Replace(round(trig.sine())),
+                Fcos => Stack::Replace(round(trig.cosine())),
+                Fsincos => Stack::ReplacePush(round(trig.sine()), round(trig.cosine())),
                 // A not-a-number is pushed in place of the 1.
-                _ => Stack::ReplacePush(round(tangent), round(if matches!(tangent, Special(Nan { .. })) { tangent } else { exact(ONE) })),
+                _ => {
+                    let tangent = trig.tangent();
+                    Stack::ReplacePush(round(tangent), round(if matches!(tangent, Special(Nan { .. })) { tangent } else { exact(ONE) }))
+                }
             };
             return Outcome { stack, conditions: [None, None, Some(false), None] };
         }
@@ -325,13 +328,43 @@ fn examine(bits: u128) -> [Option<bool>; 4] {
     [Some(c0), Some(bits >> 79 == 1), Some(c2), Some(c3)]
 }
 
+/// The sine, cosine and tangent of an argument: the results of a special argument, or the sine
+/// and cosine from the series, which the tangent is divided from only when FPTAN asks for it.
+enum Trig {
+    Special([Exact; 3]),
+    Series(Wide, Wide),
+}
+
+impl Trig {
+    fn sine(&self) -> Exact {
+        match self {
+            Trig::Special([sine, ..]) => *sine,
+            Trig::Series(sine, _) => sine.inexact(),
+        }
+    }
+
+    fn cosine(&self) -> Exact {
+        match self {
+            Trig::Special([_, cosine, _]) => *cosine,
+            Trig::Series(_, cosine) => cosine.inexact(),
+        }
+    }
+
+    fn tangent(&self) -> Exact {
+        match self {
+            Trig::Special([.., tangent]) => *tangent,
+            Trig::Series(sine, cosine) => sine.divide(*cosine).inexact(),
+        }
+    }
+}
+
 /// The sine, cosine and tangent, or none for an argument of 2^63 or more, which the processor
 /// does not reduce.
-fn trigonometry(x: Value) -> Option<[Exact; 3]> {
+fn trigonometry(x: Value) -> Option<Trig> {
     match x {
-        Nan { .. } => Some([Special(propagate(&[x]).expect("a not-a-number")); 3]),
-        Infinite { .. } => Some([Special(INDEFINITE); 3]),
-        Zero { .. } => Some([Special(x), exact(ONE), Special(x)]),
+        Nan { .. } => Some(Trig::Special([Special(propagate(&[x]).expect("a not-a-number")); 3])),
+        Infinite { .. } => Some(Trig::Special([Special(INDEFINITE); 3])),
+        Zero { .. } => Some(Trig::Special([Special(x), exact(ONE), Special(x)])),
         Finite { exp, .. } if exp >= 63 => None,
         Finite { negative, exp, significand } => {
             let (quadrant, r) = reduce(exp, significand);
@@ -343,7 +376,7 @@ fn trigonometry(x: Value) -> Option<[Exact; 3]> {
                 _ => (c.negate(), s),
             };
             let sine = if negative { sine.negate() } else { sine };
-            Some([sine.inexact(), cosine.inexact(), sine.divide(cosine).inexact()])
+            Some(Trig::Series(sine, cosine))
         }
     }
 }
@@ -366,7 +399,7 @@ fn reduce(exp: i32, significand: u64) -> (u128, Wide) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emulate::x87::Rounding;
+    use crate::x87::Rounding;
 
     /// An extended float as a number that orders as its value does, for finite floats.
     fn ordered(bits: u128) -> i128 {

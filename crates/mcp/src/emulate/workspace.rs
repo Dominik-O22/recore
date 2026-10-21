@@ -33,7 +33,8 @@ pub struct Config {
     out: PathBuf,
     /// How many crates the lifted functions are split into.
     crates: usize,
-    /// The crate of the machine the lifted code runs on; the lifted crates `use <name>::*`.
+    /// The crate of the machine the lifted code runs on, `recore-machine` at crates/machine or
+    /// one with its API; the lifted crates `use <name>::*`.
     runtime: Crate,
     binary: Binary,
     /// Packages built at opt-level 3; the lifted crates build at 1.
