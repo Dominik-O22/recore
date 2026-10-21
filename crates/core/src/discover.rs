@@ -839,7 +839,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         let pointer_size = self.image.machine.pointer_size() as usize;
         let after_table = |o: usize| {
             self.image.data_in_code && o >= pointer_size && self.pointer_slots.contains_key(&(region.section.addr + (o - pointer_size) as u64))
-                || A::LITERAL_POOLS && o > 0 && region.flags[o - 1] & IN_TABLE != 0
+                || o > 0 && region.flags[o - 1] & IN_TABLE != 0
         };
         let Some(break_at) = (earliest..=offset).rev().find(|&o| region.follows_break(o) || after_table(o)) else {
             return false;
@@ -1458,10 +1458,9 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     }
                     if self.regions[index].flags[offset] & IN_TABLE != 0 {
                         offset += 1;
-                        // Nothing runs on out of a literal pool: it follows the end of its code.
-                        if A::LITERAL_POOLS {
-                            after_data = offset;
-                        }
+                        // Nothing runs on out of a literal pool or a table: each follows the end
+                        // of its code.
+                        after_data = offset;
                         continue;
                     }
                     // Relocated pointers in a code section are a jump table. Step over the whole

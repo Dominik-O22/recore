@@ -17,7 +17,7 @@
 
 use rustc_hash::FxHashMap;
 
-use iced_x86::{ConditionCode, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{ConditionCode, Instruction, MemorySize, Mnemonic, OpKind, Register};
 
 use crate::arch::{Limit, MAX_ENTRIES, Table};
 use crate::image::Image;
@@ -51,6 +51,9 @@ enum Value {
     Pointer { table: u64, limit: Option<Limit> },
     /// A pointer loaded from the slot at this address.
     Slot(u64),
+    /// A byte read from the `entries` bytes at `table` by a bounded index: how MSVC maps sparse
+    /// cases onto a dense jump table. The largest byte bounds the index into the jump table.
+    Indexed { table: u64, entries: u16 },
 }
 
 // A state is copied at every branch that is followed, so its size is part of the analysis time.
@@ -164,6 +167,7 @@ impl State {
                 Value::Slot(instr.memory_displacement64())
             }
             Mnemonic::Movsxd if instr.op1_kind() == OpKind::Memory => self.load(instr),
+            Mnemonic::Movzx if instr.op1_kind() == OpKind::Memory && instr.memory_size() == MemorySize::UInt8 => self.index_byte(instr),
             Mnemonic::Add => match (dest.map(|d| self.get(d)), source.map(|s| self.get(s))) {
                 (Some(Value::BasedEntry { base_register, table_offset, limit }), _)
                     if source.and_then(index_of) == Some(usize::from(base_register)) =>
@@ -276,6 +280,23 @@ impl State {
         based.filter(|_| instr.op_kinds().any(|kind| kind == OpKind::Memory))
     }
 
+    /// `movzx reg, byte [index + table]` in 32-bit code, which names the table by its address,
+    /// with the index bounded from 0.
+    fn index_byte(&self, instr: &Instruction) -> Value {
+        let table = instr.memory_displacement64();
+        if instr.code_size() != iced_x86::CodeSize::Code32 || table == 0 || instr.segment_prefix() != Register::None {
+            return Value::Unknown;
+        }
+        let index = match (instr.memory_base(), instr.memory_index(), instr.memory_index_scale()) {
+            (index, Register::None, _) | (Register::None, index, 1) => index,
+            _ => return Value::Unknown,
+        };
+        match self.get(index) {
+            Value::Bounded { first: 0, last } => Value::Indexed { table, entries: (last + 1) as u16 },
+            _ => Value::Unknown,
+        }
+    }
+
     /// How many entries an index register can reach, when a bounds check established that it
     /// counts from 0.
     fn bound_of(&self, index: Register) -> Option<Limit> {
@@ -355,6 +376,14 @@ impl State {
         is_code: &dyn Fn(u64) -> bool,
         pointer_size: u64,
     ) -> Option<Table> {
+        // The byte table an index came from, and its largest byte.
+        let index_table = match self.get(jump.memory_index()) {
+            Value::Indexed { table, entries } => {
+                let bytes = image.bytes_from(table).and_then(|bytes| bytes.get(..usize::from(entries)));
+                bytes.and_then(|bytes| Some((table, table + u64::from(entries), *bytes.iter().max()?)))
+            }
+            _ => None,
+        };
         let value = match jump.op0_kind() {
             OpKind::Register => self.get(jump.op0_register()),
             // `jmp [index*4 + table]`: 32-bit code indexes a table of absolute addresses that
@@ -366,6 +395,7 @@ impl State {
                     && jump.memory_displacement64() != 0 =>
             {
                 let (first, limit) = self.span_of(jump.memory_index());
+                let limit = limit.or(index_table.map(|(_, _, max)| Limit::of(u64::from(max))));
                 Value::Pointer { table: jump.memory_displacement64().wrapping_add_signed(first * pointer_size as i64), limit }
             }
             // `jmp [base + index*8]` dispatches through absolute pointers directly.
@@ -429,9 +459,11 @@ impl State {
         // where no relocation marks their entries nothing else tells their bytes from code. A
         // table read without a bounds check stops at the first word that is no code address,
         // such as the padding after it, and only a function flush against it could look like one.
+        // A byte table that indexes it follows it, and is no code either.
         table.map(|mut table| {
             if image.section_at(table.address).is_some_and(|section| section.executable) {
-                table.inline_end = Some(table.address + table.entry_size * table.entries.len() as u64);
+                let end = table.address + table.entry_size * table.entries.len() as u64;
+                table.inline_end = Some(index_table.filter(|&(start, _, _)| start == end).map_or(end, |(_, end, _)| end));
             }
             table
         })
