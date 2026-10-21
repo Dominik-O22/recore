@@ -26,6 +26,7 @@ use serde::Deserialize;
 
 use crate::binary::Binary;
 
+mod lift;
 mod snapshot;
 mod sse;
 mod windows;
@@ -146,8 +147,8 @@ enum Userop {
     Sse(sse::Op),
     /// Nothing a function can observe: see [`HARMLESS`].
     Harmless,
-    /// What stops a run, as the run says it.
-    Stop(String),
+    /// Any other operation, by name: a run stops at it, and the lifter runs a few.
+    Other(String),
 }
 
 impl Userop {
@@ -155,9 +156,13 @@ impl Userop {
         match sse::Op::parse(name) {
             Some(op) if has_out => Userop::Sse(op),
             _ if HARMLESS.iter().any(|harmless| harmless.eq_ignore_ascii_case(name)) => Userop::Harmless,
-            _ if name.is_empty() => Userop::Stop("an unnamed processor operation is not run".into()),
-            _ => Userop::Stop(format!("the processor operation {name} is not run")),
+            _ => Userop::Other(name.into()),
         }
+    }
+
+    /// Why a run stops at an operation that is neither harmless nor in [`sse`].
+    fn stop(name: &str) -> String {
+        if name.is_empty() { "an unnamed processor operation is not run".into() } else { format!("the processor operation {name} is not run") }
     }
 }
 
@@ -971,7 +976,7 @@ impl<'a> Emulator<'a> {
                         }
                     }
                     Userop::Harmless => {}
-                    Userop::Stop(why) => return Err(why.clone()),
+                    Userop::Other(name) => return Err(Userop::stop(name)),
                 },
                 Code::Unimplemented => return Err(UNIMPLEMENTED.into()),
                 code => {
@@ -1590,7 +1595,7 @@ fn function_entry(binary: &Binary, function: &str) -> Result<u64> {
 fn stops_on(op: &Op) -> Option<String> {
     let widest = op.out.iter().chain(&op.inputs).map(|place| place.size).max().unwrap_or(0);
     match (op.code, &op.userop) {
-        (Code::CallOther, Userop::Stop(why)) => Some(why.clone()),
+        (Code::CallOther, Userop::Other(name)) => Some(Userop::stop(name)),
         // A harmless operation reads none of its operands.
         (Code::CallOther, Userop::Harmless) => None,
         (Code::Unimplemented, _) => Some(UNIMPLEMENTED.into()),
