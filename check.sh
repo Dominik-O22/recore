@@ -10,13 +10,17 @@ cargo build --release -q -p recore -p recore-corpus
 # tests; the loop runs it first, so a leaked name fails before the corpora are scored.
 cargo test --release -q -p recore --test general_naming
 corpora="${RECORE_CORPORA:-$HOME/recore-corpora}"
-for corpus in corpus corpus-arm64 corpus-armhf corpus-armel corpus-pe32 corpus-pe corpus-macho corpus-macho-x86 corpus-8051 corpus-thumb; do
-  in="$corpora/$corpus" out="target/corpus/$corpus"
+# Every corpus in the store that has truth, so a new corpus is scored without a change here.
+for in in "$corpora"/*/; do
+  in="${in%/}" corpus="$(basename "$in")"
   [ -d "$in/truth" ] || continue
+  # The held-out corpora score a change once it is done, and are never part of the loop.
+  [[ "$corpus" == *-holdout ]] && continue
+  out="target/corpus/$corpus"
   ./target/release/recore corpus "$in/bin" "$out/recore" 2>/dev/null
   dirs=("$out/recore")
-  # A raw image has no unwind info to leave out.
-  if [ "$corpus" != corpus-8051 ] && [ "$corpus" != corpus-thumb ]; then
+  # A raw image, which a layout file describes, has no unwind info to leave out.
+  if ! compgen -G "$in/bin/*.toml" >/dev/null; then
     ./target/release/recore corpus "$in/bin" "$out/recore-noframes" --no-frames 2>/dev/null
     dirs+=("$out/recore-noframes")
   fi
