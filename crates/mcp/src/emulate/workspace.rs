@@ -331,3 +331,125 @@ fn write(config: &Config, base: &Path, out: &Path, functions: Vec<Function>) -> 
     std::fs::write(out.join("Cargo.toml"), workspace)?;
     Ok(count)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEXT: u32 = 0x6000_0020;
+    const DATA: u32 = 0xc000_0040;
+
+    /// A PE32 image at 0x400000 with these sections: (rva, size in memory, flags, bytes).
+    fn pe(list: &[(u32, u32, u32, &[u8])]) -> Vec<u8> {
+        let mut image = vec![0u8; 0x200];
+        image[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        image[0x40..0x44].copy_from_slice(b"PE\0\0");
+        image[0x46..0x48].copy_from_slice(&(list.len() as u16).to_le_bytes());
+        image[0x54..0x56].copy_from_slice(&0xe0u16.to_le_bytes());
+        image[0x74..0x78].copy_from_slice(&0x40_0000u32.to_le_bytes());
+        for (i, &(rva, size, flags, bytes)) in list.iter().enumerate() {
+            let header = 0x138 + 40 * i;
+            let raw = image.len() as u32;
+            for (at, value) in [(8, size), (12, rva), (16, bytes.len() as u32), (20, raw), (36, flags)] {
+                image[header + at..header + at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            image.extend_from_slice(bytes);
+        }
+        image
+    }
+
+    #[test]
+    fn roots_come_from_code_addresses_in_data_and_in_immediates() {
+        let text = [
+            &[0x68, 0x20, 0x10, 0x40, 0x00][..],                         // PUSH 0x401020
+            &[0xb9, 0x30, 0x10, 0x40, 0x00],                             // MOV ECX, 0x401030
+            &[0xc7, 0x05, 0x00, 0x20, 0x40, 0x00, 0x40, 0x10, 0x40, 0x00], // MOV [0x402000], 0x401040
+            &[0xc7, 0x44, 0x24, 0x08, 0x50, 0x10, 0x40, 0x00],             // MOV [ESP+8], 0x401050
+            &[0x68, 0x00, 0x20, 0x40, 0x00],                             // PUSH 0x402000, data
+            &[0xc3],
+        ]
+        .concat();
+        // A word into code, one into data, and one outside the image.
+        let data = [0x0040_1060u32, 0x0040_2004, 0x1234_5678].map(u32::to_le_bytes).concat();
+        let image = pe(&[(0x1000, 0x100, TEXT, &text), (0x2000, 0x100, DATA, &data)]);
+        let sections = sections(&image).unwrap();
+        let found: Vec<(u64, u64, bool)> = sections.iter().map(|s| (s.addr, s.size, s.executable)).collect();
+        assert_eq!(found, [(0x40_1000, 0x100, true), (0x40_2000, 0x100, false)]);
+        assert_eq!(code_words(&sections), BTreeSet::from([0x40_1060]));
+        assert_eq!(immediates(&sections), BTreeSet::from([0x40_1020, 0x40_1030, 0x40_1040, 0x40_1050]));
+    }
+
+    /// A function as the lifter writes it, with `body` after its first line.
+    fn lifted(entry: u64, doc: &str, body: &str) -> Function {
+        let text = format!("#[allow(unused)]\n{doc}pub fn f_{entry:x}(c: &mut Cpu) {{\n    let mut pc: u32 = {entry:#x};\n{body}}}\n");
+        Function { entry, doc: doc.to_string(), text }
+    }
+
+    #[test]
+    fn entries_share_a_body_only_when_their_text_is_the_same() {
+        let named = lifted(0x10, "#[doc = \"step\"] ", "    let [mut st0] = c.sts64();\n");
+        let inner = lifted(0x20, "", "    let [mut st0] = c.sts64();\n");
+        // The same code entered with an x87 stack the ABI does not describe keeps its registers
+        // whole, so its text differs.
+        let odd = lifted(0x30, "", "    let [mut st0] = c.sts();\n");
+        let other = lifted(0x40, "", "    r0 = 1;\n");
+        let (odd_text, other_text) = (odd.text.clone(), other.text.clone());
+        let shared = "#[allow(unused)]\npub fn b_10(c: &mut Cpu, start: u32) {\n    let mut pc: u32 = start;\n    let [mut st0] = c.sts64();\n}\n\
+            #[allow(unused)] #[doc = \"step\"] pub fn f_10(c: &mut Cpu) { b_10(c, 0x10) }\n\
+            #[allow(unused)] pub fn f_20(c: &mut Cpu) { b_10(c, 0x20) }\n";
+        assert_eq!(units(vec![named, odd, inner, other]), [(vec![0x10, 0x20], shared.to_string()), (vec![0x30], odd_text), (vec![0x40], other_text)]);
+    }
+
+    #[test]
+    fn writes_a_workspace_of_the_lifted_crates_and_the_binary() {
+        let config: Config = toml::from_str(
+            r#"
+            exe = "game.exe"
+            out = "out/game"
+            crates = 2
+            optimize = ["the-machine"]
+            [runtime]
+            name = "the-machine"
+            path = "crates/machine"
+            [binary]
+            name = "game"
+            deps = [{ name = "host", path = "../shared/host" }]
+            run = "host::run"
+            ports = "host::PORTS"
+            "#,
+        )
+        .unwrap();
+        let out = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")).join(format!("recore-lift-workspace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        // What an earlier lift into more crates left, and the build it kept.
+        for dir in ["c5/src", "game/src", "target/release"] {
+            std::fs::create_dir_all(out.join(dir)).unwrap();
+        }
+        let caller = lifted(0x10, "", "    f_20(c); f_20(c); return;\n");
+        let callee = lifted(0x20, "", "    return;\n");
+        assert_eq!(write(&config, Path::new("/project"), &out, vec![callee, caller]).unwrap(), 2);
+
+        let read = |path: &str| std::fs::read_to_string(out.join(path)).unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["Cargo.toml", "c0", "c1", "game", "target"]);
+        let workspace = read("Cargo.toml");
+        assert!(workspace.contains("members = [\"game\", \"c0\", \"c1\"]"), "{workspace}");
+        assert!(workspace.contains("[profile.release.package.the-machine]\nopt-level = 3\n"), "{workspace}");
+        assert_eq!(read("c0/Cargo.toml"), "[package]\nname = \"c0\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nthe-machine = { path = \"/project/crates/machine\" }\n");
+        assert_eq!(
+            read("game/Cargo.toml"),
+            "[package]\nname = \"game\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nhost = { path = \"/shared/host\" }\nc0 = { path = \"../c0\" }\nc1 = { path = \"../c1\" }\n"
+        );
+        assert_eq!(
+            read("game/src/main.rs"),
+            "fn main() {\n    let mut all = Vec::new();\n    all.extend_from_slice(c0::FUNCTIONS);\n    all.extend_from_slice(c1::FUNCTIONS);\n    all.extend_from_slice(host::PORTS);\n    host::run(all);\n}\n"
+        );
+        // The larger function goes to the first crate, and every call goes through `dispatch`.
+        let (first, second) = (read("c0/src/lib.rs"), read("c1/src/lib.rs"));
+        assert!(first.contains("use the_machine::*;\n") && first.contains("    dispatch(c, 0x20); dispatch(c, 0x20); return;\n"), "{first}");
+        assert!(first.ends_with("pub const FUNCTIONS: &[(u32, Lifted)] = &[\n    (0x10, f_10),\n];\n"), "{first}");
+        assert!(second.ends_with("pub const FUNCTIONS: &[(u32, Lifted)] = &[\n    (0x20, f_20),\n];\n"), "{second}");
+        std::fs::remove_dir_all(&out).unwrap();
+    }
+}
