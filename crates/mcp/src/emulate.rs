@@ -26,6 +26,7 @@ use serde::Deserialize;
 
 use crate::binary::Binary;
 
+mod lift;
 mod snapshot;
 mod windows;
 mod x87;
