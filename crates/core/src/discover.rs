@@ -971,6 +971,15 @@ impl<'a, A: Arch> Explorer<'a, A> {
         }
     }
 
+    /// Whether `addr` begins padding that runs up to an entry point. Code that opens with
+    /// padding and goes on, as MSVC's exception handler funclets do, is not filler.
+    fn pads_to_start(&self, addr: u64) -> bool {
+        let Some(bytes) = self.image.bytes_from(addr) else { return false };
+        let mut decoded = A::decode(self.image, bytes, addr).skip_while(|decoded| decoded.insn.as_ref().is_some_and(A::is_padding));
+        let first = decoded.next().map(|decoded| decoded.addr);
+        first.is_some_and(|first| first != addr && self.starts.contains_key(&first))
+    }
+
     /// Whether the instruction that ends where `addr` begins is padding.
     fn after_padding(&self, addr: u64) -> bool {
         let Some(index) = self.region_index(addr) else { return false };
@@ -983,11 +992,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// that is weak evidence, when code runs on into them: a number that lands inside a
     /// function. Not where padding runs on into one: compilers pad between functions, and the
     /// code before the padding may be data decoded as code, or follow a call that never returns.
-    /// Nor is a number that lands in the padding itself a function.
+    /// Nor is a number that lands in the padding before another entry point a function.
     fn demote_taken_inside_code(&mut self) {
         let weak: Vec<u64> = self.starts.iter().filter(|&(&addr, &origin)| self.evidence(addr, origin) == Evidence::MaybeNumber).map(|(&addr, _)| addr).collect();
         for addr in weak {
-            if self.is_padding_at(addr) {
+            if self.pads_to_start(addr) {
                 self.starts.remove(&addr);
             } else if self.falls_into(addr) && !self.after_padding(addr) {
                 self.demote_run_into(addr);
