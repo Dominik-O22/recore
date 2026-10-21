@@ -29,6 +29,7 @@ use crate::binary::Binary;
 mod lift;
 mod snapshot;
 mod windows;
+pub mod workspace;
 mod x87;
 
 pub use snapshot::Snapshot;
