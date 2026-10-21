@@ -709,11 +709,10 @@ impl<'a, A: Arch> Explorer<'a, A> {
         if let (false, Some(&length)) = (table.bounded, self.known_lengths.get(&table.address)) {
             table.entries.truncate(length);
             table.bounded = true;
-            // What a read without a bound ran on into is no table after all. A table of bytes
-            // keeps the end its reader rounded up to where instructions may begin.
-            if table.entry_size % 2 == 0 {
-                table.inline_end = table.inline_end.map(|_| table.address + table.entry_size * length as u64);
-            }
+            // What a read without a bound ran on into is no table after all. The end stays where
+            // instructions may begin, as the reader rounded it, and short of what the reader saw.
+            let cut = table.address + (table.entry_size * length as u64).next_multiple_of(2);
+            table.inline_end = table.inline_end.map(|end| end.min(cut));
         }
         table
     }
@@ -1005,14 +1004,14 @@ impl<'a, A: Arch> Explorer<'a, A> {
     }
 
     /// Removes the entry points that only the layout speaks for, after a call and padding, that
-    /// code after them jumps back to: a loop head that the compiler aligned after a call that
+    /// their own code jumps back to: a loop head that the compiler aligned after a call that
     /// returns, as MSVC does. A jump across an entry point shows the same, but one back to the
     /// head itself crosses none.
     fn demote_loop_heads(&mut self) {
         let heads: Vec<u64> = self
             .jumps
             .iter()
-            .filter(|&&(from, to)| from > to && self.starts.get(&to) == Some(&Origin::GapAligned))
+            .filter(|&&(from, to)| from > to && self.starts.get(&to) == Some(&Origin::GapAligned) && self.starts.range(to + 1..=from).next().is_none())
             .map(|&(_, to)| to)
             .collect::<BTreeSet<u64>>()
             .into_iter()
