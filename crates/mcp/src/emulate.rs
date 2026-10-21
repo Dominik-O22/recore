@@ -30,6 +30,7 @@ mod lift;
 mod snapshot;
 mod sse;
 mod windows;
+pub mod workspace;
 mod x87;
 
 pub use snapshot::Snapshot;
