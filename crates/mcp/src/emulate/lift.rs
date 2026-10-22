@@ -272,6 +272,273 @@ fn save(fast: bool) -> String {
     if fast { format!("c.save_g({GPR}); c.save_f({FLAGS}); c.save_st64({ST});") } else { format!("c.save({GPR}, {FLAGS}, {ST});") }
 }
 
+/// Marks where a conditional branch starts in a block's text, for `structure` to find the `if`
+/// that a block ends with, before the jump into the next block.
+const COND: char = '\u{4}';
+
+/// A basic block of a body: where it starts, and its statements with a `Jump` mark wherever
+/// control goes on to another block of the body.
+struct Block {
+    addr: u64,
+    text: String,
+}
+
+/// A jump to a block of the same body, marked in a block's text until `structure` decides what it
+/// becomes. A jump that an instruction's own loop of ops makes (`fixed`) is never replaced by the
+/// code it goes to, which would put that code inside the loop.
+#[derive(Clone, Copy)]
+struct Jump {
+    to: u64,
+    fixed: bool,
+}
+
+impl Jump {
+    fn mark(self) -> String {
+        format!("\u{1}{:x}{}", self.to, if self.fixed { '\u{3}' } else { '\u{2}' })
+    }
+
+    /// `text` with each jump marked in it written by `write`.
+    fn replace(text: &str, mut write: impl FnMut(Jump) -> String) -> String {
+        let mut parts = text.split('\u{1}');
+        let mut out = parts.next().unwrap_or("").to_string();
+        for part in parts {
+            let end = part.find(['\u{2}', '\u{3}']).expect("a jump mark ends");
+            let to = u64::from_str_radix(&part[..end], 16).expect("a jump mark's address");
+            out += &write(Jump { to, fixed: part[end..].starts_with('\u{3}') });
+            out += &part[end + 1..];
+        }
+        out
+    }
+
+    fn all(text: &str) -> Vec<Jump> {
+        let mut jumps = Vec::new();
+        Jump::replace(text, |jump| {
+            jumps.push(jump);
+            String::new()
+        });
+        jumps
+    }
+}
+
+/// A body's blocks as nested Rust, without `loop { match pc }`: a block that a back edge reaches
+/// heads a `loop`, which the edge `continue`s; a block that several jumps reach follows a labeled
+/// block, which they `break`; any other block is written where its one jump was. This places
+/// every block in the dominator tree of the blocks (Ramsey, "Beyond Relooper", 2022). The root is
+/// the entry, or a `match` on `pc` over the entries when copies of the body share its text.
+/// Answers `None` for a body whose blocks loop with more than one way in (irreducible), which keeps
+/// the `match`.
+fn structure(blocks: &[Block], entries: &[u64], save: &str) -> Option<String> {
+    let root_text = match entries {
+        [only] => Jump { to: *only, fixed: false }.mark(),
+        _ => {
+            let arms: String = entries.iter().map(|e| format!("{e:#x} => {{ {} }} ", Jump { to: *e, fixed: false }.mark())).collect();
+            format!(" match pc {{ {arms}_ => {{ {save} dispatch(c, pc); return; }} }}")
+        }
+    };
+    let texts: Vec<&str> = blocks.iter().map(|b| b.text.as_str()).chain([root_text.as_str()]).collect();
+    let index: FxHashMap<u64, usize> = blocks.iter().enumerate().map(|(i, b)| (b.addr, i)).collect();
+    let jumps: Vec<Vec<(usize, bool)>> = texts.iter().map(|t| Jump::all(t).into_iter().map(|j| Some((*index.get(&j.to)?, j.fixed))).collect()).collect::<Option<_>>()?;
+    let n = texts.len();
+    let root = n - 1;
+    // Depth first from the root: the blocks in postorder, then each block's place in reverse
+    // postorder, where every edge but a back edge goes forward.
+    let mut post = Vec::new();
+    let mut seen = vec![false; n];
+    let mut stack = vec![(root, 0)];
+    seen[root] = true;
+    while let Some(&(v, i)) = stack.last() {
+        match jumps[v].get(i) {
+            Some(&(w, _)) => {
+                stack.last_mut().expect("a frame").1 += 1;
+                if !seen[w] {
+                    seen[w] = true;
+                    stack.push((w, 0));
+                }
+            }
+            None => {
+                post.push(v);
+                stack.pop();
+            }
+        }
+    }
+    let mut rpo = vec![usize::MAX; n];
+    for (k, &v) in post.iter().rev().enumerate() {
+        rpo[v] = k;
+    }
+    let order: Vec<usize> = post.iter().rev().copied().collect();
+    let mut preds = vec![Vec::new(); n];
+    for &v in &order {
+        for &(w, _) in &jumps[v] {
+            preds[w].push(v);
+        }
+    }
+    // Immediate dominators (Cooper, Harvey and Kennedy).
+    let mut idom = vec![usize::MAX; n];
+    idom[root] = root;
+    let intersect = |idom: &[usize], mut a: usize, mut b: usize| {
+        while a != b {
+            while rpo[a] > rpo[b] {
+                a = idom[a];
+            }
+            while rpo[b] > rpo[a] {
+                b = idom[b];
+            }
+        }
+        a
+    };
+    loop {
+        let mut changed = false;
+        for &v in &order[1..] {
+            let new = preds[v].iter().copied().filter(|&p| idom[p] != usize::MAX).reduce(|a, b| intersect(&idom, a, b));
+            if let Some(d) = new
+                && idom[v] != d
+            {
+                idom[v] = d;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let dominates = |d: usize, mut v: usize| loop {
+        if v == d {
+            return true;
+        }
+        if v == root {
+            return false;
+        }
+        v = idom[v];
+    };
+    let mut header = vec![false; n];
+    let mut ways_in = vec![0; n];
+    let mut fixed_in = vec![false; n];
+    for &v in &order {
+        for &(w, fixed) in &jumps[v] {
+            if rpo[w] <= rpo[v] {
+                if !dominates(w, v) {
+                    return None;
+                }
+                header[w] = true;
+            } else {
+                ways_in[w] += 1;
+                fixed_in[w] |= fixed;
+            }
+        }
+    }
+    let merge: Vec<bool> = (0..n).map(|w| ways_in[w] > 1 || fixed_in[w]).collect();
+    let mut follow = vec![Vec::new(); n];
+    for &v in &order[1..] {
+        if merge[v] {
+            follow[idom[v]].push(v);
+        }
+    }
+    let shape = Shape { texts: &texts, index: &index, addr: blocks.iter().map(|b| b.addr).collect(), rpo, header, merge, follow };
+    Some(shape.tree(root, 1, None))
+}
+
+/// What `structure` found of a body, to write it.
+struct Shape<'a> {
+    texts: &'a [&'a str],
+    index: &'a FxHashMap<u64, usize>,
+    addr: Vec<u64>,
+    rpo: Vec<usize>,
+    header: Vec<bool>,
+    merge: Vec<bool>,
+    /// The blocks written after each block, its children in the dominator tree that several
+    /// jumps reach, in reverse postorder.
+    follow: Vec<Vec<usize>>,
+}
+
+impl Shape<'_> {
+    /// Block `x` and all it dominates, at indent `depth`, where control that runs off the end goes
+    /// on to block `next`.
+    fn tree(&self, x: usize, depth: usize, next: Option<usize>) -> String {
+        let pad = "    ".repeat(depth);
+        if self.header[x] {
+            format!("{pad}'l{:x}: loop {{\n{}{pad}}}\n", self.addr[x], self.within(x, &self.follow[x], depth + 1, Some(x)))
+        } else {
+            self.within(x, &self.follow[x], depth, next)
+        }
+    }
+
+    /// Block `x` inside the labeled blocks that the blocks of `after` follow, then those blocks.
+    fn within(&self, x: usize, after: &[usize], depth: usize, next: Option<usize>) -> String {
+        let pad = "    ".repeat(depth);
+        if let Some((&last, inner)) = after.split_last() {
+            return format!("{pad}'b{:x}: {{\n{}{pad}}}\n{}", self.addr[last], self.within(x, inner, depth + 1, Some(last)), self.tree(last, depth, next));
+        }
+        // A jump as a statement, nothing where control runs on to its target anyway, or the code
+        // of the one block that only it reaches.
+        let jump = |jump: Jump, depth: usize, next: Option<usize>| {
+            let w = self.index[&jump.to];
+            let back = self.rpo[w] <= self.rpo[x];
+            if next == Some(w) && (back || self.merge[w]) {
+                Err(String::new())
+            } else if back {
+                Err(format!("continue 'l{:x};", jump.to))
+            } else if self.merge[w] {
+                Err(format!("break 'b{:x};", jump.to))
+            } else {
+                Ok(self.tree(w, depth, next))
+            }
+        };
+        let line = |text: &str| {
+            let text = Jump::replace(text, |to| jump(to, depth + 1, None).map_or_else(|statement| statement, |tree| format!("\n{tree}{pad}")));
+            let text = text.replace(COND, "");
+            if text.trim().is_empty() { String::new() } else { format!("{pad}{}\n", text.trim()) }
+        };
+        let arm = |to: Jump, depth: usize| match jump(to, depth, next) {
+            Ok(tree) => tree,
+            Err(statement) if statement.is_empty() => String::new(),
+            Err(statement) => format!("{}{statement}\n", "    ".repeat(depth)),
+        };
+        let (rest, tail) = split_tail(self.texts[x]);
+        let Some(fall) = tail else { return line(rest) };
+        // A block that ends with a conditional branch and the fall past it, as `if` and `else`.
+        if let Some(at) = rest.rfind(COND)
+            && let Some((cond, taken)) = braced(rest[at + COND.len_utf8()..].trim_end())
+            && !taken.fixed
+            && let Some(test) = cond.strip_prefix("if ").and_then(|c| c.strip_suffix(" != 0"))
+        {
+            let (yes, no) = (arm(taken, depth + 1), arm(fall, depth + 1));
+            let branch = match (yes.is_empty(), no.is_empty()) {
+                (false, false) => format!("{pad}if {test} != 0 {{\n{yes}{pad}}} else {{\n{no}{pad}}}\n"),
+                (false, true) => format!("{pad}if {test} != 0 {{\n{yes}{pad}}}\n"),
+                (true, false) => format!("{pad}if {test} == 0 {{\n{no}{pad}}}\n"),
+                (true, true) => format!("{pad}{test};\n"),
+            };
+            return line(&rest[..at]) + &branch;
+        }
+        line(rest) + &arm(fall, depth)
+    }
+}
+
+/// A block's text without the jump it ends with, and that jump: the fall into the next block, or
+/// an unconditional branch.
+fn split_tail(text: &str) -> (&str, Option<Jump>) {
+    let end = text.trim_end();
+    if let Some((before, jump)) = braced(end) {
+        if before.is_empty() || before.ends_with(';') || before.ends_with('}') {
+            return (before, Some(jump));
+        }
+        return (text, None);
+    }
+    match (end.ends_with('\u{2}'), end.rfind('\u{1}')) {
+        (true, Some(at)) => (&end[..at], Jump::all(&end[at..]).first().copied()),
+        _ => (text, None),
+    }
+}
+
+/// The text before a `{ <jump> }` that `text` ends with, and the jump.
+fn braced(text: &str) -> Option<(&str, Jump)> {
+    let inside = text.strip_suffix('}')?.trim_end();
+    let at = inside.ends_with(['\u{2}', '\u{3}']).then(|| inside.rfind('\u{1}'))??;
+    let open = inside[..at].trim_end().strip_suffix('{')?;
+    let [jump] = Jump::all(&inside[at..])[..] else { return None };
+    Some((open.trim_end(), jump))
+}
+
 
 /// The instructions reachable from `entry` by falling through and branching, for a call target
 /// the analysis did not make a function.
@@ -334,6 +601,11 @@ struct Values<'a> {
     used: &'a RefCell<BTreeSet<(u64, usize, bool)>>,
     /// The register bytes outside the locals that anything reads: lifted code or the runtime.
     read: &'a BTreeSet<u64>,
+    /// The targets of the body's jump tables.
+    tables: &'a BTreeSet<u64>,
+    /// Whether the instruction branches between its own ops, inside a loop of its own, where a
+    /// jump in the body cannot be replaced by the code it goes to (`Jump`).
+    inner: bool,
 }
 
 impl Values<'_> {
@@ -611,7 +883,7 @@ impl Values<'_> {
     fn op(&self, op: &Op, here: usize, local: &BTreeSet<u64>, calls: &CallCtx, after: Live) -> String {
         let fast = self.fast;
         let r = |i: usize| self.read(op.inputs[i]);
-        let goto = |target: u64| if local.contains(&target) { format!("{{ pc = {target:#x}; continue 'f; }}") } else { format!("{{ {} dispatch(c, {target:#x}); return; }}", save(fast)) };
+        let goto = |target: u64| if local.contains(&target) { format!("{{ {} }}", Jump { to: target, fixed: self.inner }.mark()) } else { format!("{{ {} dispatch(c, {target:#x}); return; }}", save(fast)) };
         match op.code {
             Code::Branch | Code::CBranch => {
                 let place = op.inputs[0];
@@ -621,7 +893,7 @@ impl Values<'_> {
                 } else {
                     goto(place.offset)
                 };
-                if op.code == Code::CBranch { format!("if {} != 0 {target}", r(1)) } else { target }
+                if op.code == Code::CBranch { format!("{COND}if {} != 0 {target}", r(1)) } else { target }
             }
             Code::Call => {
                 let target = op.inputs[0].offset;
@@ -633,7 +905,12 @@ impl Values<'_> {
                 let (save, load) = calls.around(None, after);
                 format!("{{ let t = {} as u32; {save} dispatch(c, t); {load} }}", typed(r(0), op.inputs[0].size))
             }
-            Code::BranchInd => format!("{{ pc = {} as u32; continue 'f; }}", typed(r(0), op.inputs[0].size)),
+            // A jump through a table goes to one of the body's table targets; any other address is
+            // code outside the body.
+            Code::BranchInd => {
+                let arms: String = self.tables.iter().filter(|t| local.contains(t)).map(|&to| format!("{to:#x} => {{ {} }} ", Jump { to, fixed: self.inner }.mark())).collect();
+                format!("{{ let t = {} as u32; match t {{ {arms}_ => {{ {} dispatch(c, t); return; }} }} }}", typed(r(0), op.inputs[0].size), save(fast))
+            }
             Code::Return => format!("{} return;", calls.leaving(after)),
             Code::Load => {
                 let out = op.out.expect("load out");
@@ -1693,11 +1970,11 @@ pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program>
     // every body extended, to compare.
     let (_, control, _) = binary.register("FPUControlWord")?;
     let exact_everywhere = std::env::var_os("LIFT_X87_EXACT").is_some();
-    // With every entry known, each body is emitted with an arm of its `match` at each place
-    // control can enter it from outside the straight line: an entry, a branch target, a jump
-    // table's target, and the instruction after one that does not fall through. The rest of a
-    // basic block follows in the same arm, without going around the loop. Every copy of a body
-    // gets the same arms, so the workspace writes them once.
+    // With every entry known, each body is split into blocks at each place control can enter it
+    // from outside the straight line: an entry, a branch target, a jump table's target, and the
+    // instruction after one that does not fall through. `structure` nests the blocks as `if`,
+    // `loop` and labeled blocks; a body it cannot nest keeps an arm of a `match pc` per block.
+    // Every copy of a body gets the same blocks, so the workspace writes them once.
     for (b, ((entry, insns, tables), group)) in bodies.into_iter().zip(body_group).enumerate() {
         let local: BTreeSet<u64> = insns.iter().map(|i| i.addr).collect();
         let mut leaders: BTreeSet<u64> = done.iter().copied().filter(|a| local.contains(a)).collect();
@@ -1718,19 +1995,20 @@ pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program>
         });
         let fast = !exact_everywhere && !loads_control;
         let calls = CallCtx { reads: &read_of, kind: kind_here, returned: returned[group], touches_x87: touches_x87[group], fast, names: &names };
-        let mut body = String::new();
+        let mut blocks: Vec<Block> = Vec::new();
         let used: RefCell<BTreeSet<(u64, usize, bool)>> = RefCell::new(BTreeSet::new());
         let mut bad_register = None;
-        // Whether an arm is open and the last instruction falls into the next.
+        // Whether a block is open and the last instruction falls into the next.
         let mut open = false;
         for (position, insn) in insns.iter().enumerate() {
             let next = insn.addr + insn.len;
             if !open || leaders.contains(&insn.addr) {
-                if open {
-                    writeln!(body, " pc = {:#x}; }}", insn.addr)?;
+                if let Some(last) = blocks.last_mut().filter(|_| open) {
+                    write!(last.text, " {}", Jump { to: insn.addr, fixed: false }.mark())?;
                 }
-                write!(body, "            {:#x} => {{", insn.addr)?;
+                blocks.push(Block { addr: insn.addr, text: String::new() });
             }
+            let body = &mut blocks.last_mut().expect("a block").text;
             let falls = if let Some((name, tail)) = imports.get(&insn.addr) {
                 // Host code reads and writes only the general registers and memory.
                 if *tail {
@@ -1771,7 +2049,7 @@ pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program>
                     let none = BTreeSet::new();
                     let dead = if inner { vec![false; ops.len()] } else { walk_ops(ops, live_out[position], &read_of, kind_here).1 };
                     let folded = if inner { none } else { folds(ops, &dead, &uniques) };
-                    let values = Values { uniques: &uniques, fast, folds: &folded, pending: RefCell::new(BTreeMap::new()), used: &used, read: &read };
+                    let values = Values { uniques: &uniques, fast, folds: &folded, pending: RefCell::new(BTreeMap::new()), used: &used, read: &read, tables: &tables, inner };
                     if inner {
                         write!(body, " {{ let mut i: i64 = 0; 'ops: loop {{ match i {{")?;
                         for (here, op) in ops.iter().enumerate() {
@@ -1794,10 +2072,11 @@ pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program>
             if falls && insns.get(position + 1).map(|i| i.addr) == Some(next) {
                 open = true;
             } else {
-                if falls {
-                    write!(body, " pc = {next:#x};")?;
+                if falls && local.contains(&next) {
+                    write!(body, " {}", Jump { to: next, fixed: false }.mark())?;
+                } else if falls {
+                    write!(body, " {} dispatch(c, {next:#x}); return;", save(fast))?;
                 }
-                writeln!(body, " }}")?;
                 open = false;
             }
         }
@@ -1808,9 +2087,22 @@ pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program>
             continue;
         }
         let declared: String = used.borrow().iter().map(|&(o, size, float)| if float { format!(" let mut x{o:x}: f64 = 0.0;") } else { format!(" let mut u{o:x}_{size}: {} = 0;", ty(size)) }).collect();
-        writeln!(code, "#[allow(unused, unused_mut, unused_assignments, unreachable_code, unused_labels, unused_parens)]\n{}pub fn f_{entry:x}(c: &mut Cpu) {{\n    let mut pc: u32 = {entry:#x};{declared}\n    let {} = c.gpr(); let mut {FLAGS} = c.flags(); let {} = c.{}();\n    'f: loop {{\n        match pc {{", doc(entry), mutable(GPR), mutable(ST), if fast { "sts64" } else { "sts" })?;
-        code.push_str(&body);
-        writeln!(code, "            _ => {{ {} dispatch(c, pc); return; }}\n        }}\n    }}\n}}", save(fast))?;
+        // The entries of the body: copies of one body share its text, so each starts at `pc`.
+        let entries: Vec<u64> = done.iter().copied().filter(|a| local.contains(a)).collect();
+        let start = if entries.len() > 1 { format!("\n    let mut pc: u32 = {entry:#x};") } else { String::new() };
+        let structured = if entries.is_empty() { None } else { structure(&blocks, &entries, &save(fast)) };
+        writeln!(code, "#[allow(unused, unused_mut, unused_assignments, unreachable_code, unused_labels, unused_parens)]\n{}pub fn f_{entry:x}(c: &mut Cpu) {{", doc(entry))?;
+        let registers = format!("{declared}\n    let {} = c.gpr(); let mut {FLAGS} = c.flags(); let {} = c.{}();", mutable(GPR), mutable(ST), if fast { "sts64" } else { "sts" });
+        match structured {
+            Some(nested) => writeln!(code, "{start}{registers}\n{nested}}}")?,
+            None => {
+                writeln!(code, "    let mut pc: u32 = {entry:#x};{registers}\n    'f: loop {{\n        match pc {{")?;
+                for block in &blocks {
+                    writeln!(code, "            {:#x} => {{{} }}", block.addr, Jump::replace(&block.text, |jump| format!("pc = {:#x}; continue 'f;", jump.to)).replace(COND, ""))?;
+                }
+                writeln!(code, "            _ => {{ {} dispatch(c, pc); return; }}\n        }}\n    }}\n}}", save(fast))?;
+            }
+        }
     }
     let functions = starts.iter().enumerate().map(|(i, &(at, entry))| Function { entry, doc: doc(entry), text: code[at..starts.get(i + 1).map_or(code.len(), |next| next.0)].to_string() }).collect();
     Ok(Program { functions, report: format!("lifted {} functions, {insn_count} instructions; {} failed\n{}", done.len(), failed.len(), failed.join("\n")) })
