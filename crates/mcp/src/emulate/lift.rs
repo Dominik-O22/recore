@@ -4,7 +4,7 @@
 //! writes it out as a cargo workspace.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
 };
 
@@ -322,8 +322,10 @@ impl Jump {
 
 /// A body's blocks as nested Rust, without `loop { match pc }`: a block that a back edge reaches
 /// heads a `loop`, which the edge `continue`s; a block that several jumps reach follows a labeled
-/// block, which they `break`; any other block is written where its one jump was. This places
-/// every block in the dominator tree of the blocks (Ramsey, "Beyond Relooper", 2022). The root is
+/// block, which they `break`; any other block is written where its one jump was, or after the
+/// `if` that holds the jump when its arm is the heavier one, or after the loop it leaves. This
+/// places every block in the dominator tree of the blocks (Ramsey, "Beyond Relooper", 2022), and
+/// keeps chains of branches and runs of loops flat instead of nesting each in the last. The root is
 /// the entry, or a `match` on `pc` over the entries when copies of the body share its text.
 /// Answers `None` for a body whose blocks loop with more than one way in (irreducible), which keeps
 /// the `match`.
@@ -427,13 +429,64 @@ fn structure(blocks: &[Block], entries: &[u64], save: &str) -> Option<String> {
         }
     }
     let merge: Vec<bool> = (0..n).map(|w| ways_in[w] > 1 || fixed_in[w]).collect();
+    let mut size = vec![1; n];
+    for &v in order[1..].iter().rev() {
+        size[idom[v]] += size[v];
+    }
+    // Each loop's heaviest exit, written after the loop instead of inside it: a block outside the
+    // loop that only the loop's blocks jump to. Outer loops choose first.
+    let mut after = vec![None; n];
+    let mut exit_of = vec![None; n];
+    for &h in order.iter().filter(|&&h| header[h]) {
+        let mut body = vec![false; n];
+        body[h] = true;
+        let mut work: Vec<usize> = preds[h].iter().copied().filter(|&p| rpo[p] >= rpo[h]).collect();
+        while let Some(v) = work.pop() {
+            if !body[v] {
+                body[v] = true;
+                work.extend(&preds[v]);
+            }
+        }
+        let leaves_only_from_body = |e: usize| {
+            let mut ways = preds[e].iter().filter(|&&p| rpo[p] < rpo[e]).peekable();
+            ways.peek().is_some() && ways.all(|&p| body[p])
+        };
+        // Code moved after the loop leaves the labeled blocks inside it, so each of its jumps out
+        // must go to a block whose label, or loop, holds the whole loop.
+        let labels_hold_loop = |e: usize| {
+            order.iter().filter(|&&v| dominates(e, v)).all(|&v| {
+                jumps[v].iter().all(|&(t, _)| {
+                    let holder = exit_of[t].unwrap_or(idom[t]);
+                    rpo[t] <= rpo[v] || dominates(e, t) || (holder != h && dominates(holder, h))
+                })
+            })
+        };
+        let mut exits: Vec<usize> = order.iter().copied().filter(|&e| !body[e] && exit_of[e].is_none() && leaves_only_from_body(e)).collect();
+        exits.sort_by_key(|&e| (std::cmp::Reverse(size[e]), rpo[e]));
+        if let Some(e) = exits.into_iter().find(|&e| labels_hold_loop(e)) {
+            after[h] = Some(e);
+            exit_of[e] = Some(h);
+        }
+    }
     let mut follow = vec![Vec::new(); n];
     for &v in &order[1..] {
-        if merge[v] {
+        if merge[v] && exit_of[v].is_none() {
             follow[idom[v]].push(v);
         }
     }
-    let shape = Shape { texts: &texts, index: &index, addr: blocks.iter().map(|b| b.addr).collect(), rpo, header, merge, follow };
+    let shape = Shape {
+        texts: &texts,
+        index: &index,
+        addr: blocks.iter().map(|b| b.addr).collect(),
+        rpo,
+        header,
+        merge,
+        follow,
+        size,
+        after,
+        exit_of,
+        ran_on: (0..n).map(|_| Cell::new(0)).collect(),
+    };
     Some(shape.tree(root, 1, None))
 }
 
@@ -448,6 +501,23 @@ struct Shape<'a> {
     /// The blocks written after each block, its children in the dominator tree that several
     /// jumps reach, in reverse postorder.
     follow: Vec<Vec<usize>>,
+    /// The blocks each block dominates, itself included: the weight that chooses which arm of a
+    /// branch is nested and which goes on after the `if`.
+    size: Vec<usize>,
+    /// The block written after each loop, and for that block the loop, which jumps to it `break`.
+    after: Vec<Option<usize>>,
+    exit_of: Vec<Option<usize>>,
+    /// How often a jump to each block was left out because control runs on to it anyway, which
+    /// tells whether an arm runs off its end.
+    ran_on: Vec<Cell<u32>>,
+}
+
+/// A jump as written: nothing where control runs on to its target anyway, a statement, or the
+/// code of the one block that only it reaches.
+enum Arm {
+    On(usize),
+    Exit(String),
+    Tree(usize),
 }
 
 impl Shape<'_> {
@@ -456,7 +526,9 @@ impl Shape<'_> {
     fn tree(&self, x: usize, depth: usize, next: Option<usize>) -> String {
         let pad = "    ".repeat(depth);
         if self.header[x] {
-            format!("{pad}'l{:x}: loop {{\n{}{pad}}}\n", self.addr[x], self.within(x, &self.follow[x], depth + 1, Some(x)))
+            let body = self.within(x, &self.follow[x], depth + 1, Some(x));
+            let after = self.after[x].map_or_else(String::new, |exit| self.tree(exit, depth, next));
+            format!("{pad}'l{:x}: loop {{\n{body}{pad}}}\n{after}", self.addr[x])
         } else {
             self.within(x, &self.follow[x], depth, next)
         }
@@ -468,50 +540,126 @@ impl Shape<'_> {
         if let Some((&last, inner)) = after.split_last() {
             return format!("{pad}'b{:x}: {{\n{}{pad}}}\n{}", self.addr[last], self.within(x, inner, depth + 1, Some(last)), self.tree(last, depth, next));
         }
-        // A jump as a statement, nothing where control runs on to its target anyway, or the code
-        // of the one block that only it reaches.
-        let jump = |jump: Jump, depth: usize, next: Option<usize>| {
-            let w = self.index[&jump.to];
-            let back = self.rpo[w] <= self.rpo[x];
-            if next == Some(w) && (back || self.merge[w]) {
-                Err(String::new())
-            } else if back {
-                Err(format!("continue 'l{:x};", jump.to))
-            } else if self.merge[w] {
-                Err(format!("break 'b{:x};", jump.to))
-            } else {
-                Ok(self.tree(w, depth, next))
+        self.block(x, self.texts[x], depth, next)
+    }
+
+    /// A jump from block `x`, where control that runs off the end goes on to block `next`.
+    fn arm(&self, x: usize, jump: Jump, next: Option<usize>) -> Arm {
+        let w = self.index[&jump.to];
+        let back = self.rpo[w] <= self.rpo[x];
+        if next == Some(w) && (back || self.merge[w]) {
+            Arm::On(w)
+        } else if back {
+            Arm::Exit(format!("continue 'l{:x};", jump.to))
+        } else if let Some(h) = self.exit_of[w] {
+            Arm::Exit(format!("break 'l{:x};", self.addr[h]))
+        } else if self.merge[w] {
+            Arm::Exit(format!("break 'b{:x};", jump.to))
+        } else {
+            Arm::Tree(w)
+        }
+    }
+
+    fn write(&self, arm: Arm, depth: usize, next: Option<usize>) -> String {
+        match arm {
+            Arm::On(w) => {
+                self.ran_on[w].set(self.ran_on[w].get() + 1);
+                String::new()
             }
-        };
+            Arm::Exit(statement) => format!("{}{statement}\n", "    ".repeat(depth)),
+            Arm::Tree(w) => self.tree(w, depth, next),
+        }
+    }
+
+    /// The blocks that the jumps in `text` bring along as code.
+    fn weight(&self, x: usize, text: &str) -> usize {
+        Jump::all(text).into_iter().map(|jump| if let Arm::Tree(w) = self.arm(x, jump, None) { self.size[w] } else { 0 }).sum()
+    }
+
+    /// The statements `text` of block `x`, all of them or those after a branch, at indent `depth`.
+    /// Of a branch to code only it reaches, the arm with fewer blocks is nested in the `if` and
+    /// the other goes on after it, so a chain of branches stays flat.
+    fn block(&self, x: usize, text: &str, depth: usize, next: Option<usize>) -> String {
+        let pad = "    ".repeat(depth);
         let line = |text: &str| {
-            let text = Jump::replace(text, |to| jump(to, depth + 1, None).map_or_else(|statement| statement, |tree| format!("\n{tree}{pad}")));
+            let text = Jump::replace(text, |to| match self.arm(x, to, None) {
+                Arm::Tree(w) => format!("\n{}{pad}", self.tree(w, depth + 1, None)),
+                Arm::Exit(statement) => statement,
+                Arm::On(_) => unreachable!("a jump runs on only to a next block"),
+            });
             let text = text.replace(COND, "");
             if text.trim().is_empty() { String::new() } else { format!("{pad}{}\n", text.trim()) }
         };
-        let arm = |to: Jump, depth: usize| match jump(to, depth, next) {
-            Ok(tree) => tree,
-            Err(statement) if statement.is_empty() => String::new(),
-            Err(statement) => format!("{}{statement}\n", "    ".repeat(depth)),
-        };
-        let (rest, tail) = split_tail(self.texts[x]);
+        for (at, _) in text.match_indices(COND) {
+            let Some((test, taken, len)) = cond_at(&text[at..]) else { continue };
+            let Arm::Tree(w) = self.arm(x, taken, None) else { continue };
+            let rest = &text[at + len..];
+            if matches!(split_tail(rest), (before, Some(_)) if before.trim().is_empty()) {
+                break;
+            }
+            if text[..at].matches('{').count() != text[..at].matches('}').count() {
+                continue;
+            }
+            let head = line(&text[..at]);
+            return if self.size[w] > self.weight(x, rest) {
+                format!("{head}{pad}if {test} == 0 {{\n{}{pad}}}\n{}", self.block(x, rest, depth + 1, None), self.tree(w, depth, next))
+            } else {
+                format!("{head}{pad}if {test} != 0 {{\n{}{pad}}}\n{}", self.tree(w, depth + 1, None), self.block(x, rest, depth, next))
+            };
+        }
+        let (rest, tail) = split_tail(text);
         let Some(fall) = tail else { return line(rest) };
-        // A block that ends with a conditional branch and the fall past it, as `if` and `else`.
         if let Some(at) = rest.rfind(COND)
             && let Some((cond, taken)) = braced(rest[at + COND.len_utf8()..].trim_end())
             && !taken.fixed
             && let Some(test) = cond.strip_prefix("if ").and_then(|c| c.strip_suffix(" != 0"))
         {
-            let (yes, no) = (arm(taken, depth + 1), arm(fall, depth + 1));
-            let branch = match (yes.is_empty(), no.is_empty()) {
+            return line(&rest[..at]) + &self.branch(x, test, taken, fall, depth, next);
+        }
+        line(rest) + &self.write(self.arm(x, fall, next), depth, next)
+    }
+
+    /// The branch that block `x` ends with, on `test`, and the fall past it. The arm with fewer
+    /// blocks is nested and the other goes on after the `if`, or in an `else` when the nested arm
+    /// also runs on to `next`.
+    fn branch(&self, x: usize, test: &str, taken: Jump, fall: Jump, depth: usize, next: Option<usize>) -> String {
+        let pad = "    ".repeat(depth);
+        let (yes, no) = (self.arm(x, taken, next), self.arm(x, fall, next));
+        let weight = |arm: &Arm| if let Arm::Tree(w) = arm { self.size[*w] } else { 0 };
+        if weight(&yes) == 0 && weight(&no) == 0 {
+            let (yes, no) = (self.write(yes, depth + 1, next), self.write(no, depth + 1, next));
+            return match (yes.is_empty(), no.is_empty()) {
                 (false, false) => format!("{pad}if {test} != 0 {{\n{yes}{pad}}} else {{\n{no}{pad}}}\n"),
                 (false, true) => format!("{pad}if {test} != 0 {{\n{yes}{pad}}}\n"),
                 (true, false) => format!("{pad}if {test} == 0 {{\n{no}{pad}}}\n"),
                 (true, true) => format!("{pad}{test};\n"),
             };
-            return line(&rest[..at]) + &branch;
         }
-        line(rest) + &arm(fall, depth)
+        let (nested, jump, other, sign) = if weight(&yes) <= weight(&no) { (yes, taken, no, "!=") } else { (no, fall, yes, "==") };
+        let before = next.map(|t| self.ran_on[t].get());
+        let nested = match nested {
+            Arm::On(_) => self.write(self.arm(x, jump, None), depth + 1, None),
+            arm => self.write(arm, depth + 1, next),
+        };
+        if next.zip(before).is_some_and(|(t, count)| self.ran_on[t].get() != count) {
+            format!("{pad}if {test} {sign} 0 {{\n{nested}{pad}}} else {{\n{}{pad}}}\n", self.write(other, depth + 1, next))
+        } else {
+            format!("{pad}if {test} {sign} 0 {{\n{nested}{pad}}}\n{}", self.write(other, depth, next))
+        }
     }
+}
+
+/// The test of the conditional branch that `text` starts with, `COND` then `if <test> != 0 {
+/// <jump> }`, its jump, and its length.
+fn cond_at(text: &str) -> Option<(&str, Jump, usize)> {
+    let branch = text.strip_prefix(COND)?.strip_prefix("if ")?;
+    let open = branch.find(" != 0 { \u{1}")?;
+    let test = &branch[..open];
+    let mark = &branch[open + " != 0 { ".len()..];
+    let end = mark.find(['\u{2}', '\u{3}'])? + 1;
+    let [jump] = Jump::all(&mark[..end])[..] else { return None };
+    let after = mark[end..].strip_prefix(" }")?;
+    (!test.contains(['\u{1}', COND])).then_some((test, jump, text.len() - after.len()))
 }
 
 /// A block's text without the jump it ends with, and that jump: the fall into the next block, or
