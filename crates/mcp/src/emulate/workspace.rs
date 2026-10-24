@@ -147,8 +147,11 @@ fn sections(data: &[u8]) -> Result<Vec<Section<'_>>> {
 }
 
 /// The roots to lift: the analysis's functions, then the code addresses found in data and taken
-/// by instructions that are not functions, each in address order. The lifter takes roots from
-/// the end, so the order fixes the order of the output.
+/// by instructions that are not functions, each in address order. A code address in data is any
+/// aligned word of a non-executable section whose value lands in an executable one, as the table
+/// of handlers a C runtime helper jumps through, less those that land inside an instruction of a
+/// function the analysis found. The lifter takes roots from the end, so the order fixes the order
+/// of the output.
 fn roots(cache: &mut Cache, exe: &Path) -> Result<Vec<u64>> {
     let data = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let functions: BTreeSet<u64> = cache.get(exe)?.program.functions().map(|f| f.addr).collect();
@@ -163,6 +166,19 @@ fn roots(cache: &mut Cache, exe: &Path) -> Result<Vec<u64>> {
             extra.insert(v);
         }
     }
+    // Compiled code never jumps into the middle of an instruction, so a value that lands inside a
+    // function's body on no instruction the analysis decoded there is not a code address, most
+    // often a short string: "SOF\0" reads as 0x464f53.
+    let program = &cache.get(exe)?.program;
+    let mut starts: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+    extra.retain(|&v| {
+        let owners = program.owners(v);
+        owners.is_empty()
+            || owners.iter().any(|&owner| {
+                let instructions = starts.entry(owner).or_insert_with(|| recore::cfg::cfg(&program.image, &program.analysis, &program.body(owner)).instructions);
+                instructions.binary_search(&v).is_ok()
+            })
+    });
     Ok(functions.iter().copied().chain(extra.into_iter().filter(|v| !functions.contains(v))).collect())
 }
 
