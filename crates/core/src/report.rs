@@ -202,7 +202,7 @@ pub struct Field {
 /// A class as the image describes it: a C++ class by its vtable and type information, or by
 /// the vtable its constructor stores where it has none, or an Objective-C class or category by
 /// its metadata.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Class {
     /// An Objective-C category is named `Class(Category)`, and a class known only by its vtable
     /// after the vtable's address, `vtable_402000`.
