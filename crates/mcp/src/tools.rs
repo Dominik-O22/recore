@@ -11,7 +11,7 @@ use recore::program::{Pattern, Program, matches, parse_addr};
 use recore::FxHashMap;
 use recore::arch::FieldUse;
 use recore::diff::{Change, Evidence, Pair};
-use recore::report::CallTarget;
+use recore::report::{CallTarget, VirtualCall};
 use recore::structs::Refusal;
 use recore_decomp::ObjectReport;
 use recore_decomp::isolate::Status;
@@ -64,7 +64,7 @@ pub fn list() -> Value {
         ),
         tool(
             "function",
-            "One function: its extent, callers, the calls it makes (imports by name), and the strings and globals it refers to. Give `addr` or `name`.",
+            "One function: its extent, callers, the calls it makes (imports by name, and calls through a vtable with the functions they reach where the object's vtable is known), and the strings and globals it refers to. Give `addr` or `name`.",
             json!({
                 "addr": addr("Any address inside the function"),
                 "name": { "type": "string", "description": "The function's name, or a part of it that only one function has." },
@@ -73,7 +73,7 @@ pub fn list() -> Value {
         ),
         tool(
             "xrefs",
-            "What refers to an address, or with `offset` what uses a field of a structure. For an address: call sites if it is a function or an import slot, and the instructions that read or write it or take its address, with the function each is in. If the address holds pointers, such as a vtable or a table of strings, lists what each entry points to.",
+            "What refers to an address, or with `offset` what uses a field of a structure. For an address: call sites if it is a function or an import slot, calls through a vtable that may reach it, and the instructions that read or write it or take its address, with the function each is in. If the address holds pointers, such as a vtable or a table of strings, lists what each entry points to.",
             json!({
                 "addr": addr("The function entry or data address"),
                 "offset": addr("Instead of `addr`: the offset of a field in a structure. Lists the functions that read or write memory at that offset from a register, which is how to find who sets or uses a field"),
@@ -957,9 +957,11 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
     writeln!(out, "called by ({}{how}): {}", callers.len(), labels(binary, &callers, &format!("`xrefs` of {entry:#x} lists all")))?;
 
     writeln!(out, "calls:")?;
-    for site in &graph.unresolved_calls {
+    let through_vtables: Vec<&VirtualCall> = body.iter().flat_map(|&(start, end)| binary.program.virtual_calls_in(start, end)).collect();
+    for site in graph.unresolved_calls.iter().filter(|&&site| !through_vtables.iter().any(|call| call.at == site)) {
         writeln!(out, "  {site:#x} calls through a register or pointer the analysis could not resolve")?;
     }
+    let mut calls: Vec<(u64, String)> = through_vtables.iter().map(|call| (call.at, format!("{} {}", if call.tail { "tail-calls" } else { "calls" }, binary.program.virtual_call_label(call)))).collect();
     for call in body.iter().flat_map(|&(start, end)| binary.program.calls_in(start, end)) {
         let target = match call.target {
             CallTarget::Function(target) => binary.program.label(target),
@@ -970,7 +972,11 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
             Some(send) => format!("{}{}", send.label(), send.implementation.map_or_else(String::new, |method| format!(", implemented only by {}", binary.program.label(method)))),
             None => target,
         };
-        writeln!(out, "  {:#x} {} {target}", call.at, if call.tail { "tail-calls" } else { "calls" })?;
+        calls.push((call.at, format!("{} {target}", if call.tail { "tail-calls" } else { "calls" })));
+    }
+    calls.sort();
+    for (at, call) in calls {
+        writeln!(out, "  {at:#x} {call}")?;
     }
     if let Some(next) = binary.program.function(entry).and_then(|function| function.runs_on) {
         writeln!(out, "  runs on into {}, which returns for both", binary.program.label(next))?;
@@ -1052,6 +1058,14 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
     lines.extend(program.calls_to(addr).map(|call| format!("{:#x} in {} {} it", call.at, program.site_label(call.at), if call.tail { "tail-calls" } else { "calls" })));
     lines.extend(program.functions().filter(|function| function.runs_on == Some(addr)).map(|function| format!("{} runs on into it", program.label(function.addr))));
     lines.extend(program.sends_to(addr).map(|send| format!("{:#x} in {} sends {}, which only it implements", send.at, program.site_label(send.at), send.label())));
+    lines.extend(program.virtual_calls_to(addr).map(|call| {
+        let how = if call.targets.len() > 1 { "may call it" } else if call.tail { "tail-calls it" } else { "calls it" };
+        let vtables = match call.vtables.as_slice() {
+            [vtable] => format!("vtable {vtable:#x}"),
+            vtables => format!("one of {} vtables", vtables.len()),
+        };
+        format!("{:#x} in {} {how} through slot {} of {vtables}", call.at, program.site_label(call.at), call.slot)
+    }));
     lines.extend(program.refs_to(addr).map(|reference| format!("{:#x} in {} {}", reference.from, program.site_label(reference.from), if reference.access { "reads or writes it" } else { "takes its address" })));
     let count = lines.len();
     let mut out = String::new();

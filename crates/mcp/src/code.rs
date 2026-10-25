@@ -49,8 +49,10 @@ fn notes(binary: &Binary, graph: Option<&Cfg>, addr: u64, end: u64) -> String {
         };
         notes.push(format!("{} {target}", if call.tail { "tail-calls" } else { "calls" }));
     }
-    if graph.is_some_and(|graph| graph.unresolved_calls.contains(&addr)) {
-        notes.push("call target unknown".into());
+    match program.virtual_calls_in(addr, end).first() {
+        Some(call) => notes.push(format!("{} {}", if call.tail { "tail-calls" } else { "calls" }, program.virtual_call_label(call))),
+        None if graph.is_some_and(|graph| graph.unresolved_calls.contains(&addr)) => notes.push("call target unknown".into()),
+        None => {}
     }
     if let Some(table) = program.analysis.jump_tables.iter().find(|table| table.jump == addr) {
         notes.push(format!("switch to {}", table.targets.iter().map(|target| format!("{target:#x}")).collect::<Vec<_>>().join(" ")));

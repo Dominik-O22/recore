@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::Image;
-use crate::report::{Analysis, AnalyzedFunction, CallSite, CallTarget, DataRef, MessageSend, StringLiteral};
+use crate::report::{Analysis, AnalyzedFunction, CallSite, CallTarget, DataRef, MessageSend, StringLiteral, VirtualCall};
 
 /// Part of a function's body.
 struct Extent {
@@ -34,6 +34,8 @@ pub struct Program {
     /// Method entry to the indices in `Analysis::sends` of the message sends that only it can
     /// answer.
     sends_to: FxHashMap<u64, Vec<usize>>,
+    /// Function entry to the indices in `Analysis::virtual_calls` of the calls that may go there.
+    virtual_to: FxHashMap<u64, Vec<usize>>,
 }
 
 /// The address a call or tail call goes to: a function entry or an import slot.
@@ -113,7 +115,13 @@ impl Program {
                 sends_to.entry(method).or_default().push(index);
             }
         }
-        Program { image, analysis, extents, reach, refs_to, calls_to, sends_to }
+        let mut virtual_to: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+        for (index, call) in analysis.virtual_calls.iter().enumerate() {
+            for &target in &call.targets {
+                virtual_to.entry(target).or_default().push(index);
+            }
+        }
+        Program { image, analysis, extents, reach, refs_to, calls_to, sends_to, virtual_to }
     }
 
     /// The function entered at `entry`, if it is one in its own right and not a fragment.
@@ -197,10 +205,33 @@ impl Program {
         self.sends_to.get(&method).into_iter().flatten().map(|&index| &self.analysis.sends[index])
     }
 
-    /// The instructions that reach the function at `entry`: calls, tail calls, and message sends
-    /// that only it can answer.
+    /// Calls through a vtable that may go to the function at `target`.
+    pub fn virtual_calls_to(&self, target: u64) -> impl Iterator<Item = &VirtualCall> {
+        self.virtual_to.get(&target).into_iter().flatten().map(|&index| &self.analysis.virtual_calls[index])
+    }
+
+    /// Where a call through a vtable goes: `through slot 3 of vtable 0x402000: 0x401060(name)`,
+    /// or with the vtables counted where the object may have several.
+    pub fn virtual_call_label(&self, call: &VirtualCall) -> String {
+        let vtables = match call.vtables.as_slice() {
+            [vtable] => format!("vtable {vtable:#x}"),
+            vtables => format!("{} vtables", vtables.len()),
+        };
+        let targets: Vec<String> = call.targets.iter().map(|&target| self.label(target)).collect();
+        format!("through slot {} of {vtables}: {}", call.slot, targets.join(" "))
+    }
+
+    /// Calls through a vtable made from `[start, end)`.
+    pub fn virtual_calls_in(&self, start: u64, end: u64) -> &[VirtualCall] {
+        let calls = &self.analysis.virtual_calls;
+        &calls[calls.partition_point(|call| call.at < start)..calls.partition_point(|call| call.at < end)]
+    }
+
+    /// The instructions that reach the function at `entry`: calls, tail calls, message sends
+    /// that only it can answer, and calls through a vtable that may go to it.
     pub fn sites_reaching(&self, entry: u64) -> impl Iterator<Item = u64> {
-        self.calls_to(entry).map(|call| call.at).chain(self.sends_to(entry).map(|send| send.at))
+        let sends = self.sends_to(entry).map(|send| send.at);
+        self.calls_to(entry).map(|call| call.at).chain(sends).chain(self.virtual_calls_to(entry).map(|call| call.at))
     }
 
     /// Instructions that refer to the data at `addr`.
