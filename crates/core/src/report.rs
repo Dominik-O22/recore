@@ -127,10 +127,11 @@ pub struct JumpTable {
 pub struct Analysis {
     pub name: String,
     pub functions: Vec<AnalyzedFunction>,
-    /// Call instructions the analyzer treats as never returning.
+    /// Call instructions the analyzer treats as never returning, sorted.
     pub noreturn_calls: Vec<u64>,
     #[serde(default)]
     pub instructions: u64,
+    /// Sorted by the address of the jump.
     #[serde(default)]
     pub jump_tables: Vec<JumpTable>,
     /// Calls and tail calls with a known target, sorted by address.

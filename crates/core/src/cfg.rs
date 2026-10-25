@@ -207,9 +207,9 @@ fn cfg_with<A: Arch>(image: &Image, analysis: &Analysis, body: &[(u64, u64)]) ->
         let bytes = &bytes[..bytes.len().min((end - start) as usize)];
         instructions.extend(A::decode(image, bytes, start).map(|decoded| (decoded.addr, decoded.next_addr(), decoded.insn.and_then(|insn| A::flow(&insn, &state, image)))));
     }
-    let table = |jump: u64| analysis.jump_tables.iter().find(|table| table.jump == jump).map(|table| &table.targets);
+    let table = |jump: u64| analysis.jump_tables.binary_search_by_key(&jump, |table| table.jump).ok().map(|index| &analysis.jump_tables[index].targets);
     let call = |at: u64| analysis.calls.binary_search_by_key(&at, |call| call.at).ok().map(|index| &analysis.calls[index]);
-    let noreturn = |at: u64| call(at).is_some_and(|call| call.noreturn) || analysis.noreturn_calls.contains(&at);
+    let noreturn = |at: u64| call(at).is_some_and(|call| call.noreturn) || analysis.noreturn_calls.binary_search(&at).is_ok();
 
     // Where each instruction can pass control inside the function, and how it leaves otherwise.
     let leaves = |&(addr, next, flow): &(u64, u64, Option<Flow>)| -> (Vec<u64>, Option<Exit>, bool) {
