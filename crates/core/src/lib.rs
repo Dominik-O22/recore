@@ -35,6 +35,7 @@ pub mod structs;
 pub mod sweep;
 pub mod swift;
 pub mod thumb;
+pub mod vtables;
 pub mod x86;
 
 pub use analysis::analyze;

@@ -58,6 +58,47 @@ pub struct TextPointer {
     pub marked: bool,
 }
 
+/// A general-purpose register, numbered by the architecture, for the pass that follows objects
+/// through registers: see [`Arch::object_effect`].
+pub type Register = u8;
+
+/// Memory an instruction reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// At an offset from the address a register holds.
+    Field { base: Register, offset: i64 },
+    /// At a fixed address.
+    Global(u64),
+}
+
+/// What an instruction puts somewhere: what a register holds, or a constant of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operand {
+    Register(Register),
+    Constant(u64),
+}
+
+/// What an instruction does that tells which vtable an object has and which slot of it a call
+/// goes through: a constructor stores the vtable's address in the object, code passes the
+/// object on through registers and memory, and a virtual call loads the vtable back and calls
+/// through one of its slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    /// Sets a register.
+    Set { to: Register, from: Operand },
+    /// Loads a register with the pointer at `from`.
+    Load { to: Register, from: Place },
+    /// Stores a pointer at `to`.
+    Store { to: Place, from: Operand },
+    /// Calls, or jumps to, the address held at `slot`, after which the registers in `clobbers`
+    /// hold what the callee left there.
+    Through { slot: Place, clobbers: u32 },
+    /// Overwrites the registers in the mask, `1 << register`, with values not followed: what
+    /// any other instruction does, and what a direct call does to the registers a callee may
+    /// change.
+    Clobbers(u32),
+}
+
 /// Upper bound on the entries read from one table.
 pub const MAX_ENTRIES: usize = 4096;
 
@@ -272,6 +313,17 @@ pub trait Arch: 'static {
 
     /// Says what the register a call returns its result in holds, after the call.
     fn set_result_object(_state: &mut Self::State, _object: u32) {}
+
+    /// The register a method gets the object it is called on in, `this`, where the calling
+    /// convention passes it in one. Only then are objects followed to the vtables they have:
+    /// see [`Arch::object_effect`].
+    const THIS: Option<Register> = None;
+
+    /// What `insn` does to the objects and vtables that registers hold, where [`Arch::THIS`]
+    /// is set.
+    fn object_effect(_insn: &Self::Insn) -> Effect {
+        Effect::Clobbers(u32::MAX)
+    }
 
     /// Filler the toolchain inserts between functions.
     fn is_padding(insn: &Self::Insn) -> bool;

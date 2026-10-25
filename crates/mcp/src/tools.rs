@@ -110,7 +110,7 @@ pub fn list() -> Value {
         ),
         tool(
             "classes",
-            "C++ classes recovered from the type information that MSVC, GCC and Clang emit: each with its base classes, its vtable address and its virtual functions in vtable order. A virtual call through slot N of an object goes to entry N here. A class with several vtables is listed once per vtable. Also the Objective-C classes and categories of a Mach-O binary with their methods, and its Swift classes, structs and enums with their fields, the protocols they conform to, and a class's methods in vtable order followed by its overrides.",
+            "C++ classes recovered from the type information that MSVC, GCC and Clang emit: each with its base classes, its vtable address and its virtual functions in vtable order. A virtual call through slot N of an object goes to entry N here. A class with several vtables is listed once per vtable. A binary built without type information still has vtables, which constructors store in objects: each is listed as a class named after its address, `vtable_402000`, with no base classes. Also the Objective-C classes and categories of a Mach-O binary with their methods, and its Swift classes, structs and enums with their fields, the protocols they conform to, and a class's methods in vtable order followed by its overrides.",
             json!({ "pattern": pattern("class name") }),
             &[],
         ),
@@ -926,9 +926,24 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
     if !asserted.is_empty() {
         writeln!(out, "its assertions name {}: its own name, or that of a function compiled into it", asserted.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", "))?;
     }
+    // A method that subclasses inherit sits in the same slot of many vtables.
+    let mut slots: BTreeMap<usize, Vec<&recore::report::Class>> = BTreeMap::new();
     for class in binary.program.analysis.classes.iter().filter(|class| !class.objc) {
         for (index, _) in class.methods.iter().enumerate().filter(|&(_, &method)| method == entry) {
-            writeln!(out, "virtual function {index} of {} (vtable {:#x})", class.name, class.vtable)?;
+            slots.entry(index).or_default().push(class);
+        }
+    }
+    for (index, classes) in slots {
+        match classes.as_slice() {
+            [_, _, _, _, ..] => {
+                let first: Vec<&str> = classes.iter().take(3).map(|class| class.name.as_str()).collect();
+                writeln!(out, "virtual function {index} of {} classes: {} ...; `classes` lists them", classes.len(), first.join(", "))?;
+            }
+            _ => {
+                for class in classes {
+                    writeln!(out, "virtual function {index} of {} (vtable {:#x})", class.name, class.vtable)?;
+                }
+            }
         }
     }
     for (addr, comment) in comments(binary, &body) {

@@ -146,8 +146,9 @@ pub struct Analysis {
     /// Strings at addresses the code or relocated pointers refer to, sorted by address.
     #[serde(default)]
     pub strings: Vec<StringLiteral>,
-    /// C++ classes that have a vtable and run-time type information, sorted by vtable address,
-    /// then Objective-C classes and categories in the order the image lists them.
+    /// C++ classes: those with a vtable and run-time type information, sorted by vtable
+    /// address, then the vtables of the rest, which a constructor stores in an object, sorted by
+    /// address; then Objective-C classes and categories in the order the image lists them.
     #[serde(default)]
     pub classes: Vec<Class>,
     /// Objective-C message sends whose selector is known, sorted by address. Each is also one
@@ -194,11 +195,13 @@ pub struct Field {
     pub type_name: Option<String>,
 }
 
-/// A class as the image describes it: a C++ class by its vtable and type information, or an
-/// Objective-C class or category by its metadata.
+/// A class as the image describes it: a C++ class by its vtable and type information, or by
+/// the vtable its constructor stores where it has none, or an Objective-C class or category by
+/// its metadata.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Class {
-    /// An Objective-C category is named `Class(Category)`.
+    /// An Objective-C category is named `Class(Category)`, and a class known only by its vtable
+    /// after the vtable's address, `vtable_402000`.
     pub name: String,
     /// Address of the vtable, or of the class object or category record in Objective-C.
     pub vtable: u64,

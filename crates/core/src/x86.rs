@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap;
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 
-use crate::arch::{Arch, Decoded, FieldUse, Flow, Table};
+use crate::arch::{Arch, Decoded, Effect, FieldUse, Flow, Operand, Place, Table};
 use crate::image::{Format, Image};
 use crate::jumptable::State;
 
@@ -123,6 +123,18 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         }
         let slot = state.loaded_from(base).filter(|_| insn.op_kinds().any(|kind| kind == OpKind::Memory))?;
         Some((slot, insn.memory_displacement64(), insn.mnemonic() != Mnemonic::Lea))
+    }
+
+    /// MSVC's thiscall passes `this` in `ecx`, its x64 convention in `rcx`, and System V's in
+    /// `rdi`. 32-bit System V code passes it on the stack.
+    const THIS: Option<crate::arch::Register> = match (BITS, WINDOWS) {
+        (32, false) => None,
+        (_, true) => Some(1),
+        (_, false) => Some(7),
+    };
+
+    fn object_effect(insn: &Instruction) -> Effect {
+        object_effect(insn, BITS, Self::CALLER_SAVED)
     }
 
     fn argument_slot(state: &State, index: usize) -> Option<u64> {
@@ -274,6 +286,86 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
             }
         }
         stubs
+    }
+}
+
+/// The number [`Effect`] gives a general-purpose register: `rax` 0, `rcx` 1, up to `r15` 15,
+/// whatever part of it the instruction names.
+fn gpr(register: Register) -> Option<crate::arch::Register> {
+    let full = register.full_register();
+    full.is_gpr64().then(|| full.number() as u8)
+}
+
+/// [`Arch::object_effect`] in code of `bits`, where a call may change the registers in
+/// `caller_saved`.
+fn object_effect(insn: &Instruction, bits: u32, caller_saved: &[Register]) -> Effect {
+    let mask = |registers: &[Register]| registers.iter().filter_map(|&register| gpr(register)).fold(0, |mask, register| mask | 1 << register);
+    let pointer = (bits / 8) as usize;
+    let pointer_register = |operand: u32| (insn.op_kind(operand) == OpKind::Register && insn.op_register(operand).size() == pointer).then(|| gpr(insn.op_register(operand))).flatten();
+    // `[register + offset]` or a fixed address, and nothing else.
+    let place = || {
+        if insn.memory_index() != Register::None || insn.segment_prefix() != Register::None {
+            return None;
+        }
+        if insn.is_ip_rel_memory_operand() {
+            return Some(Place::Global(insn.ip_rel_memory_address()));
+        }
+        if bits == 32 {
+            let offset = insn.memory_displacement32();
+            return Some(match insn.memory_base() {
+                Register::None => Place::Global(u64::from(offset)),
+                base => Place::Field { base: gpr(base)?, offset: i64::from(offset as i32) },
+            });
+        }
+        Some(Place::Field { base: gpr(insn.memory_base())?, offset: insn.memory_displacement64() as i64 })
+    };
+    let operand = |index: u32| match insn.op_kind(index) {
+        OpKind::Immediate32 | OpKind::Immediate32to64 | OpKind::Immediate64 => Some(Operand::Constant(insn.immediate(index))),
+        _ => pointer_register(index).map(Operand::Register),
+    };
+    let written = || if insn.op0_kind() == OpKind::Register { mask(&[insn.op0_register()]) } else { 0 };
+    match insn.mnemonic() {
+        Mnemonic::Mov | Mnemonic::Lea => {
+            let to = pointer_register(0);
+            let effect = match (insn.mnemonic(), insn.op0_kind(), insn.op1_kind()) {
+                (Mnemonic::Lea, _, _) if insn.is_ip_rel_memory_operand() => to.map(|to| Effect::Set { to, from: Operand::Constant(insn.ip_rel_memory_address()) }),
+                (Mnemonic::Lea, _, _) => None,
+                (_, OpKind::Register, OpKind::Memory) => to.zip(place()).map(|(to, from)| Effect::Load { to, from }),
+                (_, OpKind::Register, _) => to.zip(operand(1)).map(|(to, from)| Effect::Set { to, from }),
+                (_, OpKind::Memory, _) if insn.memory_size().size() == pointer => place().zip(operand(1)).map(|(to, from)| Effect::Store { to, from }),
+                _ => None,
+            };
+            effect.unwrap_or_else(|| Effect::Clobbers(written()))
+        }
+        // `xor eax, eax` is how a register is set to zero.
+        Mnemonic::Xor if insn.op0_kind() == OpKind::Register && insn.op1_kind() == OpKind::Register && insn.op0_register() == insn.op1_register() => match pointer_register(0) {
+            Some(to) => Effect::Set { to, from: Operand::Constant(0) },
+            None => Effect::Clobbers(written()),
+        },
+        Mnemonic::Call => match place().filter(|_| insn.op0_kind() == OpKind::Memory) {
+            Some(slot) => Effect::Through { slot, clobbers: mask(caller_saved) },
+            None => Effect::Clobbers(mask(caller_saved)),
+        },
+        Mnemonic::Jmp => place().filter(|_| insn.op0_kind() == OpKind::Memory).map_or(Effect::Clobbers(0), |slot| Effect::Through { slot, clobbers: 0 }),
+        // These read their first operand and leave it as it was.
+        Mnemonic::Push | Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Bt => Effect::Clobbers(0),
+        Mnemonic::Mul | Mnemonic::Div | Mnemonic::Idiv | Mnemonic::Cdq | Mnemonic::Cqo | Mnemonic::Cwd | Mnemonic::Rdtsc => Effect::Clobbers(mask(&[Register::RAX, Register::RDX])),
+        Mnemonic::Imul if insn.op_count() == 1 => Effect::Clobbers(mask(&[Register::RAX, Register::RDX])),
+        Mnemonic::Cpuid => Effect::Clobbers(mask(&[Register::RAX, Register::RBX, Register::RCX, Register::RDX])),
+        Mnemonic::Xchg | Mnemonic::Xadd | Mnemonic::Cmpxchg => {
+            let second = if insn.op1_kind() == OpKind::Register { mask(&[insn.op1_register()]) } else { 0 };
+            Effect::Clobbers(written() | second | mask(&[Register::RAX]))
+        }
+        Mnemonic::Loop | Mnemonic::Loope | Mnemonic::Loopne => Effect::Clobbers(mask(&[Register::RCX])),
+        Mnemonic::Leave => Effect::Clobbers(mask(&[Register::RSP, Register::RBP])),
+        // A string instruction steps the registers that point into its strings and count them.
+        _ if insn.op_kinds().any(|kind| {
+            matches!(kind, OpKind::MemorySegSI | OpKind::MemorySegESI | OpKind::MemorySegRSI | OpKind::MemoryESDI | OpKind::MemoryESEDI | OpKind::MemoryESRDI)
+        }) =>
+        {
+            Effect::Clobbers(mask(&[Register::RAX, Register::RCX, Register::RSI, Register::RDI]))
+        }
+        _ => Effect::Clobbers(written()),
     }
 }
 

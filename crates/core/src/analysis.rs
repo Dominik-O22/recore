@@ -925,6 +925,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     // with several vtables numbers the slots of each from zero, and the first to claim a name
     // keeps it.
     _phase = phase::scope("classes");
+    // A class without type information is known by the vtable its constructor stores.
+    classes.extend(crate::vtables::untyped::<A>(image, &classes, &discovery.data_refs, &discovery.uncertain_refs, |addr| is_start(addr) && !fragment_of.contains_key(&addr)));
     let mut by_depth: Vec<&crate::report::Class> = classes.iter().collect();
     by_depth.sort_by_key(|class| class.bases.len());
     let mut slot_names: FxHashSet<String> = FxHashSet::default();
@@ -942,7 +944,6 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     // Objective-C methods are named by their class and selector, and message sends by the
     // selector they pass and the receiver they can be seen to go to.
     _phase = phase::scope("objective-c");
-    let mut classes = classes;
     let mut sends = Vec::new();
     let swift = crate::swift::metadata(image).unwrap_or_default();
     if let Some(objc) = crate::objc::metadata(image) {
