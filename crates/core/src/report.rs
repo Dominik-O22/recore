@@ -155,6 +155,10 @@ pub struct Analysis {
     /// of `calls`, to the runtime's dispatcher.
     #[serde(default)]
     pub sends: Vec<MessageSend>,
+    /// Calls through a slot of an object's vtable where the vtables the object may have are
+    /// known, sorted by address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_calls: Vec<VirtualCall>,
     /// Swift classes, structs and enums, in the order the image lists them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub types: Vec<SwiftType>,
@@ -214,6 +218,24 @@ pub struct Class {
     /// Described by Objective-C metadata, where methods are found by selector and not by slot.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub objc: bool,
+}
+
+/// A call through a slot of the vtable of an object whose vtable is known to be one of a few,
+/// by following the object from a constructor's store, or from the entry of a method, where it
+/// is `this` and its vtable one of those that hold the method.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct VirtualCall {
+    /// Address of the call or jump instruction.
+    pub at: u64,
+    /// The slot, counted from zero: the call goes to entry `slot` of a class's `methods`.
+    pub slot: u64,
+    /// The vtables the object may have that are long enough to have the slot, sorted.
+    pub vtables: Vec<u64>,
+    /// The functions those vtables hold in the slot, distinct and sorted.
+    pub targets: Vec<u64>,
+    /// A jump used as a call.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tail: bool,
 }
 
 /// A call to the Objective-C runtime's dispatcher, which picks the method by the receiver's

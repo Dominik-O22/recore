@@ -926,7 +926,12 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     // keeps it.
     _phase = phase::scope("classes");
     // A class without type information is known by the vtable its constructor stores.
-    classes.extend(crate::vtables::untyped::<A>(image, &classes, &discovery.data_refs, &discovery.uncertain_refs, |addr| is_start(addr) && !fragment_of.contains_key(&addr)));
+    let untyped = crate::vtables::untyped::<A>(image, &classes, &discovery.data_refs, &discovery.uncertain_refs, |addr| is_start(addr) && !fragment_of.contains_key(&addr));
+    // Calls through vtables are followed only where type information leaves classes out. Where
+    // it describes every class, objects start in every virtual function, and following them from
+    // there costs more than the few calls it resolves are worth.
+    let follow_objects = !untyped.is_empty();
+    classes.extend(untyped);
     let mut by_depth: Vec<&crate::report::Class> = classes.iter().collect();
     by_depth.sort_by_key(|class| class.bases.len());
     let mut slot_names: FxHashSet<String> = FxHashSet::default();
@@ -992,8 +997,9 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         let code_to_end = code_pieces(f.start, f.end, inline_tables).last().is_some_and(|(from, to)| from < to && to == f.end);
         ((A::RUNS_ON && !stops) || comes_back).then_some(f.end).filter(|&end| is_start(end) && code_to_end)
     };
-    Analysis {
+    let mut analysis = Analysis {
         sends,
+        virtual_calls: Vec::new(),
         types: swift.types,
         data_refs: data_refs.into_iter().map(|(from, to, access)| DataRef { from, to, access }).collect(),
         classes,
@@ -1017,5 +1023,10 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         jump_tables: discovery.jump_tables.clone(),
         calls,
         imports: import_list,
+    };
+    if follow_objects {
+        _phase = phase::scope("virtual calls");
+        analysis.virtual_calls = crate::vtables::virtual_calls::<A>(image, &analysis);
     }
+    analysis
 }
