@@ -319,6 +319,9 @@ pub trait Arch: 'static {
     /// see [`Arch::object_effect`].
     const THIS: Option<Register> = None;
 
+    /// The register a function returns its result in, where [`Arch::THIS`] is set.
+    const RESULT: Register = 0;
+
     /// What `insn` does to the objects and vtables that registers hold, where [`Arch::THIS`]
     /// is set.
     fn object_effect(_insn: &Self::Insn) -> Effect {
