@@ -13,6 +13,8 @@ gcc-arm-none-eabi = "13.3"
 python = "3.13"
 # For Ghidra, which the reference runs need.
 java = "25"
+# For lld-link, which links bench/agent/game/build.sh's Windows program without a Microsoft SDK.
+zig = "0.17"
 
 [tasks.corpus]
 description = "Build the 8051 and Cortex-M corpora from their pinned sources"
