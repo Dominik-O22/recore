@@ -312,6 +312,8 @@ fn aarch64(bytes: &[u8], start: u64, end: u64, min_words: Option<usize>, numbers
 /// the body is decoded again passing over it, so that the code after every pool decodes from
 /// where it begins. A pool stays passed over only while a load of the pass reads it, so one
 /// that bytes of another, decoded as a load, seemed to read goes once they are passed over.
+/// Any load decoded is trusted, so bytes that are no code and no pool a load reads, such as
+/// one an `ADR` reaches, may still pass over the code after them as a pool.
 fn arm_instructions(image: &Image, body: &[(u64, u64)]) -> Option<Vec<Decoded<arm::Insn>>> {
     let as_arm = |one: Decoded<thumb::Insn>| Decoded { addr: one.addr, len: one.len, insn: one.insn.map(arm::Insn::Thumb) };
     let halfwords = |(at, to): (u64, u64)| (at & !1..to).step_by(2);
@@ -323,13 +325,13 @@ fn arm_instructions(image: &Image, body: &[(u64, u64)]) -> Option<Vec<Decoded<ar
     // Data taken for code may find more pools each pass.
     for _ in 0..3 {
         decoded.clear();
-        let mut skipped = behind.clone();
+        read.clear();
         for &(start, end) in body {
             let bytes = image.bytes_from(start)?.get(..end.checked_sub(start)? as usize)?;
             let (mut offset, mut it) = (0, 0);
             while offset < bytes.len() {
                 let addr = start + offset as u64;
-                if skipped.contains(&addr) {
+                if behind.contains(&addr) || read.contains(&addr) {
                     (offset, it) = (offset + 2, 0);
                     continue;
                 }
@@ -341,13 +343,12 @@ fn arm_instructions(image: &Image, body: &[(u64, u64)]) -> Option<Vec<Decoded<ar
                 // Only a range of an odd length leaves a byte that is no instruction at all.
                 let Some(one) = one else { break };
                 if let Some((pool, _)) = one.insn.and_then(arm::Insn::literal) {
-                    skipped.extend(halfwords(pool));
+                    read.extend(halfwords(pool));
                 }
                 offset += usize::from(one.len.max(1));
                 decoded.push(one);
             }
         }
-        read = decoded.iter().filter_map(|one| one.insn.and_then(arm::Insn::literal)).flat_map(|(pool, _)| halfwords(pool)).collect();
         let through = decoded.iter().flat_map(covers).filter(|half| read.contains(half));
         let next: FxHashSet<u64> = behind.iter().copied().filter(|half| read.contains(half)).chain(through).collect();
         if next == behind {
@@ -814,6 +815,25 @@ mod tests {
             halfwords.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<u8>>()
         };
         let hashes = |constant| arm_hashes(Machine::Thumb, build(constant), 0x1_0000, 0x2_0000, None);
+        assert_ne!(hashes(5).0, hashes(6).0);
+    }
+
+    #[test]
+    fn arm_hashes_keep_code_that_a_pool_read_as_a_load_seemed_to_read() {
+        // A32: a pool that only the load after it reads, which reads as ldr r0, [pc, #-16], a
+        // load from the mov r1 before it. A pass decodes through both; the pass after skips
+        // both, and finds that no load it decoded reads the mov.
+        let build = |constant: u32| {
+            let words = [
+                0xE3A0_1000 | constant, // mov r1, #constant
+                0xEA00_0000,            // b past the pool
+                0xE51F_0010,            // the pool
+                0xE51F_200C,            // ldr r2, [pc, #-12]
+                0xE12F_FF1E,            // bx lr
+            ];
+            words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<u8>>()
+        };
+        let hashes = |constant| arm_hashes(Machine::Arm, build(constant), 0x1_0000, 0x2_0000, None);
         assert_ne!(hashes(5).0, hashes(6).0);
     }
 
