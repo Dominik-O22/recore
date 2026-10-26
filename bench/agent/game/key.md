@@ -1,6 +1,6 @@
 # Answer key: game.exe
 
-One point per item. An item passes when the report states it, and a report that asserts something this key calls false fails the item that covers it. Addresses are as `game.exe` loads, at its preferred base 0x400000. They hold for the build whose sha256 starts `a3240cc1`, which `build.sh` checks; another compiler gives other addresses and this key does not apply to it.
+One point per item. An item passes when the report states it, and a report that asserts something this key calls false fails the item that covers it. Addresses are as `game.exe` loads, at its preferred base 0x400000. They hold for the build whose `.text` and `.data` hash to `0ff97853`, which `build.sh` checks; another compiler gives other addresses and this key does not apply to it.
 
 The game is Brogue CE 1.15.1. Names below come from `game.pdb` and the source, for whoever checks the key. The agent sees neither. Each task ends with how its key was derived, so it can be checked again: `pdb.py`, `stores.py` and `flavors.py` are in this directory, and source paths are under `target/agent/game/src`.
 

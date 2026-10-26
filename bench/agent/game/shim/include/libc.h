@@ -1,6 +1,7 @@
-// The part of the C library the game uses, which libc.c implements over kernel32. Every standard
-// header the game includes is a file that includes this one; clang supplies stddef.h, stdarg.h,
-// stdint.h and limits.h.
+// The part of the C library the game's source calls. libc.c implements, over kernel32, the
+// functions the link needs; the rest the compiler folds away. Every standard header the game
+// includes is a file that includes this one; clang supplies stddef.h, stdarg.h, stdint.h and
+// limits.h.
 #ifndef SHIM_LIBC_H
 #define SHIM_LIBC_H
 

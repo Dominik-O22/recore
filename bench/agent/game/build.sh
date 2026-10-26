@@ -27,10 +27,12 @@ llvm-dlltool -m i386 -k -d "$here/kernel32.def" -l "$out/obj/kernel32.lib"
 "$zig" lld-link /nologo /debug /pdb:"$out/game.pdb" /pdbaltpath:game.pdb /opt:ref /opt:icf /Brepro \
   /entry:mainCRTStartup /subsystem:console /nodefaultlib /machine:x86 /out:"$out/game.exe" "$out"/obj/*.obj "$out/obj/kernel32.lib"
 ls -l "$out/game.exe" "$out/game.pdb"
-# key.md's addresses are this build's. Another compiler or linker gives another exe, and the key
-# does not apply to it.
-key=a3240cc14ff9d13a8be712d17e13ae9835337e8d0d87f1e9c0f448a4fb7698d1
-if [ "$(sha256sum < "$out/game.exe" | cut -d' ' -f1)" != "$key" ]; then
-  echo "$out/game.exe is not the build key.md was written for, whose sha256 is $key" >&2
+# key.md's addresses are this build's: another compiler or linker gives other code. The check
+# hashes the code and initialized data alone, since the exe's record of its PDB changes with any
+# edit to a source file, comments included.
+key=0ff97853dcc1dea1a74336179a8185730bebdbaddbe0aa2c46668b9e925f9a51
+llvm-objcopy --dump-section=.text="$out/obj/text.bin" --dump-section=.data="$out/obj/data.bin" "$out/game.exe" "$out/obj/sections.exe"
+if [ "$(cat "$out/obj/text.bin" "$out/obj/data.bin" | sha256sum | cut -d' ' -f1)" != "$key" ]; then
+  echo "$out/game.exe is not the build key.md was written for, whose .text and .data hash to $key" >&2
   exit 1
 fi
