@@ -97,7 +97,7 @@ fn ms(start: Instant) -> f64 {
 }
 
 /// A binary as `bench/set.txt` names it, so that saved results compare wherever the corpora are.
-fn name(binary: &Path) -> String {
+pub(crate) fn name(binary: &Path) -> String {
     binary.strip_prefix(crate::corpora()).unwrap_or(binary).display().to_string()
 }
 
