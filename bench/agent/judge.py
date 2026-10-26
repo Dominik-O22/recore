@@ -3,18 +3,19 @@
 item three times, and each item takes the verdict most of the three gave. Borderline items
 come out either way from one judgement to the next.
 
-Usage: judge.py <dir>... (JUDGE names the model, claude-sonnet-5-5 unless set)
+Usage: judge.py <dir>... (JUDGE names the model, claude-sonnet-5-5 unless set, and KEY the key,
+key.md beside this file unless set, such as game/key.md)
 """
 import os, re, subprocess, sys
 from collections import Counter
 from pathlib import Path
 
-KEY = (Path(__file__).parent / "key.md").read_text()
-ITEMS = re.findall(r"^- \*\*([A-C]\d+)\.\*\*", KEY, re.M)
-VERDICT = re.compile(r"^([A-C]\d+):?\s+(PASS|FAIL)\W*(.*)$", re.M)
+KEY = Path(os.environ.get("KEY", Path(__file__).parent / "key.md")).read_text()
+ITEMS = re.findall(r"^- \*\*([A-Z]\d+)\.\*\*", KEY, re.M)
+VERDICT = re.compile(r"^([A-Z]\d+):?\s+(PASS|FAIL)\W*(.*)$", re.M)
 TIMES = 3
 
-PROMPT = """You score a report on three reverse engineering tasks against an answer key. For each item of the key, in order, write one line: the item's id, PASS or FAIL, and a short reason quoting the report. Follow the key's own rules for passing. Write nothing else.
+PROMPT = """You score a report on reverse engineering tasks against an answer key. For each item of the key, in order, write one line: the item's id, PASS or FAIL, and a short reason quoting the report. Follow the key's own rules for passing. Write nothing else.
 
 <key>
 {key}
