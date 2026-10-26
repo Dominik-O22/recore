@@ -43,9 +43,13 @@ K32 BOOL WINAPI GetFileAttributesExA(const char *path, int level, WIN32_FILE_ATT
 
 int main(int argc, char *argv[]);
 
+// The process heap, which the entry point fetches once, as Microsoft's C runtime does.
+static HANDLE heap;
+
 // The entry point: Brogue's main, with no arguments.
 void mainCRTStartup(void) {
     char *argv[] = { "brogue", 0 };
+    heap = GetProcessHeap();
     exit(main(1, argv));
 }
 
@@ -113,20 +117,20 @@ __asm__(
     ".att_syntax prefix\n");
 
 void *malloc(size_t size) {
-    return HeapAlloc(GetProcessHeap(), 0, size);
+    return HeapAlloc(heap, 0, size);
 }
 
 void *calloc(size_t count, size_t size) {
-    return HeapAlloc(GetProcessHeap(), 8 /* HEAP_ZERO_MEMORY */, count * size);
+    return HeapAlloc(heap, 8 /* HEAP_ZERO_MEMORY */, count * size);
 }
 
 void *realloc(void *block, size_t size) {
-    return block ? HeapReAlloc(GetProcessHeap(), 0, block, size) : malloc(size);
+    return block ? HeapReAlloc(heap, 0, block, size) : malloc(size);
 }
 
 void free(void *block) {
     if (block) {
-        HeapFree(GetProcessHeap(), 0, block);
+        HeapFree(heap, 0, block);
     }
 }
 
