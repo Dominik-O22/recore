@@ -12,7 +12,7 @@ const NUMERIC: [&str; 10] = ["limit", "len", "timeout", "count", "param", "arg",
 /// Options that may be given again and again, and reach the tool as a list.
 const REPEATED: [&str; 6] = ["args", "set", "read", "dump", "before", "skip"];
 /// Options that are on or off.
-const FLAGS: [&str; 5] = ["pcode", "returns", "full", "addresses", "refused"];
+const FLAGS: [&str; 6] = ["pcode", "returns", "full", "addresses", "refused", "coverage"];
 
 pub fn usage() -> String {
     let mut text = String::from(

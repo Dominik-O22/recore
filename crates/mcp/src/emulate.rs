@@ -1404,7 +1404,10 @@ pub fn emulate(binary: &mut Binary, call: &Call) -> Result<Outcome> {
 /// The arguments of the `run` tool.
 #[derive(Deserialize)]
 pub struct Run {
-    function: String,
+    function: Option<String>,
+    /// List what a run would stop on instead of running.
+    #[serde(default)]
+    coverage: bool,
     #[serde(default)]
     args: Vec<Given>,
     #[serde(default)]
@@ -1532,10 +1535,103 @@ fn function_entry(binary: &Binary, function: &str) -> Result<u64> {
     }
 }
 
+/// Why a run that reaches `op` stops there, if it does: the operations the interpreter has no
+/// meaning for and the operands wider than it holds.
+fn stops_on(op: &Op) -> Option<String> {
+    let widest = op.out.iter().chain(&op.inputs).map(|place| place.size).max().unwrap_or(0);
+    match op.code {
+        Code::CallOther if op.sse.is_none() && !HARMLESS.iter().any(|harmless| harmless.eq_ignore_ascii_case(&op.userop)) => Some(format!("the processor operation {}", op.userop)),
+        Code::Unimplemented => Some("no semantics in the processor specification".into()),
+        _ if widest > 16 => Some(format!("operands of {widest} bytes")),
+        _ => None,
+    }
+}
+
+/// The instructions a run of `function` would stop on, in it and in every function it calls,
+/// or in the whole binary without one. Each instruction is lifted once and none is run, so a
+/// path that never reaches one of them still runs; calls through pointers are not followed.
+fn coverage(binary: &mut Binary, function: Option<&str>) -> Result<String> {
+    let analysis = &binary.program.analysis;
+    let mut functions: BTreeSet<u64> = BTreeSet::new();
+    match function {
+        Some(function) => {
+            let ranges: FxHashMap<u64, &[(u64, u64)]> = analysis.functions.iter().map(|function| (function.addr, function.ranges.as_slice())).collect();
+            let mut queue = vec![function_entry(binary, function)?];
+            while let Some(entry) = queue.pop() {
+                if !functions.insert(entry) {
+                    continue;
+                }
+                for &(start, end) in ranges.get(&entry).copied().unwrap_or_default() {
+                    let calls = &analysis.calls[analysis.calls.partition_point(|call| call.at < start)..analysis.calls.partition_point(|call| call.at < end)];
+                    queue.extend(calls.iter().filter_map(|call| match call.target {
+                        CallTarget::Function(target) => Some(target),
+                        CallTarget::Import(_) => None,
+                    }));
+                }
+            }
+        }
+        None => functions.extend(analysis.functions.iter().map(|function| function.addr)),
+    }
+    // Functions share exits, so their ranges are merged where they overlap or touch.
+    let mut ranges: Vec<(u64, u64)> = analysis.functions.iter().filter(|function| functions.contains(&function.addr)).flat_map(|function| function.ranges.iter().copied()).collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let x86 = matches!(binary.program.image.machine, Machine::X86 | Machine::X86_64);
+    let mut spaces = Spaces::new();
+    // Mnemonic and why, to how many instructions and the first of them.
+    let mut stops: BTreeMap<(String, String), (usize, u64)> = BTreeMap::new();
+    let mut lifted = 0usize;
+    for (start, end) in merged {
+        for instruction in binary.lift(start, end)? {
+            let mnemonic = instruction.text.split(' ').next().unwrap_or_default();
+            lifted += 1;
+            if instruction.text == "(bad)" || x86 && x87::Instruction::parse(mnemonic).is_some() {
+                continue;
+            }
+            let why = instruction.pcode.iter().find_map(|line| match parse_op(&mut spaces, line) {
+                Ok(op) => stops_on(&op),
+                Err(error) => Some(format!("{error:#}")),
+            });
+            if let Some(why) = why {
+                let entry = stops.entry((mnemonic.to_string(), why)).or_insert((0, instruction.addr));
+                entry.0 += 1;
+            }
+        }
+    }
+    let scope = match (function, functions.len() - 1) {
+        (Some(name), 0) => name.to_string(),
+        (Some(name), 1) => format!("{name} and the function it calls"),
+        (Some(name), called) => format!("{name} and the {called} functions it calls"),
+        (None, _) => format!("the {} functions of the binary", functions.len()),
+    };
+    let mut out = String::new();
+    if stops.is_empty() {
+        writeln!(out, "run executes all {lifted} instructions of {scope}")?;
+        return Ok(out);
+    }
+    let mut stops: Vec<_> = stops.into_iter().collect();
+    stops.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+    let total: usize = stops.iter().map(|(_, (count, _))| count).sum();
+    writeln!(out, "a run stops on {total} of the {lifted} instructions of {scope}, if it reaches them:")?;
+    for ((mnemonic, why), (count, first)) in stops {
+        writeln!(out, "  {mnemonic}: {why}, {count} at {first:#x}{}", if count > 1 { " and elsewhere" } else { "" })?;
+    }
+    Ok(out)
+}
+
 /// The `run` tool.
 pub fn run(binary: &mut Binary, args: Run) -> Result<String> {
+    if args.coverage {
+        return coverage(binary, args.function.as_deref());
+    }
     ensure!(args.bits != Some(0), "`bits` is at least 1");
-    let entry = function_entry(binary, &args.function)?;
+    let entry = function_entry(binary, args.function.as_deref().context("`function` names what to run")?)?;
     let mut dump = Vec::new();
     for range in &args.dump {
         let parts: Vec<&str> = range.split(':').collect();

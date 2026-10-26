@@ -121,6 +121,8 @@ fn functions() -> Vec<(&'static str, Vec<u8>)> {
         // MOVD XMM0, [ESP+4]; PSHUFLW XMM0, XMM0, 0; MOVD EAX, XMM0: the low word of the argument
         // spread over the register, as MSVC's memset spreads its byte.
         ("spread", vec![0x66, 0x0f, 0x6e, 0x44, 0x24, 0x04, 0xf2, 0x0f, 0x70, 0xc0, 0x00, 0x66, 0x0f, 0x7e, 0xc0, RET]),
+        // FEMMS, an AMD instruction the run has no meaning for.
+        ("femms", vec![0x0f, 0x0e, RET]),
     ]
 }
 
@@ -415,3 +417,11 @@ fn an_sse_instruction_the_specification_leaves_named_runs() {
     assert_eq!(returned(&program.run("spread", json!({ "args": [0x1234] }))), "0x12341234");
 }
 
+#[test]
+fn coverage_lists_what_a_run_would_stop_on_without_running() {
+    let mut program = Program::new();
+    let whole = program.client.tool("run", json!({ "path": program.path, "coverage": true })).unwrap();
+    assert!(whole.contains(&format!("  FEMMS: the processor operation FastExitMediaState, 1 at {}\n", program.addr("femms"))), "{whole}");
+    let spread = program.run("spread", json!({ "coverage": true }));
+    assert_eq!(spread, format!("run executes all 4 instructions of {}\n", program.addr("spread")));
+}
