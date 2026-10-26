@@ -25,15 +25,15 @@ const PC: usize = 15;
 /// An A32 instruction and where it sits, which PC-relative forms need.
 #[derive(Clone, Copy)]
 pub struct A32 {
-    addr: u64,
-    word: u32,
+    pub(crate) addr: u64,
+    pub(crate) word: u32,
     /// The word a PC-relative `LDR` loads, when the decoded bytes hold it.
     literal: Option<u32>,
 }
 
 /// The second operand of an A32 data-processing instruction.
 #[derive(Clone, Copy, PartialEq)]
-enum Operand {
+pub(crate) enum Operand {
     Immediate(u32),
     /// `Rm`, shifted left by a number of bits.
     Shifted { rm: usize, left: u8 },
@@ -43,7 +43,7 @@ enum Operand {
 
 /// A load or store of one register: `[Rn, offset]`.
 #[derive(Clone, Copy)]
-struct Access {
+pub(crate) struct Access {
     load: bool,
     /// Bytes moved: 1, 2, 4, or 8 for a pair.
     size: u8,
@@ -58,7 +58,7 @@ struct Access {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Offset {
+pub(crate) enum Offset {
     Immediate(u32),
     /// `Rm` shifted left.
     Register { rm: usize, left: u8 },
@@ -93,7 +93,7 @@ impl A32 {
     }
 
     /// `B`, `BL` and `BLX` to a label, which goes to Thumb code at a halfword.
-    fn direct(self) -> Option<(u64, Transfer)> {
+    pub(crate) fn direct(self) -> Option<(u64, Transfer)> {
         if self.word >> 25 & 7 != 0b101 {
             return None;
         }
@@ -113,7 +113,7 @@ impl A32 {
     }
 
     /// `(opcode, sets flags, Rn, Rd, operand)` of a data-processing instruction.
-    fn data_processing(self) -> Option<(u32, bool, usize, usize, Operand)> {
+    pub(crate) fn data_processing(self) -> Option<(u32, bool, usize, usize, Operand)> {
         let word = self.word;
         if self.condition() == 15 || word >> 26 & 3 != 0 {
             return None;
@@ -138,7 +138,7 @@ impl A32 {
     }
 
     /// `MOVW` and `MOVT`: the register, the 16 bits, and whether they are the top half.
-    fn move_half(self) -> Option<(usize, u32, bool)> {
+    pub(crate) fn move_half(self) -> Option<(usize, u32, bool)> {
         let top = match self.word & 0x0FF0_0000 {
             0x0300_0000 => false,
             0x0340_0000 => true,
@@ -148,7 +148,7 @@ impl A32 {
     }
 
     /// A load or store of one register, of a byte, a halfword, a word or two words.
-    fn transfer(self) -> Option<Access> {
+    pub(crate) fn transfer(self) -> Option<Access> {
         let word = self.word;
         if self.condition() == 15 {
             return None;
@@ -194,7 +194,7 @@ impl A32 {
 
     /// `[start, end)` of the data a PC-relative load reads: `LDR`, `LDRB`, the halfword and
     /// doubleword forms, and `VLDR`.
-    fn literal_range(self) -> Option<(u64, u64)> {
+    pub(crate) fn literal_range(self) -> Option<(u64, u64)> {
         let address = |offset: u32, up: bool| if up { self.pc().wrapping_add(u64::from(offset)) } else { self.pc().wrapping_sub(u64::from(offset)) };
         if let Some(transfer) = self.transfer() {
             let Offset::Immediate(offset) = transfer.offset else { return None };
@@ -212,13 +212,13 @@ impl A32 {
     }
 
     /// The register a literal `LDR` of a word loads.
-    fn literal_word_register(self) -> Option<usize> {
+    pub(crate) fn literal_word_register(self) -> Option<usize> {
         let transfer = self.transfer()?;
         (self.literal_range().is_some() && transfer.size == 4 && !transfer.signed).then_some(transfer.rt)
     }
 
     /// `ADR`, `ADD Rd, PC, #imm` or `SUB Rd, PC, #imm`: the register and the address it gets.
-    fn adr(self) -> Option<(usize, u64)> {
+    pub(crate) fn adr(self) -> Option<(usize, u64)> {
         match self.data_processing()? {
             (4, false, PC, rd, Operand::Immediate(offset)) if rd != PC => Some((rd, self.pc() + u64::from(offset))),
             (2, false, PC, rd, Operand::Immediate(offset)) if rd != PC => Some((rd, self.pc().wrapping_sub(u64::from(offset)))),
@@ -292,7 +292,7 @@ pub enum Insn {
 }
 
 /// Decodes the A32 word at `offset` into `bytes`, which are loaded at `base`.
-fn decode_a32(bytes: &[u8], base: u64, offset: usize) -> Option<Decoded<Insn>> {
+pub(crate) fn decode_a32(bytes: &[u8], base: u64, offset: usize) -> Option<Decoded<Insn>> {
     let addr = base + offset as u64;
     let rest = bytes.get(offset..).filter(|rest| !rest.is_empty())?;
     // Off the word, or cut short by the end of the bytes: no instruction, and on to the next

@@ -392,6 +392,7 @@ fn diff_function(old: &mut Binary, new: &mut Binary, function: &str, timeout: Du
             None => "and so is its code",
             Some(Change::Numbers) => "though numbers in its code differ that the C does not show",
             Some(Change::Code) => "though its instructions differ: the compiler arranged them otherwise",
+            Some(Change::Unknown) => "but whether its instructions differ is not known: recore cannot compare this code",
         };
         writeln!(out, "the C is the same line for line, {how}")?;
         return Ok(out);
@@ -441,8 +442,10 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
     let size = |sizes: &FxHashMap<u64, u64>, entry: &u64| sizes.get(entry).copied().unwrap_or_default();
     let changed: Vec<_> = found.pairs.iter().filter(|pair| pair.change == Some(Change::Code)).collect();
     let renumbered: Vec<_> = found.pairs.iter().filter(|pair| pair.change == Some(Change::Numbers)).collect();
+    let unknown = found.pairs.iter().filter(|pair| pair.change == Some(Change::Unknown)).count();
     let mut out = String::new();
-    writeln!(out, "{} functions before, {} after: {} the same, {} changed, {} removed, {} added", old.functions().count(), new.functions().count(), found.pairs.len() - changed.len() - renumbered.len(), changed.len() + renumbered.len(), found.removed.len(), found.added.len())?;
+    let not_compared = if unknown == 0 { String::new() } else { format!(", {unknown} not compared, since recore cannot compare their code") };
+    writeln!(out, "{} functions before, {} after: {} the same, {} changed{not_compared}, {} removed, {} added", old.functions().count(), new.functions().count(), found.pairs.len() - changed.len() - renumbered.len() - unknown, changed.len() + renumbered.len(), found.removed.len(), found.added.len())?;
     // What a function refers to, in terms the two builds share: the functions it calls, as
     // the after build knows them, and the strings it uses.
     let refers = |program: &Program, entry: u64, in_new: &dyn Fn(u64) -> Option<u64>| -> (BTreeMap<String, String>, BTreeMap<String, String>) {
