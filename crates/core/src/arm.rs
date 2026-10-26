@@ -316,7 +316,7 @@ impl Insn {
         match self {
             Insn::A32(insn) => match (insn.adds_pc(), insn.transfer()) {
                 (Some((_, offset)), _) => Some((offset, insn.pc())),
-                (_, Some(Access { load: true, rn: PC, offset: Offset::Register { rm, left: 0 }, pre: true, writeback: false, .. })) => Some((rm, insn.pc())),
+                (_, Some(Access { load: true, size: 4, rn: PC, offset: Offset::Register { rm, left: 0 }, pre: true, up: true, writeback: false, .. })) => Some((rm, insn.pc())),
                 _ => None,
             },
             Insn::Thumb(insn) => pc_sum_thumb(&insn).map(|rd| (rd, insn.addr + 4)),

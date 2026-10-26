@@ -78,11 +78,11 @@ pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u6
 /// by itself. `None` where the code cannot be read or its machine is not hashed, which is the
 /// 8051's.
 pub fn hashes(image: &Image, pointer_slots: &FxHashMap<u64, u64>, body: &[(u64, u64)]) -> Option<(u64, u64)> {
-    // The width of x86 code, or none for AArch64.
-    let bits = match image.machine {
-        Machine::X86 => Some(32),
-        Machine::X86_64 => Some(64),
-        Machine::Aarch64 => None,
+    let x86 = |bits| move |bytes: &[u8], start, end, numbers| x86(bits, bytes, pointer_slots, start, end, None, numbers, None);
+    let range: &dyn Fn(&[u8], u64, u64, bool) -> Option<u64> = match image.machine {
+        Machine::X86 => &x86(32),
+        Machine::X86_64 => &x86(64),
+        Machine::Aarch64 => &|bytes, start, end, numbers| aarch64(bytes, start, end, None, numbers),
         // As one, since a `MOVW` and its `MOVT` may lie on either side of a jump table that
         // splits the body.
         Machine::Arm | Machine::Thumb => return arm(image, pointer_slots, body),
@@ -91,11 +91,7 @@ pub fn hashes(image: &Image, pointer_slots: &FxHashMap<u64, u64>, body: &[(u64, 
     };
     body.iter().try_fold((0, 0), |(body, shape): (u64, u64), &(start, end)| {
         let bytes = image.bytes_from(start)?.get(..end.checked_sub(start)? as usize)?;
-        let hash = |numbers| match bits {
-            Some(bits) => x86(bits, bytes, pointer_slots, start, end, None, numbers, None),
-            None => aarch64(bytes, start, end, None, numbers),
-        };
-        Some((body.rotate_left(17) ^ hash(true)?, shape.rotate_left(17) ^ hash(false)?))
+        Some((body.rotate_left(17) ^ range(bytes, start, end, true)?, shape.rotate_left(17) ^ range(bytes, start, end, false)?))
     })
 }
 
@@ -319,7 +315,9 @@ fn arm_instructions(image: &Image, body: &[(u64, u64)]) -> Option<Vec<Decoded<ar
     let as_arm = |one: Decoded<thumb::Insn>| Decoded { addr: one.addr, len: one.len, insn: one.insn.map(arm::Insn::Thumb) };
     // The halfwords of every pool found.
     let mut pooled = FxHashSet::default();
-    loop {
+    // A pass decodes through the pools it finds behind loads; data taken for code may find
+    // more each time.
+    for pass in 1.. {
         let known = pooled.len();
         let mut decoded = Vec::new();
         for &(start, end) in body {
@@ -349,12 +347,14 @@ fn arm_instructions(image: &Image, body: &[(u64, u64)]) -> Option<Vec<Decoded<ar
         if !decoded.iter().any(in_pool) {
             return Some(decoded);
         }
-        // Pools found again where they were the last time: what overlaps one is left out.
-        if pooled.len() == known {
+        // Pools found again where they were the last time, or still more after a few passes:
+        // what overlaps one is left out.
+        if pooled.len() == known || pass == 3 {
             decoded.retain(|one| !in_pool(one));
             return Some(decoded);
         }
     }
+    unreachable!()
 }
 
 /// The body and shape hashes of a 32-bit ARM function, see [`hashes`]. Blanked are the offsets
@@ -403,16 +403,21 @@ fn arm(image: &Image, pointer_slots: &FxHashMap<u64, u64>, body: &[(u64, u64)]) 
     // up to one of its own kind that sets the register whatever the condition. A pair under
     // each of two conditions is then two pairs.
     let moves: Vec<Option<(usize, u32, bool)>> = decoded.iter().map(|one| one.insn.and_then(arm::Insn::move_half)).collect();
-    let unconditional = |index: usize| decoded[index].insn.is_some_and(|insn| !insn.conditional());
+    let partner = |index: usize, register: usize, top: bool| {
+        let others: Vec<usize> = if top { (0..index).rev().collect() } else { (index + 1..moves.len()).collect() };
+        for other in others {
+            match moves[other] {
+                Some((with, value, other_top)) if with == register && other_top != top => return Some((other, value)),
+                Some((with, ..)) if with == register && decoded[other].insn.is_some_and(|insn| !insn.conditional()) => return None,
+                _ => {}
+            }
+        }
+        None
+    };
     let mut halves = vec![false; decoded.len()];
     for (index, half) in moves.iter().enumerate() {
         let Some((register, value, top)) = *half else { continue };
-        let others: Box<dyn Iterator<Item = usize>> = if top { Box::new((0..index).rev()) } else { Box::new(index + 1..moves.len()) };
-        let partner = others
-            .filter_map(|other| Some((other, moves[other].filter(|&(with, ..)| with == register)?)))
-            .find(|&(other, (_, _, other_top))| other_top != top || unconditional(other))
-            .filter(|&(_, (_, _, other_top))| other_top != top);
-        let Some((partner, (_, other, _))) = partner else { continue };
+        let Some((partner, other)) = partner(index, register, top) else { continue };
         let (high, low, top_index) = if top { (value, other, index) } else { (other, value, partner) };
         if is_address(high << 16 | low, top_index, register) {
             (halves[index], halves[partner]) = (true, true);
@@ -817,6 +822,21 @@ mod tests {
         // Without the `ADD` of the PC the word is a number.
         let hashes = |at, data| arm_hashes(Machine::Arm, a32(at, data, false), at, data, None);
         assert_ne!(hashes(0x1_0000, 0x9_0000).0, hashes(0x1_4000, 0xA_1000).0);
+    }
+
+    #[test]
+    fn arm_hashes_in_position_independent_code_mask_offsets_from_the_got_only() {
+        // ldr r2, [pc, #4]; ldr r2, [r3, r2]; bx lr; and a word: a slot of the table at
+        // 0x3_0000 that r3 holds, or a number.
+        let hashes = |word: u32| {
+            let code: Vec<u8> = [0xE59F_2004, 0xE793_2002, 0xE12F_FF1E, word].into_iter().flat_map(u32::to_le_bytes).collect();
+            let section = |name: &str, addr, data: Vec<u8>, executable| Section { name: name.into(), addr, data, file_offset: None, executable, writable: false };
+            let mut image = Image::bare(String::new(), Format::Elf, Machine::Arm, 0x1_0000, vec![section(".text", 0x1_0000, code, true), section(".got", 0x3_0000, vec![0; 0x100], false)]);
+            image.relative_targets.push((0x3_0000, 0x1_0000));
+            hashes(&image, &FxHashMap::default(), &[(0x1_0000, 0x1_0010)]).unwrap().0
+        };
+        assert_eq!(hashes(0x10), hashes(0x20));
+        assert_ne!(hashes(0x1234), hashes(0x1238));
     }
 
     #[test]
