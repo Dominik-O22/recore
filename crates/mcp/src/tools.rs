@@ -389,10 +389,10 @@ fn diff_function(old: &mut Binary, new: &mut Binary, function: &str, timeout: Du
     let changed: Vec<usize> = merged.iter().enumerate().filter(|(_, line)| line.0 != ' ').map(|(index, _)| index).collect();
     if changed.is_empty() {
         let how = match pair.change {
-            None => "and so is its code",
-            Some(Change::Numbers) => "though numbers in its code differ that the C does not show",
-            Some(Change::Code) => "though its instructions differ: the compiler arranged them otherwise",
-            Some(Change::Unknown) => "but whether its instructions differ is not known: recore cannot compare this code",
+            Change::Same => "and so is its code",
+            Change::Numbers => "though numbers in its code differ that the C does not show",
+            Change::Code => "though its instructions differ: the compiler arranged them otherwise",
+            Change::Unknown => "but whether its instructions differ is not known: recore could not compare them",
         };
         writeln!(out, "the C is the same line for line, {how}")?;
         return Ok(out);
@@ -431,7 +431,7 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
     const LINES: usize = 8;
     let timeout = Duration::try_from_secs_f64(args.timeout.unwrap_or(30.0)).map_err(|_| anyhow!("`timeout` must be a positive number of seconds"))?;
     let mut in_c: FxHashMap<u64, Vec<String>> = FxHashMap::default();
-    for pair in found.pairs.iter().filter(|pair| pair.change == Some(Change::Code)).take(limit.min(COMPARED)) {
+    for pair in found.pairs.iter().filter(|pair| pair.change == Change::Code).take(limit.min(COMPARED)) {
         let Ok(merged) = changed_lines(old, new, pair, &paired, timeout) else { continue };
         let body = merged.iter().position(|(_, line)| line.trim().is_empty() && merged.first().is_some()).map_or(0, |blank| merged[blank + 1..].iter().position(|(_, line)| line.trim().is_empty()).map_or(blank, |next| blank + 1 + next));
         let changed: Vec<String> = merged[body..].iter().filter(|(sign, line)| *sign != ' ' && !line.trim().is_empty()).map(|(sign, line)| format!("{sign} {}", line.trim())).collect();
@@ -440,12 +440,13 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
     let (old, new) = (&old.program, &new.program);
     let (old_sizes, new_sizes) = (old.sizes(), new.sizes());
     let size = |sizes: &FxHashMap<u64, u64>, entry: &u64| sizes.get(entry).copied().unwrap_or_default();
-    let changed: Vec<_> = found.pairs.iter().filter(|pair| pair.change == Some(Change::Code)).collect();
-    let renumbered: Vec<_> = found.pairs.iter().filter(|pair| pair.change == Some(Change::Numbers)).collect();
-    let unknown = found.pairs.iter().filter(|pair| pair.change == Some(Change::Unknown)).count();
+    let changed: Vec<_> = found.pairs.iter().filter(|pair| pair.change == Change::Code).collect();
+    let renumbered: Vec<_> = found.pairs.iter().filter(|pair| pair.change == Change::Numbers).collect();
+    let count = |change: Change| found.pairs.iter().filter(|pair| pair.change == change).count();
+    let (same, unknown) = (count(Change::Same), count(Change::Unknown));
     let mut out = String::new();
-    let not_compared = if unknown == 0 { String::new() } else { format!(", {unknown} not compared, since recore cannot compare their code") };
-    writeln!(out, "{} functions before, {} after: {} the same, {} changed{not_compared}, {} removed, {} added", old.functions().count(), new.functions().count(), found.pairs.len() - changed.len() - renumbered.len() - unknown, changed.len() + renumbered.len(), found.removed.len(), found.added.len())?;
+    let not_compared = if unknown == 0 { String::new() } else { format!(", {unknown} whose code could not be compared") };
+    writeln!(out, "{} functions before, {} after: {same} the same, {} changed{not_compared}, {} removed, {} added", old.functions().count(), new.functions().count(), changed.len() + renumbered.len(), found.removed.len(), found.added.len())?;
     // What a function refers to, in terms the two builds share: the functions it calls, as
     // the after build knows them, and the strings it uses.
     let refers = |program: &Program, entry: u64, in_new: &dyn Fn(u64) -> Option<u64>| -> (BTreeMap<String, String>, BTreeMap<String, String>) {

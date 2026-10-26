@@ -34,20 +34,20 @@ pub struct Pair {
     pub old: u64,
     pub new: u64,
     pub evidence: Evidence,
-    /// How the code differs, if in more than the addresses it holds. `None` only where both
-    /// were compared.
-    pub change: Option<Change>,
+    pub change: Change,
 }
 
 /// How the code of a function differs between two builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
+    /// In nothing but the addresses it holds.
+    Same,
     /// The instructions are the same and only numbers in them differ: a constant, or the
     /// offsets of fields, as in every function that uses a structure which gained one.
     Numbers,
     Code,
     /// The code of one or both could not be compared, so whether it differs is not known:
-    /// [`crate::signature::body_hash`] does not hash the machine, or the image lacks the bytes.
+    /// [`crate::signature::hashes`] does not hash the machine, or the image lacks the bytes.
     Unknown,
 }
 
@@ -72,19 +72,16 @@ enum Callee<'a> {
 /// One build, with what pairing asks of each function.
 struct Side<'a> {
     program: &'a Program,
-    /// Every function's body with its addresses blanked, fragments included, and the same
-    /// with its numbers blanked too.
+    /// The body and shape hashes of each function whose code could be hashed, fragments
+    /// included: see [`crate::signature::hashes`].
     bodies: FxHashMap<u64, (u64, u64)>,
 }
 
 impl<'a> Side<'a> {
     fn new(program: &'a Program) -> Side<'a> {
         let slots: FxHashMap<u64, u64> = program.image.relative_targets.iter().copied().collect();
-        let body = |entry: u64| {
-            let body = program.body(entry);
-            Some((entry, (crate::signature::body_hash(&program.image, &slots, &body)?, crate::signature::shape_hash(&program.image, &slots, &body)?)))
-        };
-        Side { program, bodies: program.functions().filter_map(|function| body(function.addr)).collect() }
+        let hashes = |entry: u64| Some((entry, crate::signature::hashes(&program.image, &slots, &program.body(entry))?));
+        Side { program, bodies: program.functions().filter_map(|function| hashes(function.addr)).collect() }
     }
 
     fn entries(&self) -> impl Iterator<Item = u64> + '_ {
@@ -233,10 +230,10 @@ pub fn diff(old: &Program, new: &Program) -> Diff {
     }
 
     let change = |from: u64, to: u64| match (old.bodies.get(&from), new.bodies.get(&to)) {
-        (Some(before), Some(after)) if before.0 == after.0 => None,
-        (Some(before), Some(after)) if before.1 == after.1 => Some(Change::Numbers),
-        (Some(_), Some(_)) => Some(Change::Code),
-        _ => Some(Change::Unknown),
+        (Some(before), Some(after)) if before.0 == after.0 => Change::Same,
+        (Some(before), Some(after)) if before.1 == after.1 => Change::Numbers,
+        (Some(_), Some(_)) => Change::Code,
+        _ => Change::Unknown,
     };
     let pairs = pairing.by_old.iter().map(|(&from, &(to, evidence))| Pair { old: from, new: to, evidence, change: change(from, to) }).collect();
     Diff {
@@ -266,9 +263,9 @@ mod tests {
         let change = |machine, before: &[u8], after: &[u8]| diff(&program(machine, before.to_vec()), &program(machine, after.to_vec())).pairs[0].change;
         // mov r0, #1; bx lr against mov r0, #2; bx lr.
         let (one, two) = ([1, 0, 0xA0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1], [2, 0, 0xA0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1]);
-        assert_eq!(change(Machine::Arm, &one, &one), None);
-        assert_eq!(change(Machine::Arm, &one, &two), Some(Change::Numbers));
+        assert_eq!(change(Machine::Arm, &one, &one), Change::Same);
+        assert_eq!(change(Machine::Arm, &one, &two), Change::Numbers);
         // The 8051 is not hashed: mov a, #1; ret, the same in both, is not known to be.
-        assert_eq!(change(Machine::I8051, &[0x74, 1, 0x22], &[0x74, 1, 0x22]), Some(Change::Unknown));
+        assert_eq!(change(Machine::I8051, &[0x74, 1, 0x22], &[0x74, 1, 0x22]), Change::Unknown);
     }
 }

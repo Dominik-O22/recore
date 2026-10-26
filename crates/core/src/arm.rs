@@ -212,7 +212,7 @@ impl A32 {
     }
 
     /// The register a literal `LDR` of a word loads.
-    pub(crate) fn literal_word_register(self) -> Option<usize> {
+    fn literal_word_register(self) -> Option<usize> {
         let transfer = self.transfer()?;
         (self.literal_range().is_some() && transfer.size == 4 && !transfer.signed).then_some(transfer.rt)
     }
@@ -289,6 +289,42 @@ impl A32 {
 pub enum Insn {
     A32(A32),
     Thumb(thumb::Insn),
+}
+
+impl Insn {
+    /// `[start, end)` of the data a PC-relative load reads, and the register it loads when it
+    /// loads a word.
+    pub(crate) fn literal(self) -> Option<((u64, u64), Option<usize>)> {
+        match self {
+            Insn::A32(insn) => Some((insn.literal_range()?, insn.literal_word_register())),
+            Insn::Thumb(insn) => Some((insn.literal_range()?, insn.literal_word_register())),
+        }
+    }
+
+    /// `MOVW` and `MOVT`: the register, the 16 bits, and whether they are the top half.
+    pub(crate) fn move_half(self) -> Option<(usize, u32, bool)> {
+        match self {
+            Insn::A32(insn) => insn.move_half(),
+            Insn::Thumb(insn) => insn.move_half(),
+        }
+    }
+
+    /// An `ADD` of the PC to a register, as position-independent code forms an address from
+    /// an offset: the register that holds the offset, and the PC added.
+    pub(crate) fn pc_sum(self) -> Option<(usize, u64)> {
+        match self {
+            Insn::A32(insn) => insn.adds_pc().map(|(_, offset)| (offset, insn.pc())),
+            Insn::Thumb(insn) => pc_sum_thumb(&insn).map(|rd| (rd, insn.addr + 4)),
+        }
+    }
+
+    /// Whether it runs only when a condition holds.
+    pub(crate) fn conditional(self) -> bool {
+        match self {
+            Insn::A32(insn) => insn.conditional(),
+            Insn::Thumb(insn) => insn.conditional,
+        }
+    }
 }
 
 /// Decodes the A32 word at `offset` into `bytes`, which are loaded at `base`.
