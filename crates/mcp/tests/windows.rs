@@ -118,6 +118,9 @@ fn functions() -> Vec<(&'static str, Vec<u8>)> {
         ("inner", [&[0xc7, 0x05][..], &le(GLOBAL), &le(0x99), &[0xb8, 9, 0, 0, 0, 0xc2, 4, 0]].concat()),
         // JMP to itself.
         ("spin", vec![0xeb, 0xfe]),
+        // MOVD XMM0, [ESP+4]; PSHUFLW XMM0, XMM0, 0; MOVD EAX, XMM0: the low word of the argument
+        // spread over the register, as MSVC's memset spreads its byte.
+        ("spread", vec![0x66, 0x0f, 0x6e, 0x44, 0x24, 0x04, 0xf2, 0x0f, 0x70, 0xc0, 0x00, 0x66, 0x0f, 0x7e, 0xc0, RET]),
     ]
 }
 
@@ -405,3 +408,10 @@ fn a_whole_run_is_written_out_and_steered_to_compare_with_another() {
     let spin = program.run("spin", json!({ "timeout": 0.2, "steps": 1u64 << 40 }));
     assert!(spin.ends_with("the run took more than 0.2 seconds\n"), "{spin}");
 }
+
+#[test]
+fn an_sse_instruction_the_specification_leaves_named_runs() {
+    let mut program = Program::new();
+    assert_eq!(returned(&program.run("spread", json!({ "args": [0x1234] }))), "0x12341234");
+}
+

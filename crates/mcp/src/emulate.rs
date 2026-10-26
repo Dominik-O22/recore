@@ -27,6 +27,7 @@ use serde::Deserialize;
 use crate::binary::Binary;
 
 mod snapshot;
+mod sse;
 mod windows;
 mod x87;
 
@@ -127,7 +128,8 @@ impl Code {
 }
 
 /// One p-code operation. A LOAD or STORE reaches the space `space`; a CALLOTHER is the
-/// processor operation called `userop`. Neither is among `inputs`.
+/// processor operation called `userop`, which `sse` runs when it is one of those. Neither is
+/// among `inputs`.
 #[derive(Clone, Debug)]
 struct Op {
     code: Code,
@@ -135,6 +137,7 @@ struct Op {
     inputs: Vec<Varnode>,
     space: Space,
     userop: String,
+    sse: Option<sse::Op>,
 }
 
 /// One instruction: its length and what it does.
@@ -168,11 +171,14 @@ fn parse_op(spaces: &mut Spaces, line: &str) -> Result<Op> {
         Some("-") | None => None,
         Some(word) => Some(operand(spaces, word)?),
     };
-    let mut op = Op { code, out, inputs: Vec::new(), space: CONST, userop: String::new() };
+    let mut op = Op { code, out, inputs: Vec::new(), space: CONST, userop: String::new(), sse: None };
     for (index, word) in words.enumerate() {
         match (index, code) {
             (0, Code::Load | Code::Store) => op.space = spaces.intern(word),
-            (0, Code::CallOther) if !word.contains(':') => op.userop = word.to_string(),
+            (0, Code::CallOther) if !word.contains(':') => {
+                op.sse = sse::Op::parse(word);
+                op.userop = word.to_string();
+            }
             _ => op.inputs.push(operand(spaces, word)?),
         }
     }
@@ -905,6 +911,14 @@ impl<'a> Emulator<'a> {
                     self.memory.write(&self.binary.program.image, op.space, addr, op.inputs[1].size, value, true);
                 }
                 Code::CallOther => {
+                    if let (Some(sse), Some(out)) = (op.sse, op.out) {
+                        let mut inputs = Vec::with_capacity(op.inputs.len());
+                        for &input in &op.inputs {
+                            inputs.push(self.get(input)?);
+                        }
+                        self.put(out, sse.run(out.size, &inputs))?;
+                        continue;
+                    }
                     if !HARMLESS.iter().any(|harmless| harmless.eq_ignore_ascii_case(&op.userop)) {
                         let name = if op.userop.is_empty() { "an unnamed operation" } else { &op.userop };
                         return Err(format!("the processor operation {name} is not run"));

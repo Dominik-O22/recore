@@ -77,6 +77,8 @@ The instructions the specification leaves opaque or approximate run whole. `F2XM
 
 It runs the function and what it calls, not the program. Imports such as `memcpy`, `strlen` and `malloc` run as stand-ins, a call to any other import ends the run and names it, and so does a processor operation or an instruction the specifications give no semantics. A run stops after `steps` instructions, with the bytes a stand-in moves counted as well, and after 30 seconds.
 
+The MMX, SSE, SSSE3 and SSE4.1 integer instructions that the x86 specification leaves as named operations, such as `PSHUFLW`, `PMADDWD`, `PSHUFB` and `PMOVZXBW`, run as the processor runs them: the same as this machine's in every bit over generated inputs, in a unit test and in the oracle. The string compares (`PCMPISTRI` and its kin), the packed floats the specification leaves named, AVX and 3DNow! do not.
+
 What a run does not tell you:
 - Memory that nothing wrote and the file does not hold reads as zeros. The answer counts those reads and says where the first were, labelled with the region on a Cortex-M. On a chip that memory is the peripherals and the globals the startup code sets, so a result that depends on it needs those given with `set`.
 - A write past the end of a buffer or of a block `malloc` gave is listed with the memory it landed in. The stack is not listed.
