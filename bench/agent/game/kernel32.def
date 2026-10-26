@@ -1,0 +1,20 @@
+LIBRARY kernel32.dll
+EXPORTS
+CloseHandle@4
+CreateFileA@28
+DeleteFileA@4
+ExitProcess@4
+FindClose@4
+FindFirstFileA@8
+FindNextFileA@8
+GetFileAttributesExA@12
+GetProcessHeap@0
+GetStdHandle@4
+GetSystemTimeAsFileTime@4
+HeapAlloc@12
+HeapFree@12
+HeapReAlloc@16
+MoveFileA@8
+ReadFile@20
+SetFilePointer@16
+WriteFile@20
