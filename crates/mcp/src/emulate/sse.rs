@@ -8,7 +8,7 @@
 //! Not here: the string compares (`pcmpestri` and its kin), `maskmovdqu`, which writes memory,
 //! and the VEX forms, which the specification names apart (`vpshufb_avx` and so on).
 
-use super::{mask, signed};
+use super::{mask, signed as sext};
 
 /// One of the operations, resolved from its name when the instruction is lifted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +57,8 @@ pub enum Lane {
     MulHighUnsigned,
     MulHighRounded,
     MulLow,
+    /// The unsigned average, rounded up.
+    Average,
     /// The source's absolute value.
     Abs,
     /// The destination negated, kept or cleared as the source is negative, positive or zero.
@@ -94,6 +96,8 @@ impl Op {
             "pmulhuw" => Op::Lanes(MulHighUnsigned, 2),
             "pmulhrsw" => Op::Lanes(MulHighRounded, 2),
             "pmulld" => Op::Lanes(MulLow, 4),
+            // The specification calls these once for each lane, with operands of the lane's size.
+            "pavgb" | "pavgw" => Op::Lanes(Average, last?),
             "pabsb" | "pabsw" | "pabsd" => Op::Lanes(Abs, last?),
             "psignb" | "psignw" | "psignd" => Op::Lanes(Sign, last?),
             "pmaddwd" => Op::MaddWords,
@@ -123,7 +127,8 @@ impl Op {
             _ => {
                 let rest = name.strip_prefix("pmovsx").map(|rest| (rest, true)).or_else(|| name.strip_prefix("pmovzx").map(|rest| (rest, false)));
                 let (&[from, to], signed) = rest.map(|(rest, signed)| (rest.as_bytes(), signed))? else { return None };
-                Op::Widen { from: width(from)?, to: width(to)?, signed }
+                let (from, to) = (width(from)?, width(to)?);
+                (from < to && to < 16).then_some(Op::Widen { from, to, signed })?
             }
         })
     }
@@ -134,7 +139,6 @@ impl Op {
         let arg = |index: usize| inputs.get(index).copied().unwrap_or(0);
         let (dest, src, third) = (arg(0), arg(1), arg(2));
         let result = match self {
-            Op::Lanes(Lane::Abs, width) => lanewise(size, width, src, 0, |a, _| sext(a, width).unsigned_abs()),
             Op::Lanes(lane, width) => lanewise(size, width, dest, src, |a, b| match lane {
                 Lane::AddSigned => saturate(sext(a, width) + sext(b, width), width),
                 Lane::SubSigned => saturate(sext(a, width) - sext(b, width), width),
@@ -144,12 +148,13 @@ impl Op {
                 Lane::MulHighUnsigned => (a * b) >> 16,
                 Lane::MulHighRounded => ((((sext(a, 2) * sext(b, 2)) >> 14) + 1) >> 1) as u128,
                 Lane::MulLow => a * b,
+                Lane::Average => (a + b + 1) >> 1,
+                Lane::Abs => sext(b, width).unsigned_abs(),
                 Lane::Sign => match sext(b, width).signum() {
                     -1 => a.wrapping_neg(),
                     0 => 0,
                     _ => a,
                 },
-                Lane::Abs => unreachable!("the absolute value reads only the source"),
             }),
             Op::MaddWords => join(4, (0..size / 4).map(|lane| pair(dest, src, lane, 2, |a, b| sext(a, 2) * sext(b, 2)) as u128)),
             Op::MaddBytes => join(2, (0..size / 2).map(|lane| saturate(pair(dest, src, lane, 1, |a, b| a as i128 * sext(b, 1)), 2))),
@@ -231,10 +236,6 @@ fn shuffle_words(value: u128, from: usize, imm: u128) -> u128 {
     join(2, (0..4).map(|lane| lane_of(value, 2, from + (imm >> (lane * 2) & 3) as usize)))
 }
 
-fn sext(value: u128, width: usize) -> i128 {
-    signed(value, width)
-}
-
 /// The nearest value a signed lane of `width` bytes holds to `value`.
 fn saturate(value: i128, width: usize) -> u128 {
     let bits = width as u32 * 8;
@@ -253,7 +254,7 @@ mod tests {
     fn names_resolve_to_their_operations() {
         assert_eq!(Op::parse("psubusb"), Some(Op::Lanes(Lane::SubUnsigned, 1)));
         assert_eq!(Op::parse("pmovsxwq"), Some(Op::Widen { from: 2, to: 8, signed: true }));
-        for other in ["pmovsx", "pmovzxb", "pmovsxbwq", "cpuid", "vpshufb_avx", ""] {
+        for other in ["pmovsx", "pmovzxb", "pmovsxbwq", "pmovsxqb", "cpuid", "vpshufb_avx", ""] {
             assert_eq!(Op::parse(other), None, "{other}");
         }
     }
@@ -341,6 +342,8 @@ mod tests {
         check("packusdw", &[a, b], v(_mm_packus_epi32(ma, mb)));
         check("psllw", &[a, count], v(_mm_sll_epi16(ma, m(count))));
         check("psraw", &[a, count], v(_mm_sra_epi16(ma, m(count))));
+        check("pavgb", &[a, b], v(_mm_avg_epu8(ma, mb)));
+        check("pavgw", &[a, b], v(_mm_avg_epu16(ma, mb)));
         check("pabsb", &[0, b], v(_mm_abs_epi8(mb)));
         check("pabsw", &[0, b], v(_mm_abs_epi16(mb)));
         check("pabsd", &[0, b], v(_mm_abs_epi32(mb)));

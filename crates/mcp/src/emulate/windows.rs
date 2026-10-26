@@ -42,6 +42,12 @@ pub(super) struct Thread {
     taken: u64,
 }
 
+/// The Windows functions [`Emulator::windows_stand_in`] runs. `GetTickCount` runs only with `ticks`.
+pub(super) const STAND_INS: &[&str] = &[
+    "GetLastError", "SetLastError", "GetCurrentThreadId", "GetTickCount", "TlsAlloc", "TlsGetValue", "TlsSetValue", "HeapAlloc", "HeapFree", "InitializeCriticalSection", "EnterCriticalSection",
+    "LeaveCriticalSection", "DeleteCriticalSection", "GetModuleHandleA", "GetFileVersionInfoSizeA", "GetFileVersionInfoA", "VerQueryValueA",
+];
+
 impl Emulator<'_> {
     /// Points `FS` at the block the caller chose with `FS_OFFSET`, or at the first thread the
     /// snapshot lists, or else at a fresh block whose stack is the run's and whose last error
@@ -85,7 +91,8 @@ impl Emulator<'_> {
         (index < SLOTS + EXPANSION_SLOTS && expansion != 0).then(|| expansion + 4 * (index - SLOTS))
     }
 
-    /// Runs the stand-in for the Windows function `name`, or gives `None` if it has none.
+    /// Runs the stand-in for the Windows function `name`, or gives `None` if it has none. Each
+    /// name here is in [`STAND_INS`].
     pub(super) fn windows_stand_in(&mut self, name: &str, tail: bool) -> Result<Option<Return>, String> {
         if !self.abi.windows {
             return Ok(None);
