@@ -78,10 +78,10 @@ pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u6
 /// by itself. `None` where the code cannot be read or its machine is not hashed, which is the
 /// 8051's.
 pub fn hashes(image: &Image, pointer_slots: &FxHashMap<u64, u64>, body: &[(u64, u64)]) -> Option<(u64, u64)> {
-    let x86 = |bits| move |bytes: &[u8], start, end, numbers| x86(bits, bytes, pointer_slots, start, end, None, numbers, None);
+    let x86_range = |bits| move |bytes: &[u8], start, end, numbers| x86(bits, bytes, pointer_slots, start, end, None, numbers, None);
     let range: &dyn Fn(&[u8], u64, u64, bool) -> Option<u64> = match image.machine {
-        Machine::X86 => &x86(32),
-        Machine::X86_64 => &x86(64),
+        Machine::X86 => &x86_range(32),
+        Machine::X86_64 => &x86_range(64),
         Machine::Aarch64 => &|bytes, start, end, numbers| aarch64(bytes, start, end, None, numbers),
         // As one, since a `MOVW` and its `MOVT` may lie on either side of a jump table that
         // splits the body.
@@ -308,24 +308,28 @@ fn aarch64(bytes: &[u8], start: u64, end: u64, min_words: Option<usize>, numbers
 
 /// The instructions of an ARM function's `body` in order, each A32 or Thumb as the image says,
 /// without the pools that literal loads read among them. A pool that a load before it reads is
-/// passed over as it comes; one that a load after it reads is found once decoded through, and
-/// the body is decoded again without it, so that the code after every pool decodes from where
-/// it begins.
+/// passed over as it comes. One that a load after it reads is found once decoded through, and
+/// the body is decoded again passing over it, so that the code after every pool decodes from
+/// where it begins. A pool stays passed over only while a load of the pass reads it, so one
+/// that bytes of another, decoded as a load, seemed to read goes once they are passed over.
 fn arm_instructions(image: &Image, body: &[(u64, u64)]) -> Option<Vec<Decoded<arm::Insn>>> {
     let as_arm = |one: Decoded<thumb::Insn>| Decoded { addr: one.addr, len: one.len, insn: one.insn.map(arm::Insn::Thumb) };
-    // The halfwords of every pool found.
-    let mut pooled = FxHashSet::default();
-    // A pass decodes through the pools it finds behind loads; data taken for code may find
-    // more each time.
-    for pass in 1.. {
-        let known = pooled.len();
-        let mut decoded = Vec::new();
+    let halfwords = |(at, to): (u64, u64)| (at & !1..to).step_by(2);
+    let covers = |one: &Decoded<arm::Insn>| (one.addr..one.addr + u64::from(one.len)).step_by(2);
+    // The halfwords of the pools passed over from the start of a pass.
+    let mut behind = FxHashSet::default();
+    // The decoded instructions of the pass, and the halfwords of the pools their loads read.
+    let (mut decoded, mut read) = (Vec::new(), FxHashSet::default());
+    // Data taken for code may find more pools each pass.
+    for _ in 0..3 {
+        decoded.clear();
+        let mut skipped = behind.clone();
         for &(start, end) in body {
             let bytes = image.bytes_from(start)?.get(..end.checked_sub(start)? as usize)?;
             let (mut offset, mut it) = (0, 0);
             while offset < bytes.len() {
                 let addr = start + offset as u64;
-                if pooled.contains(&addr) {
+                if skipped.contains(&addr) {
                     (offset, it) = (offset + 2, 0);
                     continue;
                 }
@@ -336,25 +340,24 @@ fn arm_instructions(image: &Image, body: &[(u64, u64)]) -> Option<Vec<Decoded<ar
                 };
                 // Only a range of an odd length leaves a byte that is no instruction at all.
                 let Some(one) = one else { break };
-                if let Some(((at, to), _)) = one.insn.and_then(arm::Insn::literal) {
-                    pooled.extend((at & !1..to).step_by(2));
+                if let Some((pool, _)) = one.insn.and_then(arm::Insn::literal) {
+                    skipped.extend(halfwords(pool));
                 }
                 offset += usize::from(one.len.max(1));
                 decoded.push(one);
             }
         }
-        let in_pool = |one: &Decoded<arm::Insn>| (one.addr..one.addr + u64::from(one.len)).step_by(2).any(|half| pooled.contains(&half));
-        if !decoded.iter().any(in_pool) {
-            return Some(decoded);
+        read = decoded.iter().filter_map(|one| one.insn.and_then(arm::Insn::literal)).flat_map(|(pool, _)| halfwords(pool)).collect();
+        let through = decoded.iter().flat_map(covers).filter(|half| read.contains(half));
+        let next: FxHashSet<u64> = behind.iter().copied().filter(|half| read.contains(half)).chain(through).collect();
+        if next == behind {
+            break;
         }
-        // Pools found again where they were the last time, or still more after a few passes:
-        // what overlaps one is left out.
-        if pooled.len() == known || pass == 3 {
-            decoded.retain(|one| !in_pool(one));
-            return Some(decoded);
-        }
+        behind = next;
     }
-    unreachable!()
+    // What still overlaps a pool after the last pass is left out.
+    decoded.retain(|one| !covers(one).any(|half| read.contains(&half)));
+    Some(decoded)
 }
 
 /// The body and shape hashes of a 32-bit ARM function, see [`hashes`]. Blanked are the offsets
@@ -404,15 +407,12 @@ fn arm(image: &Image, pointer_slots: &FxHashMap<u64, u64>, body: &[(u64, u64)]) 
     // each of two conditions is then two pairs.
     let moves: Vec<Option<(usize, u32, bool)>> = decoded.iter().map(|one| one.insn.and_then(arm::Insn::move_half)).collect();
     let partner = |index: usize, register: usize, top: bool| {
-        let others: Vec<usize> = if top { (0..index).rev().collect() } else { (index + 1..moves.len()).collect() };
-        for other in others {
-            match moves[other] {
-                Some((with, value, other_top)) if with == register && other_top != top => return Some((other, value)),
-                Some((with, ..)) if with == register && decoded[other].insn.is_some_and(|insn| !insn.conditional()) => return None,
-                _ => {}
-            }
-        }
-        None
+        let step = |other: usize| match moves[other] {
+            Some((with, value, other_top)) if with == register && other_top != top => Some(Some((other, value))),
+            Some((with, ..)) if with == register && decoded[other].insn.is_some_and(|insn| !insn.conditional()) => Some(None),
+            _ => None,
+        };
+        if top { (0..index).rev().find_map(step)? } else { (index + 1..moves.len()).find_map(step)? }
     };
     let mut halves = vec![false; decoded.len()];
     for (index, half) in moves.iter().enumerate() {
@@ -800,6 +800,24 @@ mod tests {
     }
 
     #[test]
+    fn arm_hashes_keep_code_that_a_pool_read_as_a_load_seemed_to_cover() {
+        // Thumb: a pool that only the load after it reads, whose first halfword reads as
+        // ldr r0, [pc, #4], a load from the movs r1 after the load.
+        let build = |constant: u16| {
+            let halfwords = [
+                0xE002, 0xBF00,         // b past the pool; nop
+                0x4801, 0x0002,         // the pool
+                0xF85F, 0x0008,         // ldr.w r0, [pc, #-8]
+                0x2100 | constant,      // movs r1, #constant
+                0x2203, 0x4770, 0xBF00, // movs r2, #3; bx lr; nop
+            ];
+            halfwords.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<u8>>()
+        };
+        let hashes = |constant| arm_hashes(Machine::Thumb, build(constant), 0x1_0000, 0x2_0000, None);
+        assert_ne!(hashes(5).0, hashes(6).0);
+    }
+
+    #[test]
     fn arm_hashes_mask_offsets_the_code_adds_the_pc_to_and_sram() {
         // A word loaded from the pool after the code, `data + 0x10` less the PC that the
         // `ADD` after the load adds to it, or with `pc` false that much from 0x2000_0000.
@@ -814,14 +832,25 @@ mod tests {
             let halfwords = [0x4B01, if pc { 0x447B } else { 0x440B }, 0x4770, 0xBF00, word as u16, (word >> 16) as u16];
             halfwords.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<u8>>()
         };
-        let builds: [(Machine, &dyn Fn(u64, u64, bool) -> Vec<u8>, bool); 3] = [(Machine::Arm, &a32, true), (Machine::Thumb, &thumb, true), (Machine::Thumb, &thumb, false)];
+        // ldr r3, [pc, r3] or, taking it away, ldr r3, [pc, -r3], where the add was.
+        let load = |up: bool| {
+            move |at: u64, data: u64, _| {
+                let word = (data + 0x10).wrapping_sub(at + 12) as u32;
+                [0xE59F_3004, if up { 0xE79F_3003 } else { 0xE71F_3003 }, 0xE12F_FF1E, word].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<u8>>()
+            }
+        };
+        let (up, down) = (load(true), load(false));
+        let builds: [(Machine, &dyn Fn(u64, u64, bool) -> Vec<u8>, bool); 4] = [(Machine::Arm, &a32, true), (Machine::Arm, &up, true), (Machine::Thumb, &thumb, true), (Machine::Thumb, &thumb, false)];
         for (machine, build, pc) in builds {
             let hashes = |at, data| arm_hashes(machine, build(at, data, pc), at, data, None);
             assert_eq!(hashes(0x1_0000, 0x9_0000), hashes(0x1_4000, 0xA_1000));
         }
-        // Without the `ADD` of the PC the word is a number.
-        let hashes = |at, data| arm_hashes(Machine::Arm, a32(at, data, false), at, data, None);
-        assert_ne!(hashes(0x1_0000, 0x9_0000).0, hashes(0x1_4000, 0xA_1000).0);
+        // Without the PC added the word is a number.
+        let unadded: [&dyn Fn(u64, u64, bool) -> Vec<u8>; 2] = [&a32, &down];
+        for build in unadded {
+            let hashes = |at, data| arm_hashes(Machine::Arm, build(at, data, false), at, data, None);
+            assert_ne!(hashes(0x1_0000, 0x9_0000).0, hashes(0x1_4000, 0xA_1000).0);
+        }
     }
 
     #[test]
@@ -837,6 +866,8 @@ mod tests {
         };
         assert_eq!(hashes(0x10), hashes(0x20));
         assert_ne!(hashes(0x1234), hashes(0x1238));
+        // Numbers that would be addresses in code linked to one address.
+        assert_ne!(hashes(0x1_0004), hashes(0x1_0008));
     }
 
     #[test]
