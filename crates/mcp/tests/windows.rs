@@ -440,7 +440,7 @@ fn coverage_lists_what_a_run_would_stop_on_without_running() {
     // What a function calls is covered too, from an address anywhere in it.
     let inside = format!("{:#x}", u64::from_str_radix(&program.addr("calls_femms")[2..], 16).unwrap() + 1);
     let called = program.client.tool("run", json!({ "path": program.path, "function": inside, "coverage": true })).unwrap();
-    assert_eq!(called, format!("a run stops on 1 of the 5 instructions of {inside} and the function it calls, if it reaches them:\n  FEMMS: the processor operation FastExitMediaState is not run, 1 at {}\n", program.addr("femms")));
+    assert_eq!(called, format!("a run stops on 1 of the 5 instructions of {inside} and the functions it reaches, 2 in all, if it reaches them:\n  FEMMS: the processor operation FastExitMediaState is not run, 1 at {}\n", program.addr("femms")));
     let clock = program.run("clock", json!({ "coverage": true }));
     assert!(clock.contains("  the run called GetTickCount, which answers only with `ticks`, 1 at "), "{clock}");
 }

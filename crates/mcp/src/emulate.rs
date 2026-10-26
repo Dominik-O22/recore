@@ -965,8 +965,10 @@ impl<'a> Emulator<'a> {
                         for &input in &op.inputs {
                             inputs.push(self.get(input)?);
                         }
-                        let out = op.out.ok_or("an MMX or SSE operation with no output")?;
-                        self.put(out, sse.run(out.size, &inputs))?;
+                        // `Userop::parse` gives an operation of `sse` only where there is an output.
+                        if let Some(out) = op.out {
+                            self.put(out, sse.run(out.size, &inputs))?;
+                        }
                     }
                     Userop::Harmless => {}
                     Userop::Stop(why) => return Err(why.clone()),
@@ -1589,8 +1591,8 @@ fn stops_on(op: &Op) -> Option<String> {
     let widest = op.out.iter().chain(&op.inputs).map(|place| place.size).max().unwrap_or(0);
     match (op.code, &op.userop) {
         (Code::CallOther, Userop::Stop(why)) => Some(why.clone()),
-        // The rest read their operands as an MMX or SSE operation reads them, or not at all.
-        (Code::CallOther, _) => None,
+        // A harmless operation reads none of its operands.
+        (Code::CallOther, Userop::Harmless) => None,
         (Code::Unimplemented, _) => Some(UNIMPLEMENTED.into()),
         _ if widest > 16 => Some(too_wide(widest)),
         _ => None,
@@ -1685,11 +1687,10 @@ fn coverage(binary: &mut Binary, function: Option<&str>) -> Result<String> {
             }
         }
     }
-    let scope = match (function, functions.len() - 1) {
-        (Some(name), 0) => name.to_string(),
-        (Some(name), 1) => format!("{name} and the function it calls"),
-        (Some(name), called) => format!("{name} and the {called} functions it calls"),
-        (None, _) => format!("the {} functions of the binary", functions.len()),
+    let scope = match function {
+        Some(name) if functions.len() == 1 => name.to_string(),
+        Some(name) => format!("{name} and the functions it reaches, {} in all", functions.len()),
+        None => format!("the {} functions of the binary", functions.len()),
     };
     let mut out = String::new();
     if instructions.is_empty() && imports.is_empty() {
@@ -1715,7 +1716,8 @@ fn coverage(binary: &mut Binary, function: Option<&str>) -> Result<String> {
     };
     let stopping: usize = instructions.values().map(|&(count, _)| count).sum();
     let calls: usize = imports.values().map(|&(count, _)| count).sum();
-    let imports_head = if instructions.is_empty() { format!("a run of the {lifted} instructions of {scope} stops on {calls} calls to imports, if it reaches them:") } else { format!("and on {calls} calls to imports, if it reaches them:") };
+    let calls = if calls == 1 { "1 call".to_string() } else { format!("{calls} calls") };
+    let imports_head = if instructions.is_empty() { format!("a run of the {lifted} instructions of {scope} stops on {calls} to imports, if it reaches them:") } else { format!("and on {calls} to imports, if it reaches them:") };
     part(&mut out, instructions, format!("a run stops on {stopping} of the {lifted} instructions of {scope}, if it reaches them:"), false)?;
     part(&mut out, imports, imports_head, true)?;
     Ok(out)

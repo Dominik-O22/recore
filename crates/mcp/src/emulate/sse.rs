@@ -128,7 +128,7 @@ impl Op {
                 let rest = name.strip_prefix("pmovsx").map(|rest| (rest, true)).or_else(|| name.strip_prefix("pmovzx").map(|rest| (rest, false)));
                 let (&[from, to], signed) = rest.map(|(rest, signed)| (rest.as_bytes(), signed))? else { return None };
                 let (from, to) = (width(from)?, width(to)?);
-                (from < to && to < 16).then_some(Op::Widen { from, to, signed })?
+                (from < to).then_some(Op::Widen { from, to, signed })?
             }
         })
     }
