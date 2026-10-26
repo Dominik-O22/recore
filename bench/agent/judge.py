@@ -4,13 +4,14 @@ item of the session's tasks three times, and each item takes the verdict most of
 gave. Borderline items come out either way from one judgement to the next. The tasks are the
 letters in <dir>/tasks, A to C where it has none.
 
-Usage: judge.py <dir>... (JUDGE names the model, claude-sonnet-5-5 unless set)
+Usage: judge.py <dir>... (JUDGE names the model, claude-sonnet-5-5 unless set, and KEY the key,
+key.md beside this file unless set, such as game/key.md)
 """
 import os, re, subprocess, sys
 from collections import Counter
 from pathlib import Path
 
-KEY = (Path(__file__).parent / "key.md").read_text()
+KEY = Path(os.environ.get("KEY", Path(__file__).parent / "key.md")).read_text()
 ITEM = re.compile(r"^- \*\*([A-Z]\d+)\.\*\*(.*)$", re.M)
 VERDICT = re.compile(r"^([A-Z]\d+)[.:]?\s+(PASS|FAIL)\W*(.*)$", re.M)
 TIMES = 3
