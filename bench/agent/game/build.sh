@@ -27,4 +27,10 @@ llvm-dlltool -m i386 -k -d "$here/kernel32.def" -l "$out/obj/kernel32.lib"
 "$zig" lld-link /nologo /debug /pdb:"$out/game.pdb" /pdbaltpath:game.pdb /opt:ref /opt:icf /Brepro \
   /entry:mainCRTStartup /subsystem:console /nodefaultlib /machine:x86 /out:"$out/game.exe" "$out"/obj/*.obj "$out/obj/kernel32.lib"
 ls -l "$out/game.exe" "$out/game.pdb"
-sha256sum "$out/game.exe"
+# key.md's addresses are this build's. Another compiler or linker gives another exe, and the key
+# does not apply to it.
+key=a3240cc14ff9d13a8be712d17e13ae9835337e8d0d87f1e9c0f448a4fb7698d1
+if [ "$(sha256sum < "$out/game.exe" | cut -d' ' -f1)" != "$key" ]; then
+  echo "$out/game.exe is not the build key.md was written for, whose sha256 is $key" >&2
+  exit 1
+fi
