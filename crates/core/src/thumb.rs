@@ -699,10 +699,13 @@ pub(crate) fn read_table(image: &Image, table: u64, size: u64, limit: Option<Lim
     (!entries.is_empty()).then_some(Table { address: table, entry_size: size, entries, bounded: limit.is_some(), inline_end: Some(end) })
 }
 
+/// `[start, end)` of a Cortex-M's SRAM, where its globals are.
+pub const SRAM: (u64, u64) = (0x2000_0000, 0x4000_0000);
+
 /// The parts of a Cortex-M's address space that the architecture sets aside for data, by
 /// `[start, end)` and what each is for. Below them is the code, which the image holds.
 pub const MEMORY: [(u64, u64, &str); 5] = [
-    (0x2000_0000, 0x4000_0000, "SRAM"),
+    (SRAM.0, SRAM.1, "SRAM"),
     (0x4000_0000, 0x6000_0000, "peripherals"),
     (0x6000_0000, 0xA000_0000, "external RAM"),
     (0xA000_0000, 0xE000_0000, "external devices"),

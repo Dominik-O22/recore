@@ -34,6 +34,7 @@ pub struct Pair {
     pub old: u64,
     pub new: u64,
     pub evidence: Evidence,
+    /// How the code differs, beyond the addresses it holds.
     pub change: Change,
 }
 
@@ -45,6 +46,7 @@ pub enum Change {
     /// The instructions are the same and only numbers in them differ: a constant, or the
     /// offsets of fields, as in every function that uses a structure which gained one.
     Numbers,
+    /// The instructions differ.
     Code,
     /// The code of one or both could not be compared, so whether it differs is not known:
     /// [`crate::signature::hashes`] does not hash the machine, or the image lacks the bytes.

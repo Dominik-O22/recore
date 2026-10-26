@@ -78,23 +78,25 @@ pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u6
 /// by itself. `None` where the code cannot be read or its machine is not hashed, which is the
 /// 8051's.
 pub fn hashes(image: &Image, pointer_slots: &FxHashMap<u64, u64>, body: &[(u64, u64)]) -> Option<(u64, u64)> {
-    let range = |(body, shape): (u64, u64), &(start, end): &(u64, u64)| {
-        let bytes = image.bytes_from(start)?.get(..end.checked_sub(start)? as usize)?;
-        let hash = |numbers| match image.machine {
-            Machine::X86 => x86(32, bytes, pointer_slots, start, end, None, numbers, None),
-            Machine::X86_64 => x86(64, bytes, pointer_slots, start, end, None, numbers, None),
-            _ => aarch64(bytes, start, end, None, numbers),
-        };
-        Some((body.rotate_left(17) ^ hash(true)?, shape.rotate_left(17) ^ hash(false)?))
-    };
-    match image.machine {
-        Machine::X86 | Machine::X86_64 | Machine::Aarch64 => body.iter().try_fold((0, 0), range),
+    // The width of x86 code, or none for AArch64.
+    let bits = match image.machine {
+        Machine::X86 => Some(32),
+        Machine::X86_64 => Some(64),
+        Machine::Aarch64 => None,
         // As one, since a `MOVW` and its `MOVT` may lie on either side of a jump table that
         // splits the body.
-        Machine::Arm | Machine::Thumb => arm(image, pointer_slots, body),
+        Machine::Arm | Machine::Thumb => return arm(image, pointer_slots, body),
         // Not hashed yet: nothing says which of its bytes are addresses.
-        Machine::I8051 => None,
-    }
+        Machine::I8051 => return None,
+    };
+    body.iter().try_fold((0, 0), |(body, shape): (u64, u64), &(start, end)| {
+        let bytes = image.bytes_from(start)?.get(..end.checked_sub(start)? as usize)?;
+        let hash = |numbers| match bits {
+            Some(bits) => x86(bits, bytes, pointer_slots, start, end, None, numbers, None),
+            None => aarch64(bytes, start, end, None, numbers),
+        };
+        Some((body.rotate_left(17) ^ hash(true)?, shape.rotate_left(17) ^ hash(false)?))
+    })
 }
 
 /// The numbers in the code of `[start, end)` that the shape of [`hashes`] leaves out and the
@@ -310,38 +312,49 @@ fn aarch64(bytes: &[u8], start: u64, end: u64, min_words: Option<usize>, numbers
 
 /// The instructions of an ARM function's `body` in order, each A32 or Thumb as the image says,
 /// without the pools that literal loads read among them. A pool that a load before it reads is
-/// passed over as it comes, so that the code after it decodes from where it begins.
+/// passed over as it comes; one that a load after it reads is found once decoded through, and
+/// the body is decoded again without it, so that the code after every pool decodes from where
+/// it begins.
 fn arm_instructions(image: &Image, body: &[(u64, u64)]) -> Option<Vec<Decoded<arm::Insn>>> {
     let as_arm = |one: Decoded<thumb::Insn>| Decoded { addr: one.addr, len: one.len, insn: one.insn.map(arm::Insn::Thumb) };
-    let mut decoded = Vec::new();
-    // The halfwords of every pool read so far.
+    // The halfwords of every pool found.
     let mut pooled = FxHashSet::default();
-    for &(start, end) in body {
-        let bytes = image.bytes_from(start)?.get(..end.checked_sub(start)? as usize)?;
-        let (mut offset, mut it) = (0, 0);
-        while offset < bytes.len() {
-            let addr = start + offset as u64;
-            if pooled.contains(&addr) {
-                (offset, it) = (offset + 2, 0);
-                continue;
+    loop {
+        let known = pooled.len();
+        let mut decoded = Vec::new();
+        for &(start, end) in body {
+            let bytes = image.bytes_from(start)?.get(..end.checked_sub(start)? as usize)?;
+            let (mut offset, mut it) = (0, 0);
+            while offset < bytes.len() {
+                let addr = start + offset as u64;
+                if pooled.contains(&addr) {
+                    (offset, it) = (offset + 2, 0);
+                    continue;
+                }
+                let one = match (image.machine, image.instruction_set(addr).0) {
+                    (Machine::Thumb, _) => thumb::decode_at(bytes, start, offset, &mut it, false).map(as_arm),
+                    (_, InstructionSet::A32) => arm::decode_a32(bytes, start, offset),
+                    (_, InstructionSet::Thumb) => thumb::decode_at(bytes, start, offset, &mut it, true).map(as_arm),
+                };
+                // Only a range of an odd length leaves a byte that is no instruction at all.
+                let Some(one) = one else { break };
+                if let Some(((at, to), _)) = one.insn.and_then(arm::Insn::literal) {
+                    pooled.extend((at & !1..to).step_by(2));
+                }
+                offset += usize::from(one.len.max(1));
+                decoded.push(one);
             }
-            let one = match (image.machine, image.instruction_set(addr).0) {
-                (Machine::Thumb, _) => thumb::decode_at(bytes, start, offset, &mut it, false).map(as_arm),
-                (_, InstructionSet::A32) => arm::decode_a32(bytes, start, offset),
-                (_, InstructionSet::Thumb) => thumb::decode_at(bytes, start, offset, &mut it, true).map(as_arm),
-            };
-            // A range that ends in half an instruction ends there.
-            let Some(one) = one else { break };
-            if let Some(((at, to), _)) = one.insn.and_then(arm::Insn::literal) {
-                pooled.extend((at & !1..to).step_by(2));
-            }
-            offset += usize::from(one.len.max(1));
-            decoded.push(one);
+        }
+        let in_pool = |one: &Decoded<arm::Insn>| (one.addr..one.addr + u64::from(one.len)).step_by(2).any(|half| pooled.contains(&half));
+        if !decoded.iter().any(in_pool) {
+            return Some(decoded);
+        }
+        // Pools found again where they were the last time: what overlaps one is left out.
+        if pooled.len() == known {
+            decoded.retain(|one| !in_pool(one));
+            return Some(decoded);
         }
     }
-    // A pool that a load after it reads was decoded as instructions.
-    decoded.retain(|one| !(one.addr..one.addr + u64::from(one.len)).step_by(2).any(|half| pooled.contains(&half)));
-    Some(decoded)
 }
 
 /// The body and shape hashes of a 32-bit ARM function, see [`hashes`]. Blanked are the offsets
@@ -358,8 +371,11 @@ fn arm(image: &Image, pointer_slots: &FxHashMap<u64, u64>, body: &[(u64, u64)]) 
     // where a linker's symbols for the ends point, and on a Cortex-M into SRAM, which a raw
     // image does not describe.
     let ends: FxHashSet<u64> = image.sections.iter().map(Section::end).chain(image.zero_filled.iter().map(|&(_, end)| end)).collect();
-    let sram = |value: u64| image.machine == Machine::Thumb && thumb::MEMORY.iter().any(|&(start, end, name)| name == "SRAM" && (start..end).contains(&value));
-    let lands = |value: u64| image.section_at(value).is_some() || image.is_zero_filled(value) || ends.contains(&value) || sram(value);
+    let sram = |value: u64| image.machine == Machine::Thumb && (thumb::SRAM.0..thumb::SRAM.1).contains(&value);
+    let lands = |value: u32| {
+        let value = u64::from(value);
+        image.section_at(value).is_some() || image.is_zero_filled(value) || ends.contains(&value) || sram(value)
+    };
     // The PC an `ADD` later adds to what the instruction at `index` puts in `register`, before
     // anything else of its kind puts something there: the offset is then from that PC.
     let added_pc = |index: usize, register: usize| {
@@ -369,30 +385,34 @@ fn arm(image: &Image, pointer_slots: &FxHashMap<u64, u64>, body: &[(u64, u64)]) 
             _ => None,
         })?
     };
-    // Position-independent code also holds offsets from the global offset table, which it adds
-    // to a register that holds the table's address: ones that land in the image from nearby.
-    let position_independent = !image.relative_targets.is_empty();
+    // Position-independent code holds no address itself, as the loader would have to relocate
+    // it: it holds offsets from the PC and from its global offset table, which it adds to a
+    // register that holds the table's address.
+    let table = image.sections.iter().find(|section| section.name == ".got" && !image.relative_targets.is_empty()).map(|section| section.addr as u32);
     // Whether the word the instruction at `index` puts in `register` is an address.
     let is_address = |value: u32, index: usize, register: usize| {
-        lands(u64::from(value))
-            || added_pc(index, register).is_some_and(|pc| lands(u64::from((pc as u32).wrapping_add(value))))
-            || position_independent && lands(u64::from((decoded[index].addr as u32).wrapping_add(value)))
+        added_pc(index, register).is_some_and(|pc| lands((pc as u32).wrapping_add(value)))
+            || match table {
+                Some(table) => lands(table.wrapping_add(value)),
+                None => lands(value),
+            }
     };
 
     // The halves of the pairs that form an address: each `MOVT` with the nearest `MOVW` of its
-    // register before it, and each `MOVW` with the nearest `MOVT` after it, up to a `MOVW` that
-    // sets the register whatever the condition. A pair under each of two conditions is then
-    // two pairs.
-    let moves: Vec<Option<(usize, u32, bool, bool)>> = decoded.iter().map(|one| one.insn.and_then(|insn| insn.move_half().map(|(register, value, top)| (register, value, top, insn.conditional())))).collect();
+    // register before it, and each `MOVW` with the nearest `MOVT` after it, in either direction
+    // up to one of its own kind that sets the register whatever the condition. A pair under
+    // each of two conditions is then two pairs.
+    let moves: Vec<Option<(usize, u32, bool)>> = decoded.iter().map(|one| one.insn.and_then(arm::Insn::move_half)).collect();
+    let unconditional = |index: usize| decoded[index].insn.is_some_and(|insn| !insn.conditional());
     let mut halves = vec![false; decoded.len()];
     for (index, half) in moves.iter().enumerate() {
-        let Some((register, value, top, _)) = *half else { continue };
-        let found = if top {
-            moves[..index].iter().enumerate().rev().find(|(_, half)| matches!(half, Some((other, _, false, _)) if *other == register))
-        } else {
-            moves.iter().enumerate().skip(index + 1).take_while(|(_, half)| !matches!(half, Some((other, _, false, false)) if *other == register)).find(|(_, half)| matches!(half, Some((other, _, true, _)) if *other == register))
-        };
-        let Some((partner, &Some((_, other, ..)))) = found else { continue };
+        let Some((register, value, top)) = *half else { continue };
+        let others: Box<dyn Iterator<Item = usize>> = if top { Box::new((0..index).rev()) } else { Box::new(index + 1..moves.len()) };
+        let partner = others
+            .filter_map(|other| Some((other, moves[other].filter(|&(with, ..)| with == register)?)))
+            .find(|&(other, (_, _, other_top))| other_top != top || unconditional(other))
+            .filter(|&(_, (_, _, other_top))| other_top != top);
+        let Some((partner, (_, other, _))) = partner else { continue };
         let (high, low, top_index) = if top { (value, other, index) } else { (other, value, partner) };
         if is_address(high << 16 | low, top_index, register) {
             (halves[index], halves[partner]) = (true, true);
@@ -772,6 +792,31 @@ mod tests {
         let hashes = |at, data, constant| arm_hashes(Machine::Arm, build(at, data, constant), at, data, Some(&[(0, 12), (20, 36)]));
         assert_eq!(hashes(0x1_0000, 0x2_0000, 5), hashes(0x1_4000, 0x3_1000, 5));
         assert_ne!(hashes(0x1_0000, 0x2_0000, 5).0, hashes(0x1_0000, 0x2_0000, 6).0);
+    }
+
+    #[test]
+    fn arm_hashes_mask_offsets_the_code_adds_the_pc_to_and_sram() {
+        // A word loaded from the pool after the code, `data + 0x10` less the PC that the
+        // `ADD` after the load adds to it, or with `pc` false that much from 0x2000_0000.
+        let a32 = |at: u64, data: u64, pc: bool| {
+            let add = if pc { 0xE08F_3003 } else { 0xE081_3003 }; // add r3, pc, r3 or add r3, r1, r3
+            let word = (data + 0x10).wrapping_sub(at + 12) as u32;
+            [0xE59F_3004, add, 0xE12F_FF1E, word].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<u8>>()
+        };
+        let thumb = |at: u64, data: u64, pc: bool| {
+            // ldr r3, [pc, #4]; add r3, pc or add r3, r1; bx lr; nop; and the word.
+            let word = if pc { (data + 0x10).wrapping_sub(at + 6) as u32 } else { 0x2000_0000 + (data as u32 & 0xFFFF) };
+            let halfwords = [0x4B01, if pc { 0x447B } else { 0x440B }, 0x4770, 0xBF00, word as u16, (word >> 16) as u16];
+            halfwords.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<u8>>()
+        };
+        let builds: [(Machine, &dyn Fn(u64, u64, bool) -> Vec<u8>, bool); 3] = [(Machine::Arm, &a32, true), (Machine::Thumb, &thumb, true), (Machine::Thumb, &thumb, false)];
+        for (machine, build, pc) in builds {
+            let hashes = |at, data| arm_hashes(machine, build(at, data, pc), at, data, None);
+            assert_eq!(hashes(0x1_0000, 0x9_0000), hashes(0x1_4000, 0xA_1000));
+        }
+        // Without the `ADD` of the PC the word is a number.
+        let hashes = |at, data| arm_hashes(Machine::Arm, a32(at, data, false), at, data, None);
+        assert_ne!(hashes(0x1_0000, 0x9_0000).0, hashes(0x1_4000, 0xA_1000).0);
     }
 
     #[test]

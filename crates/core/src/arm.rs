@@ -309,11 +309,16 @@ impl Insn {
         }
     }
 
-    /// An `ADD` of the PC to a register, as position-independent code forms an address from
-    /// an offset: the register that holds the offset, and the PC added.
+    /// An `ADD` of the PC to a register, or a load from the PC plus a register, as
+    /// position-independent code reaches an address from an offset: the register that holds
+    /// the offset, and the PC added.
     pub(crate) fn pc_sum(self) -> Option<(usize, u64)> {
         match self {
-            Insn::A32(insn) => insn.adds_pc().map(|(_, offset)| (offset, insn.pc())),
+            Insn::A32(insn) => match (insn.adds_pc(), insn.transfer()) {
+                (Some((_, offset)), _) => Some((offset, insn.pc())),
+                (_, Some(Access { load: true, rn: PC, offset: Offset::Register { rm, left: 0 }, pre: true, writeback: false, .. })) => Some((rm, insn.pc())),
+                _ => None,
+            },
             Insn::Thumb(insn) => pc_sum_thumb(&insn).map(|rd| (rd, insn.addr + 4)),
         }
     }
