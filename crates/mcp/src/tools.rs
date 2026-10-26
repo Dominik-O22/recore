@@ -179,8 +179,9 @@ pub fn list() -> Value {
                 "timeout": { "type": "number", "description": "Seconds the run may take before it stops, whatever `steps` allows (default 30)." },
                 "skip": { "type": "array", "items": { "type": "string" }, "description": "Functions that return as soon as they are entered, as FUNCTION:BYTES with the bytes of arguments each takes off the stack, 0 unless it is stdcall: `0x401230:8`. The result register keeps what it held. For a function the run cannot or need not go through, such as one that draws." },
                 "ticks": { "type": "integer", "minimum": 0, "description": "What `GetTickCount` returns, every time it is called, so that a run that reads the clock can be compared with another. Without it a call to GetTickCount stops the run." },
+                "coverage": { "type": "boolean", "description": "Run nothing, and list what a run would stop on: the instructions it cannot run and the calls to imports with no stand-in, in `function` and every function it calls, or in the whole binary without `function`. A path that never reaches them still runs; calls through pointers are not followed, and `skip`, `ticks` and `args` are not read. x86 and x86-64 only." },
             }),
-            &["function"],
+            &[],
         ),
         tool(
             "symbols",

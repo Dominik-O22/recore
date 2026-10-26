@@ -27,6 +27,7 @@ use serde::Deserialize;
 use crate::binary::Binary;
 
 mod snapshot;
+mod sse;
 mod windows;
 mod x87;
 
@@ -126,15 +127,45 @@ impl Code {
     }
 }
 
-/// One p-code operation. A LOAD or STORE reaches the space `space`; a CALLOTHER is the
-/// processor operation called `userop`. Neither is among `inputs`.
+/// One p-code operation. A LOAD or STORE reaches the space `space`; what a CALLOTHER does is
+/// `userop`, resolved from the name of its processor operation. Neither is among `inputs`.
 #[derive(Clone, Debug)]
 struct Op {
     code: Code,
     out: Option<Varnode>,
     inputs: Vec<Varnode>,
     space: Space,
-    userop: String,
+    userop: Userop,
+}
+
+/// What a CALLOTHER does, resolved from the name of its processor operation when the instruction
+/// is lifted: what a run does there and what `coverage` reports agree by being read from here.
+#[derive(Clone, Debug)]
+enum Userop {
+    /// One of the MMX and SSE operations of [`sse`].
+    Sse(sse::Op),
+    /// Nothing a function can observe: see [`HARMLESS`].
+    Harmless,
+    /// What stops a run, as the run says it.
+    Stop(String),
+}
+
+impl Userop {
+    fn parse(name: &str, has_out: bool) -> Userop {
+        match sse::Op::parse(name) {
+            Some(op) if has_out => Userop::Sse(op),
+            _ if HARMLESS.iter().any(|harmless| harmless.eq_ignore_ascii_case(name)) => Userop::Harmless,
+            _ if name.is_empty() => Userop::Stop("an unnamed processor operation is not run".into()),
+            _ => Userop::Stop(format!("the processor operation {name} is not run")),
+        }
+    }
+}
+
+const UNIMPLEMENTED: &str = "the processor specification gives this instruction no semantics";
+
+/// What stops a run at an operand wider than the interpreter holds.
+fn too_wide(size: usize) -> String {
+    format!("an operand of {size} bytes is not run")
 }
 
 /// One instruction: its length and what it does.
@@ -168,13 +199,17 @@ fn parse_op(spaces: &mut Spaces, line: &str) -> Result<Op> {
         Some("-") | None => None,
         Some(word) => Some(operand(spaces, word)?),
     };
-    let mut op = Op { code, out, inputs: Vec::new(), space: CONST, userop: String::new() };
+    let mut op = Op { code, out, inputs: Vec::new(), space: CONST, userop: Userop::Harmless };
+    let mut userop = "";
     for (index, word) in words.enumerate() {
         match (index, code) {
             (0, Code::Load | Code::Store) => op.space = spaces.intern(word),
-            (0, Code::CallOther) if !word.contains(':') => op.userop = word.to_string(),
+            (0, Code::CallOther) if !word.contains(':') => userop = word,
             _ => op.inputs.push(operand(spaces, word)?),
         }
+    }
+    if code == Code::CallOther {
+        op.userop = Userop::parse(userop, out.is_some());
     }
     Ok(op)
 }
@@ -392,6 +427,26 @@ fn compute(code: Code, size: usize, inputs: &[(u128, usize)], arm: bool) -> Resu
 const HARMLESS: &[&str] = &[
     "setISAMode", "lock", "unlock", "nop", "sev", "SendEvent", "Yield", "Hint_Prefetch", "DataMemoryBarrier", "DataSynchronizationBarrier", "InstructionSynchronizationBarrier",
 ];
+
+/// The C library functions [`Emulator::stand_in`] runs, by their names without leading underscores
+/// or a `_chk` suffix, and those whose call ends a run.
+const STAND_INS: &[&str] = &["memcpy", "memmove", "memset", "memcmp", "strncmp", "strcmp", "strlen", "strcpy", "abs", "malloc", "calloc", "free"];
+const ENDS_RUN: &[&str] = &["abort", "exit", "Exit", "stack_chk_fail", "assert_fail"];
+
+/// Why a call to the import `name` stops a run, if it does: on Windows, with `ticks` given or not.
+fn import_stop(name: &str, windows: bool, ticks: bool) -> Option<String> {
+    let plain = name.trim_start_matches('_').trim_end_matches("_chk");
+    if ENDS_RUN.contains(&plain) {
+        return Some(format!("the run called {name}"));
+    }
+    if name == "GetTickCount" && windows && !ticks {
+        return Some(format!("the run called {name}, which answers only with `ticks`"));
+    }
+    if STAND_INS.contains(&plain) || windows && windows::STAND_INS.contains(&name) {
+        return None;
+    }
+    Some(format!("the run called {name}, an import with no stand-in"))
+}
 
 struct Page {
     bytes: [u8; PAGE],
@@ -728,7 +783,7 @@ impl<'a> Emulator<'a> {
 
     fn get(&mut self, place: Varnode) -> Result<u128, String> {
         if place.size > 16 {
-            return Err(format!("an operand of {} bytes is not run", place.size));
+            return Err(too_wide(place.size));
         }
         let place = self.banked(place)?;
         Ok(if place.space == CONST { u128::from(place.offset) } else { self.memory.read(&self.binary.program.image, place.space, place.offset, place.size) })
@@ -736,7 +791,7 @@ impl<'a> Emulator<'a> {
 
     fn put(&mut self, place: Varnode, value: u128) -> Result<(), String> {
         if place.size > 16 {
-            return Err(format!("an operand of {} bytes is not run", place.size));
+            return Err(too_wide(place.size));
         }
         let place = self.banked(place)?;
         let value = value & mask(place.size);
@@ -904,13 +959,21 @@ impl<'a> Emulator<'a> {
                     let value = self.get(op.inputs[1])?;
                     self.memory.write(&self.binary.program.image, op.space, addr, op.inputs[1].size, value, true);
                 }
-                Code::CallOther => {
-                    if !HARMLESS.iter().any(|harmless| harmless.eq_ignore_ascii_case(&op.userop)) {
-                        let name = if op.userop.is_empty() { "an unnamed operation" } else { &op.userop };
-                        return Err(format!("the processor operation {name} is not run"));
+                Code::CallOther => match &op.userop {
+                    Userop::Sse(sse) => {
+                        let mut inputs = Vec::with_capacity(op.inputs.len());
+                        for &input in &op.inputs {
+                            inputs.push(self.get(input)?);
+                        }
+                        // `Userop::parse` gives an operation of `sse` only where there is an output.
+                        if let Some(out) = op.out {
+                            self.put(out, sse.run(out.size, &inputs))?;
+                        }
                     }
-                }
-                Code::Unimplemented => return Err("the processor specification gives this instruction no semantics".into()),
+                    Userop::Harmless => {}
+                    Userop::Stop(why) => return Err(why.clone()),
+                },
+                Code::Unimplemented => return Err(UNIMPLEMENTED.into()),
                 code => {
                     let mut inputs = Vec::with_capacity(op.inputs.len());
                     for &input in &op.inputs {
@@ -982,6 +1045,9 @@ impl<'a> Emulator<'a> {
 
     /// Runs the stand-in for the import `name`.
     fn stand_in(&mut self, name: &str, tail: bool) -> Result<Return, String> {
+        if let Some(why) = import_stop(name, self.abi.windows, self.ticks.is_some()) {
+            return Err(why);
+        }
         let plain = name.trim_start_matches('_').trim_end_matches("_chk");
         let value = match plain {
             "memcpy" | "memmove" => {
@@ -1051,7 +1117,6 @@ impl<'a> Emulator<'a> {
                 Some(self.allocate(size).unwrap_or(0))
             }
             "free" => None,
-            "abort" | "exit" | "Exit" | "stack_chk_fail" | "assert_fail" => return Err(format!("the run called {name}")),
             _ => return self.windows_stand_in(name, tail)?.ok_or_else(|| format!("the run called {name}, an import with no stand-in")),
         };
         Ok(Return { value, pops: 0 })
@@ -1390,7 +1455,10 @@ pub fn emulate(binary: &mut Binary, call: &Call) -> Result<Outcome> {
 /// The arguments of the `run` tool.
 #[derive(Deserialize)]
 pub struct Run {
-    function: String,
+    function: Option<String>,
+    /// List what a run would stop on instead of running.
+    #[serde(default)]
+    coverage: bool,
     #[serde(default)]
     args: Vec<Given>,
     #[serde(default)]
@@ -1518,10 +1586,150 @@ fn function_entry(binary: &Binary, function: &str) -> Result<u64> {
     }
 }
 
+/// Why a run that reaches `op` stops there, if it does, as the run says it.
+fn stops_on(op: &Op) -> Option<String> {
+    let widest = op.out.iter().chain(&op.inputs).map(|place| place.size).max().unwrap_or(0);
+    match (op.code, &op.userop) {
+        (Code::CallOther, Userop::Stop(why)) => Some(why.clone()),
+        // A harmless operation reads none of its operands.
+        (Code::CallOther, Userop::Harmless) => None,
+        (Code::Unimplemented, _) => Some(UNIMPLEMENTED.into()),
+        _ if widest > 16 => Some(too_wide(widest)),
+        _ => None,
+    }
+}
+
+/// Lines of each part of a `coverage` answer, the most frequent first.
+const COVERAGE_LINES: usize = 40;
+
+/// What a run of `function` would stop on, in it and in every function it calls, or in the whole
+/// binary without one: the instructions it cannot run and the imports it has no stand-in for.
+/// Each instruction is lifted once and none is run, so a path that never reaches one of them
+/// still runs. Calls through pointers are not followed, and `skip`, `ticks` and `args` are not
+/// read. Only x86 code is read: decoding a function's whole span on ARM decodes its literal pools
+/// too, which can switch the decoder between ARM and Thumb for the rest of the session.
+fn coverage(binary: &mut Binary, function: Option<&str>) -> Result<String> {
+    let program = &binary.program;
+    ensure!(matches!(program.image.machine, Machine::X86 | Machine::X86_64), "`coverage` reads x86 and x86-64 code only");
+    let mut functions: BTreeSet<u64> = BTreeSet::new();
+    let ranges: Vec<(u64, u64)> = match function {
+        Some(function) => {
+            let addr = function_entry(binary, function)?;
+            let mut queue = program.owners(addr);
+            if queue.is_empty() {
+                queue.push(addr);
+            }
+            let mut ranges = Vec::new();
+            while let Some(entry) = queue.pop() {
+                if !functions.insert(entry) {
+                    continue;
+                }
+                // The body holds the pieces a compiler split off, such as a `.cold` part.
+                for (start, end) in program.body(entry) {
+                    ranges.push((start, end));
+                    let calls = &program.analysis.calls[program.analysis.calls.partition_point(|call| call.at < start)..program.analysis.calls.partition_point(|call| call.at < end)];
+                    queue.extend(calls.iter().filter_map(|call| match call.target {
+                        CallTarget::Function(target) => Some(target),
+                        CallTarget::Import(_) => None,
+                    }));
+                }
+            }
+            ranges
+        }
+        None => {
+            functions.extend(program.functions().map(|function| function.addr));
+            program.analysis.functions.iter().flat_map(|function| function.ranges.iter().copied()).collect()
+        }
+    };
+    // Functions share exits, so their ranges are merged where they overlap. Ranges that only
+    // touch stay apart, so that no one lift covers the whole of the code.
+    let mut sorted = ranges;
+    sorted.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in sorted {
+        match merged.last_mut() {
+            Some(last) if start < last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    // What a call stops on, from the merged ranges so that a shared exit counts once.
+    let windows = abi(&program.image)?.windows;
+    let mut imports: BTreeMap<(String, String), (usize, u64)> = BTreeMap::new();
+    for &(start, end) in &merged {
+        for call in &program.analysis.calls[program.analysis.calls.partition_point(|call| call.at < start)..program.analysis.calls.partition_point(|call| call.at < end)] {
+            let CallTarget::Import(slot) = call.target else { continue };
+            let Some(name) = program.image.import_slots.get(&slot) else { continue };
+            if let Some(why) = import_stop(name, windows, false) {
+                imports.entry((name.clone(), why)).or_insert((0, call.at)).0 += 1;
+            }
+        }
+    }
+    let mut spaces = Spaces::new();
+    // Mnemonic and why, to how many instructions and the first of them.
+    let mut instructions: BTreeMap<(String, String), (usize, u64)> = BTreeMap::new();
+    let mut lifted = 0usize;
+    for (start, end) in merged {
+        for instruction in binary.lift(start, end)? {
+            let mnemonic = instruction.text.split(' ').next().unwrap_or_default();
+            lifted += 1;
+            let why = if instruction.text == "(bad)" {
+                Some("no instruction decodes here".to_string())
+            } else if x87::Instruction::parse(mnemonic).is_some() {
+                None
+            } else {
+                instruction.pcode.iter().find_map(|line| match parse_op(&mut spaces, line) {
+                    Ok(op) => stops_on(&op),
+                    Err(error) => Some(format!("{error:#}")),
+                })
+            };
+            if let Some(why) = why {
+                instructions.entry((mnemonic.to_string(), why)).or_insert((0, instruction.addr)).0 += 1;
+            }
+        }
+    }
+    let scope = match function {
+        Some(name) if functions.len() == 1 => name.to_string(),
+        Some(name) => format!("{name} and the functions it reaches, {} in all", functions.len()),
+        None => format!("the {} functions of the binary", functions.len()),
+    };
+    let mut out = String::new();
+    if instructions.is_empty() && imports.is_empty() {
+        writeln!(out, "run executes all {lifted} instructions of {scope}, and every import they call has a stand-in")?;
+        return Ok(out);
+    }
+    // An instruction's line starts with its mnemonic; what a call stops on names the import.
+    let part = |out: &mut String, found: BTreeMap<(String, String), (usize, u64)>, head: String, named: bool| -> Result<()> {
+        if found.is_empty() {
+            return Ok(());
+        }
+        writeln!(out, "{head}")?;
+        let mut found: Vec<_> = found.into_iter().collect();
+        found.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+        for ((what, why), (count, first)) in found.iter().take(COVERAGE_LINES) {
+            let what = if named { String::new() } else { format!("{what}: ") };
+            writeln!(out, "  {what}{why}, {count} at {first:#x}{}", if *count > 1 { " and elsewhere" } else { "" })?;
+        }
+        if found.len() > COVERAGE_LINES {
+            writeln!(out, "  and {} more", found.len() - COVERAGE_LINES)?;
+        }
+        Ok(())
+    };
+    let stopping: usize = instructions.values().map(|&(count, _)| count).sum();
+    let calls: usize = imports.values().map(|&(count, _)| count).sum();
+    let calls = if calls == 1 { "1 call".to_string() } else { format!("{calls} calls") };
+    let imports_head = if instructions.is_empty() { format!("a run of the {lifted} instructions of {scope} stops on {calls} to imports, if it reaches them:") } else { format!("and on {calls} to imports, if it reaches them:") };
+    part(&mut out, instructions, format!("a run stops on {stopping} of the {lifted} instructions of {scope}, if it reaches them:"), false)?;
+    part(&mut out, imports, imports_head, true)?;
+    Ok(out)
+}
+
 /// The `run` tool.
 pub fn run(binary: &mut Binary, args: Run) -> Result<String> {
+    if args.coverage {
+        return coverage(binary, args.function.as_deref());
+    }
     ensure!(args.bits != Some(0), "`bits` is at least 1");
-    let entry = function_entry(binary, &args.function)?;
+    let entry = function_entry(binary, args.function.as_deref().context("`function` names what to run")?)?;
     let mut dump = Vec::new();
     for range in &args.dump {
         let parts: Vec<&str> = range.split(':').collect();

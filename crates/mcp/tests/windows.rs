@@ -118,6 +118,18 @@ fn functions() -> Vec<(&'static str, Vec<u8>)> {
         ("inner", [&[0xc7, 0x05][..], &le(GLOBAL), &le(0x99), &[0xb8, 9, 0, 0, 0, 0xc2, 4, 0]].concat()),
         // JMP to itself.
         ("spin", vec![0xeb, 0xfe]),
+        // MOVD XMM0, [ESP+4]; PSHUFLW XMM0, XMM0, 0; MOVD EAX, XMM0: the low word of the argument
+        // spread over the register, as MSVC's memset spreads its byte.
+        ("spread", vec![0x66, 0x0f, 0x6e, 0x44, 0x24, 0x04, 0xf2, 0x0f, 0x70, 0xc0, 0x00, 0x66, 0x0f, 0x7e, 0xc0, RET]),
+        // MOVQ MM0, [ESP+4]; MOVQ MM1, [ESP+12]; PADDSW MM0, MM1; PAVGB MM0, MM1;
+        // PSHUFW MM0, MM0, 0x1b; MOVD EAX, MM0; EMMS: the 8-byte forms, PAVGB a lane at a time.
+        (
+            "mmx",
+            vec![0x0f, 0x6f, 0x44, 0x24, 0x04, 0x0f, 0x6f, 0x4c, 0x24, 0x0c, 0x0f, 0xed, 0xc1, 0x0f, 0xe0, 0xc1, 0x0f, 0x70, 0xc0, 0x1b, 0x0f, 0x7e, 0xc0, 0x0f, 0x77, RET],
+        ),
+        // FEMMS, an AMD instruction the run has no meaning for, and a function that calls it.
+        ("femms", vec![0x0f, 0x0e, RET]),
+        ("calls_femms", vec![0x90, 0xe8, 0xf7, 0xff, 0xff, 0xff, RET]),
     ]
 }
 
@@ -400,8 +412,35 @@ fn a_whole_run_is_written_out_and_steered_to_compare_with_another() {
     assert_eq!(skipped, format!("{outer} returned EAX = 0x7 (7) after 4 instructions\nskipped: {inner} x1\n"));
     // The clock answers only when it is given, and the same each time.
     let clock = program.run("clock", json!({}));
-    assert!(clock.contains("the run called GetTickCount, an import with no stand-in"), "{clock}");
+    assert!(clock.contains("the run called GetTickCount, which answers only with `ticks`"), "{clock}");
     assert_eq!(returned(&program.run("clock", json!({ "ticks": 0x1234 }))), "0x1234");
     let spin = program.run("spin", json!({ "timeout": 0.2, "steps": 1u64 << 40 }));
     assert!(spin.ends_with("the run took more than 0.2 seconds\n"), "{spin}");
+}
+
+#[test]
+fn an_sse_instruction_the_specification_leaves_named_runs() {
+    let mut program = Program::new();
+    assert_eq!(returned(&program.run("spread", json!({ "args": [0x1234] }))), "0x12341234");
+    // Words 0x1234, 0x8000, 0x0001, 0x7fff and 0x0102, 0x8000, 0x7fff, 0x0001: saturating sums
+    // 0x1336, 0x8000, 0x7fff, 0x7fff, byte averages with the second rounded up, words reversed.
+    let mmx = program.run("mmx", json!({ "args": [0x8000_1234u32, 0x7fff_0001u32, 0x8000_0102u32, 0x0001_7fffu32] }));
+    assert_eq!(returned(&mmx), "0x7fff4080", "{mmx}");
+}
+
+#[test]
+fn coverage_lists_what_a_run_would_stop_on_without_running() {
+    let mut program = Program::new();
+    let whole = program.client.tool("run", json!({ "path": program.path, "coverage": true })).unwrap();
+    assert!(whole.contains(&format!("  FEMMS: the processor operation FastExitMediaState is not run, 1 at {}\n", program.addr("femms"))), "{whole}");
+    let spread = program.run("spread", json!({ "coverage": true }));
+    assert_eq!(spread, format!("run executes all 4 instructions of {}, and every import they call has a stand-in\n", program.addr("spread")));
+    let files = program.run("system", json!({ "coverage": true }));
+    assert_eq!(files, format!("run executes all 29 instructions of {}, and every import they call has a stand-in\n", program.addr("system")));
+    // What a function calls is covered too, from an address anywhere in it.
+    let inside = format!("{:#x}", u64::from_str_radix(&program.addr("calls_femms")[2..], 16).unwrap() + 1);
+    let called = program.client.tool("run", json!({ "path": program.path, "function": inside, "coverage": true })).unwrap();
+    assert_eq!(called, format!("a run stops on 1 of the 5 instructions of {inside} and the functions it reaches, 2 in all, if it reaches them:\n  FEMMS: the processor operation FastExitMediaState is not run, 1 at {}\n", program.addr("femms")));
+    let clock = program.run("clock", json!({ "coverage": true }));
+    assert!(clock.contains("  the run called GetTickCount, which answers only with `ticks`, 1 at "), "{clock}");
 }

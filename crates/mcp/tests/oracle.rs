@@ -150,6 +150,8 @@ enum Needs {
     Wide,
     /// Floats, which x86-64 and AArch64 take in registers.
     Floats,
+    /// The MMX, SSE, SSSE3 and SSE4.1 integer instructions, which only x86 has.
+    Vectors,
 }
 
 struct Function {
@@ -159,7 +161,7 @@ struct Function {
     needs: Needs,
 }
 
-use Needs::{Everything, Floats, Wide};
+use Needs::{Everything, Floats, Vectors, Wide};
 use Ty::{F32, F64, I16, I32, I64, U8, U32, U64};
 
 const FUNCTIONS: &[Function] = &[
@@ -185,6 +187,15 @@ const FUNCTIONS: &[Function] = &[
     Function { name: "ftoi", params: &[any(F64)], ret: I32, needs: Floats },
     Function { name: "itof", params: &[any(I32)], ret: F64, needs: Floats },
     Function { name: "fmixf", params: &[any(F32), any(F32)], ret: F32, needs: Floats },
+    Function { name: "saturating", params: &[any(U32), any(U32), any(U32)], ret: U32, needs: Vectors },
+    Function { name: "multiplying", params: &[any(U32), any(U32), any(U32)], ret: U32, needs: Vectors },
+    Function { name: "packing", params: &[any(U32), any(U32), any(U32)], ret: U32, needs: Vectors },
+    Function { name: "shifting", params: &[any(U32), any(U32), any(U32)], ret: U32, needs: Vectors },
+    Function { name: "shuffling", params: &[any(U32), any(U32), any(U32)], ret: U32, needs: Vectors },
+    Function { name: "masking", params: &[any(U32), any(U32), any(U32)], ret: U32, needs: Vectors },
+    Function { name: "ssse3", params: &[any(U32), any(U32), any(U32)], ret: U32, needs: Vectors },
+    Function { name: "sse41", params: &[any(U32), any(U32), any(U32)], ret: U32, needs: Vectors },
+    Function { name: "mmx", params: &[any(U32), any(U32), any(U32)], ret: U32, needs: Vectors },
 ];
 
 /// Every operation is on unsigned numbers or cannot overflow, so the C means one thing on every
@@ -269,6 +280,82 @@ double dmix(double a, double b) { return a * b + a / (b == 0.0 ? 1.0 : b) - __bu
 int32_t ftoi(double d) { return d >= 2147483647.0 ? INT32_MAX : d <= -2147483648.0 ? INT32_MIN : (int32_t)d; }
 double itof(int32_t i) { return (double)i * 0.5; }
 float fmixf(float a, float b) { return a * b - a / (b == 0.0f ? 1.0f : b); }
+#endif
+
+#ifdef VECTORS
+#include <immintrin.h>
+
+// The instruction sets go on the functions, so that nothing else in the file is built with them.
+#define VECTOR __attribute__((target("sse2,ssse3,sse4.1")))
+
+// Three words spread over a register so that its lanes differ and some sit at their limits.
+// The helpers are built apart, with SSE2 alone, so that the compiler moves values in and out of
+// the registers with plain moves and not with SSE4.1 inserts that are not the instructions under
+// test.
+#define PLAIN __attribute__((noinline, target("sse2")))
+
+PLAIN static __m128i spread(uint32_t a, uint32_t b, uint32_t c) {
+    uint32_t w[4] = { a + c, c ^ 0x80007fffu, b * 2654435761u, a ^ (b << 16) };
+    return _mm_loadu_si128((const __m128i *)w);
+}
+
+PLAIN static uint32_t fold(__m128i v) {
+    uint32_t w[4];
+    _mm_storeu_si128((__m128i *)w, v);
+    return ((w[0] * 2654435761u ^ w[1]) * 2246822519u ^ w[2]) * 3266489917u ^ w[3];
+}
+
+VECTOR uint32_t saturating(uint32_t a, uint32_t b, uint32_t c) {
+    __m128i x = spread(a, b, c), y = spread(c, a, b);
+    return fold(_mm_adds_epi8(x, y)) ^ fold(_mm_adds_epu16(x, y)) * 3 ^ fold(_mm_subs_epi16(x, y)) * 5 ^ fold(_mm_subs_epu8(x, y)) * 7;
+}
+
+VECTOR uint32_t multiplying(uint32_t a, uint32_t b, uint32_t c) {
+    __m128i x = spread(a, b, c), y = spread(b, c, a);
+    return fold(_mm_mulhi_epi16(x, y)) ^ fold(_mm_mulhi_epu16(x, y)) * 3 ^ fold(_mm_madd_epi16(x, y)) * 5 ^ fold(_mm_sad_epu8(x, y)) * 7;
+}
+
+VECTOR uint32_t packing(uint32_t a, uint32_t b, uint32_t c) {
+    __m128i x = spread(a, b, c), y = spread(c, b, a);
+    return fold(_mm_packs_epi16(x, y)) ^ fold(_mm_packs_epi32(x, y)) * 3;
+}
+
+// The count's high quadword is not zero, and the processor reads only the low one.
+VECTOR uint32_t shifting(uint32_t a, uint32_t b, uint32_t c) {
+    __m128i x = spread(a, b, c), count = _mm_unpacklo_epi64(_mm_cvtsi32_si128((int)(c % 20)), spread(b, a, c));
+    return fold(_mm_sll_epi16(x, count)) ^ fold(_mm_sra_epi16(x, count)) * 3 ^ fold(_mm_slli_epi16(x, 3)) * 5 ^ fold(_mm_srai_epi16(x, 5)) * 7;
+}
+
+VECTOR uint32_t shuffling(uint32_t a, uint32_t b, uint32_t c) {
+    __m128i x = spread(a, b, c);
+    return fold(_mm_shufflelo_epi16(x, 0)) ^ fold(_mm_shufflelo_epi16(x, 0x1b)) * 3 ^ fold(_mm_shufflehi_epi16(x, 0x4e)) * 5;
+}
+
+VECTOR uint32_t masking(uint32_t a, uint32_t b, uint32_t c) {
+    __m128i x = spread(a, b, c);
+    return (uint32_t)_mm_movemask_ps(_mm_castsi128_ps(x)) | (uint32_t)_mm_movemask_pd(_mm_castsi128_pd(x)) << 4;
+}
+
+VECTOR uint32_t ssse3(uint32_t a, uint32_t b, uint32_t c) {
+    __m128i x = spread(a, b, c), y = spread(b, a, c);
+    return fold(_mm_shuffle_epi8(x, y)) ^ fold(_mm_abs_epi8(y)) * 3 ^ fold(_mm_sign_epi16(x, y)) * 5 ^ fold(_mm_hadd_epi16(x, y)) * 7
+        ^ fold(_mm_hadds_epi16(x, y)) * 11 ^ fold(_mm_hsub_epi32(x, y)) * 13 ^ fold(_mm_maddubs_epi16(x, y)) * 17 ^ fold(_mm_mulhrs_epi16(x, y)) * 19;
+}
+
+VECTOR uint32_t sse41(uint32_t a, uint32_t b, uint32_t c) {
+    __m128i x = spread(a, b, c), y = spread(c, a, b);
+    return fold(_mm_mullo_epi32(x, y)) ^ fold(_mm_mul_epi32(x, y)) * 3 ^ fold(_mm_packus_epi32(x, y)) * 5 ^ fold(_mm_minpos_epu16(x)) * 7
+        ^ fold(_mm_cvtepi8_epi16(x)) * 11 ^ fold(_mm_cvtepu16_epi32(y)) * 13 ^ fold(_mm_blend_epi16(x, y, 0xa5)) * 17
+        ^ fold(_mm_blendv_epi8(x, y, spread(b, c, a))) * 19 ^ fold(_mm_mpsadbw_epu8(x, y, 5)) * 23;
+}
+
+VECTOR uint32_t mmx(uint32_t a, uint32_t b, uint32_t c) {
+    __m64 x = _mm_set_pi32((int)(a ^ 0x80007fffu), (int)b), y = _mm_set_pi32((int)c, (int)(a * 2654435761u));
+    __m64 r = _mm_xor_si64(_mm_adds_pi16(x, y), _mm_shuffle_pi16(x, 0x1b));
+    uint32_t low = (uint32_t)_mm_cvtsi64_si32(r), high = (uint32_t)_mm_cvtsi64_si32(_mm_srli_si64(r, 32));
+    _mm_empty();
+    return low * 2654435761u ^ high;
+}
 #endif
 "#;
 
@@ -434,6 +521,7 @@ struct Machine {
     wide: bool,
     /// The register a float result comes back in, where floats are asked for.
     floats: Option<&'static str>,
+    vectors: bool,
 }
 
 impl Machine {
@@ -442,17 +530,18 @@ impl Machine {
             Everything => true,
             Wide => self.wide,
             Floats => self.floats.is_some(),
+            Vectors => self.vectors,
         }
     }
 }
 
 fn native(dir: &Path, source: &Path) -> Machine {
     let image = dir.join("native.so");
-    command("gcc", &["-O2", "-fPIC", "-shared", "-fno-math-errno", "-DWIDE", "-DFLOATS", "-o", path(&image), path(source)]);
-    Machine { name: "x86-64", image, addresses: BTreeMap::new(), result: "RAX", wide: true, floats: Some("XMM0") }
+    command("gcc", &["-O2", "-fPIC", "-shared", "-fno-math-errno", "-DWIDE", "-DFLOATS", "-DVECTORS", "-o", path(&image), path(source)]);
+    Machine { name: "x86-64", image, addresses: BTreeMap::new(), result: "RAX", wide: true, floats: Some("XMM0"), vectors: true }
 }
 
-fn shared(dir: &Path, source: &Path, name: &'static str, target: &str, linker_machine: &[&str], result: &'static str, wide: bool, floats: Option<&'static str>) -> Machine {
+fn shared(dir: &Path, source: &Path, name: &'static str, target: &str, linker_machine: &[&str], result: &'static str, wide: bool, floats: Option<&'static str>, vectors: bool) -> Machine {
     let object = dir.join(format!("{name}.o"));
     let image = dir.join(format!("{name}.so"));
     let target = format!("--target={target}");
@@ -463,12 +552,15 @@ fn shared(dir: &Path, source: &Path, name: &'static str, target: &str, linker_ma
     if floats.is_some() {
         compile.push("-DFLOATS");
     }
+    if vectors {
+        compile.push("-DVECTORS");
+    }
     command("clang", &compile);
     let mut link = vec!["-flavor", "gnu", "-shared"];
     link.extend(linker_machine);
     link.extend(["-o", path(&image), path(&object)]);
     command(rust_lld(), &link);
-    Machine { name, image, addresses: BTreeMap::new(), result, wide, floats }
+    Machine { name, image, addresses: BTreeMap::new(), result, wide, floats, vectors }
 }
 
 /// A Cortex-M3 image of flash at 0, with the layout file that names it.
@@ -501,7 +593,7 @@ fn thumb(dir: &Path, source: &Path) -> Machine {
             (kind == "T").then(|| (name.to_string(), u64::from_str_radix(address, 16).unwrap() & !1))
         })
         .collect();
-    Machine { name: "thumb", image, addresses, result: "r0", wide: false, floats: None }
+    Machine { name: "thumb", image, addresses, result: "r0", wide: false, floats: None, vectors: false }
 }
 
 /// The first value a register has in an answer of `run`, as the bits it printed.
@@ -564,7 +656,7 @@ fn the_oracle_agrees_with_the_machines() {
     // What the C gives on this machine, from the functions built apart from the program that
     // calls them so that the compiler cannot see through the call.
     let reference = dir.join("reference");
-    command("gcc", &["-O2", "-c", "-fno-math-errno", "-DWIDE", "-DFLOATS", "-o", path(&dir.join("functions.o")), path(&source)]);
+    command("gcc", &["-O2", "-c", "-fno-math-errno", "-DWIDE", "-DFLOATS", "-DVECTORS", "-o", path(&dir.join("functions.o")), path(&source)]);
     std::fs::write(dir.join("driver.c"), driver(&cases)).unwrap();
     command("gcc", &["-O0", "-o", path(&reference), path(&dir.join("driver.c")), path(&dir.join("functions.o"))]);
     for line in command(&reference, &[]).lines() {
@@ -574,8 +666,8 @@ fn the_oracle_agrees_with_the_machines() {
 
     let machines = [
         native(&dir, &source),
-        shared(&dir, &source, "aarch64", "aarch64-linux-gnu", &[], "x0", true, Some("d0")),
-        shared(&dir, &source, "x86-32", "i686-linux-gnu", &["-m", "elf_i386"], "EAX", false, None),
+        shared(&dir, &source, "aarch64", "aarch64-linux-gnu", &[], "x0", true, Some("d0"), false),
+        shared(&dir, &source, "x86-32", "i686-linux-gnu", &["-m", "elf_i386"], "EAX", false, None, true),
         thumb(&dir, &source),
     ];
     let mut client = Client::start();
