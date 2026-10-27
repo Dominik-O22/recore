@@ -539,3 +539,119 @@ pub fn score_instruction_sets(corpus: &Path, detail: bool) -> Result<(usize, usi
         .collect();
     Ok(counts.into_iter().fold((0, 0), |(right, all), (r, a)| (right + r, all + a)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[rustfmt::skip]
+    const A32: [u8; 20] = [
+        0x3e, 0x00, 0x00, 0xeb, // 100  bl 0x200
+        0x3d, 0x00, 0x00, 0x0b, // 104  bleq 0x200
+        0x78, 0x56, 0x34, 0x12, // 108  a literal
+        0x7b, 0x00, 0x00, 0xeb, // 10c  bl 0x300
+        0x00, 0x00, 0xa0, 0xe1, // 110  mov r0, r0
+    ];
+
+    #[rustfmt::skip]
+    const THUMB: [u8; 12] = [
+        0x00, 0xf0, 0x7e, 0xf8, // 200  bl 0x300
+        0x00, 0xbf,             // 204  nop
+        0x00, 0xf0, 0x7c, 0xe8, // 206  blx 0x300, from the word-aligned PC 0x208
+        0x70, 0x47,             // 20a  bx lr
+    ];
+
+    fn code() -> Code<'static> {
+        Code { sections: vec![(0x100, &A32), (0x200, &THUMB)], marks: vec![(0x100, Run::A32), (0x108, Run::Data), (0x10c, Run::A32), (0x200, Run::Thumb)] }
+    }
+
+    #[test]
+    fn an_a32_function_calls_unconditionally_steps_over_its_data_and_ends_with_a_call_through_padding() {
+        let scan = scan(&code(), 0x100, 0x114, Run::A32);
+        assert_eq!(scan.calls, [(0x100, Callee::Direct(0x200)), (0x10c, Callee::Direct(0x300))]);
+        assert_eq!((scan.instructions, scan.data_bytes, scan.final_call), (4, 4, Some(0x10c)));
+    }
+
+    /// The jump tables of `words`, one A32 function from 0, with `$d` over `data` and `.rodata`
+    /// holding `readonly`, as `(jump, targets)` and the reasons for those rejected.
+    fn tables(words: &[u32], data: Option<(u64, u64)>, readonly: &[u8]) -> (Vec<(u64, Vec<u64>)>, Vec<String>) {
+        let code: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let mut symbols = vec![("$a", 0, 0), ("f", 0, code.len() as u64)];
+        symbols.extend(data.into_iter().flat_map(|(start, end)| [("$d", start, 0), ("$a", end, 0)]));
+        let bytes = crate::truth::fixture::elf(object::Architecture::Arm, &code, &symbols, &[(".rodata", readonly)]);
+        let file = object::File::parse(&*bytes).unwrap();
+        let extracted = jump_tables("t".into(), &file, &file).unwrap().unwrap();
+        (extracted.truth.tables.into_iter().map(|table| (table.jump, table.targets)).collect(), extracted.rejected.into_iter().map(|rejected| rejected.reason).collect())
+    }
+
+    /// `ldrls pc, [pc, r0, lsl #2]` and the addresses after it, of which `second` is the last.
+    fn load_of_pc(second: u32) -> [u32; 7] {
+        #[rustfmt::skip]
+        let words = [
+            0xe350_0001, // 00  cmp r0, #1
+            0x979f_f100, // 04  ldrls pc, [pc, r0, lsl #2]
+            0xea00_0002, // 08  b 0x18
+            0x0000_0014, // 0c  a case
+            second,      // 10  a case
+            0xe12f_ff1e, // 14  bx lr
+            0xe12f_ff1e, // 18  bx lr
+        ];
+        words
+    }
+
+    #[test]
+    fn a_conditional_load_of_pc_reads_the_addresses_after_it_and_falls_through_to_the_default() {
+        assert_eq!(tables(&load_of_pc(0x18), Some((0xc, 0x14)), &[]), (vec![(0x4, vec![0x8, 0x14, 0x18])], vec![]));
+    }
+
+    #[test]
+    fn a_table_with_a_case_that_is_no_instruction_of_the_function_is_rejected() {
+        let (found, rejected) = tables(&load_of_pc(0x16), Some((0xc, 0x14)), &[]);
+        assert_eq!((found, rejected), (vec![], vec!["a case at 0x16, no instruction of the function".to_string()]));
+    }
+
+    #[test]
+    fn a_byte_table_in_read_only_data_adds_four_times_each_entry_to_pc_up_to_the_compared_bound() {
+        #[rustfmt::skip]
+        let words: [u32; 10] = [
+            0xe59f_3018, // 00  ldr r3, [pc, #0x18], the literal at 0x20
+            0xe08f_3003, // 04  add r3, pc, r3: 0xc + the literal, the table at 0 in .rodata
+            0xe350_0002, // 08  cmp r0, #2
+            0xe7d3_0000, // 0c  ldrb r0, [r3, r0]
+            0x908f_f100, // 10  addls pc, pc, r0, lsl #2
+            0xea00_0002, // 14  b 0x24
+            0xe12f_ff1e, // 18  bx lr
+            0xe12f_ff1e, // 1c  bx lr
+            0xffff_fff4, // 20  the literal, -0xc
+            0xe12f_ff1e, // 24  bx lr
+        ];
+        // Three entries for the indices up to 2; the fourth is past the bound.
+        let (found, rejected) = tables(&words, Some((0x20, 0x24)), &[0, 1, 0, 9]);
+        assert_eq!((found, rejected), (vec![(0x10, vec![0x14, 0x18, 0x1c])], vec![]));
+    }
+
+    #[test]
+    fn a_row_of_branches_after_an_add_to_pc_is_a_table_only_with_a_bound_on_its_index() {
+        #[rustfmt::skip]
+        let mut words = [
+            0xe350_0001, // 00  cmp r0, #1
+            0x908f_f100, // 04  addls pc, pc, r0, lsl #2
+            0xea00_0002, // 08  b 0x18
+            0xea00_0001, // 0c  b 0x18, case 0
+            0xea00_0000, // 10  b 0x18, case 1
+            0xe12f_ff1e, // 14  bx lr
+            0xe12f_ff1e, // 18  bx lr
+        ];
+        assert_eq!(tables(&words, None, &[]), (vec![(0x4, vec![0x8, 0xc, 0x10])], vec![]));
+        // Without the compare it is a jump into unrolled code, as libgcc's division makes.
+        words[0] = 0xe3a0_1000; // mov r1, #0
+        assert_eq!(tables(&words, None, &[]), (vec![], vec![]));
+    }
+
+    #[test]
+    fn a_thumb_call_counts_from_pc_and_a_blx_from_pc_down_to_a_word() {
+        let scan = scan(&code(), 0x200, 0x20c, Run::Thumb);
+        assert_eq!(scan.calls, [(0x200, Callee::Direct(0x300)), (0x206, Callee::Direct(0x300))]);
+        assert_eq!((scan.instructions, scan.final_call), (4, None));
+    }
+}

@@ -72,7 +72,7 @@ fn is_zero(value: &u64) -> bool {
 }
 
 /// Where a call instruction goes, as far as the decode alone can tell.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Callee {
     Direct(u64),
     /// Through the GOT-style slot at this address.
@@ -170,9 +170,7 @@ fn dwarf_noreturn(debug: &object::File) -> Result<NoReturn> {
 fn is_fragment(name: &str) -> bool {
     // The AArch64 linker moves an instruction hit by Cortex-A53 erratum 843419 into a veneer
     // named `e843419@...`: a piece of some function, reached and left by a plain branch.
-    name.starts_with("e843419@")
-        || [".cold", ".part.", ".isra.", ".constprop.", ".lto_priv."].iter().any(|marker| name.contains(marker))
-            && (name.contains(".cold") || name.contains(".part."))
+    name.starts_with("e843419@") || name.contains(".cold") || name.contains(".part.")
 }
 
 /// glibc's `error` returns when its status argument is zero, but gnulib declares a noreturn overload.
@@ -312,9 +310,14 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     }
     let debug_data = std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?;
     let debug = object::File::parse(&*debug_data)?;
+    elf(binary_path, &binary, &debug)
+}
+
+/// Truth for an ELF binary, from its debug file.
+fn elf(binary_path: &Path, binary: &object::File, debug: &object::File) -> Result<Truth> {
     let architecture = binary.architecture();
     if architecture == Architecture::Arm {
-        return arm::extract(binary_path, &binary, &debug);
+        return arm::extract(binary_path, binary, debug);
     }
     if !matches!(architecture, Architecture::X86_64 | Architecture::Aarch64) {
         bail!("unsupported architecture {architecture:?}");
@@ -325,7 +328,7 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     let in_exec = |addr: u64| exec.iter().any(|&(start, end)| addr >= start && addr < end);
 
     // A debug file without DWARF (some Go builds) still has a usable symbol table.
-    let noreturn = dwarf_noreturn(&debug).unwrap_or_default();
+    let noreturn = dwarf_noreturn(debug).unwrap_or_default();
 
     // Aliases share an address; keep one, preferring a non-fragment name.
     let mut by_addr: BTreeMap<u64, Function> = BTreeMap::new();
@@ -356,10 +359,10 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     }
     let noreturn_addrs: HashSet<u64> = by_addr.values().filter(|f| f.noreturn).map(|f| f.addr).collect();
 
-    let slots = import_slots(&binary);
+    let slots = import_slots(binary);
     // AArch64 reaches imports by a direct call to a PLT stub; x86-64 truth does not resolve stubs.
     let (stubs, data) = match architecture {
-        Architecture::Aarch64 => (aarch64::plt_stubs(&binary), aarch64::data_ranges(&binary, &debug)),
+        Architecture::Aarch64 => (aarch64::plt_stubs(binary), aarch64::data_ranges(binary, debug)),
         _ => Default::default(),
     };
     let scans = by_addr.values().filter_map(|function| {
@@ -401,4 +404,150 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
         undecodable_bytes: calls.undecodable_bytes,
         data_bytes: calls.data_bytes,
     })
+}
+
+/// Debug files built inside a test.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use object::write::{Object, StandardSection, Symbol, SymbolSection};
+    use object::{Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope};
+
+    /// An ELF relocatable object of `architecture`, whose sections all sit at 0, with `code` in
+    /// `.text` and each symbol in it as `(name, address, size)`: a function, or a mapping symbol
+    /// where the name starts with `$`. `sections` adds sections of other data by name.
+    pub fn elf(architecture: Architecture, code: &[u8], symbols: &[(&str, u64, u64)], sections: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut object = Object::new(BinaryFormat::Elf, architecture, Endianness::Little);
+        let text = object.section_id(StandardSection::Text);
+        object.append_section_data(text, code, 4);
+        for &(name, value, size) in symbols {
+            let kind = if name.starts_with('$') { SymbolKind::Label } else { SymbolKind::Text };
+            let symbol = Symbol { name: name.into(), value, size, kind, scope: SymbolScope::Compilation, weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None };
+            object.add_symbol(symbol);
+        }
+        for &(name, data) in sections {
+            let kind = if name.starts_with(".debug") { object::SectionKind::Debug } else { object::SectionKind::ReadOnlyData };
+            let section = object.add_section(Vec::new(), name.into(), kind);
+            object.append_section_data(section, data, 1);
+        }
+        object.write().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gimli::write::{Address, AttributeValue, DwarfUnit, EndianVec, Sections};
+    use gimli::{Encoding, Format, LittleEndian};
+
+    use super::*;
+
+    /// Callees where every import but `printf` never returns.
+    fn callees<'a>(noreturn_addrs: &'a HashSet<u64>, stubs: &'a HashMap<u64, u64>, slots: &'a HashMap<u64, String>, widen_slots: bool) -> Callees<'a> {
+        Callees { noreturn_addrs, stubs, slots, is_noreturn_import: &|name| name != "printf", widen_slots }
+    }
+
+    /// The scan of a function that makes `calls`, and ends with `final_call`.
+    fn calls(calls: &[(u64, Callee)], final_call: Option<u64>) -> Scan {
+        Scan { calls: calls.to_vec(), final_call, ..Scan::default() }
+    }
+
+    #[test]
+    fn a_call_never_returns_where_its_callee_does_directly_through_a_stub_or_through_a_slot() {
+        let stubs = HashMap::from([(0x600, 0x900)]);
+        let slots = HashMap::from([(0x900, "abort".to_string()), (0x908, "exit".to_string()), (0x910, "printf".to_string())]);
+        let scan = calls(&[(0x10, Callee::Direct(0x500)), (0x20, Callee::Direct(0x600)), (0x30, Callee::Slot(0x908)), (0x40, Callee::Slot(0x910)), (0x50, Callee::Direct(0x700))], None);
+        let out = classify([scan].into_iter(), &callees(&HashSet::from([0x500]), &stubs, &slots, false));
+        assert_eq!(out.noreturn_calls, [0x10, 0x20, 0x30]);
+        assert_eq!(out.noreturn_imports.into_iter().collect::<Vec<_>>(), ["abort", "exit"]);
+    }
+
+    #[test]
+    fn a_call_that_ends_a_function_makes_every_call_of_its_callee_terminal() {
+        let (noreturn, stubs, slots) = Default::default();
+        let ends = calls(&[(0x10, Callee::Direct(0x700))], Some(0x10));
+        let other = calls(&[(0x110, Callee::Direct(0x700)), (0x120, Callee::Direct(0x800))], None);
+        assert_eq!(classify([ends, other].into_iter(), &callees(&noreturn, &stubs, &slots, false)).terminal_calls, [0x10, 0x110]);
+    }
+
+    #[test]
+    fn calls_through_a_slot_widen_only_where_the_platform_says_so() {
+        let (noreturn, stubs, slots) = Default::default();
+        let scans = || [calls(&[(0x10, Callee::Slot(0x900))], Some(0x10)), calls(&[(0x110, Callee::Slot(0x900))], None)].into_iter();
+        assert_eq!(classify(scans(), &callees(&noreturn, &stubs, &slots, false)).terminal_calls, [0x10]);
+        assert_eq!(classify(scans(), &callees(&noreturn, &stubs, &slots, true)).terminal_calls, [0x10, 0x110]);
+    }
+
+    #[test]
+    fn cold_and_partial_pieces_and_erratum_veneers_are_fragments_but_clones_are_not() {
+        for name in ["f.cold", "f.part.0", "f.constprop.0.cold", "e843419@0002_0000001c_14"] {
+            assert!(is_fragment(name), "{name}");
+        }
+        for name in ["f", "f.isra.0", "f.constprop.0", "f.lto_priv.0", "cold"] {
+            assert!(!is_fragment(name), "{name}");
+        }
+    }
+
+    /// What [`dwarf_noreturn`] reads from a debug file with one unit, which `build` fills in.
+    fn noreturn(build: impl FnOnce(&mut gimli::write::Unit)) -> NoReturn {
+        let mut dwarf = DwarfUnit::new(Encoding { format: Format::Dwarf32, version: 4, address_size: 8 });
+        build(&mut dwarf.unit);
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf.write(&mut sections).unwrap();
+        let mut written = Vec::new();
+        sections
+            .for_each(|id, data| {
+                written.push((id.name(), data.slice()));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        let bytes = fixture::elf(Architecture::X86_64, &[0xc3], &[], &written);
+        dwarf_noreturn(&object::File::parse(&*bytes).unwrap()).unwrap()
+    }
+
+    /// Adds a subprogram named `name` with `attributes`.
+    fn subprogram(unit: &mut gimli::write::Unit, name: &str, attributes: &[(gimli::DwAt, AttributeValue)]) -> gimli::write::UnitEntryId {
+        let id = unit.add(unit.root(), gimli::DW_TAG_subprogram);
+        let entry = unit.get_mut(id);
+        entry.set(gimli::DW_AT_name, AttributeValue::String(name.into()));
+        for (at, value) in attributes {
+            entry.set(*at, value.clone());
+        }
+        id
+    }
+
+    #[test]
+    fn a_noreturn_definition_gives_its_name_and_address_and_an_external_declaration_its_name_for_imports() {
+        let found = noreturn(|unit| {
+            subprogram(unit, "die", &[(gimli::DW_AT_noreturn, AttributeValue::Flag(true)), (gimli::DW_AT_external, AttributeValue::Flag(true)), (gimli::DW_AT_low_pc, AttributeValue::Address(Address::Constant(0x40)))]);
+            // The abstract instance of an inlined function has no address and declares nothing.
+            subprogram(unit, "inlined", &[(gimli::DW_AT_noreturn, AttributeValue::Flag(true)), (gimli::DW_AT_external, AttributeValue::Flag(true))]);
+            subprogram(unit, "abort", &[(gimli::DW_AT_noreturn, AttributeValue::Flag(true)), (gimli::DW_AT_declaration, AttributeValue::Flag(true)), (gimli::DW_AT_external, AttributeValue::Flag(true))]);
+            subprogram(unit, "work", &[(gimli::DW_AT_low_pc, AttributeValue::Address(Address::Constant(0x80)))]);
+        });
+        assert_eq!((found.names, found.declared, found.addrs), (HashSet::from(["die".into(), "inlined".into()]), HashSet::from(["abort".into()]), HashSet::from([0x40])));
+    }
+
+    #[test]
+    fn a_definition_never_returns_where_the_declaration_it_completes_says_so() {
+        let found = noreturn(|unit| {
+            let declaration = subprogram(unit, "fatal", &[(gimli::DW_AT_noreturn, AttributeValue::Flag(true)), (gimli::DW_AT_declaration, AttributeValue::Flag(true))]);
+            let definition = unit.add(unit.root(), gimli::DW_TAG_subprogram);
+            unit.get_mut(definition).set(gimli::DW_AT_specification, AttributeValue::UnitRef(declaration));
+            unit.get_mut(definition).set(gimli::DW_AT_low_pc, AttributeValue::Address(Address::Constant(0x40)));
+        });
+        assert_eq!(found.addrs, HashSet::from([0x40]));
+    }
+
+    #[test]
+    fn a_function_keeps_the_name_at_its_address_that_is_no_fragment_and_counts_without_a_size() {
+        // `push rbp; ret` at 0, `ret` at 2 for a sizeless symbol, as `frame_dummy` is.
+        let code = [0x55, 0xc3, 0xc3];
+        for symbols in [[("f.cold", 0, 2), ("f", 0, 2), ("stub", 2, 0)], [("f", 0, 2), ("f.cold", 0, 2), ("stub", 2, 0)]] {
+            let bytes = fixture::elf(Architecture::X86_64, &code, &symbols, &[]);
+            let file = object::File::parse(&*bytes).unwrap();
+            let truth = elf(Path::new("t"), &file, &file).unwrap();
+            let functions: Vec<_> = truth.functions.iter().map(|f| (f.addr, f.name.as_str(), f.fragment)).collect();
+            assert_eq!(functions, [(0, "f", false), (2, "stub", false)], "{symbols:?}");
+            assert_eq!(truth.instructions, 2);
+        }
+    }
 }

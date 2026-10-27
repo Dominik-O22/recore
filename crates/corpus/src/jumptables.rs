@@ -489,3 +489,110 @@ fn derive(name: String, source: &Source) -> Extracted {
     rejected.sort_unstable_by_key(|r| r.table);
     Extracted { truth: JumpTables { name, tables }, listed: listed.len(), rejected }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SYSV: Option<Platform> = Some(Platform { caller_saved: SYSV_CALLER_SAVED, image_base: None });
+
+    /// Derives the truth of one function at 0x1000 holding `code`, with one table at 0x2000.
+    /// Code is 64-bit where there is a `platform` to follow its dispatch, and 32-bit without.
+    fn derive_one(code: &[u8], encoding: Encoding, platform: Option<Platform>, entries: &[u32]) -> Extracted {
+        let table: Vec<u8> = entries.iter().flat_map(|entry| entry.to_le_bytes()).collect();
+        let source = Source {
+            listed: vec![(0x2000, entries.len() as u64)],
+            functions: vec![(0x1000, code.len() as u64)],
+            bitness: if platform.is_some() { 64 } else { 32 },
+            encoding,
+            platform,
+            table: Box::new(|addr, size| (addr == 0x2000 && size == table.len() as u64).then_some(&table[..])),
+            code: Box::new(|start, size| Some(vec![(start, code.get(..size as usize)?)])),
+        };
+        derive("t".into(), &source)
+    }
+
+    /// Entries of a clang table at 0x2000, as offsets from it.
+    fn relative(targets: &[u64]) -> Vec<u32> {
+        targets.iter().map(|&target| target.wrapping_sub(0x2000) as u32).collect()
+    }
+
+    fn found(extracted: &Extracted) -> Vec<(u64, u64, Vec<u64>, Option<u64>)> {
+        extracted.truth.tables.iter().map(|t| (t.jump, t.table, t.targets.clone(), t.unreachable)).collect()
+    }
+
+    fn rejected(extracted: &Extracted) -> Vec<&str> {
+        extracted.rejected.iter().map(|rejected| rejected.reason.as_str()).collect()
+    }
+
+    #[rustfmt::skip]
+    const CLANG: [u8; 23] = [
+        0x83, 0xff, 0x01,                         // 1000  cmp edi, 1
+        0x77, 0x11,                               // 1003  ja 0x1016
+        0x48, 0x8d, 0x05, 0xf4, 0x0f, 0x00, 0x00, // 1005  lea rax, [rip + 0xff4], the table at 0x2000
+        0x48, 0x63, 0x0c, 0xb8,                   // 100c  movsxd rcx, dword ptr [rax + rdi*4]
+        0x48, 0x01, 0xc1,                         // 1010  add rcx, rax
+        0xff, 0xe1,                               // 1013  jmp rcx
+        0xc3,                                     // 1015  ret
+        0xc3,                                     // 1016  ret
+    ];
+
+    #[test]
+    fn a_clang_table_is_read_by_the_jump_its_address_flows_to_and_an_entry_at_the_end_is_unreachable() {
+        let extracted = derive_one(&CLANG, Encoding::Relative, SYSV, &relative(&[0x1016, 0x1015, 0x1016, 0x1017]));
+        assert_eq!(found(&extracted), [(0x1013, 0x2000, vec![0x1015, 0x1016], Some(0x1017))]);
+        assert_eq!(rejected(&extracted), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_table_with_a_target_inside_an_instruction_or_outside_its_function_is_rejected() {
+        let inside = derive_one(&CLANG, Encoding::Relative, SYSV, &relative(&[0x1015, 0x1014]));
+        assert_eq!((found(&inside), rejected(&inside)), (vec![], vec!["function 0x1000: target 0x1014 is not an instruction boundary"]));
+        let outside = derive_one(&CLANG, Encoding::Relative, SYSV, &relative(&[0x1015, 0x1020]));
+        assert_eq!((found(&outside), rejected(&outside)), (vec![], vec!["target 0x1020 is outside the function at 0x1000"]));
+    }
+
+    #[test]
+    fn a_call_between_the_table_address_and_the_jump_loses_the_address() {
+        #[rustfmt::skip]
+        let code = [
+            0x48, 0x8d, 0x05, 0xf9, 0x0f, 0x00, 0x00, // 1000  lea rax, [rip + 0xff9]
+            0xe8, 0x00, 0x00, 0x00, 0x00,             // 1007  call 0x100c
+            0x48, 0x63, 0x0c, 0xb8,                   // 100c  movsxd rcx, dword ptr [rax + rdi*4]
+            0x48, 0x01, 0xc1,                         // 1010  add rcx, rax
+            0xff, 0xe1,                               // 1013  jmp rcx
+            0xc3,                                     // 1015  ret
+            0xc3,                                     // 1016  ret
+        ];
+        let extracted = derive_one(&code, Encoding::Relative, SYSV, &relative(&[0x1015, 0x1016]));
+        assert_eq!((found(&extracted), rejected(&extracted)), (vec![], vec!["function 0x1000: no dispatch found for table 0x2000"]));
+    }
+
+    #[test]
+    fn an_msvc_table_of_rvas_is_read_by_the_jump_that_adds_the_image_base_to_an_entry() {
+        #[rustfmt::skip]
+        let code = [
+            0x48, 0x8d, 0x15, 0xf9, 0xff, 0xff, 0xff, // 1000  lea rdx, [rip - 0x7], the image base at 0x1000
+            0x8b, 0x8c, 0x82, 0x00, 0x10, 0x00, 0x00, // 1007  mov ecx, dword ptr [rdx + rax*4 + 0x1000]
+            0x48, 0x01, 0xd1,                         // 100e  add rcx, rdx
+            0xff, 0xe1,                               // 1011  jmp rcx
+            0xc3,                                     // 1013  ret
+            0xc3,                                     // 1014  ret
+        ];
+        let platform = Platform { caller_saved: WIN64_CALLER_SAVED, image_base: Some(0x1000) };
+        let extracted = derive_one(&code, Encoding::Rva(0x1000), Some(platform), &[0x14, 0x13]);
+        assert_eq!(found(&extracted), [(0x1011, 0x2000, vec![0x1013, 0x1014], None)]);
+    }
+
+    #[test]
+    fn an_i386_table_of_addresses_is_named_by_its_jump() {
+        #[rustfmt::skip]
+        let code = [
+            0xff, 0x24, 0x85, 0x00, 0x20, 0x00, 0x00, // 1000  jmp dword ptr [eax*4 + 0x2000]
+            0xc3,                                     // 1007  ret
+            0xc3,                                     // 1008  ret
+        ];
+        let extracted = derive_one(&code, Encoding::Absolute, None, &[0x1008, 0x1007]);
+        assert_eq!(found(&extracted), [(0x1000, 0x2000, vec![0x1007, 0x1008], None)]);
+    }
+}

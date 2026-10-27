@@ -192,3 +192,103 @@ pub fn score(truth: &Truth, jump_tables: Option<&JumpTables>, analysis: &Analysi
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::jumptables::JumpTable;
+    use crate::truth::Function;
+
+    /// Truth with `.text` at `[0x1000, 0x2000)`: `f` at 0x1000, `g` at 0x1100, a cold fragment
+    /// at 0x1800, and `h` past `.text` at 0x3000.
+    fn truth() -> Truth {
+        let function = |addr, size, fragment| Function { addr, size, name: format!("{addr:#x}"), fragment, noreturn: false, thunk: false };
+        Truth {
+            name: "t".into(),
+            exec: vec![(0x1000, 0x4000)],
+            text: (0x1000, 0x2000),
+            functions: vec![function(0x1000, 0x100, false), function(0x1100, 0x80, false), function(0x1800, 0x40, true), function(0x3000, 0x10, false)],
+            instructions: 0,
+            noreturn_calls: vec![],
+            terminal_calls: vec![],
+            noreturn_imports: vec![],
+            undecodable_bytes: 0,
+            data_bytes: 0,
+        }
+    }
+
+    /// An analysis reporting functions as `(entry, body ranges)`, and nothing else.
+    fn analysis(functions: &[(u64, &[(u64, u64)])]) -> Analysis {
+        let functions: Vec<_> = functions.iter().map(|(addr, ranges)| json!({ "addr": addr, "ranges": ranges })).collect();
+        serde_json::from_value(json!({ "name": "t", "functions": functions, "noreturn_calls": [] })).unwrap()
+    }
+
+    /// An analysis reporting functions at `entries`, without bodies.
+    fn starts(entries: &[u64]) -> Analysis {
+        analysis(&entries.iter().map(|&addr| (addr, &[][..])).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_start_is_found_at_an_entry_and_otherwise_mid_function_in_a_fragment_or_outside() {
+        let s = score(&truth(), None, &starts(&[0x1000, 0x1040, 0x1180, 0x1810, 0x1a00]));
+        assert_eq!((s.truth_functions, s.found, s.mid_function, s.in_fragment, s.outside), (2, 1, 1, 1, 2));
+        assert_eq!((s.precision(), s.recall(), s.f1()), (1.0 / 4.0, 1.0 / 2.0, 1.0 / 3.0), "a start in a fragment is left out of precision");
+    }
+
+    #[test]
+    fn a_start_counts_once_and_only_inside_text_and_never_at_a_fragment_entry() {
+        let s = score(&truth(), None, &starts(&[0x1000, 0x1000, 0x1800, 0x2000, 0x3000]));
+        assert_eq!((s.found, s.mid_function, s.in_fragment, s.outside), (1, 0, 0, 0));
+    }
+
+    #[test]
+    fn a_body_that_covers_another_entry_runs_on_and_one_that_ends_at_it_does_not() {
+        let swallows: &[_] = &[(0x1000, 0x1101)];
+        let stops: &[_] = &[(0x1000, 0x1100)];
+        assert_eq!(score(&truth(), None, &analysis(&[(0x1000, swallows)])).run_on, 1);
+        assert_eq!(score(&truth(), None, &analysis(&[(0x1000, stops)])).run_on, 0);
+    }
+
+    #[test]
+    fn coverage_counts_each_true_byte_once_however_many_bodies_hold_it() {
+        let f: &[_] = &[(0x1000, 0x1080)];
+        let overlapping: &[_] = &[(0x1040, 0x10c0)];
+        let past_g: &[_] = &[(0x1100, 0x1200)];
+        let s = score(&truth(), None, &analysis(&[(0x1000, f), (0x1040, overlapping), (0x1100, past_g)]));
+        assert_eq!((s.covered_bytes, s.truth_bytes), (0xc0 + 0x80, 0x100 + 0x80 + 0x40));
+    }
+
+    #[test]
+    fn a_noreturn_call_is_found_or_extra_and_extra_ones_inside_no_function_are_not_counted() {
+        let mut truth = truth();
+        truth.noreturn_calls = vec![0x1010, 0x1020];
+        truth.terminal_calls = vec![0x1030];
+        let mut reported = starts(&[]);
+        reported.noreturn_calls = vec![0x1010, 0x1010, 0x1030, 0x1040, 0x1a00, 0x3000];
+        let s = score(&truth, None, &reported);
+        assert_eq!((s.truth_noreturn_calls, s.found_noreturn_calls, s.extra_noreturn_calls, s.extra_noreturn_at_end), (2, 1, 2, 1));
+    }
+
+    #[test]
+    fn a_table_is_exact_missing_targets_extra_targets_or_unresolved() {
+        let table = |jump, targets: &[u64], unreachable| JumpTable { jump, table: jump + 8, targets: targets.to_vec(), unreachable };
+        let tables = JumpTables {
+            name: "t".into(),
+            tables: vec![
+                table(0x1010, &[0x1020, 0x1030], None),
+                table(0x1050, &[0x1060, 0x1070], Some(0x10ff)),
+                table(0x1110, &[0x1120, 0x1130], None),
+                table(0x1150, &[0x1160], None),
+                table(0x1170, &[0x1180], None),
+                table(0x1190, &[0x11a0, 0x11b0], None),
+            ],
+        };
+        let mut reported = starts(&[]);
+        let resolved = [(0x1010, &[0x1030, 0x1020][..]), (0x1050, &[0x1060, 0x1070, 0x10ff]), (0x1110, &[0x1120, 0x1140]), (0x1150, &[]), (0x1190, &[0x11a0])];
+        reported.jump_tables = resolved.iter().map(|&(jump, targets)| recore::report::JumpTable { jump, targets: targets.to_vec() }).collect();
+        let s = score(&truth(), Some(&tables), &reported);
+        assert_eq!((s.truth_tables, s.exact_tables, s.tables_missing_targets, s.tables_extra_targets, s.unresolved_tables), (6, 2, 2, 1, 2));
+    }
+}
