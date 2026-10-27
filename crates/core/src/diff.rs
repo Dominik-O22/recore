@@ -157,8 +157,8 @@ fn pair_in_order(old: &Side, new: &Side, pairing: &mut Pairing) -> bool {
             Some(Ok(paired)) => paired,
             None => u64::MAX,
         };
-        let between = |entry: &&u64| **entry >= after && **entry < before && !pairing.new.contains(*entry);
-        let candidates: Vec<u64> = new_entries.iter().filter(between).copied().collect();
+        let (first, end) = (new_entries.partition_point(|&entry| entry < after), new_entries.partition_point(|&entry| entry < before));
+        let candidates: Vec<u64> = new_entries[first..end.max(first)].iter().filter(|entry| !pairing.new.contains(*entry)).copied().collect();
         if candidates.len() == run.len() {
             found.extend(run.iter().copied().zip(candidates));
         }
