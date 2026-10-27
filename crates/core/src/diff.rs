@@ -3,7 +3,8 @@
 //! Functions are paired by what stays the same between two builds: a name, then a body that no
 //! other function has, then a place among functions already paired, since a function is called
 //! by the same callers and calls the same callees in the same order. A pair whose bodies differ
-//! in more than the addresses they hold is a change.
+//! in more than the addresses they hold is a change. Code that cannot be hashed, as the 8051's,
+//! is paired all the same, and says it was not compared.
 
 use std::collections::BTreeMap;
 
@@ -33,17 +34,23 @@ pub struct Pair {
     pub old: u64,
     pub new: u64,
     pub evidence: Evidence,
-    /// How the code differs, if in more than the addresses it holds.
-    pub change: Option<Change>,
+    /// How the code differs, beyond the addresses it holds.
+    pub change: Change,
 }
 
 /// How the code of a function differs between two builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
+    /// In nothing but the addresses it holds.
+    Same,
     /// The instructions are the same and only numbers in them differ: a constant, or the
     /// offsets of fields, as in every function that uses a structure which gained one.
     Numbers,
+    /// The instructions differ.
     Code,
+    /// The code of one or both could not be compared, so whether it differs is not known:
+    /// [`crate::signature::hashes`] does not hash the machine, or the image lacks the bytes.
+    Unknown,
 }
 
 /// How two builds of a program differ, function by function.
@@ -67,23 +74,16 @@ enum Callee<'a> {
 /// One build, with what pairing asks of each function.
 struct Side<'a> {
     program: &'a Program,
-    /// Every function's body with its addresses blanked, fragments included, and the same
-    /// with its numbers blanked too.
+    /// The body and shape hashes of each function whose code could be hashed, fragments
+    /// included: see [`crate::signature::hashes`].
     bodies: FxHashMap<u64, (u64, u64)>,
 }
 
 impl<'a> Side<'a> {
     fn new(program: &'a Program) -> Side<'a> {
         let slots: FxHashMap<u64, u64> = program.image.relative_targets.iter().copied().collect();
-        let body = |entry: u64| {
-            let (mut hash, mut shape) = (0u64, 0u64);
-            for (start, end) in program.body(entry) {
-                hash = hash.rotate_left(17) ^ crate::signature::body_hash(&program.image, &slots, start, end)?;
-                shape = shape.rotate_left(17) ^ crate::signature::shape_hash(&program.image, &slots, start, end)?;
-            }
-            Some((entry, (hash, shape)))
-        };
-        Side { program, bodies: program.functions().filter_map(|function| body(function.addr)).collect() }
+        let hashes = |entry: u64| Some((entry, crate::signature::hashes(&program.image, &slots, &program.body(entry))?));
+        Side { program, bodies: program.functions().filter_map(|function| hashes(function.addr)).collect() }
     }
 
     fn entries(&self) -> impl Iterator<Item = u64> + '_ {
@@ -232,15 +232,42 @@ pub fn diff(old: &Program, new: &Program) -> Diff {
     }
 
     let change = |from: u64, to: u64| match (old.bodies.get(&from), new.bodies.get(&to)) {
-        (Some(before), Some(after)) if before.0 == after.0 => None,
-        (Some(before), Some(after)) if before.1 == after.1 => Some(Change::Numbers),
-        (None, None) => None,
-        _ => Some(Change::Code),
+        (Some(before), Some(after)) if before.0 == after.0 => Change::Same,
+        (Some(before), Some(after)) if before.1 == after.1 => Change::Numbers,
+        (Some(_), Some(_)) => Change::Code,
+        _ => Change::Unknown,
     };
     let pairs = pairing.by_old.iter().map(|(&from, &(to, evidence))| Pair { old: from, new: to, evidence, change: change(from, to) }).collect();
     Diff {
         pairs,
         removed: old.entries().filter(|entry| !pairing.by_old.contains_key(entry)).collect(),
         added: new.entries().filter(|entry| !pairing.new.contains(entry)).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image::{Format, Image, Machine, Section};
+    use crate::report::{Analysis, AnalyzedFunction};
+
+    /// A program of `code` at 0 that is one function, `main`.
+    fn program(machine: Machine, code: Vec<u8>) -> Program {
+        let end = code.len() as u64;
+        let text = Section { name: ".text".into(), addr: 0, data: code, file_offset: None, executable: true, writable: false };
+        let main = AnalyzedFunction { addr: 0, ranges: vec![(0, end)], noreturn: false, thunk: false, origin: Default::default(), name: Some("main".into()), fragment_of: None, runs_on: None };
+        let analysis = Analysis { name: String::new(), functions: vec![main], noreturn_calls: vec![], instructions: 0, jump_tables: vec![], calls: vec![], imports: vec![], data_refs: vec![], strings: vec![], classes: vec![], sends: vec![], types: vec![] };
+        Program::new(Image::bare(String::new(), Format::Raw, machine, 0, vec![text]), analysis)
+    }
+
+    #[test]
+    fn a_pair_whose_code_cannot_be_hashed_is_not_called_the_same() {
+        let change = |machine, before: &[u8], after: &[u8]| diff(&program(machine, before.to_vec()), &program(machine, after.to_vec())).pairs[0].change;
+        // mov r0, #1; bx lr against mov r0, #2; bx lr.
+        let (one, two) = ([1, 0, 0xA0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1], [2, 0, 0xA0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1]);
+        assert_eq!(change(Machine::Arm, &one, &one), Change::Same);
+        assert_eq!(change(Machine::Arm, &one, &two), Change::Numbers);
+        // The 8051 is not hashed: mov a, #1; ret, the same in both, is not known to be.
+        assert_eq!(change(Machine::I8051, &[0x74, 1, 0x22], &[0x74, 1, 0x22]), Change::Unknown);
     }
 }
