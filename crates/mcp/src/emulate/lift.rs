@@ -61,10 +61,7 @@ fn lift_range(binary: &mut Binary, spaces: &mut Spaces, start: u64, end: u64, ou
             if instruction.addr != pc || instruction.text == "(bad)" || pc >= end {
                 break;
             }
-            let semantics = match instruction.text.split(' ').next().and_then(x87::Instruction::parse) {
-                Some(whole) => Semantics::X87(whole),
-                None => Semantics::Pcode(instruction.pcode.iter().map(|line| parse_op(spaces, line)).collect::<Result<Vec<_>>>().map_err(|e| format!("{e:#}"))),
-            };
+            let semantics = Semantics::of(spaces, &instruction, true);
             out.push(Insn { addr: pc, len: instruction.len, semantics, x87: x87_step(&instruction.text) });
             pc += instruction.len;
         }
@@ -701,10 +698,7 @@ fn discover(binary: &mut Binary, spaces: &mut Spaces, entry: u64) -> Result<Vec<
         let mut one = Vec::new();
         let instructions = binary.lift(pc, pc + 16)?;
         let instruction = instructions.into_iter().find(|i| i.addr == pc).with_context(|| format!("nothing decodes at {pc:#x}"))?;
-        let semantics = match instruction.text.split(' ').next().and_then(x87::Instruction::parse) {
-            Some(whole) => Semantics::X87(whole),
-            None => Semantics::Pcode(instruction.pcode.iter().map(|line| parse_op(spaces, line)).collect::<Result<Vec<_>>>().map_err(|e| format!("{e:#}"))),
-        };
+        let semantics = Semantics::of(spaces, &instruction, true);
         let mut falls = true;
         if let Semantics::Pcode(Ok(ops)) = &semantics {
             for op in ops {
@@ -1699,7 +1693,7 @@ pub struct Function {
 pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program> {
     let mut spaces = Spaces::new();
     spaces.intern("ram");
-    let functions: FxHashMap<u64, Vec<(u64, u64)>> = binary.program.analysis.functions.iter().map(|f| (f.addr, f.ranges.clone())).collect();
+    let jump_tables: FxHashMap<u64, Vec<u64>> = binary.program.analysis.jump_tables.iter().map(|t| (t.jump, t.targets.clone())).collect();
     let imports: FxHashMap<u64, (String, bool)> = binary
         .program
         .analysis
@@ -1733,20 +1727,13 @@ pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program>
         }
         let mut insns = Vec::new();
         let mut error = None;
-        match functions.get(&entry).cloned() {
-            Some(ranges) => {
-                for (start, end) in ranges {
-                    if let Err(e) = lift_range(binary, &mut spaces, start, end, &mut insns) {
-                        error = Some(format!("{e:#}"));
-                        break;
-                    }
-                }
-            }
-            // An entry inside a known function, as a method or a switch case reached from a
-            // table: that function's whole body, entered here.
-            None if functions.values().any(|r| r.iter().any(|&(lo, hi)| (lo..hi).contains(&entry))) => {
-                let ranges = functions.values().find(|r| r.iter().any(|&(lo, hi)| (lo..hi).contains(&entry))).cloned().unwrap_or_default();
-                for (start, end) in ranges {
+        // A function's body, or for an entry inside one, as a method or a switch case reached
+        // from a table, that function's whole body, entered here.
+        let program = &binary.program;
+        let owner = if program.function(entry).is_some() { Some(entry) } else { program.owners(entry).first().copied() };
+        match owner.map(|owner| program.body(owner)) {
+            Some(body) => {
+                for (start, end) in body {
                     if let Err(e) = lift_range(binary, &mut spaces, start, end, &mut insns) {
                         error = Some(format!("{e:#}"));
                         break;
@@ -1761,48 +1748,13 @@ pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program>
                 Err(e) => error = Some(format!("{e:#}")),
             },
         }
-        // Jump tables: an indirect jump through `[reg*4 + table]` goes to the table's entries,
-        // read while they point near the function.
-        let mut scanned: BTreeSet<u64> = BTreeSet::new();
+        // Jump tables: an indirect jump goes to the targets the analysis found for it, which
+        // can be code only the table reaches. Code followed there can hold more of them.
         let mut tables: BTreeSet<u64> = BTreeSet::new();
-        while error.is_none() && !insns.is_empty() {
-            let before = insns.len();
-            let (low, high) = (insns.iter().map(|i| i.addr).min().unwrap_or(0).saturating_sub(0x1000), insns.iter().map(|i| i.addr).max().unwrap_or(0) + 0x1000);
-            let mut extra = Vec::new();
-            let known: BTreeSet<u64> = insns.iter().map(|i| i.addr).collect();
-            for insn in &insns {
-                let Semantics::Pcode(Ok(ops)) = &insn.semantics else { continue };
-                // The analysis ends some functions after a call followed by an alignment NOP
-                // (0x538f10 at 0x538faa), though the call returns: the code after it is the body.
-                let next = insn.addr + insn.len;
-                if ops.iter().any(|op| matches!(op.code, Code::Call | Code::CallInd))
-                    && !known.contains(&next)
-                    && binary.program.image.bytes_from(next).and_then(|b| b.first().copied()) == Some(0x90)
-                {
-                    extra.push(next);
-                }
-                if !ops.iter().any(|op| op.code == Code::BranchInd) || !scanned.insert(insn.addr) {
-                    continue;
-                }
-                let text = binary.lift(insn.addr, insn.addr + insn.len).ok().and_then(|found| found.into_iter().next()).map(|i| i.text).unwrap_or_default();
-                let Some(table) = text.split("*0x4 + 0x").nth(1).and_then(|rest| u64::from_str_radix(rest.trim_end_matches(']').split(|c: char| !c.is_ascii_hexdigit()).next()?, 16).ok()) else { continue };
-                // MSVC's memcpy also indexes a table backwards, after `NEG ECX`.
-                for step in [4i64, -4] {
-                    for n in 0..256i64 {
-                        let Some(bytes) = binary.program.image.bytes_from((table as i64 + step * n) as u64) else { break };
-                        let Some(word) = bytes.get(..4) else { break };
-                        let target = u64::from(u32::from_le_bytes(word.try_into().unwrap()));
-                        // An index that starts at 1 leaves a word of something else first.
-                        if !(low..high).contains(&target) {
-                            if n == 0 {
-                                continue;
-                            }
-                            break;
-                        }
-                        extra.push(target);
-                        tables.insert(target);
-                    }
-                }
+        while error.is_none() {
+            let extra: Vec<u64> = insns.iter().filter_map(|insn| jump_tables.get(&insn.addr)).flatten().copied().filter(|&target| tables.insert(target)).collect();
+            if extra.is_empty() {
+                break;
             }
             let mut have: BTreeSet<u64> = insns.iter().map(|i| i.addr).collect();
             for target in extra {
@@ -1818,9 +1770,6 @@ pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program>
                 }
             }
             insns.sort_by_key(|i| i.addr);
-            if insns.len() == before {
-                break;
-            }
         }
         if let Some(e) = error {
             starts.push((code.len(), entry));

@@ -188,6 +188,16 @@ enum Semantics {
     X87(x87::Instruction),
 }
 
+impl Semantics {
+    /// What `instruction` does: on x86 an x87 instruction runs whole, anything else as its p-code.
+    fn of(spaces: &mut Spaces, instruction: &recore_decomp::Instruction, x86: bool) -> Semantics {
+        match instruction.text.split(' ').next().and_then(x87::Instruction::parse) {
+            Some(whole) if x86 => Semantics::X87(whole),
+            _ => Semantics::Pcode(instruction.pcode.iter().map(|line| parse_op(spaces, line)).collect::<Result<Vec<_>>>().map_err(|error| format!("{error:#}"))),
+        }
+    }
+}
+
 fn operand(spaces: &mut Spaces, text: &str) -> Result<Varnode> {
     let mut parts = text.split(':');
     let (Some(space), Some(offset), Some(size), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
@@ -912,10 +922,7 @@ impl<'a> Emulator<'a> {
                 break;
             }
             let x86 = matches!(self.binary.program.image.machine, Machine::X86 | Machine::X86_64);
-            let semantics = match instruction.text.split(' ').next().and_then(x87::Instruction::parse) {
-                Some(whole) if x86 => Semantics::X87(whole),
-                _ => Semantics::Pcode(instruction.pcode.iter().map(|line| parse_op(&mut self.spaces, line)).collect::<Result<Vec<_>>>().map_err(|error| format!("{error:#}"))),
-            };
+            let semantics = Semantics::of(&mut self.spaces, &instruction, x86);
             self.lifted.entry(instruction.addr).or_insert_with(|| Rc::new(Lifted { len: instruction.len, semantics }));
         }
         self.lifted.get(&pc).cloned().ok_or_else(|| format!("no instruction decodes at {pc:#x}"))

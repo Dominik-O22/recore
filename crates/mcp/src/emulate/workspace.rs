@@ -3,9 +3,8 @@
 //! lifted code runs on, and the binary that runs it; [`Config`] gives each field.
 //!
 //! The roots are every function the analysis finds, every word of the data sections that points
-//! into code (code reached only through tables of addresses), and every code address an
-//! instruction takes as an immediate that `xrefs` confirms (callbacks the analysis lists inside
-//! another function). The lifted functions are split into `crates` crates `c0`..`cN` of about the
+//! into code (code reached only through tables of addresses), and every code address the analysis
+//! finds an instruction taking (callbacks it lists inside another function). The lifted functions are split into `crates` crates `c0`..`cN` of about the
 //! same size, so rustc checks them in parallel; every call between functions goes through
 //! `dispatch`, so a port in the binary's `ports` replaces a lifted function for every caller.
 
@@ -18,7 +17,6 @@ use std::{
 use anyhow::{Context, Result};
 use recore::FxHashMap;
 use serde::Deserialize;
-use serde_json::json;
 
 use super::lift::{Function, X87Abi, lift};
 use crate::binary::Cache;
@@ -119,116 +117,36 @@ pub fn run(config: &Path, out: Option<&Path>) -> Result<String> {
     Ok(format!("{first} ({} roots; the failures are in {})\n{count} functions in {} crates under {}\n", roots.len(), out.join("report.txt").display(), config_file.crates, out.display()))
 }
 
-/// A section of a PE file: its address, its size in memory, the bytes the file holds, and whether
-/// it is executable (IMAGE_SCN_MEM_EXECUTE).
-struct Section<'a> {
-    addr: u64,
-    size: u64,
-    bytes: &'a [u8],
-    executable: bool,
-}
-
-fn sections(data: &[u8]) -> Result<Vec<Section<'_>>> {
-    let u16_at = |at: usize| data.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]])).context("a PE header");
-    let u32_at = |at: usize| data.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes"))).context("a PE header");
-    let pe = u32_at(0x3c)? as usize;
-    let (count, optional) = (u16_at(pe + 6)? as usize, u16_at(pe + 20)? as usize);
-    let base = u64::from(u32_at(pe + 24 + 28)?);
-    let table = pe + 24 + optional;
-    (0..count)
-        .map(|i| {
-            let at = table + 40 * i;
-            let (size, rva, raw_size, raw) = (u32_at(at + 8)?, u32_at(at + 12)?, u32_at(at + 16)? as usize, u32_at(at + 20)? as usize);
-            let flags = u32_at(at + 36)?;
-            let bytes = data.get(raw.min(data.len())..(raw + raw_size).min(data.len())).unwrap_or_default();
-            Ok(Section { addr: base + u64::from(rva), size: u64::from(size), bytes, executable: flags & 0x2000_0000 != 0 })
-        })
-        .collect()
-}
-
 /// The roots to lift: the analysis's functions, then the code addresses found in data and taken
 /// by instructions that are not functions, each in address order. A code address in data is any
-/// aligned word of a non-executable section whose value lands in an executable one, as the table
-/// of handlers a C runtime helper jumps through, less those that land inside an instruction of a
-/// function the analysis found. The lifter takes roots from the end, so the order fixes the order
-/// of the output.
+/// aligned word outside code and resources that lands in code, as the table of handlers a C
+/// runtime helper jumps through; one an instruction takes is an immediate the analysis found it
+/// taking, as a callback one function pushes and the analysis lists inside another. Either is
+/// dropped when it lands inside an instruction of a function the analysis found. The lifter
+/// takes roots from the end, so the order fixes the order of the output.
 fn roots(cache: &mut Cache, exe: &Path) -> Result<Vec<u64>> {
-    let data = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let functions: BTreeSet<u64> = cache.get(exe)?.program.functions().map(|f| f.addr).collect();
-    let sections = sections(&data)?;
-    let mut extra = code_words(&sections);
-    // An immediate that only looks like an address is dropped unless `xrefs` says an instruction
-    // takes it.
-    let path = exe.to_string_lossy().into_owned();
-    for v in immediates(&sections).into_iter().filter(|v| !functions.contains(v)) {
-        let answer = crate::tools::call(cache, "xrefs", json!({ "path": path, "addr": format!("{v:#x}") })).context("the xrefs tool")?;
-        if answer.is_ok_and(|text| text.contains("takes its address")) {
-            extra.insert(v);
-        }
-    }
+    let program = &cache.get(exe)?.program;
+    let image = &program.image;
+    let functions: BTreeSet<u64> = program.functions().map(|f| f.addr).collect();
+    // Every word, not only the image's pointer slots: without relocations the loader drops words
+    // that read as text, and a table of handlers can (0x46205c reads as "\ F"). A word that is
+    // not an address costs a lifted function; an address missed costs a crash when it is called.
+    let in_data = image.sections.iter().filter(|s| !s.executable && s.name != ".rsrc").flat_map(|s| s.data.as_chunks::<4>().0.iter().map(|&word| u64::from(u32::from_le_bytes(word))));
+    let taken = program.analysis.data_refs.iter().filter(|r| !r.access).map(|r| r.to);
+    let mut extra: BTreeSet<u64> = in_data.chain(taken).filter(|&v| image.is_code(v) && !functions.contains(&v)).collect();
     // Compiled code never jumps into the middle of an instruction, so a value that lands inside a
     // function's body on no instruction the analysis decoded there is not a code address, most
     // often a short string: "SOF\0" reads as 0x464f53.
-    let program = &cache.get(exe)?.program;
     let mut starts: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
     extra.retain(|&v| {
         let owners = program.owners(v);
         owners.is_empty()
             || owners.iter().any(|&owner| {
-                let instructions = starts.entry(owner).or_insert_with(|| recore::cfg::cfg(&program.image, &program.analysis, &program.body(owner)).instructions);
+                let instructions = starts.entry(owner).or_insert_with(|| recore::cfg::cfg(image, &program.analysis, &program.body(owner)).instructions);
                 instructions.binary_search(&v).is_ok()
             })
     });
-    Ok(functions.iter().copied().chain(extra.into_iter().filter(|v| !functions.contains(v))).collect())
-}
-
-/// Whether `v` lies in an executable section.
-fn in_code(sections: &[Section], v: u64) -> bool {
-    sections.iter().any(|s| s.executable && (s.addr..s.addr + s.size).contains(&v))
-}
-
-fn word(raw: &[u8], at: usize) -> u64 {
-    u64::from(u32::from_le_bytes(raw[at..at + 4].try_into().expect("4 bytes")))
-}
-
-/// Every aligned word of the data sections that points into code: code reached only through
-/// tables of addresses.
-fn code_words(sections: &[Section]) -> BTreeSet<u64> {
-    let data = sections.iter().filter(|s| !s.executable);
-    data.flat_map(|s| (0..s.bytes.len().saturating_sub(3)).step_by(4).map(|at| word(s.bytes, at))).filter(|&v| in_code(sections, v)).collect()
-}
-
-/// Code addresses an instruction may take as an immediate, such as a callback one function pushes
-/// and the analysis lists inside another: the immediates of PUSH imm32, MOV reg, imm32 and
-/// MOV r/m32, imm32 that land in code. The scan reads every byte as a possible opcode, so some
-/// are bytes that only look like one of the three.
-fn immediates(sections: &[Section]) -> BTreeSet<u64> {
-    let mut taken = BTreeSet::new();
-    for section in sections.iter().filter(|s| s.executable) {
-        let raw = section.bytes;
-        for (i, &op) in raw.iter().enumerate() {
-            let at = if op == 0x68 || (0xb8..=0xbf).contains(&op) {
-                i + 1
-            } else if op == 0xc7 && i + 2 < raw.len() {
-                let modrm = raw[i + 1];
-                let (mode, rm) = (modrm >> 6, modrm & 7);
-                let sib = mode != 3 && rm == 4;
-                let disp = match mode {
-                    0 if rm == 5 || (sib && raw[i + 2] & 7 == 5) => 4,
-                    1 => 1,
-                    2 => 4,
-                    _ => 0,
-                };
-                i + 2 + usize::from(sib) + disp
-            } else {
-                continue;
-            };
-            if at + 4 <= raw.len() && in_code(sections, word(raw, at)) {
-                taken.insert(word(raw, at));
-            }
-        }
-    }
-    taken
+    Ok(functions.into_iter().chain(extra).collect())
 }
 
 /// The lifted functions as units to write: a body lifted for several entries, as when a jump
@@ -351,49 +269,6 @@ fn write(config: &Config, base: &Path, out: &Path, functions: Vec<Function>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const TEXT: u32 = 0x6000_0020;
-    const DATA: u32 = 0xc000_0040;
-
-    /// A PE32 image at 0x400000 with these sections: (rva, size in memory, flags, bytes).
-    fn pe(list: &[(u32, u32, u32, &[u8])]) -> Vec<u8> {
-        let mut image = vec![0u8; 0x200];
-        image[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
-        image[0x40..0x44].copy_from_slice(b"PE\0\0");
-        image[0x46..0x48].copy_from_slice(&(list.len() as u16).to_le_bytes());
-        image[0x54..0x56].copy_from_slice(&0xe0u16.to_le_bytes());
-        image[0x74..0x78].copy_from_slice(&0x40_0000u32.to_le_bytes());
-        for (i, &(rva, size, flags, bytes)) in list.iter().enumerate() {
-            let header = 0x138 + 40 * i;
-            let raw = image.len() as u32;
-            for (at, value) in [(8, size), (12, rva), (16, bytes.len() as u32), (20, raw), (36, flags)] {
-                image[header + at..header + at + 4].copy_from_slice(&value.to_le_bytes());
-            }
-            image.extend_from_slice(bytes);
-        }
-        image
-    }
-
-    #[test]
-    fn roots_come_from_code_addresses_in_data_and_in_immediates() {
-        let text = [
-            &[0x68, 0x20, 0x10, 0x40, 0x00][..],                         // PUSH 0x401020
-            &[0xb9, 0x30, 0x10, 0x40, 0x00],                             // MOV ECX, 0x401030
-            &[0xc7, 0x05, 0x00, 0x20, 0x40, 0x00, 0x40, 0x10, 0x40, 0x00], // MOV [0x402000], 0x401040
-            &[0xc7, 0x44, 0x24, 0x08, 0x50, 0x10, 0x40, 0x00],             // MOV [ESP+8], 0x401050
-            &[0x68, 0x00, 0x20, 0x40, 0x00],                             // PUSH 0x402000, data
-            &[0xc3],
-        ]
-        .concat();
-        // A word into code, one into data, and one outside the image.
-        let data = [0x0040_1060u32, 0x0040_2004, 0x1234_5678].map(u32::to_le_bytes).concat();
-        let image = pe(&[(0x1000, 0x100, TEXT, &text), (0x2000, 0x100, DATA, &data)]);
-        let sections = sections(&image).unwrap();
-        let found: Vec<(u64, u64, bool)> = sections.iter().map(|s| (s.addr, s.size, s.executable)).collect();
-        assert_eq!(found, [(0x40_1000, 0x100, true), (0x40_2000, 0x100, false)]);
-        assert_eq!(code_words(&sections), BTreeSet::from([0x40_1060]));
-        assert_eq!(immediates(&sections), BTreeSet::from([0x40_1020, 0x40_1030, 0x40_1040, 0x40_1050]));
-    }
 
     /// A function as the lifter writes it, with `body` after its first line.
     fn lifted(entry: u64, doc: &str, body: &str) -> Function {
