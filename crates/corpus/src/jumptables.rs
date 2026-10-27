@@ -306,8 +306,11 @@ struct Source<'a> {
     table: Box<dyn Fn(u64, u64) -> Option<&'a [u8]> + 'a>,
     /// The code of the function at `(start, size)` as `(address, bytes)` pieces, without the
     /// data MSVC keeps inside a function's length.
-    code: Box<dyn Fn(u64, u64) -> Option<Vec<(u64, &'a [u8])>> + 'a>,
+    code: Box<dyn Fn(u64, u64) -> Option<Pieces<'a>> + 'a>,
 }
+
+/// Code as `(address, bytes)` pieces.
+type Pieces<'a> = Vec<(u64, &'a [u8])>;
 
 /// The i386 dispatch names its table outright: `jmp dword ptr [index*4 + table]`.
 fn direct_dispatches(instrs: &[Instruction], tables: &[Table]) -> BTreeMap<u64, usize> {
@@ -360,7 +363,7 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Option<Extracted
 
 /// Reads the compiler's `(table address, entry count)` pairs of `width`-byte integers.
 fn listed(meta: &[u8], width: usize) -> Result<Vec<(u64, u64)>> {
-    ensure!(meta.len() % (2 * width) == 0, "{META_SECTION} is not a whole number of (address, count) pairs");
+    ensure!(meta.len().is_multiple_of(2 * width), "{META_SECTION} is not a whole number of (address, count) pairs");
     let int = |bytes: &[u8]| bytes.iter().rev().fold(0u64, |value, &byte| value << 8 | u64::from(byte));
     Ok(meta.chunks_exact(2 * width).map(|pair| (int(&pair[..width]), int(&pair[width..]))).collect())
 }
@@ -415,9 +418,9 @@ fn derive(name: String, source: &Source) -> Extracted {
                 .and_then(|size| (source.table)(addr, size))
                 .ok_or_else(|| format!("{count} entries are not inside a read-only data section"))?;
             let mut targets: BTreeSet<u64> = bytes
-                .chunks_exact(ENTRY_SIZE as usize)
+                .as_chunks::<{ ENTRY_SIZE as usize }>().0.iter()
                 .map(|entry| {
-                    let entry = i32::from_le_bytes(entry.try_into().unwrap());
+                    let entry = i32::from_le_bytes(*entry);
                     match source.encoding {
                         Encoding::Relative => addr.wrapping_add_signed(entry.into()),
                         Encoding::Absolute => u64::from(entry as u32),

@@ -442,10 +442,8 @@ pub(crate) fn parse_frames(data: &[u8], addr: u64) -> Vec<(u64, u64)> {
                     cies.insert(offset, cie.clone());
                     Ok(cie)
                 });
-                if let Ok(fde) = fde {
-                    if fde.len() > 0 {
-                        frames.push((fde.initial_address(), fde.initial_address() + fde.len()));
-                    }
+                if let Ok(fde) = fde && fde.len() > 0 {
+                    frames.push((fde.initial_address(), fde.initial_address() + fde.len()));
                 }
             }
         }

@@ -82,7 +82,7 @@ fn message_sends_resolve_on_x86_64() {
 #[test]
 fn a_send_names_its_receiver_where_the_code_says_which() {
     let analysis = analyze("shapes-arm64");
-    let known: Vec<_> = analysis.sends.iter().filter_map(|send| Some((send.at, send.label(), send.implementation))).filter(|send| !send.1.contains('?')).collect();
+    let known: Vec<_> = analysis.sends.iter().map(|send| (send.at, send.label(), send.implementation)).filter(|send| !send.1.contains('?')).collect();
     assert_eq!(
         known,
         [

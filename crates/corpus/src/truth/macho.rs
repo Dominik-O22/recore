@@ -101,7 +101,7 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     let mut data_ranges: Vec<(u64, u64)> = match data_in_code {
         Some(command) => command
             .data(endian, &*data)?
-            .chunks_exact(8)
+            .as_chunks::<8>().0.iter()
             .map(|entry| {
                 let start = base + u64::from(u32::from_le_bytes(entry[..4].try_into().unwrap()));
                 (start, start + u64::from(u16::from_le_bytes(entry[4..6].try_into().unwrap())))

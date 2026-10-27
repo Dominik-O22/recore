@@ -104,7 +104,7 @@ pub fn type_names(image: &Image) -> Vec<(u64, String)> {
                 let text = std::str::from_utf8(&rest[..rest.iter().position(|&byte| byte == 0)?]).ok()?;
                 // A descriptor is aligned, and its name follows two pointers.
                 let addr = section.addr + offset as u64;
-                (addr % pointer == 0 && text.ends_with("@@")).then(|| (addr, text.to_string()))
+                (addr.is_multiple_of(pointer) && text.ends_with("@@")).then(|| (addr, text.to_string()))
             })
         })
         .collect();

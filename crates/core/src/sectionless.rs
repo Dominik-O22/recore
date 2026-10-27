@@ -209,13 +209,13 @@ impl<'a> Elf<'a> {
         let bytes = self.data.get(at..at + 64)?;
         let found = match self.machine {
             EM_X86_64 | EM_386 => bytes.iter().position(|&byte| byte == 0xC3).map(|end| end + 1),
-            EM_AARCH64 => bytes.chunks_exact(4).position(|word| word == 0xd65f_03c0u32.to_le_bytes()).map(|end| 4 * end + 4),
+            EM_AARCH64 => bytes.as_chunks::<4>().0.iter().position(|word| *word == 0xd65f_03c0u32.to_le_bytes()).map(|end| 4 * end + 4),
             // Thumb: `bx lr` or a `pop` that takes the pc.
-            EM_ARM if addr & 1 == 1 => bytes.chunks_exact(2).position(|half| half == [0x70, 0x47] || half[1] == 0xBD).map(|end| 2 * end + 2),
+            EM_ARM if addr & 1 == 1 => bytes.as_chunks::<2>().0.iter().position(|half| *half == [0x70, 0x47] || half[1] == 0xBD).map(|end| 2 * end + 2),
             // A32: `bx lr`, or a load of several registers from the stack that takes the pc.
             EM_ARM => bytes
-                .chunks_exact(4)
-                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .as_chunks::<4>().0.iter()
+                .map(|word| u32::from_le_bytes(*word))
                 .position(|word| word == 0xE12F_FF1E || word & 0xFFFF_8000 == 0xE8BD_8000)
                 .map(|end| 4 * end + 4),
             _ => None,

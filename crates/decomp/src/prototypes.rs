@@ -24,7 +24,7 @@ pub fn stdcall_words(name: &str) -> Option<usize> {
     let identifier = base.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     let digits = !bytes.is_empty() && bytes.bytes().all(|b| b.is_ascii_digit());
     let bytes: usize = bytes.parse().ok().filter(|_| identifier && digits)?;
-    (bytes % 4 == 0).then_some(bytes / 4)
+    bytes.is_multiple_of(4).then_some(bytes / 4)
 }
 
 /// Types the tables are written in. `{ptr}` is the pointer-sized unsigned integer, and `{long}`

@@ -11,9 +11,12 @@ enum Better {
     Lower,
 }
 
-/// The counts a change to the analysis can move, as `score` names them. The truth's own counts
-/// are left out: both runs are scored against the same truth.
-const COUNTS: [(&str, fn(&Score) -> u64, Better); 12] = [
+/// A count by the name `score` gives it, how to read it from a score, and which way it improves.
+type Count = (&'static str, fn(&Score) -> u64, Better);
+
+/// The counts a change to the analysis can move. The truth's own counts are left out: both runs
+/// are scored against the same truth.
+const COUNTS: [Count; 12] = [
     ("starts found", |s| s.found, Better::Higher),
     ("mid-func", |s| s.mid_function, Better::Lower),
     ("in-cold", |s| s.in_fragment, Better::Lower),

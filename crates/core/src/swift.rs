@@ -595,7 +595,7 @@ fn read(image: &Image, naming: bool) -> Option<Metadata> {
     // of that offset and the size of the frame to allocate.
     collector.functions.extend(reader.words("__swift_as_entry").map(|(slot, offset)| slot.wrapping_add_signed(i64::from(offset as i32))));
 
-    let aligned = |addr: u64| image.machine != Machine::Aarch64 || addr % 4 == 0;
+    let aligned = |addr: u64| image.machine != Machine::Aarch64 || addr.is_multiple_of(4);
     let is_function = |addr: u64| aligned(addr) && image.section_at(addr).is_some_and(|section| section.executable && !section.is_stubs());
     let Collector { mut functions, mut names, types, instance_methods, .. } = collector;
     functions.retain(|&addr| is_function(addr));

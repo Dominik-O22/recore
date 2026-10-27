@@ -14,7 +14,7 @@ const BTI_C: u32 = 0xd503_245f;
 
 /// Decodes one 4-byte word. `udf` counts as undecodable: compilers do not emit it as code, so in
 /// practice it is a zero word of padding or data.
-fn decode(word: &[u8]) -> Option<Instruction> {
+fn decode(word: &[u8; 4]) -> Option<Instruction> {
     let instr = InstDecoder::default().decode(&mut U8Reader::new(word)).ok()?;
     (!matches!(instr.opcode, Opcode::Invalid | Opcode::UDF)).then_some(instr)
 }
@@ -45,10 +45,10 @@ pub fn plt_stubs(binary: &object::File) -> HashMap<u64, u64> {
     let mut stubs = HashMap::new();
     for section in binary.sections().filter(|s| s.name().is_ok_and(|name| name.starts_with(".plt"))) {
         let Ok(data) = section.data() else { continue };
-        let words: Vec<&[u8]> = data.chunks_exact(4).collect();
+        let words = data.as_chunks::<4>().0;
         for (index, window) in words.windows(4).enumerate() {
             let at = section.address() + 4 * index as u64;
-            let [Some(first), Some(second), Some(third), Some(fourth)] = [0, 1, 2, 3].map(|i| decode(window[i])) else { continue };
+            let [Some(first), Some(second), Some(third), Some(fourth)] = [0, 1, 2, 3].map(|i| decode(&window[i])) else { continue };
             let (Some((16, page)), Some((17, 16, offset))) = (adrp(&first, at), load(&second)) else { continue };
             let jumps = (third.opcode, fourth.opcode, fourth.operands[0]) == (Opcode::ADD, Opcode::BR, Operand::Register(SizeCode::X, 17));
             if !jumps {
@@ -115,10 +115,10 @@ pub fn scan(bytes: &[u8], addr: u64, data: &[(u64, u64)]) -> Scan {
     // Only an unbroken run of `adrp` and `ldr` leading up to a `blr` is trusted.
     let mut known: HashMap<u16, Known> = HashMap::new();
     let mut last_real: Option<(u64, bool)> = None;
-    let words = bytes.chunks_exact(4);
-    scan.undecodable_bytes += words.remainder().len() as u64;
+    let (words, rest) = bytes.as_chunks::<4>();
+    scan.undecodable_bytes += rest.len() as u64;
 
-    for (index, word) in words.enumerate() {
+    for (index, word) in words.iter().enumerate() {
         let at = addr + 4 * index as u64;
         if is_data(at) {
             scan.data_bytes += 4;
@@ -133,7 +133,7 @@ pub fn scan(bytes: &[u8], addr: u64, data: &[(u64, u64)]) -> Scan {
         scan.instructions += 1;
 
         let is_call = matches!(instr.opcode, Opcode::BL | Opcode::BLR | Opcode::BLRAA | Opcode::BLRAAZ | Opcode::BLRAB | Opcode::BLRABZ);
-        if word != NOP.to_le_bytes() {
+        if *word != NOP.to_le_bytes() {
             last_real = Some((at, is_call));
         }
         match (instr.opcode, instr.operands[0]) {

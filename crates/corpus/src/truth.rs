@@ -212,12 +212,8 @@ fn import_slots(binary: &object::File) -> HashMap<u64, String> {
         return slots;
     };
     for (addr, reloc) in relocations {
-        if let object::RelocationTarget::Symbol(index) = reloc.target() {
-            if let Ok(name) = dynsyms.symbol_by_index(index).and_then(|symbol| symbol.name()) {
-                if !name.is_empty() {
-                    slots.insert(addr, name.to_string());
-                }
-            }
+        if let object::RelocationTarget::Symbol(index) = reloc.target() && let Ok(name) = dynsyms.symbol_by_index(index).and_then(|symbol| symbol.name()) && !name.is_empty() {
+            slots.insert(addr, name.to_string());
         }
     }
     slots
