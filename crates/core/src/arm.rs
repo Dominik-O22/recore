@@ -332,7 +332,10 @@ impl Insn {
     }
 }
 
-/// Decodes the A32 word at `offset` into `bytes`, which are loaded at `base`.
+/// Decodes the A32 word at `offset` into `bytes`, which are loaded at `base`. Inlined into
+/// [`Decoder::next`] whatever else calls it: out of line, analyzing A32 code executes 5% more
+/// instructions.
+#[inline(always)]
 pub(crate) fn decode_a32(bytes: &[u8], base: u64, offset: usize) -> Option<Decoded<Insn>> {
     let addr = base + offset as u64;
     let rest = bytes.get(offset..).filter(|rest| !rest.is_empty())?;
