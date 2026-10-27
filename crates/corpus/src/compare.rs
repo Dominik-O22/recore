@@ -136,6 +136,13 @@ mod tests {
     }
 
     #[test]
+    fn a_loss_that_a_gain_cancels_is_not_worse() {
+        let score = |name: &str, n: u64| (name.to_string(), Score { found: n, mid_function: n, ..Score::default() });
+        let (changes, _) = compare(&[score("a", 10), score("b", 10)], &[score("a", 7), score("b", 13)]);
+        assert_eq!(changes.iter().map(|c| (c.count, c.worse)).collect::<Vec<_>>(), [("starts found", false), ("mid-func", false)]);
+    }
+
+    #[test]
     fn a_count_where_lower_is_better_is_worse_when_it_grows() {
         let base = [("a".to_string(), Score { mid_function: 3, ..Score::default() })];
         let head = [("a".to_string(), Score { mid_function: 5, ..Score::default() })];
