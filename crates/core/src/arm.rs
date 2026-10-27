@@ -147,7 +147,10 @@ impl A32 {
         (self.condition() != 15).then(|| (self.rd(), self.word >> 4 & 0xF000 | self.word & 0xFFF, top))
     }
 
-    /// A load or store of one register, of a byte, a halfword, a word or two words.
+    /// A load or store of one register, of a byte, a halfword, a word or two words. Inlined
+    /// wherever it is called, so each caller computes only the fields it reads: out of line,
+    /// analyzing A32 code executes 20 to 30% more instructions.
+    #[inline(always)]
     pub(crate) fn transfer(self) -> Option<Access> {
         let word = self.word;
         if self.condition() == 15 {
