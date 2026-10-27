@@ -174,7 +174,8 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         // The first store of each: the register is free for other use once it is saved.
         let home = |register: Register| insns.iter().find(|insn| stored(insn, &[register]) && stack(insn)).map(|insn| insn.memory_displacement64());
         let (Some(third), Some(fourth)) = (home(Register::R8), home(Register::R9)) else { return false };
-        fourth == third + 8 && insns.iter().any(|insn| insn.mnemonic() == Mnemonic::Lea && stack(insn) && insn.memory_displacement64() <= third && third - insn.memory_displacement64() <= 16)
+        // Displacements are signed values held in a `u64`, so a negative one wraps.
+        fourth == third.wrapping_add(8) && insns.iter().any(|insn| insn.mnemonic() == Mnemonic::Lea && stack(insn) && insn.memory_displacement64() <= third && third - insn.memory_displacement64() <= 16)
     }
 
     fn field_use(insn: &Instruction) -> Option<(u64, FieldUse)> {
