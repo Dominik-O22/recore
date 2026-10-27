@@ -222,7 +222,7 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
         starts.dedup();
     }
     let mut data_starts: Vec<u64> = match data_in_code {
-        Some(command) => command.data(endian, data)?.chunks_exact(8).map(|entry| base + u64::from(u32::from_le_bytes(entry[..4].try_into().unwrap()))).collect(),
+        Some(command) => command.data(endian, data)?.as_chunks::<8>().0.iter().map(|entry| base + u64::from(u32::from_le_bytes(entry[..4].try_into().unwrap()))).collect(),
         None => Vec::new(),
     };
     data_starts.sort_unstable();

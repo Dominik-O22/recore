@@ -68,14 +68,14 @@ impl<'a> Reader<'a> {
     /// The 32-bit words stored in the section called `name`, with the address of each.
     pub(crate) fn words(&self, name: &'a str) -> impl Iterator<Item = (u64, u32)> + 'a {
         self.sections(name).flat_map(|section| {
-            section.data.chunks_exact(4).zip((section.addr..).step_by(4)).map(|(bytes, slot)| (slot, u32::from_le_bytes(bytes.try_into().unwrap())))
+            section.data.as_chunks::<4>().0.iter().zip((section.addr..).step_by(4)).map(|(bytes, slot)| (slot, u32::from_le_bytes(*bytes)))
         })
     }
 
     /// The pointers stored in the section called `name`, with the slot of each.
     fn pointers(&self, name: &'a str) -> impl Iterator<Item = (u64, u64)> + 'a {
         self.sections(name).flat_map(|section| {
-            section.data.chunks_exact(8).zip((section.addr..).step_by(8)).map(|(bytes, slot)| (slot, u64::from_le_bytes(bytes.try_into().unwrap())))
+            section.data.as_chunks::<8>().0.iter().zip((section.addr..).step_by(8)).map(|(bytes, slot)| (slot, u64::from_le_bytes(*bytes)))
         })
     }
 

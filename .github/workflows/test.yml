@@ -11,7 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       # The decompiler engine and the Swift demangler are C++; the second builds with cmake.
       - run: cmake --version && c++ --version
+      - run: cargo clippy --release --workspace --all-targets -- -D warnings
       - run: cargo test --release --workspace

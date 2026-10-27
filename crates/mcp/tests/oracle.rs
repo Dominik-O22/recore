@@ -510,6 +510,7 @@ fn path(path: &Path) -> &str {
 }
 
 /// A machine to run the functions on, and how to ask the oracle for one of them.
+#[derive(Default)]
 struct Machine {
     name: &'static str,
     /// The image the oracle loads.
@@ -541,7 +542,9 @@ fn native(dir: &Path, source: &Path) -> Machine {
     Machine { name: "x86-64", image, addresses: BTreeMap::new(), result: "RAX", wide: true, floats: Some("XMM0"), vectors: true }
 }
 
-fn shared(dir: &Path, source: &Path, name: &'static str, target: &str, linker_machine: &[&str], result: &'static str, wide: bool, floats: Option<&'static str>, vectors: bool) -> Machine {
+/// Builds `machine` for `target` with clang and lld, linking for `linker_machine`.
+fn shared(dir: &Path, source: &Path, target: &str, linker_machine: &[&str], machine: Machine) -> Machine {
+    let Machine { name, wide, floats, vectors, .. } = machine;
     let object = dir.join(format!("{name}.o"));
     let image = dir.join(format!("{name}.so"));
     let target = format!("--target={target}");
@@ -560,7 +563,7 @@ fn shared(dir: &Path, source: &Path, name: &'static str, target: &str, linker_ma
     link.extend(linker_machine);
     link.extend(["-o", path(&image), path(&object)]);
     command(rust_lld(), &link);
-    Machine { name, image, addresses: BTreeMap::new(), result, wide, floats, vectors }
+    Machine { image, ..machine }
 }
 
 /// A Cortex-M3 image of flash at 0, with the layout file that names it.
@@ -666,8 +669,8 @@ fn the_oracle_agrees_with_the_machines() {
 
     let machines = [
         native(&dir, &source),
-        shared(&dir, &source, "aarch64", "aarch64-linux-gnu", &[], "x0", true, Some("d0"), false),
-        shared(&dir, &source, "x86-32", "i686-linux-gnu", &["-m", "elf_i386"], "EAX", false, None, true),
+        shared(&dir, &source, "aarch64-linux-gnu", &[], Machine { name: "aarch64", result: "x0", wide: true, floats: Some("d0"), ..Machine::default() }),
+        shared(&dir, &source, "i686-linux-gnu", &["-m", "elf_i386"], Machine { name: "x86-32", result: "EAX", vectors: true, ..Machine::default() }),
         thumb(&dir, &source),
     ];
     let mut client = Client::start();

@@ -665,8 +665,11 @@ mod tests {
         crate::library::STAND_INS.iter().find(|stand_in| stand_in.0 == name).unwrap().1
     }
 
+    /// The length of an instruction and its control flow.
+    type Step = (u8, Option<Flow>);
+
     /// The length and the control flow of the instruction `bytes` holds at `addr`.
-    fn decoded(bytes: &[u8], addr: u64) -> (u8, Option<Flow>) {
+    fn decoded(bytes: &[u8], addr: u64) -> Step {
         let first = decode(bytes, addr).next().unwrap();
         (first.len, I8051::flow(&first.insn.unwrap(), &State::default(), &image(bytes, addr)))
     }
@@ -674,7 +677,7 @@ mod tests {
     #[test]
     fn every_kind_of_jump_goes_where_its_bytes_say() {
         use Flow::*;
-        let cases: &[(&[u8], u64, (u8, Option<Flow>))] = &[
+        let cases: &[(&[u8], u64, Step)] = &[
             // LJMP 0x1234; LCALL 0x1234
             (&[0x02, 0x12, 0x34], 0x0100, (3, Some(Jump(0x1234)))),
             (&[0x12, 0x12, 0x34], 0x0100, (3, Some(Call(0x1234)))),
@@ -781,7 +784,7 @@ mod tests {
             // The function called.
             0x22,
         ];
-        code.extend(b"ab\0%d\00123456789ABCDEF\0left over\0nobody\0");
+        code.extend(b"ab\0%d\x000123456789ABCDEF\0left over\0nobody\0");
         let analysis = crate::analyze(&image(&code, 0));
         let strings: Vec<(u64, &str)> = analysis.strings.iter().map(|string| (string.addr, string.text.as_str())).collect();
         assert_eq!(strings, [(0x2D, "ab"), (0x30, "%d"), (0x33, "0123456789ABCDEF"), (0x44, "left over"), (0x4E, "nobody")]);

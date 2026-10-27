@@ -244,7 +244,7 @@ impl A32 {
 
     /// `BX Rm` or `BLX Rm`: the register and whether it calls.
     fn exchange(self) -> Option<(usize, bool)> {
-        (self.word & 0x0FFF_FFD0 == 0x012F_FF10 && self.condition() != 15).then(|| ((self.word & 15) as usize, self.word & 0x20 != 0))
+        (self.word & 0x0FFF_FFD0 == 0x012F_FF10 && self.condition() != 15).then_some(((self.word & 15) as usize, self.word & 0x20 != 0))
     }
 
     /// `CMP Rn, #imm` and `CMP Rn, Rm` where `Rm` holds a number.
@@ -341,7 +341,7 @@ pub(crate) fn decode_a32(bytes: &[u8], base: u64, offset: usize) -> Option<Decod
     let rest = bytes.get(offset..).filter(|rest| !rest.is_empty())?;
     // Off the word, or cut short by the end of the bytes: no instruction, and on to the next
     // halfword, which may be one in the other set.
-    if addr % 4 != 0 || rest.len() < 4 {
+    if !addr.is_multiple_of(4) || rest.len() < 4 {
         return Some(Decoded { addr, len: 2.min(rest.len() as u8), insn: None });
     }
     let word = u32::from_le_bytes(rest[..4].try_into().unwrap());
@@ -946,7 +946,7 @@ fn thumb_only(insns: &[Insn]) -> Option<Vec<thumb::Insn>> {
 /// #a; ADD IP, IP, #b; LDR PC, [IP, #c]!`. A Thumb caller that cannot `BLX` reaches it through
 /// `BX PC; NOP` right before it.
 fn plt_stubs(section: &Section) -> Vec<(u64, u64)> {
-    let words: Vec<u32> = section.data.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap())).collect();
+    let words: Vec<u32> = section.data.as_chunks::<4>().0.iter().map(|word| u32::from_le_bytes(*word)).collect();
     let mut stubs = Vec::new();
     for (index, window) in words.windows(3).enumerate() {
         let is = |word: u32, pattern: u32| word & 0xFFFF_F000 == pattern;
@@ -974,7 +974,7 @@ pub(crate) fn load(file: &object::File, image: &mut Image) {
     use object::{Object, ObjectSection, ObjectSymbol};
     let code: Vec<(u64, u64)> = image.sections.iter().filter(|section| section.executable).map(|section| (section.addr, section.end())).collect();
     let is_code = |addr: u64| code.iter().any(|&(start, end)| (start..end).contains(&addr));
-    let reads = |start: u64| start % 4 == 0 && image.bytes_from(start).is_some_and(|bytes| reads_as_a32(&bytes[..bytes.len().min(48)]));
+    let reads = |start: u64| start.is_multiple_of(4) && image.bytes_from(start).is_some_and(|bytes| reads_as_a32(&bytes[..bytes.len().min(48)]));
     // Where the set is known for sure: the entry point, the exports and the pointers that the
     // loader relocates into code, each with the Thumb bit or without it, and the PLT, which
     // GNU ld writes in A32.
@@ -1040,7 +1040,7 @@ fn exception_index(file: &object::File) -> Vec<(u64, u64)> {
     let Ok(data) = section.data() else { return Vec::new() };
     // The first word of each entry is a 31-bit offset from the entry to the function.
     let mut entries: Vec<(u64, bool)> = data
-        .chunks_exact(8)
+        .as_chunks::<8>().0.iter()
         .enumerate()
         .map(|(index, entry)| {
             let word = |at: usize| u32::from_le_bytes(entry[at..at + 4].try_into().unwrap());
@@ -1058,7 +1058,7 @@ fn exception_index(file: &object::File) -> Vec<(u64, u64)> {
 /// or 15 there and says nothing. Thumb code that calls through the PLT has 14 there often, for
 /// the second half of a `BLX`, so this tells A32 from a label inside Thumb code and no more.
 fn reads_as_a32(bytes: &[u8]) -> bool {
-    let conditions: Vec<u32> = bytes.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap()) >> 28).filter(|condition| (1..15).contains(condition)).collect();
+    let conditions: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|word| u32::from_le_bytes(*word) >> 28).filter(|condition| (1..15).contains(condition)).collect();
     let always = conditions.iter().filter(|&&condition| condition == 14).count();
     conditions.len() >= 2 && always * 4 >= conditions.len() * 3
 }
@@ -1070,7 +1070,7 @@ fn dynamic_code_pointers(file: &object::File) -> Vec<u64> {
     const DT_INIT: u32 = 12;
     const DT_FINI: u32 = 13;
     let Some(data) = file.section_by_name(".dynamic").and_then(|section| section.data().ok()) else { return Vec::new() };
-    data.chunks_exact(8)
+    data.as_chunks::<8>().0.iter()
         .filter_map(|entry| {
             let (tag, value) = (u32::from_le_bytes(entry[..4].try_into().unwrap()), u32::from_le_bytes(entry[4..].try_into().unwrap()));
             matches!(tag, DT_INIT | DT_FINI).then_some(u64::from(value))

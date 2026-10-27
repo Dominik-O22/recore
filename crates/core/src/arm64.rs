@@ -68,7 +68,7 @@ impl Insn {
 
     /// `br`, `blr`, `ret` and their pointer-authenticating forms: the operation number.
     fn register_branch(self) -> Option<u32> {
-        (self.word & 0xFE00_0000 == 0xD600_0000).then(|| self.word >> 21 & 7)
+        (self.word & 0xFE00_0000 == 0xD600_0000).then_some(self.word >> 21 & 7)
     }
 
     /// `adr` and `adrp`: the address formed.
@@ -403,8 +403,8 @@ impl Arch for Arm64 {
     const ALIGNMENT_IS_EVIDENCE: bool = false;
 
     fn decode<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> + 'a {
-        bytes.chunks_exact(4).zip((addr..).step_by(4)).map(|(chunk, addr)| {
-            let word = u32::from_le_bytes(chunk.try_into().unwrap());
+        bytes.as_chunks::<4>().0.iter().zip((addr..).step_by(4)).map(|(chunk, addr)| {
+            let word = u32::from_le_bytes(*chunk);
             Decoded { addr, len: 4, insn: Some(Insn { word, addr }) }
         })
     }
@@ -655,10 +655,8 @@ impl Arch for Arm64 {
                     state.step(insn);
                     continue;
                 }
-                if let (Some(0), Value::Slot(slot)) = (insn.register_branch(), state.registers[insn.rn()]) {
-                    if image.import_slots.contains_key(&slot) {
-                        stubs.insert(start, slot);
-                    }
+                if let (Some(0), Value::Slot(slot)) = (insn.register_branch(), state.registers[insn.rn()]) && image.import_slots.contains_key(&slot) {
+                    stubs.insert(start, slot);
                 }
                 (state, stub_start) = (State::default(), None);
             }

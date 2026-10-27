@@ -157,7 +157,7 @@ fn headers<'d, Pe: ImageNtHeaders>(data: &'d [u8]) -> Result<Headers<'d>> {
     let mut pdata: Vec<RuntimeFunction> = Vec::new();
     if bitness == 64 {
         pdata = directory(IMAGE_DIRECTORY_ENTRY_EXCEPTION)
-            .chunks_exact(12)
+            .as_chunks::<12>().0.iter()
             .map(|entry| RuntimeFunction {
                 begin: base + u32_at(&entry[0..4]),
                 end: base + u32_at(&entry[4..8]),

@@ -145,7 +145,7 @@ fn function_frames(pdata: &Section, sections: &[Section], base: u64) -> Vec<(u64
 
     let mut entries: Vec<(u64, u64, bool)> = pdata
         .data
-        .chunks_exact(12)
+        .as_chunks::<12>().0.iter()
         .map(|entry| (base + rva(&entry[0..4]), base + rva(&entry[4..8]), is_chained(base + rva(&entry[8..12]))))
         .filter(|&(start, end, _)| start != base && end > start)
         .collect();

@@ -86,8 +86,8 @@ impl Cpu {
             // DIV AB, which leaves A and B as they were when it divides by zero
             0x84 => {
                 (self.cy, self.ov) = (false, self.b == 0);
-                if self.b != 0 {
-                    (self.a, self.b) = (a / self.b, a % self.b);
+                if let Some(quotient) = a.checked_div(self.b) {
+                    (self.a, self.b) = (quotient, a % self.b);
                 }
             }
             // JC, JNC
@@ -242,7 +242,7 @@ impl Program {
                 "INT_EQUAL" => (input(0) == input(1)).into(),
                 "INT_NOTEQUAL" => (input(0) != input(1)).into(),
                 "INT_LESS" => (input(0) < input(1)).into(),
-                "INT_CARRY" => (input(0) + input(1) >> bits != 0).into(),
+                "INT_CARRY" => ((input(0) + input(1)) >> bits != 0).into(),
                 "INT_SCARRY" => (sign(input(0), bits) + sign(input(1), bits) != sign(input(0).wrapping_add(input(1)), bits)).into(),
                 "INT_SBORROW" => (sign(input(0), bits) - sign(input(1), bits) != sign(input(0).wrapping_sub(input(1)), bits)).into(),
                 "POPCOUNT" => input(0).count_ones().into(),

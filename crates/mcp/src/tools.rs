@@ -433,7 +433,7 @@ fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
     let mut in_c: FxHashMap<u64, Vec<String>> = FxHashMap::default();
     for pair in found.pairs.iter().filter(|pair| pair.change == Change::Code).take(limit.min(COMPARED)) {
         let Ok(merged) = changed_lines(old, new, pair, &paired, timeout) else { continue };
-        let body = merged.iter().position(|(_, line)| line.trim().is_empty() && merged.first().is_some()).map_or(0, |blank| merged[blank + 1..].iter().position(|(_, line)| line.trim().is_empty()).map_or(blank, |next| blank + 1 + next));
+        let body = merged.iter().position(|(_, line)| line.trim().is_empty() && !merged.is_empty()).map_or(0, |blank| merged[blank + 1..].iter().position(|(_, line)| line.trim().is_empty()).map_or(blank, |next| blank + 1 + next));
         let changed: Vec<String> = merged[body..].iter().filter(|(sign, line)| *sign != ' ' && !line.trim().is_empty()).map(|(sign, line)| format!("{sign} {}", line.trim())).collect();
         in_c.insert(pair.old, changed);
     }

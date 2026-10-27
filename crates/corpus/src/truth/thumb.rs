@@ -358,7 +358,7 @@ pub(super) fn table_at<'a>(
                 base.wrapping_add_signed(2 * if signed { value << bits >> bits } else { value })
             })
             .collect(),
-        Dispatch::Absolute { .. } => bytes.chunks_exact(4).map(|entry| u64::from(u32::from_le_bytes(entry.try_into().unwrap())) & !1).collect(),
+        Dispatch::Absolute { .. } => bytes.as_chunks::<4>().0.iter().map(|entry| u64::from(u32::from_le_bytes(*entry)) & !1).collect(),
     };
     // Padding: an entry whose case would be the table itself.
     targets.retain(|&target| !(table..table_end).contains(&target));

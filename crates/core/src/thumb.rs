@@ -648,7 +648,7 @@ impl CaseHelper {
     /// The helper whose code is at `addr`, if any.
     fn at(image: &Image, addr: u64) -> Option<&'static CaseHelper> {
         let bytes = image.bytes_from(addr)?;
-        let is = |helper: &CaseHelper| bytes.len() >= 2 * helper.code.len() && helper.code.iter().zip(bytes.chunks_exact(2)).all(|(&half, bytes)| half.to_le_bytes() == bytes);
+        let is = |helper: &CaseHelper| bytes.len() >= 2 * helper.code.len() && helper.code.iter().zip(bytes.as_chunks::<2>().0.iter()).all(|(&half, bytes)| half.to_le_bytes() == *bytes);
         Self::ALL.iter().find(|helper| is(helper))
     }
 
@@ -763,7 +763,7 @@ pub fn vector_table(table: &[u8], is_code: impl Fn(u64) -> bool) -> (u64, Vec<u6
     /// The architecture's 16 exceptions and at most 496 interrupts.
     const MOST: usize = 512;
     const RESERVED: [usize; 5] = [7, 8, 9, 10, 13];
-    let words = table.chunks_exact(4).map(|word| u64::from(u32::from_le_bytes(word.try_into().unwrap())));
+    let words = table.as_chunks::<4>().0.iter().map(|word| u64::from(u32::from_le_bytes(*word)));
     let mut handlers = Vec::new();
     let mut length = 4;
     for (index, word) in words.enumerate().skip(1).take(MOST - 1) {
@@ -1330,8 +1330,11 @@ mod tests {
         Image::bare(String::new(), crate::image::Format::Raw, crate::image::Machine::Thumb, addr, vec![section])
     }
 
+    /// The length of an instruction and its control flow.
+    type Step = (u8, Option<Flow>);
+
     /// The length and the control flow of each instruction of `halfwords` at `addr`.
-    fn flows(halfwords: &[u16], addr: u64) -> Vec<(u8, Option<Flow>)> {
+    fn flows(halfwords: &[u16], addr: u64) -> Vec<Step> {
         let bytes: Vec<u8> = halfwords.iter().flat_map(|half| half.to_le_bytes()).collect();
         let image = image(&bytes, addr);
         let mut state = State::default();
@@ -1348,7 +1351,7 @@ mod tests {
     #[test]
     fn every_kind_of_branch_goes_where_its_bits_say() {
         use Flow::*;
-        let cases: &[(&[u16], u64, &[(u8, Option<Flow>)])] = &[
+        let cases: &[(&[u16], u64, &[Step])] = &[
             // B<c> T1 back and forward; B T2; CBZ; CBNZ.
             (&[0xD1FE], 0x1000, &[(2, Some(Branch(0x1000)))]),
             (&[0xD836], 0x100C, &[(2, Some(Branch(0x107C)))]),

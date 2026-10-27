@@ -113,7 +113,7 @@ pub fn string_at(image: &Image, addr: u64, from_code: bool) -> Option<StringLite
         return Some(StringLiteral { addr, text: String::from_utf8(narrow).ok()?, wide: false });
     }
 
-    let units = || bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+    let units = || bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
     let wide: Vec<u16> = units().take(MAX_CHARS).take_while(|&unit| is_text(u32::from(unit))).collect();
     (wide.len() >= min_chars && units().nth(wide.len()) == Some(0))
         .then(|| StringLiteral { addr, text: String::from_utf16_lossy(&wide), wide: true })

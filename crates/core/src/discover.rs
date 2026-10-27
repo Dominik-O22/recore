@@ -644,7 +644,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
             Origin::AddressTaken | Origin::DataPointer if self.taken_is_weak() => Evidence::MaybeNumber,
             // Where the format puts labels among the code, any pointer may be one. Elsewhere
             // only one off the alignment functions have.
-            Origin::DataPointer if self.image.data_in_code || addr % A::FUNCTION_ALIGN != 0 => Evidence::MaybeLabel,
+            Origin::DataPointer if self.image.data_in_code || !addr.is_multiple_of(A::FUNCTION_ALIGN) => Evidence::MaybeLabel,
             Origin::AddressTaken | Origin::DataPointer => Evidence::Pointer,
             Origin::Unknown | Origin::Frame | Origin::Export | Origin::Call | Origin::Unreachable | Origin::Thunk => Evidence::Sure,
         }
@@ -693,13 +693,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
         /// Offsets from a pointer further than this are not fields of what it points to.
         const FARTHEST_FIELD: u64 = 1 << 20;
         let through = A::through_pointer(insn, state).filter(|&(_, offset, _)| !speculative && offset < FARTHEST_FIELD);
-        if let Some((pointee, offset, access)) = through.and_then(|(slot, offset, access)| Some((*self.pointer_slots.get(&slot)?, offset, access))) {
-            if self.is_data(pointee) && self.is_data(pointee + offset) {
-                if access {
-                    self.note_access(at, pointee + offset);
-                } else {
-                    self.data_ref_sites.push((at, pointee + offset, false));
-                }
+        if let Some((pointee, offset, access)) = through.and_then(|(slot, offset, access)| Some((*self.pointer_slots.get(&slot)?, offset, access))) && self.is_data(pointee) && self.is_data(pointee + offset) {
+            if access {
+                self.note_access(at, pointee + offset);
+            } else {
+                self.data_ref_sites.push((at, pointee + offset, false));
             }
         }
     }
@@ -816,10 +814,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
             .iter()
             .map(|(jump, table)| {
                 let mut count = table.entries.len();
-                if !table.bounded {
-                    if let Some(&next) = data_refs.get(data_refs.partition_point(|&addr| addr <= table.address)) {
-                        count = count.min(((next - table.address) / table.entry_size) as usize);
-                    }
+                if !table.bounded && let Some(&next) = data_refs.get(data_refs.partition_point(|&addr| addr <= table.address)) {
+                    count = count.min(((next - table.address) / table.entry_size) as usize);
                 }
                 let function_end = self.frame_end(*jump);
                 let mut targets: Vec<u64> =
@@ -1081,10 +1077,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
         for (jump, table) in self.tables.iter().filter(|(_, table)| table.bounded) {
             for target in &table.entries {
                 // A dispatch that jumps to its own function's entry is a loop, not a label.
-                if self.starts.range(..=*jump).next_back().map(|(&start, _)| start) != Some(*target) {
-                    if !matches!(self.starts.get(target), Some(Origin::Frame | Origin::Export | Origin::Call)) {
-                        self.starts.remove(target);
-                    }
+                if self.starts.range(..=*jump).next_back().map(|(&start, _)| start) != Some(*target) && !matches!(self.starts.get(target), Some(Origin::Frame | Origin::Export | Origin::Call)) {
+                    self.starts.remove(target);
                 }
             }
         }

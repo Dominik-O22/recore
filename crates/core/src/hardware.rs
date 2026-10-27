@@ -258,7 +258,7 @@ pub fn bits(image: &Image, addr: u64) -> Vec<(u64, &str)> {
     let first = match addr {
         _ if image.machine != Machine::I8051 => return Vec::new(),
         _ if (IDATA + 0x20..IDATA + 0x30).contains(&addr) => (addr - IDATA - 0x20) * 8,
-        _ if addr >= SFR + 0x80 && addr % 8 == 0 => addr - SFR,
+        _ if addr >= SFR + 0x80 && addr.is_multiple_of(8) => addr - SFR,
         _ => return Vec::new(),
     };
     (first..first + 8).filter_map(|bit| Some((bit, image.symbol_names.get(&(BIT + bit))?.as_str()))).collect()

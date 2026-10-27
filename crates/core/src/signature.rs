@@ -205,7 +205,7 @@ fn aarch64(bytes: &[u8], start: u64, end: u64, min_words: Option<usize>, numbers
         return None;
     }
     const NOP: u32 = 0xD503_201F;
-    let words = || bytes.chunks_exact(4).map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()));
+    let words = || bytes.as_chunks::<4>().0.iter().map(|chunk| u32::from_le_bytes(*chunk));
     // Without padding, a branch inside the function is told by which instruction it goes to,
     // counted without the padding, since padding moves everything after it: for each word,
     // how many before it are not padding.

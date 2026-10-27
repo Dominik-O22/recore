@@ -207,7 +207,7 @@ pub fn plt_stubs(binary: &object::File) -> HashMap<u64, u64> {
     let mut stubs = HashMap::new();
     for section in binary.sections().filter(|s| s.name().is_ok_and(|name| name.starts_with(".plt"))) {
         let Ok(data) = section.data() else { continue };
-        let words: Vec<u32> = data.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap())).collect();
+        let words: Vec<u32> = data.as_chunks::<4>().0.iter().map(|word| u32::from_le_bytes(*word)).collect();
         for (index, window) in words.windows(3).enumerate() {
             let at = section.address() + 4 * index as u64;
             let is = |word: u32, pattern: u32| word & 0xFFFF_F000 == pattern;
@@ -398,7 +398,7 @@ fn a32_dispatch(code: &Code, readonly: &[(u64, &[u8])], data: &[(u64, u64)], ins
             times_four(instruction.operands[1])?;
             let Some(&(start, end)) = data.iter().find(|&&(start, _)| start == base) else { return Some(Err("LDR PC with no data after it".into())) };
             let bytes = code.bytes(start, end)?;
-            let targets = bytes.chunks_exact(4).map(|entry| u64::from(u32::from_le_bytes(entry.try_into().unwrap())) & !1).collect();
+            let targets = bytes.as_chunks::<4>().0.iter().map(|entry| u64::from(u32::from_le_bytes(*entry)) & !1).collect();
             Some(Ok(JumpTable { jump, table: start, targets, unreachable: None }))
         }
         // ADD PC, Rt, Re: clang's table of offsets from its own start, which an `ADR` before
@@ -416,7 +416,7 @@ fn a32_dispatch(code: &Code, readonly: &[(u64, &[u8])], data: &[(u64, u64)], ins
             let Some(&(_, end)) = data.iter().find(|&&(start, end)| start <= table && table < end && start == jump + 4) else { return Some(Err(format!("ADD PC, Rt, Re with the table at {table:#x} not in the data after it"))) };
             let end = a32_literals(instructions).into_iter().filter(|&literal| literal > table && literal < end).min().unwrap_or(end);
             let bytes = code.bytes(table, end)?;
-            let targets = bytes.chunks_exact(4).map(|entry| table.wrapping_add(u64::from(u32::from_le_bytes(entry.try_into().unwrap()))) & 0xFFFF_FFFF).collect();
+            let targets = bytes.as_chunks::<4>().0.iter().map(|entry| table.wrapping_add(u64::from(u32::from_le_bytes(*entry))) & 0xFFFF_FFFF).collect();
             Some(Ok(JumpTable { jump, table, targets, unreachable: None }))
         }
         // ADD PC, PC, Rm, LSL #2: four times an entry, or the index itself into a row of branches.

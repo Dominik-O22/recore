@@ -474,8 +474,8 @@ impl State {
 fn read_relative(image: &Image, table: u64, anchor: u64, limit: Option<Limit>, is_target: &dyn Fn(u64) -> bool) -> Option<Table> {
     let bytes = image.bytes_from(table)?;
     let mut entries = Vec::new();
-    for entry in bytes.chunks_exact(4).take(Limit::entries(limit)) {
-        let offset = i32::from_le_bytes(entry.try_into().unwrap());
+    for entry in bytes.as_chunks::<4>().0.iter().take(Limit::entries(limit)) {
+        let offset = i32::from_le_bytes(*entry);
         let target = anchor.wrapping_add_signed(offset as i64);
         if !is_target(target) {
             // A bounded table with an impossible entry is a misread, not a short table.

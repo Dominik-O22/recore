@@ -260,10 +260,8 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
             let mut stub_start = section.addr;
             for decoded in Self::decode(image, &section.data, section.addr) {
                 let flow = decoded.insn.as_ref().and_then(classify);
-                if let Some(Flow::JumpIndirect(Some(slot))) = flow {
-                    if image.import_slots.contains_key(&slot) {
-                        stubs.insert(stub_start, slot);
-                    }
+                if let Some(Flow::JumpIndirect(Some(slot))) = flow && image.import_slots.contains_key(&slot) {
+                    stubs.insert(stub_start, slot);
                 }
                 // ELF pads stubs to 16 bytes, so the next one starts at the next boundary.
                 // Mach-O packs them, each ending with its jump.

@@ -70,7 +70,7 @@ fn walk(dir: &Path, parts: &mut Vec<String>, hits: &mut Vec<String>) {
             if kind.is_dir() {
                 walk(&entry.path(), parts, hits);
             } else if kind.is_file() {
-                let bytes = fs::read(&entry.path()).unwrap_or_else(|e| panic!("{}: {e}", parts.join("/")));
+                let bytes = fs::read(entry.path()).unwrap_or_else(|e| panic!("{}: {e}", parts.join("/")));
                 if is_text(&bytes) {
                     for at in word_starts(&bytes) {
                         let line = 1 + bytes[..at].iter().filter(|&&b| b == b'\n').count();

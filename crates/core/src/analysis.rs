@@ -734,10 +734,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     let mut jumped_from: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
     for function in &functions {
         for control in &function.controls {
-            if let Flow::Jump(target) | Flow::Branch(target) = control.flow {
-                if leaves(function, target) && is_start(target) {
-                    jumped_from.entry(target).or_default().push(function.start);
-                }
+            if let Flow::Jump(target) | Flow::Branch(target) = control.flow && leaves(function, target) && is_start(target) {
+                jumped_from.entry(target).or_default().push(function.start);
             }
         }
     }
@@ -942,7 +940,6 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     // Objective-C methods are named by their class and selector, and message sends by the
     // selector they pass and the receiver they can be seen to go to.
     _phase = phase::scope("objective-c");
-    let mut classes = classes;
     let mut sends = Vec::new();
     let swift = crate::swift::metadata(image).unwrap_or_default();
     if let Some(objc) = crate::objc::metadata(image) {

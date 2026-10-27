@@ -7,10 +7,13 @@ use recore_decomp::isolate::Status;
 
 use crate::report::BinaryReport;
 
+/// The name a mark is reported under, and whether a function's C has it.
+type Mark = (&'static str, fn(&str) -> bool);
+
 /// What is looked for in a function's C, by the name it is reported under. Each stands for a
 /// value the engine could not explain: a flag kept as a bit of the status register, a wide value
 /// seen only as its bytes, or a register a convention does not account for.
-const MARKS: [(&str, fn(&str) -> bool); 8] = [
+const MARKS: [Mark; 8] = [
     ("flag arithmetic", |c| c.lines().any(|line| !declares(line) && words(line).any(is_flag))),
     ("carry call", |c| ["CARRY1(", "SCARRY1(", "SBORROW1("].iter().any(|call| c.contains(call))),
     ("CONCAT", |c| c.contains("CONCAT")),

@@ -19,15 +19,11 @@ pub fn display_name(symbol: &str) -> String {
         // The alternate form drops the trailing hash.
         return format!("{demangled:#}");
     }
-    if symbol.starts_with("_Z") {
-        if let Some(demangled) = cpp_demangle::Symbol::new(symbol).ok().and_then(|parsed| parsed.demangle().ok()) {
-            return demangled;
-        }
+    if symbol.starts_with("_Z") && let Some(demangled) = cpp_demangle::Symbol::new(symbol).ok().and_then(|parsed| parsed.demangle().ok()) {
+        return demangled;
     }
-    if symbol.starts_with('?') {
-        if let Ok(demangled) = msvc_demangler::demangle(symbol, msvc_demangler::DemangleFlags::NAME_ONLY) {
-            return demangled;
-        }
+    if symbol.starts_with('?') && let Ok(demangled) = msvc_demangler::demangle(symbol, msvc_demangler::DemangleFlags::NAME_ONLY) {
+        return demangled;
     }
     symbol.to_string()
 }
