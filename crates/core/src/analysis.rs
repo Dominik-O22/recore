@@ -629,6 +629,11 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         // nothing, as MSVC lays out a cold block after a call that never returns. Only an
         // extent that unwind information vouches for counts as "ends the function": an extent
         // inferred from layout may stop short at a wrong boundary.
+        // A literal pool or jump table after a call is data, which decodes as instructions.
+        let in_inline_table = |addr: u64| {
+            let index = inline_tables.partition_point(|&(start, _)| start <= addr);
+            index > 0 && addr < inline_tables[index - 1].1
+        };
         let after_call = |f: &Function, control: &Control| {
             if control.next == f.end && frame_end.contains_key(&f.start) {
                 return After::Ends;
@@ -683,6 +688,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             if let Some(next) = next
                 && ends.contains_key(&target)
                 && !jumped_to.contains(&next)
+                && !in_inline_table(next)
             {
                 *goes_on.entry(target).or_default() += 1;
             }
