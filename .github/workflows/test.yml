@@ -14,6 +14,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Its key hashes Cargo.lock and each crate's Cargo.toml but not the root one, where the
+          # profiles are, so a profile change would restore a cache for the old profile and keep it.
+          key: ${{ hashFiles('Cargo.toml') }}
       # The decompiler engine and the Swift demangler are C++; the second builds with cmake.
       - run: cmake --version && c++ --version
       - run: cargo clippy --profile ci --workspace --all-targets -- -D warnings
