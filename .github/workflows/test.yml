@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  # Three runners at once. Core's tests get their own, so the rest wait less for core to compile.
+  # Three runners at once. Core's tests get their own, so the rest don't wait for core's test build.
   check:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -25,6 +25,8 @@ jobs:
       # a change leaves alone come from the cache even though checkout touches every file.
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
+      # When the cache can't be reached, compile without it instead of failing.
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98 # mise.toml pins the same, so a new release adds no lints by surprise
@@ -34,8 +36,11 @@ jobs:
         with:
           # Its key hashes Cargo.lock and each crate's Cargo.toml but not the root one, where the
           # profiles are, so a profile change would restore a cache for the old profile and keep it.
+          # The matrix entries share a job id, so each also needs its own index to keep its own target.
           key: ${{ hashFiles('Cargo.toml') }}-${{ strategy.job-index }}
       - uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: v0.19.0
       # The decompiler engine and the Swift demangler are C++; the second builds with cmake.
       - run: cmake --version && c++ --version
       - run: ${{ matrix.run }}
