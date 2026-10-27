@@ -27,6 +27,8 @@ pub struct Program {
     extents: Vec<Extent>,
     /// For each extent, the furthest end among it and those before it.
     reach: Vec<u64>,
+    /// Every extent as `(owner, start, end)`, sorted, so a function's body is one run of it.
+    by_owner: Vec<(u64, u64, u64)>,
     /// Data address to the indices in `Analysis::data_refs` that refer to it.
     refs_to: FxHashMap<u64, Vec<usize>>,
     /// Function entry or import slot to the indices in `Analysis::calls` that go there.
@@ -90,6 +92,8 @@ impl Program {
             .collect();
         extents.sort_unstable();
         extents.dedup();
+        let mut by_owner: Vec<(u64, u64, u64)> = extents.iter().map(|&(start, end, owner)| (owner, start, end)).collect();
+        by_owner.sort_unstable();
         let extents: Vec<Extent> = extents.into_iter().map(|(start, end, owner)| Extent { start, end, owner }).collect();
         let reach = extents
             .iter()
@@ -113,7 +117,7 @@ impl Program {
                 sends_to.entry(method).or_default().push(index);
             }
         }
-        Program { image, analysis, extents, reach, refs_to, calls_to, sends_to }
+        Program { image, analysis, extents, reach, by_owner, refs_to, calls_to, sends_to }
     }
 
     /// The function entered at `entry`, if it is one in its own right and not a fragment.
@@ -147,7 +151,8 @@ impl Program {
     /// The body of the function at `entry` as `[start, end)` ranges, sorted: its own ranges and
     /// those of its fragments.
     pub fn body(&self, entry: u64) -> Vec<(u64, u64)> {
-        self.extents.iter().filter(|extent| extent.owner == entry).map(|extent| (extent.start, extent.end)).collect()
+        let first = self.by_owner.partition_point(|&(owner, ..)| owner < entry);
+        self.by_owner[first..].iter().take_while(|&&(owner, ..)| owner == entry).map(|&(_, start, end)| (start, end)).collect()
     }
 
     /// Bytes of code per function entry.
