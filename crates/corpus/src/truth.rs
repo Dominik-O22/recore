@@ -170,9 +170,7 @@ fn dwarf_noreturn(debug: &object::File) -> Result<NoReturn> {
 fn is_fragment(name: &str) -> bool {
     // The AArch64 linker moves an instruction hit by Cortex-A53 erratum 843419 into a veneer
     // named `e843419@...`: a piece of some function, reached and left by a plain branch.
-    name.starts_with("e843419@")
-        || [".cold", ".part.", ".isra.", ".constprop.", ".lto_priv."].iter().any(|marker| name.contains(marker))
-            && (name.contains(".cold") || name.contains(".part."))
+    name.starts_with("e843419@") || name.contains(".cold") || name.contains(".part.")
 }
 
 /// glibc's `error` returns when its status argument is zero, but gnulib declares a noreturn overload.

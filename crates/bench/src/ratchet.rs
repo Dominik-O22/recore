@@ -2,8 +2,8 @@
 //!
 //! `bench/budget.json` holds, for each binary of the set, the instructions that loading and
 //! analyzing it executed, and those that `diff` of it against itself executed. A run fails when
-//! a count grew past its budget by more than [`SLACK`], and lowers the budget where a count
-//! shrank by as much, so the next change is held to the faster code. Counted instructions do
+//! a count grew past its budget by more than [`SLACK`] percent, and lowers the budget where a
+//! count shrank by as much, so the next change is held to the faster code. Counted instructions do
 //! not move with the machine's load, but they do with the compiler and with the processor,
 //! where a library picks its code by what the processor has: a budget is kept on one machine.
 //! Each binary is counted in a process of its own, because in one process the allocator's
@@ -16,9 +16,9 @@ use anyhow::{Context, Result, bail};
 use recore::program::Program;
 use serde::{Deserialize, Serialize};
 
-/// How far a count may move and still be the same: between runs it moves by a few hundredths
-/// of a percent.
-const SLACK: f64 = 0.01;
+/// How far a count may move, in percent of its budget, and still be the same: between runs it
+/// moves by a few hundredths of a percent.
+const SLACK: u128 = 1;
 
 /// Instructions executed for one binary, in the order they are printed.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -53,12 +53,14 @@ impl Ratchet {
         for (what, now, limit) in [("analysis", now.analysis, &mut limit.analysis), ("diff", now.diff, &mut limit.diff)] {
             let change = now as f64 / (*limit).max(1) as f64 - 1.0;
             shown.push(format!("{:>10.1} {:>+7.1}%", now as f64 / 1e6, change * 100.0));
-            if change > SLACK {
+            // In whole numbers, which put a count exactly `SLACK` off still inside it.
+            let (percent, budget) = (u128::from(now) * 100, u128::from((*limit).max(1)));
+            if percent > budget * (100 + SLACK) {
                 self.over.push(format!("{name}: {what} {:.1}M -> {:.1}M ({:+.1}%)", *limit as f64 / 1e6, now as f64 / 1e6, change * 100.0));
                 if self.accept {
                     *limit = now;
                 }
-            } else if change < -SLACK {
+            } else if percent < budget * (100 - SLACK) {
                 *limit = now;
                 self.lowered += 1;
             }
@@ -162,7 +164,7 @@ mod tests {
 
     #[test]
     fn a_count_within_one_percent_either_way_leaves_its_budget() {
-        for analysis in [990_100, 1_009_900] {
+        for analysis in [990_000, 1_000_000, 1_010_000] {
             let (budget, moved) = finish_with(analysis, false).unwrap();
             assert_eq!((budget["a"], moved.as_str()), (LIMIT, "0 raised, 0 lowered, 0 added"), "{analysis}");
         }
