@@ -7,6 +7,14 @@ debug = 1
 lto = "fat"
 codegen-units = 1
 
+# For the tests and clippy, here and in CI: release without whole-program optimization, which made
+# building the tests take ten minutes. Analysis is too slow to test unoptimized.
+[profile.tests]
+inherits = "release"
+debug = false
+lto = "off"
+codegen-units = 16
+
 # For `recore-bench profile`: full debug info, so that samples in inlined code name the right
 # caller, and frame pointers, so that every stack unwinds.
 [profile.profiling]

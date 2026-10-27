@@ -11,7 +11,7 @@ run = "cargo build --release"
 
 [tasks.test]
 description = "Run the tests, which need no corpus"
-run = "cargo test --release --workspace"
+run = "cargo test --profile tests --workspace"
 
 [tasks.check]
 description = "Analyze and score the corpora, once corpus/fetch*.py have downloaded them"
