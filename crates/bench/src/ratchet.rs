@@ -37,14 +37,20 @@ pub fn run(binaries: &[PathBuf], path: &Path, accept: bool) -> Result<()> {
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
     let (mut over, mut lowered, mut added) = (Vec::new(), 0, 0);
-    println!("{:<46} {:>10} {:>8} {:>10} {:>8}", "binary", "analysis M", "budget", "diff M", "budget");
-    for binary in binaries.iter().filter(|binary| binary.exists()) {
+    // A store can hold some corpora and not others, but one that holds none of the set is a
+    // wrong path, which must not pass for a check.
+    let (present, missing): (Vec<&PathBuf>, Vec<&PathBuf>) = binaries.iter().partition(|binary| binary.exists());
+    if present.is_empty() {
+        bail!("none of the {} binaries of the set is in {}", binaries.len(), crate::corpora().display());
+    }
+    println!("{:<46} {:>10} {:>8} {:>10} {:>8}", "binary", "analysis M", "change", "diff M", "change");
+    for binary in present {
         let name = crate::suites::name(binary);
         let counted = std::process::Command::new(std::env::current_exe()?).arg("count").arg(binary).output()?;
         if !counted.status.success() {
             bail!("counting {}: {}", binary.display(), String::from_utf8_lossy(&counted.stderr).trim());
         }
-        let now: Work = serde_json::from_slice(&counted.stdout)?;
+        let now: Work = serde_json::from_slice(&counted.stdout).with_context(|| format!("counting {}", binary.display()))?;
         let limit = budget.entry(name.clone()).or_insert_with(|| {
             added += 1;
             now
@@ -70,6 +76,9 @@ pub fn run(binaries: &[PathBuf], path: &Path, accept: bool) -> Result<()> {
     }
     std::fs::write(path, serde_json::to_string_pretty(&budget)? + "\n").with_context(|| format!("writing {}", path.display()))?;
     println!("{} raised, {lowered} lowered, {added} added in {}", if accept { over.len() } else { 0 }, path.display());
+    if !missing.is_empty() {
+        println!("{} binaries of the set are not in {} and were not counted", missing.len(), crate::corpora().display());
+    }
     Ok(())
 }
 
