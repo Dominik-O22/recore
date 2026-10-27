@@ -106,5 +106,36 @@ EXPORT int halves(int a) {
     return (int)(r.u >> 20);
 }
 
+// Arms of a branch that each hold a loop, one heavier than the other, so the lighter one nests.
+EXPORT int arms(int n, int k) {
+    int r = n;
+    if (n & 1) {
+        for (int i = 0; i < (k & 7); i++) r += i * n;
+    } else {
+        for (int i = 0; i < (n & 15); i++) {
+            if (i & 2) r ^= i * k;
+            else r -= k;
+            if (r & 0x40) r >>= 1;
+        }
+        r *= 3;
+    }
+    while (r & 1) r = r / 3 + (r & 0xff);
+    return r;
+}
+
+// A switch too sparse for a table: a chain of compares, each one level deeper.
+EXPORT int sparse(int x) {
+    x &= 0x3f;
+    switch (x * 37) {
+    case 37: return 10;
+    case 259: return x * 2;
+    case 555: return -x;
+    case 1147: return 7;
+    case 1665: return x ^ 0x99;
+    case 2072: return x + 300;
+    default: return x + 1;
+    }
+}
+
 // The entry point calls nothing; the exports are the functions.
 int start(void) { return 0; }

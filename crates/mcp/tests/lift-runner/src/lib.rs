@@ -33,7 +33,8 @@ pub fn run(functions: Vec<(u32, Lifted)>) {
     let low = functions.iter().map(|f| f.0).min().unwrap_or(0);
     let high = functions.iter().map(|f| f.0).max().unwrap_or(0);
     install(functions, low..high + 1);
-    let mut c = Cpu::new(Some(image), None, Box::new(NoImports), false).unwrap();
+    // Flat memory, as a program runs.
+    let mut c = Cpu::new(Some(image), None, Box::new(NoImports), true).unwrap();
     c.set_reg(regs::ESP, STACK);
     let eax = c.call(number(function), None, &rest.iter().map(|a| number(a)).collect::<Vec<_>>());
     println!("{eax:#x}");

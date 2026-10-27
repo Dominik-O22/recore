@@ -1,9 +1,9 @@
 //! Lifts tests/data/lift.exe with `recore-mcp lift`, builds the workspace it writes on
 //! crates/machine with tests/lift-runner as the host, and runs each function the fixture
 //! exports on generated arguments twice: lifted and natively built, and in the emulator's `run`.
-//! The two must return the same EAX. The fixture covers loops, a jump table, recursion, the
-//! stack, a global, calls through a table in data, and x87 arithmetic, comparisons and
-//! conversions.
+//! The two must return the same EAX. The fixture covers loops, a jump table, a chain of
+//! compares, branches whose arms hold loops, recursion, the stack, a global, calls through a
+//! table in data, and x87 arithmetic, comparisons and conversions.
 
 mod common;
 
@@ -17,8 +17,10 @@ const EXE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/lift.exe");
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 
 /// The fixture's exports, with how many arguments each takes.
-const FUNCTIONS: [(&str, usize); 10] =
-    [("collatz", 1), ("classify", 1), ("mix", 2), ("fib", 1), ("sum_squares", 1), ("step", 1), ("apply", 2), ("length", 2), ("scaled", 2), ("halves", 1)];
+const FUNCTIONS: [(&str, usize); 12] = [
+    ("collatz", 1), ("classify", 1), ("mix", 2), ("fib", 1), ("sum_squares", 1), ("step", 1), ("apply", 2), ("length", 2), ("scaled", 2), ("halves", 1), ("arms", 2),
+    ("sparse", 1),
+];
 
 /// Arguments tried on each function.
 const CASES: usize = 20;
@@ -85,4 +87,19 @@ fn lifted_functions_return_what_the_emulator_does() {
         }
     }
     assert!(differ.is_empty(), "{} of {} runs differ:\n{}", differ.len(), FUNCTIONS.len() * CASES, differ.join("\n"));
+}
+
+#[test]
+fn coverage_lists_the_functions_a_run_entered() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("lift-coverage");
+    std::fs::create_dir_all(&dir).unwrap();
+    let lifted = build(&dir);
+    let symbols = Client::start().tool("symbols", json!({ "path": EXE })).unwrap();
+    let addr = |name: &str| symbols.lines().find(|line| line.ends_with(&format!("function: {name}"))).and_then(|line| line.split(' ').next()).unwrap().to_string();
+    let file = dir.join("coverage.txt");
+    let run = Command::new(&lifted).arg(EXE).arg(addr("fib")).arg("0x5").env("LIFT_COVERAGE", &file).output().unwrap();
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let coverage = std::fs::read_to_string(&file).unwrap();
+    assert!(coverage.starts_with("functions ") && coverage.contains(&format!("{} lifted", addr("fib"))), "{coverage}");
+    assert!(!coverage.contains(&format!("{} lifted", addr("collatz"))), "{coverage}");
 }
