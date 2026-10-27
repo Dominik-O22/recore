@@ -162,3 +162,30 @@ pub fn scan(bytes: &[u8], addr: u64, data: &[(u64, u64)]) -> Scan {
     }
     scan
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_scan_steps_over_data_and_names_the_slot_of_a_call_only_after_an_unbroken_adrp_and_ldr() {
+        let words: [u32; 11] = [
+            0x9000_0090, // 4000  adrp x16, 0x14000
+            0xf940_0e11, // 4004  ldr x17, [x16, #0x18]
+            0xd63f_0220, // 4008  blr x17, through the slot at 0x14018
+            0x9000_0090, // 400c  adrp x16, 0x14000
+            0xf940_0e11, // 4010  ldr x17, [x16, #0x18]
+            0x1234_5678, // 4014  two words of literals, which `$d` marks
+            0x9abc_def0, // 4018
+            0xd63f_0220, // 401c  blr x17, through no slot known
+            0x0000_0000, // 4020  udf
+            0x9400_0040, // 4024  bl 0x4124
+            NOP,         // 4028
+        ];
+        // Two bytes past the last whole word do not decode either.
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).chain([0, 0]).collect();
+        let scan = scan(&bytes, 0x4000, &[(0x4014, 0x401c)]);
+        assert_eq!(scan.calls, [(0x4008, Callee::Slot(0x14018)), (0x4024, Callee::Direct(0x4124))]);
+        assert_eq!((scan.instructions, scan.data_bytes, scan.undecodable_bytes, scan.final_call), (8, 8, 6, Some(0x4024)));
+    }
+}
