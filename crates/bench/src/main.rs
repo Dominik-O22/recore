@@ -105,6 +105,10 @@ enum Command {
         #[arg(long)]
         accept: bool,
     },
+    /// Counts the instructions of one binary for `ratchet`, which runs each binary in a
+    /// process of its own, and prints them as JSON.
+    #[command(hide = true)]
+    Count { binary: PathBuf },
 }
 
 fn saved(name: &str) -> PathBuf {
@@ -175,5 +179,6 @@ fn main() -> Result<()> {
         Command::DecodeFloor { binary, runs } => suites::decode_floor(&binary, runs),
         Command::Profile { what, binary, functions, seconds, top, collapsed } => profile::run(what, &binary, &functions, seconds, top, collapsed.as_deref()),
         Command::Ratchet { set, budget, accept } => ratchet::run(&binaries(&set, None)?, &budget, accept),
+        Command::Count { binary } => ratchet::count(&binary),
     }
 }

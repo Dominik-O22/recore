@@ -6,6 +6,8 @@
 //! shrank by as much, so the next change is held to the faster code. Counted instructions do
 //! not move with the machine's load, but they do with the compiler and with the processor,
 //! where a library picks its code by what the processor has: a budget is kept on one machine.
+//! Each binary is counted in a process of its own, because in one process the allocator's
+//! state after the binaries before it moved a count by up to 2%.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -38,18 +40,11 @@ pub fn run(binaries: &[PathBuf], path: &Path, accept: bool) -> Result<()> {
     println!("{:<46} {:>10} {:>8} {:>10} {:>8}", "binary", "analysis M", "budget", "diff M", "budget");
     for binary in binaries.iter().filter(|binary| binary.exists()) {
         let name = crate::suites::name(binary);
-        let (loaded, analysis) = crate::work::instructions(|| -> Result<_> {
-            let image = recore::Image::load(binary)?;
-            let analysis = recore::analyze(&image);
-            Ok((image, analysis))
-        });
-        let (image, found) = loaded?;
-        let program = Program::new(image, found);
-        let (_, diff) = crate::work::instructions(|| recore::diff::diff(&program, &program));
-        let (Some(analysis), Some(diff)) = (analysis, diff) else {
-            bail!("the kernel lets this process count no instructions; /proc/sys/kernel/perf_event_paranoid must be 2 or less");
-        };
-        let now = Work { analysis, diff };
+        let counted = std::process::Command::new(std::env::current_exe()?).arg("count").arg(binary).output()?;
+        if !counted.status.success() {
+            bail!("counting {}: {}", binary.display(), String::from_utf8_lossy(&counted.stderr).trim());
+        }
+        let now: Work = serde_json::from_slice(&counted.stdout)?;
         let limit = budget.entry(name.clone()).or_insert_with(|| {
             added += 1;
             now
@@ -75,5 +70,23 @@ pub fn run(binaries: &[PathBuf], path: &Path, accept: bool) -> Result<()> {
     }
     std::fs::write(path, serde_json::to_string_pretty(&budget)? + "\n").with_context(|| format!("writing {}", path.display()))?;
     println!("{} raised, {lowered} lowered, {added} added in {}", if accept { over.len() } else { 0 }, path.display());
+    Ok(())
+}
+
+/// Counts the instructions that loading and analyzing `binary`, and `diff` of it against
+/// itself, execute, and prints them as JSON for [`run`].
+pub fn count(binary: &Path) -> Result<()> {
+    let (loaded, analysis) = crate::work::instructions(|| -> Result<_> {
+        let image = recore::Image::load(binary)?;
+        let analysis = recore::analyze(&image);
+        Ok((image, analysis))
+    });
+    let (image, found) = loaded?;
+    let program = Program::new(image, found);
+    let (_, diff) = crate::work::instructions(|| recore::diff::diff(&program, &program));
+    let (Some(analysis), Some(diff)) = (analysis, diff) else {
+        bail!("the kernel lets this process count no instructions; /proc/sys/kernel/perf_event_paranoid must be 2 or less");
+    };
+    println!("{}", serde_json::to_string(&Work { analysis, diff })?);
     Ok(())
 }
