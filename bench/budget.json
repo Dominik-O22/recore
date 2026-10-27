@@ -1,150 +1,150 @@
 {
   "corpus-arm64/bin/deb__cmake__ctest": {
     "analysis": 2750704265,
-    "diff": 27517026482
+    "diff": 1982175112
   },
   "corpus-arm64/bin/deb__coreutils__seq": {
     "analysis": 6440794,
-    "diff": 6564922
+    "diff": 4685520
   },
   "corpus-arm64/bin/deb__git__git-imap-send": {
     "analysis": 496944168,
-    "diff": 2121855737
+    "diff": 295691444
   },
   "corpus-arm64/bin/deb__gzip__gzip": {
     "analysis": 12282745,
-    "diff": 11041070
+    "diff": 8103017
   },
   "corpus-arm64/bin/deb__openssh-client__ssh-agent": {
     "analysis": 43019206,
-    "diff": 73391133
+    "diff": 33867839
   },
   "corpus-arm64/bin/deb__re2c__re2rust": {
     "analysis": 130215201,
-    "diff": 299632617
+    "diff": 97991687
   },
   "corpus-armel/bin/deb__cmake__ctest": {
     "analysis": 9749712003,
-    "diff": 36842711012
+    "diff": 6615034542
   },
   "corpus-armel/bin/deb__coreutils__expr": {
     "analysis": 20262945,
-    "diff": 16862787
+    "diff": 14914763
   },
   "corpus-armel/bin/deb__git__git-imap-send": {
     "analysis": 1937696002,
-    "diff": 2987656416
+    "diff": 1078567224
   },
   "corpus-armel/bin/deb__gzip__gzip": {
     "analysis": 48154264,
-    "diff": 43433986
+    "diff": 40083114
   },
   "corpus-armel/bin/deb__openssh-client__ssh-agent": {
     "analysis": 143301277,
-    "diff": 155622730
+    "diff": 111867100
   },
   "corpus-armel/bin/deb__re2c__re2rust": {
     "analysis": 632605011,
-    "diff": 608115095
+    "diff": 396788396
   },
   "corpus-armhf/bin/deb__cmake__ctest": {
     "analysis": 10279616559,
-    "diff": 36126208817
+    "diff": 5563169389
   },
   "corpus-armhf/bin/deb__coreutils__expr": {
     "analysis": 18929537,
-    "diff": 15403846
+    "diff": 13453588
   },
   "corpus-armhf/bin/deb__git__git-imap-send": {
     "analysis": 1670601428,
-    "diff": 2833670107
+    "diff": 903641820
   },
   "corpus-armhf/bin/deb__gzip__gzip": {
     "analysis": 40982720,
-    "diff": 33771672
+    "diff": 31491354
   },
   "corpus-armhf/bin/deb__openssh-client__ssh-agent": {
     "analysis": 132930755,
-    "diff": 139372075
+    "diff": 95274477
   },
   "corpus-armhf/bin/deb__re2c__re2rust": {
     "analysis": 348733619,
-    "diff": 543356519
+    "diff": 325027947
   },
   "corpus-pe/bin/git__git-remote-https.exe": {
     "analysis": 920128787,
-    "diff": 3760202997
+    "diff": 1109055266
   },
   "corpus-pe/bin/mingw__bzip2.exe": {
     "analysis": 23474620,
-    "diff": 44342132
+    "diff": 42138271
   },
   "corpus-pe/bin/node4__node-v4.9.1-x64.exe": {
     "analysis": 4021666887,
-    "diff": 47748249006
+    "diff": 4447639697
   },
   "corpus-pe/bin/obs__frontend-tools.dll": {
     "analysis": 111372426,
-    "diff": 409843997
+    "diff": 142581414
   },
   "corpus-pe/bin/obs__obs-browser.dll": {
     "analysis": 289648419,
-    "diff": 1077465573
+    "diff": 332994980
   },
   "corpus-pe/bin/php83__php_ldap.dll": {
     "analysis": 82476295,
-    "diff": 144994323
+    "diff": 96184356
   },
   "corpus-pe32/bin/dell__DELL_IspLibrary.dll": {
     "analysis": 83887750,
-    "diff": 161352455
+    "diff": 107103619
   },
   "corpus-pe32/bin/mingw__mujs.exe": {
     "analysis": 163512635,
-    "diff": 207055026
+    "diff": 164524683
   },
   "corpus-pe32/bin/node4__node-v4.9.1-x86.exe": {
     "analysis": 4342216662,
-    "diff": 53558448974
+    "diff": 4177163201
   },
   "corpus-pe32/bin/obs__inject-helper32.exe": {
     "analysis": 40377542,
-    "diff": 66083630
+    "diff": 43498412
   },
   "corpus-pe32/bin/php83__php_ldap.dll": {
     "analysis": 77470037,
-    "diff": 136108224
+    "diff": 97602325
   },
   "corpus-pe32/bin/php83__php_opcache.dll": {
     "analysis": 221153640,
-    "diff": 383546144
+    "diff": 310807205
   },
   "corpus-pe32/bin/py__libcrypto-3.dll": {
     "analysis": 1707707949,
-    "diff": 24526222602
+    "diff": 1432293308
   },
   "corpus/bin/binutils__strip": {
     "analysis": 37539073,
-    "diff": 47161259
+    "diff": 43782239
   },
   "corpus/bin/deb__cmake__ctest": {
     "analysis": 4321965577,
-    "diff": 37278955756
+    "diff": 6257334860
   },
   "corpus/bin/deb__fish__fish_key_reader": {
     "analysis": 319717001,
-    "diff": 453044787
+    "diff": 360474310
   },
   "corpus/bin/diffutils__cmp": {
     "analysis": 11275953,
-    "diff": 10794433
+    "diff": 10541652
   },
   "corpus/bin/fd__fd": {
     "analysis": 1019624432,
-    "diff": 2256855644
+    "diff": 1195096852
   },
   "corpus/bin/htop__htop": {
     "analysis": 95242699,
-    "diff": 180069923
+    "diff": 130050577
   }
 }

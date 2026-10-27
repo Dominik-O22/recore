@@ -77,13 +77,29 @@ struct Side<'a> {
     /// The body and shape hashes of each function whose code could be hashed, fragments
     /// included: see [`crate::signature::hashes`].
     bodies: FxHashMap<u64, (u64, u64)>,
+    /// What each function calls, in the order of the calls in its code. Fragments too, since a
+    /// call can go to one and a fragment can own others.
+    callees: FxHashMap<u64, Vec<Callee<'a>>>,
 }
 
 impl<'a> Side<'a> {
     fn new(program: &'a Program) -> Side<'a> {
         let slots: FxHashMap<u64, u64> = program.image.relative_targets.iter().copied().collect();
-        let hashes = |entry: u64| Some((entry, crate::signature::hashes(&program.image, &slots, &program.body(entry))?));
-        Side { program, bodies: program.functions().filter_map(|function| hashes(function.addr)).collect() }
+        let (mut bodies, mut callees) = (FxHashMap::default(), FxHashMap::default());
+        for function in &program.analysis.functions {
+            let body = program.body(function.addr);
+            if function.fragment_of.is_none()
+                && let Some(hashes) = crate::signature::hashes(&program.image, &slots, &body)
+            {
+                bodies.insert(function.addr, hashes);
+            }
+            let callee = |target| match target {
+                CallTarget::Function(callee) => Callee::Function(callee),
+                CallTarget::Import(slot) => Callee::Import(program.import_name(slot).unwrap_or_default()),
+            };
+            callees.insert(function.addr, body.into_iter().flat_map(|(start, end)| program.calls_in(start, end)).map(|call| callee(call.target)).collect());
+        }
+        Side { program, bodies, callees }
     }
 
     fn entries(&self) -> impl Iterator<Item = u64> + '_ {
@@ -91,13 +107,8 @@ impl<'a> Side<'a> {
     }
 
     /// What the function calls, in the order of the calls in its code.
-    fn callees(&self, entry: u64) -> Vec<Callee<'a>> {
-        let program = self.program;
-        let callee = |target| match target {
-            CallTarget::Function(callee) => Callee::Function(callee),
-            CallTarget::Import(slot) => Callee::Import(program.import_name(slot).unwrap_or_default()),
-        };
-        program.body(entry).into_iter().flat_map(|(start, end)| program.calls_in(start, end)).map(|call| callee(call.target)).collect()
+    fn callees(&self, entry: u64) -> &[Callee<'a>] {
+        self.callees.get(&entry).map_or(&[], Vec::as_slice)
     }
 
     /// The functions that call the function.
@@ -157,8 +168,8 @@ fn pair_in_order(old: &Side, new: &Side, pairing: &mut Pairing) -> bool {
             Some(Ok(paired)) => paired,
             None => u64::MAX,
         };
-        let between = |entry: &&u64| **entry >= after && **entry < before && !pairing.new.contains(*entry);
-        let candidates: Vec<u64> = new_entries.iter().filter(between).copied().collect();
+        let (first, end) = (new_entries.partition_point(|&entry| entry < after), new_entries.partition_point(|&entry| entry < before));
+        let candidates: Vec<u64> = new_entries[first..end.max(first)].iter().filter(|entry| !pairing.new.contains(*entry)).copied().collect();
         if candidates.len() == run.len() {
             found.extend(run.iter().copied().zip(candidates));
         }
@@ -194,10 +205,10 @@ pub fn diff(old: &Program, new: &Program) -> Diff {
                 },
                 (from, to) => from == to,
             };
-            if old_calls.len() != new_calls.len() || !old_calls.iter().zip(&new_calls).all(agree) {
+            if old_calls.len() != new_calls.len() || !old_calls.iter().zip(new_calls).all(agree) {
                 continue;
             }
-            for calls in old_calls.iter().zip(&new_calls) {
+            for calls in old_calls.iter().zip(new_calls) {
                 if let (Callee::Function(from), Callee::Function(to)) = calls {
                     progress |= pairing.pair(*from, *to, Evidence::Callee);
                 }
@@ -249,7 +260,7 @@ pub fn diff(old: &Program, new: &Program) -> Diff {
 mod tests {
     use super::*;
     use crate::image::{Format, Image, Machine, Section};
-    use crate::report::{Analysis, AnalyzedFunction};
+    use crate::report::{Analysis, AnalyzedFunction, CallSite};
 
     /// A program of `code` at 0 that is one function, `main`.
     fn program(machine: Machine, code: Vec<u8>) -> Program {
@@ -269,5 +280,22 @@ mod tests {
         assert_eq!(change(Machine::Arm, &one, &two), Change::Numbers);
         // The 8051 is not hashed: mov a, #1; ret, the same in both, is not known to be.
         assert_eq!(change(Machine::I8051, &[0x74, 1, 0x22], &[0x74, 1, 0x22]), Change::Unknown);
+    }
+
+    #[test]
+    fn a_call_from_a_fragment_of_a_fragment_pairs_its_callee() {
+        // main calls 0x10, a fragment of 0x20 that owns the fragment 0x30, which calls 0x40.
+        // 0x40 is also called by 0x50, which nothing pairs, and 8051 code is not hashed, so only
+        // the call from the fragment can pair 0x40.
+        let function = |addr: u64, name: Option<&str>, fragment_of| AnalyzedFunction { addr, ranges: vec![(addr, addr + 0x10)], noreturn: false, thunk: false, origin: Default::default(), name: name.map(Into::into), fragment_of, runs_on: None };
+        let call = |at, to| CallSite { at, target: CallTarget::Function(to), noreturn: false, tail: false, conditional: false };
+        let side = || {
+            let Program { image, mut analysis, .. } = program(Machine::I8051, vec![0; 0x60]);
+            analysis.functions = vec![function(0, Some("main"), None), function(0x10, None, Some(0x20)), function(0x20, None, None), function(0x30, None, Some(0x10)), function(0x40, None, None), function(0x50, None, None)];
+            analysis.calls = vec![call(0, 0x10), call(0x30, 0x40), call(0x50, 0x40)];
+            Program::new(image, analysis)
+        };
+        let found = diff(&side(), &side());
+        assert_eq!(found.pairs.iter().find(|pair| pair.old == 0x40).map(|pair| (pair.new, pair.evidence)), Some((0x40, Evidence::Callee)));
     }
 }
