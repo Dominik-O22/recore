@@ -68,6 +68,9 @@ pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u6
     }
 }
 
+/// Hashes the code `bytes` holds from `start` to `end`, with its numbers or without them.
+type RangeHash<'a> = dyn Fn(&[u8], u64, u64, bool) -> Option<u64> + 'a;
+
 /// Two fingerprints of the code of a function's `body`, its ranges in order, however short it
 /// is. The first, of its body, is equal for two builds of one function that differ only in
 /// where they and what they refer to were linked, and in the padding that aligns their loops.
@@ -79,7 +82,7 @@ pub fn fingerprint(image: &Image, pointer_slots: &FxHashMap<u64, u64>, start: u6
 /// 8051's.
 pub fn hashes(image: &Image, pointer_slots: &FxHashMap<u64, u64>, body: &[(u64, u64)]) -> Option<(u64, u64)> {
     let x86_range = |bits| move |bytes: &[u8], start, end, numbers| x86(bits, bytes, pointer_slots, start, end, None, numbers, None);
-    let range: &dyn Fn(&[u8], u64, u64, bool) -> Option<u64> = match image.machine {
+    let range: &RangeHash = match image.machine {
         Machine::X86 => &x86_range(32),
         Machine::X86_64 => &x86_range(64),
         Machine::Aarch64 => &|bytes, start, end, numbers| aarch64(bytes, start, end, None, numbers),
@@ -745,7 +748,9 @@ mod tests {
 
     #[test]
     fn arm_hashes_ignore_where_the_function_and_its_data_are() {
-        let builds: [(Machine, fn(u64, u64, u32) -> Vec<u8>); 2] = [(Machine::Arm, a32_function), (Machine::Thumb, thumb_function)];
+        /// Builds a function at an address, with its data at another and a constant in it.
+        type Build = fn(u64, u64, u32) -> Vec<u8>;
+        let builds: [(Machine, Build); 2] = [(Machine::Arm, a32_function), (Machine::Thumb, thumb_function)];
         for (machine, build) in builds {
             let hashes = |at, data, constant| arm_hashes(machine, build(at, data, constant), at, data, None);
             let here = hashes(0x1_0000, 0x2_0000, 5);
@@ -860,7 +865,8 @@ mod tests {
             }
         };
         let (up, down) = (load(true), load(false));
-        let builds: [(Machine, &dyn Fn(u64, u64, bool) -> Vec<u8>, bool); 4] = [(Machine::Arm, &a32, true), (Machine::Arm, &up, true), (Machine::Thumb, &thumb, true), (Machine::Thumb, &thumb, false)];
+        type Build<'a> = &'a dyn Fn(u64, u64, bool) -> Vec<u8>;
+        let builds: [(Machine, Build, bool); 4] = [(Machine::Arm, &a32, true), (Machine::Arm, &up, true), (Machine::Thumb, &thumb, true), (Machine::Thumb, &thumb, false)];
         for (machine, build, pc) in builds {
             let hashes = |at, data| arm_hashes(machine, build(at, data, pc), at, data, None);
             assert_eq!(hashes(0x1_0000, 0x9_0000), hashes(0x1_4000, 0xA_1000));
