@@ -1771,6 +1771,10 @@ pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program>
             }
             insns.sort_by_key(|i| i.addr);
         }
+        // An entry inside one of its body's instructions would run the body from somewhere else.
+        if error.is_none() && !insns.iter().any(|i| i.addr == entry) {
+            error = Some(format!("{entry:#x} is inside an instruction of the body it lies in"));
+        }
         if let Some(e) = error {
             starts.push((code.len(), entry));
             writeln!(code, "#[allow(unused)] {}pub fn f_{entry:x}(c: &mut Cpu) {{ panic!(\"cannot lift {entry:#x}: {}\") }}", doc(entry), e.replace('"', "'"))?;
