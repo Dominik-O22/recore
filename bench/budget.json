@@ -1,26 +1,26 @@
 {
   "corpus-arm64/bin/deb__cmake__ctest": {
-    "analysis": 2750704265,
+    "analysis": 2800085177,
     "diff": 1982175112
   },
   "corpus-arm64/bin/deb__coreutils__seq": {
-    "analysis": 6440794,
+    "analysis": 6568290,
     "diff": 4685520
   },
   "corpus-arm64/bin/deb__git__git-imap-send": {
-    "analysis": 496944168,
+    "analysis": 505229562,
     "diff": 295691444
   },
   "corpus-arm64/bin/deb__gzip__gzip": {
-    "analysis": 12282745,
+    "analysis": 12512624,
     "diff": 8103017
   },
   "corpus-arm64/bin/deb__openssh-client__ssh-agent": {
-    "analysis": 43019206,
+    "analysis": 43958815,
     "diff": 33867839
   },
   "corpus-arm64/bin/deb__re2c__re2rust": {
-    "analysis": 130215201,
+    "analysis": 133096303,
     "diff": 97991687
   },
   "corpus-armel/bin/deb__cmake__ctest": {
@@ -56,7 +56,7 @@
     "diff": 13453588
   },
   "corpus-armhf/bin/deb__git__git-imap-send": {
-    "analysis": 1670601428,
+    "analysis": 1688764850,
     "diff": 903641820
   },
   "corpus-armhf/bin/deb__gzip__gzip": {
@@ -96,7 +96,7 @@
     "diff": 96184356
   },
   "corpus-pe32/bin/dell__DELL_IspLibrary.dll": {
-    "analysis": 83887750,
+    "analysis": 84803466,
     "diff": 107103619
   },
   "corpus-pe32/bin/mingw__mujs.exe": {
@@ -128,11 +128,11 @@
     "diff": 43782239
   },
   "corpus/bin/deb__cmake__ctest": {
-    "analysis": 4321965577,
+    "analysis": 4383300704,
     "diff": 6257334860
   },
   "corpus/bin/deb__fish__fish_key_reader": {
-    "analysis": 319717001,
+    "analysis": 326035635,
     "diff": 360474310
   },
   "corpus/bin/diffutils__cmp": {
@@ -140,7 +140,7 @@
     "diff": 10541652
   },
   "corpus/bin/fd__fd": {
-    "analysis": 1019624432,
+    "analysis": 1032252010,
     "diff": 1195096852
   },
   "corpus/bin/htop__htop": {
