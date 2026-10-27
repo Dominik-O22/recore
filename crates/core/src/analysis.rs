@@ -21,9 +21,19 @@ use crate::x86::X86;
 #[derive(Debug, Clone, Copy)]
 struct Control {
     addr: u64,
-    #[allow(dead_code)]
     next: u64,
     flow: Flow,
+}
+
+/// What follows a call instruction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum After {
+    /// A trap, or the end of a function that unwind information vouches for.
+    Ends,
+    /// Code of the same function.
+    Code,
+    /// Padding, bytes that don't decode, or the end of an extent inferred from layout.
+    Nothing,
 }
 
 struct Function {
@@ -32,6 +42,13 @@ struct Function {
     /// Control-flow instructions in address order.
     controls: Vec<Control>,
     instructions: u64,
+}
+
+impl Function {
+    /// Each direct call, with the function it calls.
+    fn calls(&self) -> impl Iterator<Item = (&Control, u64)> {
+        self.controls.iter().filter_map(|control| if let Flow::Call(target) = control.flow { Some((control, target)) } else { None })
+    }
 }
 
 /// The parts of `[start, end)` that are code: all of it but the jump tables in `tables` that
@@ -602,28 +619,81 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
         // A compiler emits nothing after a call it knows will not return: the call is followed
         // by a trap, or ends the function. Padding after a call proves nothing, since an
-        // aligned loop head can follow a call that returns. One such call site settles it for the
+        // aligned loop head can follow a call that returns. Such call sites settle it for the
         // callee, even when the callee's own code has a return in it, as some C runtime exit
-        // functions do. Only an extent that unwind information vouches for counts as "ends
-        // the function": an extent inferred from layout may stop short at a wrong boundary.
-        let terminal_callees: FxHashSet<u64> = functions
+        // functions do, unless three times as many sites go on or more: code that only the
+        // call leads to follows them. A trap also follows a call that returns when the compiler
+        // proves the code after it can't run, such as a use of a null pointer, and clang emits
+        // one there. Code after a call that never returns is rarer, from a compiler that was
+        // not told, so one trap outweighs a few such sites. Code that a jump leads to proves
+        // nothing, as MSVC lays out a cold block after a call that never returns. Only an
+        // extent that unwind information vouches for counts as "ends the function": an extent
+        // inferred from layout may stop short at a wrong boundary.
+        // A literal pool or jump table after a call is data, which decodes as instructions.
+        let in_inline_table = |addr: u64| {
+            let index = inline_tables.partition_point(|&(start, _)| start <= addr);
+            index > 0 && addr < inline_tables[index - 1].1
+        };
+        let after_call = |f: &Function, control: &Control| {
+            if control.next == f.end && frame_end.contains_key(&f.start) {
+                return After::Ends;
+            }
+            // Read the bytes themselves: a trap that pads the end of a function has been
+            // trimmed from its extent.
+            let Some(insn) = image.bytes_from(control.next).and_then(|bytes| A::decode(image, bytes, control.next).next()?.insn) else {
+                return After::Nothing;
+            };
+            if A::flow(&insn, &A::State::default(), image) == Some(Flow::Halt) {
+                After::Ends
+            } else if control.next < f.end && !A::is_padding(&insn) {
+                After::Code
+            } else {
+                After::Nothing
+            }
+        };
+        // Each call that ends or that code follows, with what it calls and, for code, where.
+        let sites: Vec<(u64, Option<u64>)> = functions
             .par_iter()
             .chain(&chunks)
             .flat_map_iter(|f| {
-                let has_frame = frame_end.contains_key(&f.start);
-                f.controls.iter().filter_map(move |control| {
-                    let Flow::Call(target) = control.flow else { return None };
-                    let ends_function = control.next == f.end && has_frame;
-                    // Read the bytes themselves: a trap that pads the end of a function has
-                    // been trimmed from its extent.
-                    let trap_follows = || {
-                        let insn = A::decode(image, image.bytes_from(control.next)?, control.next).next()?.insn?;
-                        Some(A::flow(&insn, &A::State::default(), image) == Some(Flow::Halt))
-                    };
-                    (ends_function || trap_follows() == Some(true)).then_some(target)
+                f.calls().filter_map(|(control, target)| match after_call(f, control) {
+                    After::Ends => Some((target, None)),
+                    After::Code => Some((target, Some(control.next))),
+                    After::Nothing => None,
                 })
             })
             .collect();
+        let mut ends: FxHashMap<u64, u32> = FxHashMap::default();
+        for &(target, _) in sites.iter().filter(|(_, next)| next.is_none()) {
+            *ends.entry(target).or_default() += 1;
+        }
+        // Only the sites of a callee that some site ends after can outvote it.
+        let contested: FxHashSet<u64> = sites.iter().filter(|(target, _)| ends.contains_key(target)).filter_map(|&(_, next)| next).collect();
+        let jumped_to: FxHashSet<u64> = if contested.is_empty() {
+            FxHashSet::default()
+        } else {
+            program
+                .controls
+                .iter()
+                .filter_map(|control| match control.flow {
+                    Flow::Jump(target) | Flow::Branch(target) => Some(target),
+                    _ => None,
+                })
+                .chain(tables.values().flat_map(|targets| targets.iter().copied()))
+                .filter(|target| contested.contains(target))
+                .collect()
+        };
+        let mut goes_on: FxHashMap<u64, u32> = FxHashMap::default();
+        for &(target, next) in &sites {
+            if let Some(next) = next
+                && ends.contains_key(&target)
+                && !jumped_to.contains(&next)
+                && !in_inline_table(next)
+            {
+                *goes_on.entry(target).or_default() += 1;
+            }
+        }
+        let terminal_callees = ends.into_iter().filter(|(target, ends)| ends * 3 > goes_on.get(target).copied().unwrap_or(0)).map(|(target, _)| target);
 
         // Least fixpoint: a function joins the set once no path through it can return. What a
         // walk finds changes only when a function it asked about joins the set, and it asks at
