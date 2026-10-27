@@ -1,0 +1,4 @@
+# CodeRabbit skips every review here while the repository has under 10 stars, and says so in a
+# comment on each PR. This turns that comment off.
+reviews:
+  review_status: false
