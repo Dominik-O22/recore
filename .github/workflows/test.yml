@@ -5,16 +5,54 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  # Three runners at once. Core's tests get their own, so the rest don't wait for core's test build.
+  check:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: clippy
+            run: cargo clippy --profile ci --workspace --all-targets -- -D warnings
+          - name: core tests
+            run: cargo test --profile ci -p recore
+          - name: other tests
+            run: cargo test --profile ci --workspace --exclude recore
+    env:
+      # sccache caches each rustc and C++ compile by content, so the engine's 83 files and the crates
+      # a change leaves alone come from the cache even though checkout touches every file.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      # When the cache can't be reached, compile without it instead of failing.
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98 # mise.toml pins the same, so a new release adds no lints by surprise
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Its key hashes Cargo.lock and each crate's Cargo.toml but not the root one, where the
+          # profiles are, so a profile change would restore a cache for the old profile and keep it.
+          # The matrix entries share a job id, so each also needs its own index to keep its own target.
+          key: ${{ hashFiles('Cargo.toml') }}-${{ strategy.job-index }}
+      - uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: v0.19.0
       # The decompiler engine and the Swift demangler are C++; the second builds with cmake.
       - run: cmake --version && c++ --version
-      - run: cargo clippy --release --workspace --all-targets -- -D warnings
-      - run: cargo test --release --workspace
+      - run: ${{ matrix.run }}
+
+  # Branch protection requires a check named test. It passes only when every job above passed,
+  # and runs even when one failed, since a skipped check would count as passing.
+  test:
+    if: always()
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.check.result }}" = success

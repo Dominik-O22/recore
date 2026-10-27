@@ -4,7 +4,7 @@
 //! ignores case, and a word counts only when no letter or digit comes just before it, so
 //! identifiers such as `sort31` do not count.
 //!
-//! CI runs the scan with `cargo test --release --workspace`, and `./check.sh` runs it before
+//! CI runs the scan with `cargo test --profile ci --workspace`, and `./check.sh` runs it before
 //! it scores the corpora.
 
 use std::fs;

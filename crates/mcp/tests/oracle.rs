@@ -13,7 +13,7 @@
 //! `s51` from the sdcc package, so it is ignored by default. Run it after a change to the
 //! interpreter, the shim or a specification:
 //!
-//!     cargo test --release -p recore-mcp --test oracle -- --ignored
+//!     cargo test --profile ci -p recore-mcp --test oracle -- --ignored
 //!
 //! What C leaves undefined has no answer to compare with, so this does not judge it: dividing
 //! by zero, a quotient too large for its register, and the registers a function reads without
@@ -641,7 +641,7 @@ fn float_arg(ty: Ty, bits: u64) -> String {
 }
 
 #[test]
-#[ignore = "builds for four machines: cargo test --release -p recore-mcp --test oracle -- --ignored"]
+#[ignore = "builds for four machines: cargo test --profile ci -p recore-mcp --test oracle -- --ignored"]
 fn the_oracle_agrees_with_the_machines() {
     require(&["gcc", "clang", "nm", "llvm-objcopy"]);
     let dir = edits_dir();
@@ -732,7 +732,7 @@ fn ulps(a: u128, b: u128) -> u128 {
 }
 
 #[test]
-#[ignore = "needs a gcc that builds 32-bit programs: cargo test --release -p recore-mcp --test oracle -- --ignored"]
+#[ignore = "needs a gcc that builds 32-bit programs: cargo test --profile ci -p recore-mcp --test oracle -- --ignored"]
 fn the_oracle_agrees_with_the_x87() {
     require(&["gcc"]);
     let dir = edits_dir();
@@ -903,7 +903,7 @@ fn symbols(map: &str) -> BTreeMap<String, usize> {
 }
 
 #[test]
-#[ignore = "needs sdcc and s51: cargo test --release -p recore-mcp --test oracle -- --ignored"]
+#[ignore = "needs sdcc and s51: cargo test --profile ci -p recore-mcp --test oracle -- --ignored"]
 fn the_oracle_agrees_with_the_8051_simulator() {
     require(&["sdcc", "s51", "llvm-objcopy"]);
     let dir = edits_dir();
