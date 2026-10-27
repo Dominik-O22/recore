@@ -4,15 +4,22 @@
 //! [`HOST`] goes to the [`Host`], which the program running the lifted code provides: it stands
 //! in for Windows and the other DLLs the executable imports.
 
+mod coverage;
 pub mod image;
 pub mod ops;
 pub mod x87;
 
-use std::{collections::HashMap, fs::File, io::Read, os::unix::fs::FileExt, path::Path, sync::OnceLock};
+use std::{collections::HashMap, fs::File, io::Read, path::Path, sync::OnceLock};
 
 pub use ops::Code;
 pub use x87::{f64_to_f80, f80_to_f64};
 use ops::{compute, signed};
+
+#[cold]
+#[inline(never)]
+fn outside_flat(addr: u32, len: usize) -> ! {
+    panic!("memory {addr:#x}+{len:#x} is outside flat memory, which ends at {FLAT_SIZE:#x}");
+}
 
 /// Register offsets in the x86 p-code register space, as `(offset, size)`.
 pub mod regs {
@@ -37,6 +44,12 @@ pub const HOST: u32 = 0xf000_0000;
 
 const PAGE: usize = 4096;
 
+/// Whether flat memory reserves the whole 32-bit address space, as a 64-bit Unix host can. A
+/// 32-bit host (wasm) holds only the low [`FLAT_SIZE`] bytes, where the host puts everything the
+/// program uses, and an access above them panics.
+const RESERVES_ALL: bool = cfg!(all(unix, target_pointer_width = "64"));
+const FLAT_SIZE: u64 = if RESERVES_ALL { 1 << 32 } else { 1 << 29 };
+
 struct Page {
     bytes: [u8; PAGE],
     dirty: [bool; PAGE],
@@ -49,8 +62,8 @@ enum Backing {
     Image(Vec<image::Section>),
 }
 
-/// The program's memory, in one of two layouts. Flat: the whole 32-bit address space is one
-/// reserved mapping and an access is one unaligned load or store. Paged: pages filled on first
+/// The program's memory, in one of two layouts. Flat: the address space ([`FLAT_SIZE`] bytes of
+/// it) is one block and an access is one unaligned load or store. Paged: pages filled on first
 /// touch, which also remember which bytes the program wrote, for comparisons with recore's
 /// emulator (`writes`).
 pub struct Mem {
@@ -67,6 +80,14 @@ impl Mem {
         if !flat {
             return Ok(Mem { flat: std::ptr::null_mut(), pages: (0..(1usize << 20)).map(|_| None).collect(), backing });
         }
+        let base = Self::flat_block(&backing)?;
+        Ok(Mem { flat: base, pages: Vec::new(), backing })
+    }
+
+    /// The whole address space: a private anonymous mapping reserved without backing store,
+    /// snapshot regions mapped over it at their addresses.
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn flat_block(backing: &Backing) -> std::io::Result<*mut u8> {
         // SAFETY: a fresh private anonymous mapping, reserved without backing store; regions are
         // mapped over it at fixed addresses inside it.
         let base = unsafe { libc::mmap(std::ptr::null_mut(), (1usize << 32) + PAGE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0) };
@@ -74,7 +95,7 @@ impl Mem {
             return Err(std::io::Error::last_os_error());
         }
         let base = base.cast::<u8>();
-        match &backing {
+        match backing {
             Backing::Snapshot { regions } => {
                 use std::os::fd::AsRawFd;
                 for (start, end, file) in regions {
@@ -89,14 +110,51 @@ impl Mem {
                     }
                 }
             }
-            Backing::Image(sections) => {
-                for s in sections {
-                    // SAFETY: inside the reservation.
-                    unsafe { std::ptr::copy_nonoverlapping(s.data.as_ptr(), base.add(s.addr as usize), s.data.len()) };
+            Backing::Image(sections) => Self::copy_sections(base, sections),
+        }
+        Ok(base)
+    }
+
+    /// The low [`FLAT_SIZE`] bytes, zeroed, and a page more for the widest access at their end.
+    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    fn flat_block(backing: &Backing) -> std::io::Result<*mut u8> {
+        let layout = std::alloc::Layout::from_size_align(FLAT_SIZE as usize + PAGE, PAGE).expect("flat memory's layout");
+        // SAFETY: the layout's size is not zero.
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        if base.is_null() {
+            return Err(std::io::ErrorKind::OutOfMemory.into());
+        }
+        match backing {
+            Backing::Snapshot { regions } => {
+                for (start, end, file) in regions {
+                    let mut bytes = Vec::new();
+                    file.take(u64::from(end - start)).read_to_end(&mut bytes)?;
+                    assert!(u64::from(*start) + bytes.len() as u64 <= FLAT_SIZE, "snapshot region {start:#x} is outside flat memory");
+                    // SAFETY: inside the block, as just checked.
+                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(*start as usize), bytes.len()) };
                 }
             }
+            Backing::Image(sections) => Self::copy_sections(base, sections),
         }
-        Ok(Mem { flat: base, pages: Vec::new(), backing })
+        Ok(base)
+    }
+
+    fn copy_sections(base: *mut u8, sections: &[image::Section]) {
+        for s in sections {
+            assert!(u64::from(s.addr) + s.data.len() as u64 <= FLAT_SIZE, "section {:#x} is outside flat memory", s.addr);
+            // SAFETY: inside the block, as just checked.
+            unsafe { std::ptr::copy_nonoverlapping(s.data.as_ptr(), base.add(s.addr as usize), s.data.len()) };
+        }
+    }
+
+    /// Where `len` bytes from `addr` live in flat memory; panics when they are outside it.
+    #[inline(always)]
+    fn flat_at(&self, addr: u32, len: usize) -> *mut u8 {
+        if !RESERVES_ALL && u64::from(addr) + len as u64 > FLAT_SIZE {
+            outside_flat(addr, len);
+        }
+        // SAFETY: inside the block: the whole address space, or checked above.
+        unsafe { self.flat.add(addr as usize) }
     }
 
     fn page(&mut self, index: usize) -> &mut Page {
@@ -106,7 +164,9 @@ impl Mem {
             match &self.backing {
                 Backing::Snapshot { regions } => {
                     if let Some((s, _, file)) = regions.iter().find(|(s, e, _)| *s <= start && start < *e) {
-                        let _ = file.read_at(&mut page.bytes, u64::from(start - s));
+                        use std::io::{Seek, SeekFrom};
+                        let mut file = file;
+                        let _ = file.seek(SeekFrom::Start(u64::from(start - s))).and_then(|_| file.read(&mut page.bytes));
                     }
                 }
                 Backing::Image(sections) => {
@@ -126,9 +186,9 @@ impl Mem {
     #[inline]
     pub fn read(&mut self, addr: u32, size: usize) -> u128 {
         if !self.flat.is_null() {
-            // SAFETY: every 32-bit address and the 16 bytes after it are in the reservation.
+            let p = self.flat_at(addr, size);
+            // SAFETY: `flat_at` answers a place with `size` bytes and a page after it.
             return unsafe {
-                let p = self.flat.add(addr as usize);
                 match size {
                     1 => u128::from(*p),
                     2 => u128::from(p.cast::<u16>().read_unaligned()),
@@ -149,9 +209,9 @@ impl Mem {
     #[inline]
     pub fn write(&mut self, addr: u32, size: usize, v: u128) {
         if !self.flat.is_null() {
+            let p = self.flat_at(addr, size);
             // SAFETY: as in `read`.
             unsafe {
-                let p = self.flat.add(addr as usize);
                 match size {
                     1 => *p = v as u8,
                     2 => p.cast::<u16>().write_unaligned(v as u16),
@@ -172,8 +232,9 @@ impl Mem {
 
     /// Writes without marking the bytes as written by the program, for setup.
     pub fn poke(&mut self, addr: u32, bytes: &[u8]) {
-        if let Some(p) = self.ptr(addr) {
-            // SAFETY: as in `bytes`.
+        if !self.flat.is_null() {
+            let p = self.flat_at(addr, bytes.len());
+            // SAFETY: `flat_at` answers a place with `bytes.len()` bytes.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
             return;
         }
@@ -184,8 +245,9 @@ impl Mem {
     }
 
     pub fn bytes(&mut self, addr: u32, len: usize) -> Vec<u8> {
-        if let Some(p) = self.ptr(addr) {
-            // SAFETY: as in `read`; the reservation covers every 32-bit address.
+        if !self.flat.is_null() {
+            let p = self.flat_at(addr, len);
+            // SAFETY: `flat_at` answers a place with `len` bytes.
             return unsafe { std::slice::from_raw_parts(p, len) }.to_vec();
         }
         (0..len).map(|i| self.read(addr.wrapping_add(i as u32), 1) as u8).collect()
@@ -195,8 +257,7 @@ impl Mem {
     /// in place. Paged memory has no such place.
     #[inline]
     pub fn ptr(&self, addr: u32) -> Option<*mut u8> {
-        // SAFETY: inside the reservation, which covers every 32-bit address.
-        (!self.flat.is_null()).then(|| unsafe { self.flat.add(addr as usize) })
+        (!self.flat.is_null()).then(|| self.flat_at(addr, 1))
     }
 
     /// The text at `addr` up to its terminating zero.
@@ -309,6 +370,8 @@ pub struct Cpu {
     pub mem: Mem,
     host: Option<Box<dyn Host>>,
     tsc: u64,
+    /// Lifted code the host asked for with [`Cpu::defer`], with its arguments.
+    deferred: Vec<(u32, Vec<u32>)>,
 }
 
 /// A lifted function.
@@ -348,6 +411,7 @@ pub fn install(functions: Vec<(u32, Lifted)>, code: std::ops::Range<u32>) {
     }
     others.sort_by_key(|e| e.0);
     replaced.sort_by_key(|e| e.0);
+    coverage::start(slots.len());
     TABLE.set(Table { code, slots, others, replaced }).ok();
 }
 
@@ -364,6 +428,7 @@ pub fn dispatch(c: &mut Cpu, addr: u32) {
         let mut host = c.host.take().expect("a host");
         let next = host.call(c, addr, Frame::Called);
         c.host = Some(host);
+        c.run_deferred();
         if let Some(target) = next {
             dispatch(c, target);
         }
@@ -371,7 +436,9 @@ pub fn dispatch(c: &mut Cpu, addr: u32) {
     }
     let table = TABLE.get().expect("the lifted functions");
     let found = if table.code.contains(&addr) {
-        table.slots[(addr - table.code.start) as usize]
+        let index = (addr - table.code.start) as usize;
+        coverage::entered(index);
+        table.slots[index]
     } else {
         table.others.binary_search_by_key(&addr, |e| e.0).ok().map(|i| table.others[i].1)
     };
@@ -403,7 +470,7 @@ impl Cpu {
             (None, Some(image)) => Backing::Image(image.sections),
             (None, None) => Backing::Image(Vec::new()),
         };
-        let mut c = Cpu { regs: Box::new([0; 0x2000]), st: [0.0; 8], g: [0; 8], f: [0; 16], uniques: HashMap::new(), mem: Mem::new(backing, flat)?, host: Some(host), tsc: 0 };
+        let mut c = Cpu { regs: Box::new([0; 0x2000]), st: [0.0; 8], g: [0; 8], f: [0; 16], uniques: HashMap::new(), mem: Mem::new(backing, flat)?, host: Some(host), tsc: 0, deferred: Vec::new() };
         c.wg(FPU_CONTROL.0, 2, 0x27f);
         Ok(c)
     }
@@ -735,9 +802,30 @@ impl Cpu {
         let mut host = self.host.take().expect("a host");
         let next = host.import(self, name, if tail { Frame::Called } else { Frame::AtCallSite });
         self.host = Some(host);
+        self.run_deferred();
         if let Some(target) = next {
             dispatch(self, target);
         }
+    }
+
+    /// Asks for a call of lifted code at `addr` with `args` once the host function running now
+    /// returns, as Windows runs a library's callbacks on a thread of its own. The host cannot run
+    /// lifted code itself, since that code calls the host in turn.
+    pub fn defer(&mut self, addr: u32, args: Vec<u32>) {
+        self.deferred.push((addr, args));
+    }
+
+    /// Runs the calls [`Cpu::defer`] asked for, keeping the host function's answer in EAX and EDX.
+    fn run_deferred(&mut self) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        let (eax, edx) = (self.reg(EAX), self.reg(EDX));
+        for (addr, args) in std::mem::take(&mut self.deferred) {
+            self.call(addr, None, &args);
+        }
+        self.set_reg(EAX, eax);
+        self.set_reg(EDX, edx);
     }
 
     /// Replaces a host function entered with `frame`, which took `taken` stack arguments, with a
