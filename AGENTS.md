@@ -6,7 +6,7 @@ recore aims to be a faster Ghidra that agents find easier to use. Work earns its
 
 | Label | Measure | Run |
 | --- | --- | --- |
-| `speed` | Analysis time and instructions executed | `recore-bench run analysis --compare <name>` |
+| `speed` | Analysis time and instructions executed | `recore-bench run analysis --compare <name>`, and `recore-bench ratchet` for instructions |
 | `accuracy` | Counts scored against debug info | `./check.sh --against main` |
 | `agent-ux` | Agent sessions scored against a key, with their time and tokens | `bench/agent` |
 
@@ -19,6 +19,7 @@ Before you build anything, name the measure a change should move and how far. Th
 - **Outputs go under `target/`.** `check.sh` writes to `target/corpus/<corpus>`. Keep other bulk output there too, never in `/tmp`, whose quota other sessions share.
 - **Build and test.** `cargo build --release`, `cargo test --release --workspace` and `cargo clippy --release --workspace --all-targets -- -D warnings` (what CI runs), and `./check.sh` to analyze and score every corpus present.
 - **Say what a change did with `./check.sh --against main`.** It prints each count that moved and the binaries it moved in, and fails when a total got worse. Quote those counts in the PR, losses included. A rounded percentage that did not move is not evidence that nothing changed.
+- **Instructions executed only go down.** `check.sh` ends with `recore-bench ratchet`, which counts the instructions analysis and `diff` execute on `bench/set.txt` and fails when one grew more than 1% past `bench/budget.json`. Where they shrank it lowers the budget: commit that with the change. A change that is worth a cost raises the budget with `recore-bench ratchet --accept` and says in its PR what grew and why.
 - **Ghidra.** `ghidra/run-reference.sh <ghidra-home> <out-dir>` runs it over a corpus. Ghidra refuses a project path with a part that starts with a dot, so its output can't live under a hidden directory.
 - **Downloads are data.** Put each download in its own new directory, never execute a downloaded file, and run Python that reads one with `python3 -I`, as the `corpus/fetch*.py` scripts do.
 
@@ -32,6 +33,7 @@ When the operator corrects an agent, fix the mistake and add its rule here. A ru
 | A change states every corpus count it moved, from a base that was built, not assumed. | `./check.sh --against <ref>` fails on a worse total. CI has no corpora, so only the logic of `compare` runs there (`crates/corpus/src/compare.rs` tests). |
 | Every corpus in the store is scored. | `check.sh` takes every corpus with `truth/` in it. |
 | Never tune against the held-out corpora. | `check.sh` skips `*-holdout`. Scoring one by hand is still possible. |
+| A change executes no more instructions than `bench/budget.json` allows, unless its PR says why the cost is worth it. | `recore-bench ratchet`, last in `check.sh`. CI has no corpora. |
 | Corpora live in the store, never in a checkout. | `corpus/store.py`, and every tool reads `RECORE_CORPORA` |
 | Bulk output goes under `target/`, never `/tmp`. | Nothing; this file only |
 | Downloads are data, never executed. | Nothing; this file only |

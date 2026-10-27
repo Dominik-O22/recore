@@ -1,14 +1,16 @@
 //! Timings to trust and compare: `recore-bench run` measures the benchmark set, `recore-bench
-//! profile` says where the time of one binary goes.
+//! profile` says where the time of one binary goes, and `recore-bench ratchet` holds the
+//! instructions executed to a budget that only tightens.
 //!
 //! Every number is the fastest of several runs, because noise on a quiet machine only ever adds
 //! time. The median is kept beside it, and the gap between the two is reported as the noise.
 
 mod profile;
+mod ratchet;
 mod suites;
 mod work;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -90,6 +92,23 @@ enum Command {
         #[arg(long)]
         collapsed: Option<PathBuf>,
     },
+    /// Counts the instructions analyzing each binary of the set and diffing it against itself
+    /// execute, and fails where they grew past `bench/budget.json`. Lowers the budget where
+    /// they shrank.
+    Ratchet {
+        /// The list of binaries, one path per line, relative to the corpora's directory.
+        #[arg(long, default_value = "bench/set.txt")]
+        set: PathBuf,
+        #[arg(long, default_value = "bench/budget.json")]
+        budget: PathBuf,
+        /// Raises the budget to what grew, for a change worth what it costs.
+        #[arg(long)]
+        accept: bool,
+    },
+    /// Counts the instructions of one binary for `ratchet`, which runs each binary in a
+    /// process of its own, and prints them as JSON.
+    #[command(hide = true)]
+    Count { binary: PathBuf },
 }
 
 fn saved(name: &str) -> PathBuf {
@@ -101,20 +120,26 @@ pub(crate) fn corpora() -> PathBuf {
     std::env::var_os("RECORE_CORPORA").map_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("recore-corpora"), PathBuf::from)
 }
 
+/// The binaries `set` lists, as paths into the corpora, those whose path contains `only` if
+/// it is given.
+fn binaries(set: &Path, only: Option<&str>) -> Result<Vec<PathBuf>> {
+    let list = std::fs::read_to_string(set).with_context(|| format!("reading {}", set.display()))?;
+    Ok(list
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter(|line| only.is_none_or(|only| line.contains(only)))
+        .map(|line| corpora().join(line))
+        .collect())
+}
+
 fn main() -> Result<()> {
     // Every suite starts from no edits, whatever names and types are saved for these binaries.
     // SAFETY: no other thread has started yet.
     unsafe { std::env::set_var(recore::edits::DIR_VAR, std::path::absolute("target/bench/edits")?) };
     match Args::parse().command {
         Command::Run { suites, set, only, runs, functions, walks, save, compare } => {
-            let list = std::fs::read_to_string(&set).with_context(|| format!("reading {}", set.display()))?;
-            let binaries: Vec<PathBuf> = list
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                .filter(|line| only.as_deref().is_none_or(|only| line.contains(only)))
-                .map(|line| corpora().join(line))
-                .collect();
+            let binaries = binaries(&set, only.as_deref())?;
             let wanted = |suite| suites.is_empty() || suites.contains(&suite);
             let before: Option<suites::Results> = match &compare {
                 Some(name) => {
@@ -153,5 +178,7 @@ fn main() -> Result<()> {
         Command::Phases { binary, runs } => suites::phases(&binary, runs),
         Command::DecodeFloor { binary, runs } => suites::decode_floor(&binary, runs),
         Command::Profile { what, binary, functions, seconds, top, collapsed } => profile::run(what, &binary, &functions, seconds, top, collapsed.as_deref()),
+        Command::Ratchet { set, budget, accept } => ratchet::run(&binaries(&set, None)?, &budget, accept),
+        Command::Count { binary } => ratchet::count(&binary),
     }
 }
