@@ -3,10 +3,12 @@
 //! lifted code runs on, and the binary that runs it; [`Config`] gives each field.
 //!
 //! The roots are every function the analysis finds, every word of the data sections that points
-//! into code (code reached only through tables of addresses), and every code address the analysis
-//! finds an instruction taking (callbacks it lists inside another function). The lifted functions are split into `crates` crates `c0`..`cN` of about the
-//! same size, so rustc checks them in parallel; every call between functions goes through
-//! `dispatch`, so a port in the binary's `ports` replaces a lifted function for every caller.
+//! into code (code reached only through tables of addresses), only the relocated ones where the
+//! image keeps its relocations, and every code address the analysis finds an instruction taking
+//! (callbacks it lists inside another function). The lifted functions are split into `crates`
+//! crates `c0`..`cN` of about the same size, so rustc checks them in parallel; every call between
+//! functions goes through `dispatch`, so a port in the binary's `ports` replaces a lifted function
+//! for every caller.
 
 use std::{
     collections::BTreeSet,
@@ -15,7 +17,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use recore::FxHashMap;
+use recore::{FxHashMap, Image};
 use serde::Deserialize;
 
 use super::lift::{Function, X87Abi, lift};
@@ -119,22 +121,18 @@ pub fn run(config: &Path, out: Option<&Path>) -> Result<String> {
 }
 
 /// The roots to lift: the analysis's functions, then the code addresses found in data and taken
-/// by instructions that are not functions, each in address order. A code address in data is any
-/// aligned word outside code and resources that lands in code, as the table of handlers a C
-/// runtime helper jumps through; one an instruction takes is an immediate the analysis found it
-/// taking, as a callback one function pushes and the analysis lists inside another. Either is
-/// dropped when it lands inside an instruction of a function the analysis found. The lifter
-/// takes roots from the end, so the order fixes the order of the output.
+/// by instructions that are not functions, each in address order. A code address in data is a
+/// word of [`data_words`] that lands in code, as the table of handlers a C runtime helper jumps
+/// through; one an instruction takes is an immediate the analysis found it taking, as a callback
+/// one function pushes and the analysis lists inside another. Either is dropped when it lands
+/// inside an instruction of a function the analysis found. The lifter takes roots from the end,
+/// so the order fixes the order of the output.
 fn roots(cache: &mut Cache, exe: &Path) -> Result<Vec<u64>> {
     let program = &cache.get(exe)?.program;
     let image = &program.image;
     let functions: BTreeSet<u64> = program.functions().map(|f| f.addr).collect();
-    // Every word, not only the image's pointer slots: without relocations the loader drops words
-    // that read as text, and a table of handlers can (0x46205c reads as "\ F"). A word that is
-    // not an address costs a lifted function; an address missed costs a crash when it is called.
-    let in_data = image.sections.iter().filter(|s| !s.executable && s.name != ".rsrc").flat_map(|s| s.data.as_chunks::<4>().0.iter().map(|&word| u64::from(u32::from_le_bytes(word))));
     let taken = program.analysis.data_refs.iter().filter(|r| !r.access).map(|r| r.to);
-    let mut extra: BTreeSet<u64> = in_data.chain(taken).filter(|&v| image.is_code(v) && !functions.contains(&v)).collect();
+    let mut extra: BTreeSet<u64> = data_words(image).into_iter().chain(taken).filter(|&v| image.is_code(v) && !functions.contains(&v)).collect();
     // Compiled code never jumps into the middle of an instruction, so a value that lands inside a
     // function's body on no instruction the analysis decoded there is not a code address, most
     // often a short string: "SOF\0" reads as 0x464f53.
@@ -148,6 +146,19 @@ fn roots(cache: &mut Cache, exe: &Path) -> Result<Vec<u64>> {
             })
     });
     Ok(functions.into_iter().chain(extra).collect())
+}
+
+/// The words outside code that may be addresses. An image that keeps its relocations names them:
+/// its relocated words. One linked to load only at its base names none, so every aligned word
+/// outside code and resources may be one, not only the image's pointer slots: those leave out
+/// words that read as text, and a table of handlers can (0x46205c reads as "\ F"). A word that is
+/// not an address costs a lifted function; an address missed costs a crash when it is called.
+fn data_words(image: &Image) -> Vec<u64> {
+    if !image.relocations_stripped {
+        return image.relative_targets.iter().filter(|&&(slot, _)| !image.is_code(slot)).map(|&(_, target)| target).collect();
+    }
+    let data = image.sections.iter().filter(|s| !s.executable && s.name != ".rsrc");
+    data.flat_map(|s| s.data.as_chunks::<4>().0.iter().map(|&word| u64::from(u32::from_le_bytes(word)))).collect()
 }
 
 /// The lifted functions as units to write: a body lifted for several entries, as when a jump
@@ -269,7 +280,35 @@ fn write(config: &Config, base: &Path, out: &Path, functions: Vec<Function>) -> 
 
 #[cfg(test)]
 mod tests {
+    use recore::image::{Format, Machine, Section};
+
     use super::*;
+
+    #[test]
+    fn data_words_are_the_relocated_ones_where_the_image_keeps_relocations() {
+        let section = |name: &str, addr: u64, words: &[u32], executable: bool| Section {
+            name: name.into(),
+            addr,
+            data: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            file_offset: None,
+            executable,
+            writable: false,
+        };
+        let image = || {
+            let sections = vec![
+                section(".text", 0x40_1000, &[0x40_1010], true),
+                section(".data", 0x40_2000, &[0x40_1020, 0x40_1030], false),
+                section(".rsrc", 0x40_3000, &[0x40_1040], false),
+            ];
+            Image::bare("game".into(), Format::Pe, Machine::X86, 0x40_1000, sections)
+        };
+        // Relocated: a word of .data, and an immediate in .text, which the analysis reads instead.
+        let relocated = Image { relative_targets: vec![(0x40_2004, 0x40_1030), (0x40_1000, 0x40_1010)], ..image() };
+        assert_eq!(data_words(&relocated), [0x40_1030]);
+        // Linked to load only at its base: every word outside code and resources.
+        let fixed = Image { relocations_stripped: true, ..image() };
+        assert_eq!(data_words(&fixed), [0x40_1020, 0x40_1030]);
+    }
 
     /// A function as the lifter writes it, with `body` after its first line.
     fn lifted(entry: u64, doc: &str, body: &str) -> Function {
