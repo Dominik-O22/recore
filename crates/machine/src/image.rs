@@ -9,6 +9,8 @@ pub struct Section {
     pub addr: u32,
     pub size: u32,
     pub data: Vec<u8>,
+    /// Whether it holds code: IMAGE_SCN_CNT_CODE or IMAGE_SCN_MEM_EXECUTE.
+    pub executable: bool,
 }
 
 pub struct Import {
@@ -41,6 +43,14 @@ fn c_str(b: &[u8], at: usize) -> String {
 }
 
 impl Image {
+    /// From the first executable section's start to the last one's end: the addresses
+    /// [`crate::install`] keeps a slot for each of.
+    pub fn code(&self) -> std::ops::Range<u32> {
+        let code = self.sections.iter().filter(|s| s.executable);
+        let start = code.clone().map(|s| s.addr).min().unwrap_or(0);
+        start..code.map(|s| s.addr + s.size).max().unwrap_or(start)
+    }
+
     pub fn load(path: &Path) -> Result<Image> {
         let file = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         ensure!(file.get(..2) == Some(b"MZ"), "{} is not a PE file", path.display());
@@ -59,9 +69,10 @@ impl Image {
         for i in 0..count {
             let s = table + 40 * i;
             let (size, rva, raw_size, raw) = (u32_at(&file, s + 8), u32_at(&file, s + 12), u32_at(&file, s + 16), u32_at(&file, s + 20));
+            let executable = u32_at(&file, s + 36) & 0x2000_0020 != 0;
             let mut data = file.get(raw as usize..(raw + raw_size.min(size.max(raw_size))) as usize).unwrap_or(&[]).to_vec();
             data.resize(size.max(raw_size) as usize, 0);
-            sections.push(Section { addr: base + rva, size: size.max(raw_size), data });
+            sections.push(Section { addr: base + rva, size: size.max(raw_size), data, executable });
         }
         let rva_bytes = |rva: u32| -> Option<&[u8]> {
             let addr = base + rva;
@@ -103,5 +114,18 @@ impl Image {
             Some((base + u32_at(data, 0), u32_at(data, 4)))
         }).flatten();
         Ok(Image { base, entry: base + entry_rva, sections, imports, version })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_code_runs_from_the_first_executable_section_to_the_last() {
+        let section = |addr, size, executable| Section { addr, size, data: Vec::new(), executable };
+        let sections = vec![section(0x40_1000, 0x1000, true), section(0x40_2000, 0x800, false), section(0x40_3000, 0x2000, true), section(0x40_6000, 0x1000, false)];
+        let image = Image { base: 0x40_0000, entry: 0x40_1000, sections, imports: Vec::new(), version: None };
+        assert_eq!(image.code(), 0x40_1000..0x40_5000);
     }
 }

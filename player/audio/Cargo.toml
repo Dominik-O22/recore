@@ -1,0 +1,9 @@
+[package]
+name = "recore-audio"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+cpal = "0.18"

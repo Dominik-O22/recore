@@ -1,0 +1,8 @@
+# The player: what a game lifted with `recore-mcp lift` runs on besides the machine. Its own
+# workspace, so that recore's build and CI never compile the window and audio crates it needs.
+[workspace]
+resolver = "3"
+members = ["host", "window", "audio"]
+
+[profile.release]
+debug = "line-tables-only"
