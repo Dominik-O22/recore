@@ -68,7 +68,7 @@
     "diff": 95274477
   },
   "corpus-armhf/bin/deb__re2c__re2rust": {
-    "analysis": 348733619,
+    "analysis": 352405570,
     "diff": 325027947
   },
   "corpus-pe/bin/git__git-remote-https.exe": {
@@ -76,7 +76,7 @@
     "diff": 1109055266
   },
   "corpus-pe/bin/mingw__bzip2.exe": {
-    "analysis": 23474620,
+    "analysis": 23709958,
     "diff": 42138271
   },
   "corpus-pe/bin/node4__node-v4.9.1-x64.exe": {
