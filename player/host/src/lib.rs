@@ -139,7 +139,7 @@ pub struct Win32 {
 impl Win32 {
     pub fn new(game: &'static Game, game_dir: PathBuf, image: &Image, exe: &[u8]) -> Win32 {
         let imports = image.imports.iter().map(|i| (i.dll.clone(), i.name.clone())).collect();
-        let overlay_dir = PathBuf::from(std::env::var_os("TT_OVERLAY").unwrap_or_else(|| "out/game-files".into()));
+        let overlay_dir = session::overlay(PathBuf::from(std::env::var_os("TT_OVERLAY").unwrap_or_else(|| "out/game-files".into())));
         Win32 {
             game,
             game_dir,
@@ -343,9 +343,11 @@ impl Win32 {
         self.watch.frame(c, frames);
         (self.game.present)(c, frames);
         self.record_sound();
-        let Some(frame) = self.dd.screen(c) else { return };
+        if !self.dd.has_screen() {
+            return;
+        }
         if let Some(link) = &mut self.link {
-            link.present(frame);
+            link.present(|| self.dd.screen(c).expect("a primary surface"));
         }
     }
 

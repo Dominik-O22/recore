@@ -62,5 +62,5 @@ The host reads these from the environment. They start with `TT_` for the first g
 | `TT_FILES` | Prints every file the game opens or looks for |
 | `TT_BACKTRACE` | `name,...`: prints the game functions that called those imports or methods |
 | `TT_WATCH` | Prints game memory each frame it changes (host/src/watch.rs) |
-| `TT_RECORD`, `TT_REPLAY` | `dir`: records the input and clock of a session there, or plays one back |
+| `TT_RECORD`, `TT_REPLAY` | `dir`: records the input and clock of a session there, and the overlay's files it starts from, or plays one back from a fresh copy of those in `dir/replay` |
 | `TT_PAGED` | Runs on paged memory instead of flat memory |
