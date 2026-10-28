@@ -1,6 +1,7 @@
-//! A windowed session recorded so it can be replayed offscreen, step for step. A window run differs from the last only in what the game reads from the
-//! clock and from the window. With TT_RECORD=<dir>, every clock reading goes to `<dir>/clock`
-//! and every change of input, with the number of the input poll that took it, to `<dir>/input`.
+//! A windowed session recorded so it can be replayed offscreen, step for step. A window run
+//! differs from the last only in what the game reads from the clock and from the window. With
+//! TT_RECORD=<dir>, every clock reading goes to `<dir>/clock` and every change of input, with the
+//! number of the input poll that took it, to `<dir>/input`.
 //! With TT_REPLAY=<dir>, the host answers from those files instead, so the game takes the same
 //! path, a crash included.
 

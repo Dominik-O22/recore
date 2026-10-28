@@ -294,8 +294,8 @@ impl Win32 {
         }
     }
 
-    /// The imports that make a host object: DirectDrawCreate, DirectInputCreateA, and
-    /// DirectDrawEnumerateA, which finds one driver, the primary display's.
+    /// The imports that make a host object: DirectDrawCreate, DirectInputCreateA,
+    /// DirectSoundCreate, and DirectDrawEnumerateA, which finds one driver, the primary display's.
     fn create(&mut self, c: &mut Cpu, name: &str, f: Frame) -> bool {
         match name {
             "DirectDrawEnumerateA" => {
