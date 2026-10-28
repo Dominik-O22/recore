@@ -3,7 +3,8 @@
 //! exports on generated arguments twice: lifted and natively built, and in the emulator's `run`.
 //! The two must return the same EAX. The fixture covers loops, a jump table, a chain of
 //! compares, branches whose arms hold loops, recursion, the stack, a global, calls through a
-//! table in data, and x87 arithmetic, comparisons and conversions.
+//! table in data, and x87 arithmetic, comparisons and conversions, under control words set to
+//! single precision and to rounding up too.
 
 mod common;
 
@@ -17,9 +18,9 @@ const EXE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/lift.exe");
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 
 /// The fixture's exports, with how many arguments each takes.
-const FUNCTIONS: [(&str, usize); 12] = [
+const FUNCTIONS: [(&str, usize); 14] = [
     ("collatz", 1), ("classify", 1), ("mix", 2), ("fib", 1), ("sum_squares", 1), ("step", 1), ("apply", 2), ("length", 2), ("scaled", 2), ("halves", 1), ("arms", 2),
-    ("sparse", 1),
+    ("sparse", 1), ("single", 2), ("upward", 2),
 ];
 
 /// Arguments tried on each function.

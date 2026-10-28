@@ -137,5 +137,40 @@ EXPORT int sparse(int x) {
     }
 }
 
+// Arithmetic under a control word set to single precision, as a software renderer sets it:
+// each quotient and sum rounds to 24 bits until the word is put back.
+EXPORT unsigned single(int a, int b) {
+    volatile int va = a, vb = b | 1;
+    unsigned short saved, narrow;
+    __asm__ volatile("fnstcw %0" : "=m"(saved) : : "memory");
+    narrow = saved & 0xfcff;
+    __asm__ volatile("fldcw %0" : : "m"(narrow) : "memory");
+    volatile double x = (double)va / (double)vb + 0.1;
+    __asm__ volatile("fldcw %0" : : "m"(saved) : "memory");
+    Bits r;
+    r.d = x;
+    return (unsigned)(r.u ^ r.u >> 32);
+}
+
+// The same under a control word that rounds up, as some renderers set it, and a store to a
+// 4-byte float that rounds up too.
+EXPORT unsigned upward(int a, int b) {
+    volatile int va = a, vb = b | 1;
+    unsigned short saved, up;
+    __asm__ volatile("fnstcw %0" : "=m"(saved) : : "memory");
+    up = (saved & 0xf3ff) | 0x0800;
+    __asm__ volatile("fldcw %0" : : "m"(up) : "memory");
+    volatile double x = (double)va / (double)vb + 0.1;
+    volatile float y = (float)x * 3.0f;
+    __asm__ volatile("fldcw %0" : : "m"(saved) : "memory");
+    Bits r;
+    r.d = x;
+    union {
+        float f;
+        unsigned u;
+    } s = {y};
+    return (unsigned)(r.u ^ r.u >> 32) ^ s.u;
+}
+
 // The entry point calls nothing; the exports are the functions.
 int start(void) { return 0; }
