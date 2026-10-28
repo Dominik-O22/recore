@@ -9,7 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  # Three runners at once. Core's tests get their own, so the rest don't wait for core's test build.
+  # Four runners at once. Core's tests get their own, so the rest don't wait for core's test build,
+  # and the player builds in its own workspace.
   check:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -23,6 +24,10 @@ jobs:
             run: cargo test --profile ci -p recore
           - name: other tests
             run: cargo test --profile ci --workspace --exclude recore
+          # The player is a workspace of its own; cpal plays through ALSA on Linux.
+          - name: player
+            workspace: player
+            run: sudo apt-get install -y libasound2-dev && cd player && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
     env:
       # sccache caches each rustc and C++ compile by content, so the engine's 83 files and the crates
       # a change leaves alone come from the cache even though checkout touches every file.
@@ -41,6 +46,7 @@ jobs:
           # profiles are, so a profile change would restore a cache for the old profile and keep it.
           # The matrix entries share a job id, so each also needs its own index to keep its own target.
           key: ${{ hashFiles('Cargo.toml') }}-${{ strategy.job-index }}
+          workspaces: ${{ matrix.workspace || '.' }}
       - uses: mozilla-actions/sccache-action@v0.0.9
         with:
           version: v0.19.0

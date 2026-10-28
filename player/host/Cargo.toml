@@ -1,0 +1,15 @@
+[package]
+name = "recore-host"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+recore-machine = { path = "../../crates/machine" }
+recore-window = { path = "../window" }
+recore-audio = { path = "../audio" }
+anyhow = "1"
+libc = "0.2"
+flate2 = "1"
+lewton = "0.10"
