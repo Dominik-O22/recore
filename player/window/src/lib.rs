@@ -146,18 +146,18 @@ impl Link {
     }
 
     /// Hands a frame on: to the window, which the game waits for while it draws the last one, to
-    /// a file, or to the page.
-    pub fn present(&mut self, frame: Frame) {
+    /// a file, or to the page. `frame` makes the picture, which offscreen only a saved frame needs.
+    pub fn present(&mut self, frame: impl FnOnce() -> Frame) {
         self.presented += 1;
         for (_, event) in self.script.iter().filter(|(at, _)| *at == self.presented) {
             event.apply(&mut self.input.lock().expect("input"));
         }
         match &mut self.out {
             #[cfg(not(target_family = "wasm"))]
-            Out::Window(window) => window.present(frame),
+            Out::Window(window) => window.present(frame()),
             Out::Shots(shots) => {
                 if let Some((_, path)) = shots.iter().find(|s| s.0 == self.presented) {
-                    save_png(path, &frame).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+                    save_png(path, &frame()).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
                     eprintln!("window: frame {} saved to {}", self.presented, path.display());
                 }
                 if shots.iter().all(|s| s.0 <= self.presented) {
@@ -165,7 +165,19 @@ impl Link {
                 }
             }
             #[cfg(target_family = "wasm")]
-            Out::Page(page) => page.present(&frame),
+            Out::Page(page) => page.present(&frame()),
+        }
+    }
+
+    /// Waits for the window's next refresh, as a flip waits for the display. Offscreen nothing
+    /// waits, so a run there goes as fast as the game can.
+    pub fn wait_for_refresh(&mut self) {
+        match &mut self.out {
+            #[cfg(not(target_family = "wasm"))]
+            Out::Window(window) => window.wait_for_refresh(),
+            Out::Shots(_) => {}
+            #[cfg(target_family = "wasm")]
+            Out::Page(_) => {}
         }
     }
 

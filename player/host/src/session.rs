@@ -1,7 +1,8 @@
 //! A windowed session recorded so it can be replayed offscreen, step for step. A window run
 //! differs from the last only in what the game reads from the clock and from the window. With
 //! TT_RECORD=<dir>, every clock reading goes to `<dir>/clock` and every change of input, with the
-//! number of the input poll that took it, to `<dir>/input`.
+//! number of the input poll that took it, to `<dir>/input`, and the files the game had written
+//! before, its overlay, to `<dir>/files`.
 //! With TT_REPLAY=<dir>, the host answers from those files instead, so the game takes the same
 //! path, a crash included.
 
@@ -20,6 +21,44 @@ fn directory() -> Option<(PathBuf, bool)> {
         (None, Some(dir)) => Some((dir.into(), false)),
         _ => None,
     }
+}
+
+/// The overlay the game reads and writes this run (files.rs). A recording copies the live
+/// overlay, as the session starts from it, to `<dir>/files`. A replay plays from a fresh copy of
+/// that in `<dir>/replay`, so each replay starts as the session did and none changes the live
+/// overlay. A session recorded before sessions kept their files replays from the live overlay's.
+pub fn overlay(live: PathBuf) -> PathBuf {
+    match directory() {
+        Some((dir, recording)) => session_overlay(&dir, recording, live),
+        None => live,
+    }
+}
+
+fn session_overlay(dir: &std::path::Path, recording: bool, live: PathBuf) -> PathBuf {
+    let (from, to) = if recording {
+        (live.clone(), dir.join("files"))
+    } else {
+        let kept = dir.join("files");
+        (if kept.exists() { kept } else { live.clone() }, dir.join("replay"))
+    };
+    if to.exists() {
+        std::fs::remove_dir_all(&to).expect("the session's last copy of the game's files");
+    }
+    copy(&from, &to).expect("a copy of the game's files");
+    if recording { live } else { to }
+}
+
+fn copy(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    if !from.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let path = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() { copy(&entry.path(), &path)? } else { std::fs::copy(entry.path(), path).map(drop)? }
+    }
+    Ok(())
 }
 
 /// Numbers in the order the game reads them: each the zigzag LEB128 of its difference from the
@@ -206,5 +245,28 @@ impl Inputs {
         if let Inputs::Record { file, .. } = self {
             file.flush().ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_overlay;
+    use std::fs;
+
+    #[test]
+    fn a_replay_starts_from_the_files_the_recording_started_from() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/session-overlay")).to_path_buf();
+        let (live, session) = (root.join("live"), root.join("session"));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("stats.cfg"), "before").unwrap();
+        assert_eq!(session_overlay(&session, true, live.clone()), live);
+        fs::write(live.join("stats.cfg"), "after the session").unwrap();
+        for _ in 0..2 {
+            let replay = session_overlay(&session, false, live.clone());
+            assert_eq!(fs::read_to_string(replay.join("stats.cfg")).unwrap(), "before");
+            fs::write(replay.join("stats.cfg"), "written by the replay").unwrap();
+        }
+        assert_eq!(fs::read_to_string(live.join("stats.cfg")).unwrap(), "after the session");
     }
 }

@@ -113,6 +113,11 @@ impl DirectDraw {
         self.next
     }
 
+    /// Whether there is a primary surface to show.
+    pub fn has_screen(&self) -> bool {
+        self.primary.is_some_and(|p| self.surfaces.contains_key(&p))
+    }
+
     /// The front buffer as a picture, if there is a primary surface.
     pub fn screen(&self, c: &mut Cpu) -> Option<recore_window::Frame> {
         let s = self.surfaces.get(&self.primary?)?;
@@ -368,12 +373,16 @@ fn surface(w: &mut Win32, c: &mut Cpu, iface: Iface, name: &str, a: &Args) -> Op
         // pixels and its address. A game that asks for its flipping chain in system memory (caps
         // 0xa18) may redraw only what changed since the last frame and keep the back buffer's
         // address after unlocking it, so swapping the two buffers' memory would leave every other
-        // frame's changes behind.
+        // frame's changes behind. It waits for the display's refresh first; a blit to the front
+        // buffer doesn't.
         "Flip" => {
             let back = w.dd.surfaces.get(&id)?.back?;
             let (front, back) = (w.dd.surfaces.get(&id)?, w.dd.surfaces.get(&back)?);
             let pixels = c.mem.bytes(back.bits, (back.pitch * back.height) as usize);
             c.mem.poke(front.bits, &pixels);
+            if let Some(link) = &mut w.link {
+                link.wait_for_refresh();
+            }
             w.present(c);
             OK
         }

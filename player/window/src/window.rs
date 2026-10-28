@@ -9,6 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
+    time::{Duration, Instant},
 };
 
 use winit::{
@@ -26,9 +27,27 @@ pub struct Sender {
     frames: SyncSender<Frame>,
     proxy: EventLoopProxy<()>,
     captured: Arc<AtomicBool>,
+    /// The next refresh, for `wait_for_refresh`.
+    next: Instant,
 }
 
+/// The time between frames: a flip waits for the display's vertical blank, 60 a second.
+const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
 impl Sender {
+    /// Waits for the next refresh, as a flip waits for the display.
+    pub fn wait_for_refresh(&mut self) {
+        let now = Instant::now();
+        if now < self.next {
+            std::thread::sleep(self.next - now);
+        }
+        // The next refresh after this one; a frame that missed some waits for the one after.
+        let now = Instant::now();
+        while self.next <= now {
+            self.next += FRAME;
+        }
+    }
+
     /// Hands a frame to the window; waits while the previous one is still being drawn.
     pub fn present(&self, frame: Frame) {
         if self.frames.send(frame).is_ok() {
@@ -48,7 +67,7 @@ pub fn run(title: &str, game: impl FnOnce(Link) + Send + 'static) -> anyhow::Res
     let event_loop = EventLoop::<()>::with_user_event().build()?;
     let (frames, received) = sync_channel(1);
     let (input, captured) = (Arc::new(Mutex::new(Input::default())), Arc::new(AtomicBool::new(false)));
-    let link = Link::new(Out::Window(Sender { frames, proxy: event_loop.create_proxy(), captured: captured.clone() }), input.clone());
+    let link = Link::new(Out::Window(Sender { frames, proxy: event_loop.create_proxy(), captured: captured.clone(), next: Instant::now() }), input.clone());
     std::thread::spawn(move || on_game_stack(move || game(link)));
     let mut app = App { title: title.to_string(), window: None, surface: None, frames: received, frame: None, input, captured, locked: false, focused: false, rest: (0.0, 0.0) };
     event_loop.run_app(&mut app)?;
