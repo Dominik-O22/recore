@@ -66,8 +66,8 @@ fn code_pieces(start: u64, end: u64, tables: &[(u64, u64)]) -> impl Iterator<Ite
 
 /// Decodes `[start, end)` linearly, stepping over `tables`, and keeps its control-flow
 /// instructions. With `trim`, `end` is only an upper bound and the function ends before any
-/// trailing padding. A call through a register goes where `register_calls` says, which
-/// discovery learned on its way there.
+/// trailing padding that nothing runs. A call through a register goes where `register_calls`
+/// says, which discovery learned on its way there.
 fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool, tables: &[(u64, u64)], register_calls: &FxHashMap<u64, u64>) -> Function {
     let mut function = Function { start, end, controls: Vec::new(), instructions: 0 };
     let mut body_end = start;
@@ -102,8 +102,17 @@ fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool, tables: &[(u
         }
     }
     if trim {
-        function.end = body_end;
         function.controls.retain(|c| c.addr < body_end);
+        // Padding after code that goes on into it runs too, up to a trap: Watcom aligns the
+        // function a body runs on into with `lea eax, [eax+0]`. Code goes on unless its last
+        // instruction is a jump, a return, a halt or a call.
+        let goes_on = body_end > start && function.controls.last().is_none_or(|c| c.next < body_end || matches!(c.flow, Flow::Branch(_)));
+        if goes_on && let Some((_, to)) = code_pieces(start, end, tables).find(|&(_, to)| to > body_end) && let Some(bytes) = image.bytes_from(body_end) {
+            let bytes = &bytes[..bytes.len().min((to - body_end) as usize)];
+            let runs = A::decode(image, bytes, body_end).map_while(|decoded| decoded.insn.filter(|insn| A::is_padding(insn) && A::flow(insn, &A::State::default(), image).is_none()).map(|_| decoded.next_addr()));
+            body_end = runs.last().unwrap_or(body_end);
+        }
+        function.end = body_end;
     }
     function
 }
@@ -253,8 +262,9 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program, mut r
         let mut index = first_control_from(addr);
         let boundary = next_start(addr);
         let mut run_start = addr;
-        // Whether the last control passed was a direct call to a function with a return in it.
-        let mut called = false;
+        // Whether the last control passed was a call, and whether it was a direct one to a
+        // function with a return in it.
+        let (mut after_call, mut called) = (false, false);
         loop {
             let Some(control) = controls.get(index).filter(|c| c.addr < boundary) else {
                 // Ran off the end of a function, which only code that never returns does, or
@@ -273,12 +283,14 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program, mut r
                     result.may_return = true;
                 }
                 // Running on into the next function is a tail call of it, when code leads
-                // right up to its entry. Elsewhere than where functions run on, only a call that
-                // comes back right at the entry does so: hand-written code such as MSVC's `cos`
-                // calls a loader and comes back into the routine it shares. A compiler emits
-                // nothing after a call it knows never returns, so the callee must have a return.
+                // right up to its entry. Elsewhere than where functions run on, code that runs
+                // off the end right after a call does so because the call never returns: a
+                // compiler that knows emits nothing after it. Code that gets there any other way
+                // falls through, as Watcom's runtime runs a load on into a `ret` it shares.
+                // Hand-written code such as MSVC's `cos` also calls a loader and comes back right
+                // at the entry of the routine it shares, which takes a callee with a return.
                 let came_back = called && run_start == boundary;
-                if (program.runs_on || came_back) && program.is_start(boundary) && program.is_covered(boundary - 1) && target_returns(boundary) {
+                if (program.runs_on || !after_call || came_back) && program.is_start(boundary) && program.is_covered(boundary - 1) && target_returns(boundary) {
                     result.may_return = true;
                 }
                 break;
@@ -289,6 +301,7 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program, mut r
             }
             reached(run_start, control.next);
             run_start = control.next;
+            after_call = matches!(control.flow, Flow::Call(_) | Flow::CallIndirect(_));
             called = matches!(control.flow, Flow::Call(target) if program.has_return(target));
             if in_extent(control.addr) {
                 result.reach_end = result.reach_end.max(control.next);
@@ -697,9 +710,10 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
 
         // Least fixpoint: a function joins the set once no path through it can return. What a
         // walk finds changes only when a function it asked about joins the set, and it asks at
-        // the calls and jumps it passes. So after the first round only the functions that can
-        // pass a call or jump to one that has just joined are walked again: those with one in
-        // their extent, and those that leave their extent, which may pass any.
+        // the calls and jumps it passes and at the entry it runs on into. So after the first
+        // round only the functions that can pass a call or jump to one that has just joined, or
+        // run on into it, are walked again: those with one in their extent, and those that
+        // leave their extent, which may pass any.
         let mut noreturn: FxHashSet<u64> = terminal_callees.into_iter().filter(|target| starts.binary_search(target).is_ok()).collect();
         let mut open: Vec<Open> = functions
             .iter()
@@ -715,8 +729,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             if added.is_empty() {
                 break;
             }
-            // In address order, as the controls are.
-            let asking: Vec<u64> = program
+            let mut asking: Vec<u64> = program
                 .controls
                 .iter()
                 .filter(|control| {
@@ -728,7 +741,10 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                     target.is_some_and(|target| added.contains(&target))
                 })
                 .map(|control| control.addr)
+                // A function whose code runs on into an entry asks about it at its last byte.
+                .chain(added.iter().filter_map(|entry| entry.checked_sub(1)))
                 .collect();
+            asking.sort_unstable();
             let passes = |f: &Function| asking.get(asking.partition_point(|&addr| addr < f.start)).is_some_and(|&addr| addr < f.end);
             open.retain(|open| open.may_return);
             for open in &mut open {
@@ -1043,11 +1059,12 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     data_refs.sort_unstable();
     data_refs.dedup();
     // A body that ends where another function begins runs on into it, unless its last
-    // instruction sends control elsewhere. Elsewhere than where functions run on, only one
-    // whose last instruction is a call that returns, to a function with a return, does, as
-    // `walk` has it.
+    // instruction sends control elsewhere. Elsewhere than where functions run on, as `walk`
+    // has it, one whose last control is a call does not, as that call never returns, unless the
+    // call is the last instruction and goes to a function with a return.
     let has_return = |entry: u64| functions.binary_search_by_key(&entry, |f| f.start).is_ok_and(|index| functions[index].controls.iter().any(|c| c.flow == Flow::Return));
     let runs_on = |f: &Function| {
+        let after_call = f.controls.last().is_some_and(|control| matches!(control.flow, Flow::Call(_) | Flow::CallIndirect(_)));
         let last = f.controls.last().filter(|control| control.next == f.end);
         let stops = last.is_some_and(|control| match control.flow {
             Flow::Jump(_) | Flow::JumpIndirect(_) | Flow::Return | Flow::Halt => true,
@@ -1056,7 +1073,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         });
         let comes_back = !stops && last.is_some_and(|control| matches!(control.flow, Flow::Call(target) if has_return(target)));
         let code_to_end = code_pieces(f.start, f.end, inline_tables).last().is_some_and(|(from, to)| from < to && to == f.end);
-        ((A::RUNS_ON && !stops) || comes_back).then_some(f.end).filter(|&end| is_start(end) && code_to_end)
+        (((A::RUNS_ON || !after_call) && !stops) || comes_back).then_some(f.end).filter(|&end| is_start(end) && code_to_end)
     };
     Analysis {
         sends,
@@ -1083,5 +1100,79 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         jump_tables: discovery.jump_tables.clone(),
         calls,
         imports: import_list,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::image::{Format, Image, Machine, Section};
+    use crate::report::AnalyzedFunction;
+
+    const BASE: u64 = 0x401000;
+    /// `call [0x402000]`, which nothing says where it goes.
+    const CALL_SLOT: [u8; 6] = [0xff, 0x15, 0x00, 0x20, 0x40, 0x00];
+    /// `mov eax, [0x402000]`
+    const MOV_EAX_FROM_SLOT: [u8; 5] = [0xa1, 0x00, 0x20, 0x40, 0x00];
+    /// `xor eax, eax; ret`
+    const RETURN_ZERO: [u8; 3] = [0x31, 0xc0, 0xc3];
+    const RET: u8 = 0xc3;
+    const INT3: u8 = 0xcc;
+
+    /// Analyzes x86 code laid out from [`BASE`], whose entry calls each of `callees` and returns.
+    /// Each callee is placed at the address in front of its code, `int3` padding the gaps.
+    fn analyze(callees: &[(u64, &[u8])]) -> Vec<AnalyzedFunction> {
+        let mut code = Vec::new();
+        for &(callee, _) in callees {
+            let next = BASE + code.len() as u64 + 5;
+            code.push(0xe8);
+            code.extend(((callee as i64 - next as i64) as i32).to_le_bytes());
+        }
+        code.push(RET);
+        for &(callee, bytes) in callees {
+            code.resize((callee - BASE) as usize, INT3);
+            code.extend(bytes);
+        }
+        let text = Section { name: ".text".into(), addr: BASE, data: code, file_offset: None, executable: true, writable: false };
+        let image = Image { base: 0x400000, ..Image::bare("run on".into(), Format::Pe, Machine::X86, BASE, vec![text]) };
+        crate::analyze(&image).functions
+    }
+
+    fn function(functions: &[AnalyzedFunction], addr: u64) -> &AnalyzedFunction {
+        functions.iter().find(|function| function.addr == addr).unwrap()
+    }
+
+    /// Watcom's runtime loads a value and runs on into a `ret` that other code calls on its own.
+    #[test]
+    fn code_that_runs_into_another_function_without_a_call_returns_with_it() {
+        let functions = analyze(&[(0x401010, &MOV_EAX_FROM_SLOT), (0x401015, &[RET])]);
+
+        let load = function(&functions, 0x401010);
+        assert!(!load.noreturn);
+        assert_eq!(load.runs_on, Some(0x401015));
+    }
+
+    /// Watcom aligns the function a body runs on into with `lea eax, [eax+0]`, which runs too.
+    #[test]
+    fn padding_that_code_runs_into_belongs_to_its_body() {
+        const MOV_EAX_9_THEN_LEA_PADDING: [u8; 8] = [0xb8, 0x09, 0x00, 0x00, 0x00, 0x8d, 0x40, 0x00];
+        let functions = analyze(&[(0x401010, &MOV_EAX_9_THEN_LEA_PADDING), (0x401018, &[RET])]);
+
+        let constant = function(&functions, 0x401010);
+        assert_eq!(constant.ranges, [(0x401010, 0x401018)]);
+        assert!(!constant.noreturn);
+        assert_eq!(constant.runs_on, Some(0x401018));
+    }
+
+    /// A compiler that knows a call never returns emits nothing after it but padding, if that.
+    #[test]
+    fn a_call_that_ends_its_function_never_returns_with_or_without_padding() {
+        for padding in [0, 3] {
+            let next = 0x401010 + CALL_SLOT.len() as u64 + padding;
+            let functions = analyze(&[(0x401010, &CALL_SLOT), (next, &RETURN_ZERO)]);
+
+            let caller = function(&functions, 0x401010);
+            assert!(caller.noreturn, "{padding} bytes of padding");
+            assert_eq!(caller.runs_on, None, "{padding} bytes of padding");
+        }
     }
 }
