@@ -532,7 +532,7 @@ fn accessors(names: &[u8], addr: u64) -> Vec<u64> {
             0x18..=0x1F => (false, 9),
             _ => (false, 1),
         };
-        if let Some(offset) = names.get(at + length - 4..at + length).filter(|_| accessor) {
+        if accessor && let Some(offset) = names.get(at + length - 4..at + length) {
             let offset = i32::from_le_bytes(offset.try_into().unwrap());
             found.push((addr + (at + length - 4) as u64).wrapping_add_signed(offset.into()));
         }
