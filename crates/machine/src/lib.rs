@@ -359,8 +359,8 @@ pub trait Host {
 pub struct Cpu {
     regs: Box<[u8; 0x2000]>,
     /// The x87 registers ST0 to ST7, as `f64`: a program that keeps the control word at 53 bits
-    /// computes so outside the few functions that load another, and lifted code keeps them so
-    /// there. `sts` and `save_st` give them in the extended format.
+    /// computes so, and lifted code keeps them so, rounding as the word says in the functions that
+    /// load another. `sts` and `save_st` give them in the extended format.
     st: [f64; 8],
     /// The general registers EAX to EDI and the flag bytes 0x200 to 0x20f, which lifted code
     /// saves and loads around every call; the other registers stay bytes in `regs`.
@@ -584,6 +584,82 @@ impl Cpu {
 
     pub fn set_u32(&mut self, addr: u32, v: u32) {
         self.mem.write(addr, 4, u128::from(v));
+    }
+
+    /// The control word, as lifted code that keeps the x87 registers as f64 reads it.
+    #[inline]
+    fn control_word(&self) -> u16 {
+        let at = FPU_CONTROL.0 as usize;
+        u16::from_le_bytes([self.regs[at], self.regs[at + 1]])
+    }
+
+    /// A float operation of a lifted body that loads the control word, on its `f64` registers,
+    /// rounded as the word says. `native` is the operation done in `f64`: what the processor gives
+    /// to nearest at 53 bits, and narrowed to a normal `f32` at 24. Any other rounding, or a
+    /// result past single precision's range at 24 bits, is the x87's own on the operands widened,
+    /// which hold them exactly, rounded once into an `f64`.
+    #[inline]
+    fn controlled(&self, code: Code, inputs: &[f64], native: f64) -> f64 {
+        let word = self.control_word();
+        if word & 0xc00 == 0 {
+            if word & 0x300 != 0 {
+                return native;
+            }
+            let narrow = native as f32;
+            if narrow.is_normal() {
+                return f64::from(narrow);
+            }
+        }
+        let mut widened = [(0, 10); 2];
+        for (place, &x) in widened.iter_mut().zip(inputs) {
+            place.0 = f64_to_f80(x);
+        }
+        f64::from_bits(x87::compute(code, 8, &widened[..inputs.len()], self.control()).unwrap_or_else(|e| panic!("{code:?}: {e}")) as u64)
+    }
+
+    #[inline]
+    pub fn f64_add(&self, a: f64, b: f64) -> f64 {
+        self.controlled(Code::FAdd, &[a, b], a + b)
+    }
+
+    #[inline]
+    pub fn f64_sub(&self, a: f64, b: f64) -> f64 {
+        self.controlled(Code::FSub, &[a, b], a - b)
+    }
+
+    #[inline]
+    pub fn f64_mult(&self, a: f64, b: f64) -> f64 {
+        self.controlled(Code::FMult, &[a, b], a * b)
+    }
+
+    #[inline]
+    pub fn f64_div(&self, a: f64, b: f64) -> f64 {
+        self.controlled(Code::FDiv, &[a, b], a / b)
+    }
+
+    #[inline]
+    pub fn f64_sqrt(&self, a: f64) -> f64 {
+        self.controlled(Code::FSqrt, &[a], a.sqrt())
+    }
+
+    /// `x` stored as a 4-byte float, rounded the way the control word says.
+    #[inline]
+    pub fn f64_to_4(&self, x: f64) -> u32 {
+        if self.control_word() & 0xc00 == 0 {
+            return (x as f32).to_bits();
+        }
+        x87::compute(Code::Float2Float, 4, &[(f64_to_f80(x), 10)], self.control()).unwrap_or_else(|e| panic!("Float2Float: {e}")) as u32
+    }
+
+    /// `x` rounded to an integer in the direction the control word says.
+    #[inline]
+    pub fn to_integral(&self, x: f64) -> f64 {
+        match self.control_word() >> 10 & 3 {
+            0 => x.round_ties_even(),
+            1 => x.floor(),
+            2 => x.ceil(),
+            _ => x.trunc(),
+        }
     }
 
     fn control(&self) -> x87::Control {

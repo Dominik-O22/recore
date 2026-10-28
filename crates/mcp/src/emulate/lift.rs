@@ -735,6 +735,8 @@ struct Values<'a> {
     uniques: &'a BTreeMap<u64, usize>,
     /// Whether the body keeps the x87 registers as f64 (`native_float`).
     fast: bool,
+    /// Whether its f64 results round as the control word says at run time (`native_float`).
+    controlled: bool,
     /// The temporaries to fold, by offset and size.
     folds: &'a BTreeSet<(u64, usize)>,
     /// A folded temporary's expression until its reader takes it, and whether it is an f64.
@@ -843,19 +845,23 @@ impl Values<'_> {
     }
 }
 
-/// A float op of a fast body as Rust on `f64`, which computes what the x87 does with the
-/// control word the game keeps outside the bodies that load one: 53 bits, to nearest (0x27f;
-/// docs/design/lifting.md). `f` reads an input as an f64, `i` as bits. Answers the expression
-/// and whether it is an f64.
-fn native_float(op: &Op, f: &dyn Fn(usize) -> String, i: &dyn Fn(usize) -> String) -> Option<(String, bool)> {
+/// A float op of a body that keeps the x87 registers as `f64`, as Rust. Most bodies compute what
+/// the x87 does with the control word a program keeps outside the bodies that load one: 53 bits,
+/// to nearest (0x27f; docs/design/lifting.md). A body that loads one is `controlled`: it rounds
+/// each result to the precision the control word holds as it runs, and to an integer the way it
+/// says (`Cpu::f64_add` and its kin, `Cpu::to_integral`). `f` reads an input as an f64, `i` as
+/// bits.
+/// Answers the expression and whether it is an f64.
+fn native_float(op: &Op, controlled: bool, f: &dyn Fn(usize) -> String, i: &dyn Fn(usize) -> String) -> Option<(String, bool)> {
     let sizes: Vec<usize> = op.inputs.iter().map(|v| v.size).collect();
-    let binary = |sign: &str| format!("({} {sign} {})", f(0), f(1));
+    let binary = |sign: &str, method: &str| if controlled { format!("{{ let (a, b) = ({}, {}); c.{method}(a, b) }}", f(0), f(1)) } else { format!("({} {sign} {})", f(0), f(1)) };
     let compare = |sign: &str| format!("(({} {sign} {}) as u8)", f(0), f(1));
     Some(match (op.code, sizes.as_slice(), op.out?.size) {
-        (Code::FAdd, [10, 10], 10) => (binary("+"), true),
-        (Code::FSub, [10, 10], 10) => (binary("-"), true),
-        (Code::FMult, [10, 10], 10) => (binary("*"), true),
-        (Code::FDiv, [10, 10], 10) => (binary("/"), true),
+        (Code::FAdd, [10, 10], 10) => (binary("+", "f64_add"), true),
+        (Code::FSub, [10, 10], 10) => (binary("-", "f64_sub"), true),
+        (Code::FMult, [10, 10], 10) => (binary("*", "f64_mult"), true),
+        (Code::FDiv, [10, 10], 10) => (binary("/", "f64_div"), true),
+        (Code::FSqrt, [10], 10) if controlled => (format!("{{ let x = {}; c.f64_sqrt(x) }}", f(0)), true),
         (Code::FSqrt, [10], 10) => (format!("{}.sqrt()", f(0)), true),
         (Code::FNeg, [10], 10) => (format!("(-{})", f(0)), true),
         (Code::FAbs, [10], 10) => (format!("{}.abs()", f(0)), true),
@@ -867,9 +873,11 @@ fn native_float(op: &Op, f: &dyn Fn(usize) -> String, i: &dyn Fn(usize) -> Strin
         (Code::Copy | Code::Float2Float, [10], 10) => (f(0), true),
         (Code::Float2Float, [4], 10) => (format!("f64::from(f32::from_bits({}))", i(0)), true),
         (Code::Float2Float, [8], 10) => (format!("f64::from_bits({})", i(0)), true),
+        (Code::Float2Float, [10], 4) if controlled => (format!("{{ let x = {}; c.f64_to_4(x) }}", f(0)), false),
         (Code::Float2Float, [10], 4) => (format!("({} as f32).to_bits()", f(0)), false),
         (Code::Float2Float, [10], 8) => (format!("{}.to_bits()", f(0)), false),
         (Code::Int2Float, [n @ (1 | 2 | 4 | 8)], 10) => (format!("({} as f64)", signed_of(&i(0), *n)), true),
+        (Code::Round, [10], 10) if controlled => (format!("{{ let x = {}; c.to_integral(x) }}", f(0)), true),
         (Code::Round, [10], 10) => (format!("{}.round_ties_even()", f(0)), true),
         (Code::Trunc, [10], 10) => (format!("{}.trunc()", f(0)), true),
         (Code::Ceil, [10], 10) => (format!("{}.ceil()", f(0)), true),
@@ -1074,7 +1082,7 @@ impl Values<'_> {
                 let out = op.out.expect("op out");
                 if fast {
                     let f = |i: usize| self.read_f(op.inputs[i]);
-                    if let Some((value, float)) = native_float(op, &f, &r) {
+                    if let Some((value, float)) = native_float(op, self.controlled, &f, &r) {
                         return if float { self.write_f(out, value) } else { self.write(out, value) };
                     }
                 }
@@ -2066,9 +2074,8 @@ pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program>
         let (_, offset, size) = binary.register(name)?;
         read.extend(offset..offset + size as u64);
     }
-    // A body keeps the x87 registers as f64 unless it loads the control word, as the C
-    // runtime's math functions do around their extended-precision work; LIFT_X87_EXACT keeps
-    // every body extended, to compare.
+    // A body keeps the x87 registers as f64, and one that loads the control word rounds as it
+    // says at run time (`native_float`). LIFT_X87_EXACT keeps every body extended, to compare.
     let (_, control, _) = binary.register("FPUControlWord")?;
     let exact_everywhere = std::env::var_os("LIFT_X87_EXACT").is_some();
     // With every entry known, each body is split into blocks at each place control can enter it
@@ -2094,7 +2101,7 @@ pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program>
             Semantics::Pcode(Ok(ops)) => ops.iter().any(|op| op.out.is_some_and(|o| o.space == REGISTER && (o.offset..o.offset + o.size as u64).contains(&control))),
             _ => false,
         });
-        let fast = !exact_everywhere && !loads_control;
+        let fast = !exact_everywhere;
         let calls = CallCtx { reads: &read_of, kind: kind_here, returned: returned[group], touches_x87: touches_x87[group], fast, names: &names };
         let mut blocks: Vec<Block> = Vec::new();
         let used: RefCell<BTreeSet<(u64, usize, bool)>> = RefCell::new(BTreeSet::new());
@@ -2150,7 +2157,7 @@ pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program>
                     let none = BTreeSet::new();
                     let dead = if inner { vec![false; ops.len()] } else { walk_ops(ops, live_out[position], &read_of, kind_here).1 };
                     let folded = if inner { none } else { folds(ops, &dead, &uniques) };
-                    let values = Values { uniques: &uniques, fast, folds: &folded, pending: RefCell::new(BTreeMap::new()), used: &used, read: &read, tables: &tables, inner };
+                    let values = Values { uniques: &uniques, fast, controlled: loads_control, folds: &folded, pending: RefCell::new(BTreeMap::new()), used: &used, read: &read, tables: &tables, inner };
                     if inner {
                         write!(body, " {{ let mut i: i64 = 0; 'ops: loop {{ match i {{")?;
                         for (here, op) in ops.iter().enumerate() {
