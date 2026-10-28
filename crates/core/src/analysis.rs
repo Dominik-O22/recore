@@ -107,7 +107,7 @@ fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool, tables: &[(u
         // function a body runs on into with `lea eax, [eax+0]`. Code goes on unless its last
         // instruction is a jump, a return, a halt or a call.
         let goes_on = body_end > start && function.controls.last().is_none_or(|c| c.next < body_end || matches!(c.flow, Flow::Branch(_)));
-        if goes_on && let Some((_, to)) = code_pieces(start, end, tables).find(|&(_, to)| to > body_end) && let Some(bytes) = image.bytes_from(body_end) {
+        if goes_on && let Some((_, to)) = code_pieces(start, end, tables).find(|&(from, to)| from <= body_end && to > body_end) && let Some(bytes) = image.bytes_from(body_end) {
             let bytes = &bytes[..bytes.len().min((to - body_end) as usize)];
             let runs = A::decode(image, bytes, body_end).map_while(|decoded| decoded.insn.filter(|insn| A::is_padding(insn) && A::flow(insn, &A::State::default(), image).is_none()).map(|_| decoded.next_addr()));
             body_end = runs.last().unwrap_or(body_end);
@@ -284,9 +284,10 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program, mut r
                 }
                 // Running on into the next function is a tail call of it, when code leads
                 // right up to its entry. Elsewhere than where functions run on, code that runs
-                // off the end right after a call does so because the call never returns: a
-                // compiler that knows emits nothing after it. Code that gets there any other way
-                // falls through, as Watcom's runtime runs a load on into a `ret` it shares.
+                // off the end with no control since a call does so because the call never
+                // returns: a compiler that knows emits nothing after it but padding. Code that
+                // gets there any other way falls through, as Watcom's runtime runs a load on into
+                // a `ret` it shares.
                 // Hand-written code such as MSVC's `cos` also calls a loader and comes back right
                 // at the entry of the routine it shares, which takes a callee with a return.
                 let came_back = called && run_start == boundary;
@@ -1060,11 +1061,16 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     data_refs.dedup();
     // A body that ends where another function begins runs on into it, unless its last
     // instruction sends control elsewhere. Elsewhere than where functions run on, as `walk`
-    // has it, one whose last control is a call does not, as that call never returns, unless the
-    // call is the last instruction and goes to a function with a return.
+    // has it, only code that falls through to the end does: code after the last control when
+    // that is a conditional branch, or when a branch or jump lands there. Code after a call that
+    // never returns is padding. A call that is the last instruction runs on too when it goes to
+    // a function with a return.
     let has_return = |entry: u64| functions.binary_search_by_key(&entry, |f| f.start).is_ok_and(|index| functions[index].controls.iter().any(|c| c.flow == Flow::Return));
     let runs_on = |f: &Function| {
-        let after_call = f.controls.last().is_some_and(|control| matches!(control.flow, Flow::Call(_) | Flow::CallIndirect(_)));
+        let falls_through = f.controls.last().is_none_or(|last| {
+            matches!(last.flow, Flow::Branch(_))
+                || (last.next < f.end && f.controls.iter().any(|c| matches!(c.flow, Flow::Jump(target) | Flow::Branch(target) if target >= last.next && target < f.end)))
+        });
         let last = f.controls.last().filter(|control| control.next == f.end);
         let stops = last.is_some_and(|control| match control.flow {
             Flow::Jump(_) | Flow::JumpIndirect(_) | Flow::Return | Flow::Halt => true,
@@ -1073,7 +1079,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         });
         let comes_back = !stops && last.is_some_and(|control| matches!(control.flow, Flow::Call(target) if has_return(target)));
         let code_to_end = code_pieces(f.start, f.end, inline_tables).last().is_some_and(|(from, to)| from < to && to == f.end);
-        (((A::RUNS_ON || !after_call) && !stops) || comes_back).then_some(f.end).filter(|&end| is_start(end) && code_to_end)
+        ((A::RUNS_ON && !stops) || falls_through || comes_back).then_some(f.end).filter(|&end| is_start(end) && code_to_end)
     };
     Analysis {
         sends,
@@ -1149,6 +1155,21 @@ mod tests {
         let load = function(&functions, 0x401010);
         assert!(!load.noreturn);
         assert_eq!(load.runs_on, Some(0x401015));
+    }
+
+    /// Code after the last `ret` that a branch leads to runs on into the next function as well.
+    #[test]
+    fn code_a_branch_leads_to_after_a_return_runs_on() {
+        #[rustfmt::skip]
+        const BRANCH_PAST_RET: [u8; 10] = [
+            0x85, 0xc9,                    // test ecx, ecx
+            0x75, 0x01,                    // jnz 0x401015
+            0xc3,                          // ret
+            0xb8, 0x01, 0x00, 0x00, 0x00,  // 0x401015  mov eax, 1
+        ];
+        let functions = analyze(&[(0x401010, &BRANCH_PAST_RET), (0x40101a, &[RET])]);
+
+        assert_eq!(function(&functions, 0x401010).runs_on, Some(0x40101a));
     }
 
     /// Watcom aligns the function a body runs on into with `lea eax, [eax+0]`, which runs too.
