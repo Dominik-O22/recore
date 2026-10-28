@@ -26,9 +26,11 @@ use serde::Deserialize;
 
 use crate::binary::Binary;
 
+mod lift;
 mod snapshot;
 mod sse;
 mod windows;
+pub mod workspace;
 mod x87;
 
 pub use snapshot::Snapshot;
@@ -146,8 +148,8 @@ enum Userop {
     Sse(sse::Op),
     /// Nothing a function can observe: see [`HARMLESS`].
     Harmless,
-    /// What stops a run, as the run says it.
-    Stop(String),
+    /// Any other operation, by name: a run stops at it, and the lifter runs a few.
+    Other(String),
 }
 
 impl Userop {
@@ -155,9 +157,13 @@ impl Userop {
         match sse::Op::parse(name) {
             Some(op) if has_out => Userop::Sse(op),
             _ if HARMLESS.iter().any(|harmless| harmless.eq_ignore_ascii_case(name)) => Userop::Harmless,
-            _ if name.is_empty() => Userop::Stop("an unnamed processor operation is not run".into()),
-            _ => Userop::Stop(format!("the processor operation {name} is not run")),
+            _ => Userop::Other(name.into()),
         }
+    }
+
+    /// Why a run stops at an operation that is neither harmless nor in [`sse`].
+    fn stop(name: &str) -> String {
+        if name.is_empty() { "an unnamed processor operation is not run".into() } else { format!("the processor operation {name} is not run") }
     }
 }
 
@@ -180,6 +186,16 @@ enum Semantics {
     Pcode(Result<Vec<Op>, String>),
     /// An x87 instruction run whole, which the specification leaves opaque or approximate.
     X87(x87::Instruction),
+}
+
+impl Semantics {
+    /// What `instruction` does: on x86 an x87 instruction runs whole, anything else as its p-code.
+    fn of(spaces: &mut Spaces, instruction: &recore_decomp::Instruction, x86: bool) -> Semantics {
+        match instruction.text.split(' ').next().and_then(x87::Instruction::parse) {
+            Some(whole) if x86 => Semantics::X87(whole),
+            _ => Semantics::Pcode(instruction.pcode.iter().map(|line| parse_op(spaces, line)).collect::<Result<Vec<_>>>().map_err(|error| format!("{error:#}"))),
+        }
+    }
 }
 
 fn operand(spaces: &mut Spaces, text: &str) -> Result<Varnode> {
@@ -906,10 +922,7 @@ impl<'a> Emulator<'a> {
                 break;
             }
             let x86 = matches!(self.binary.program.image.machine, Machine::X86 | Machine::X86_64);
-            let semantics = match instruction.text.split(' ').next().and_then(x87::Instruction::parse) {
-                Some(whole) if x86 => Semantics::X87(whole),
-                _ => Semantics::Pcode(instruction.pcode.iter().map(|line| parse_op(&mut self.spaces, line)).collect::<Result<Vec<_>>>().map_err(|error| format!("{error:#}"))),
-            };
+            let semantics = Semantics::of(&mut self.spaces, &instruction, x86);
             self.lifted.entry(instruction.addr).or_insert_with(|| Rc::new(Lifted { len: instruction.len, semantics }));
         }
         self.lifted.get(&pc).cloned().ok_or_else(|| format!("no instruction decodes at {pc:#x}"))
@@ -971,7 +984,7 @@ impl<'a> Emulator<'a> {
                         }
                     }
                     Userop::Harmless => {}
-                    Userop::Stop(why) => return Err(why.clone()),
+                    Userop::Other(name) => return Err(Userop::stop(name)),
                 },
                 Code::Unimplemented => return Err(UNIMPLEMENTED.into()),
                 code => {
@@ -1590,7 +1603,7 @@ fn function_entry(binary: &Binary, function: &str) -> Result<u64> {
 fn stops_on(op: &Op) -> Option<String> {
     let widest = op.out.iter().chain(&op.inputs).map(|place| place.size).max().unwrap_or(0);
     match (op.code, &op.userop) {
-        (Code::CallOther, Userop::Stop(why)) => Some(why.clone()),
+        (Code::CallOther, Userop::Other(name)) => Some(Userop::stop(name)),
         // A harmless operation reads none of its operands.
         (Code::CallOther, Userop::Harmless) => None,
         (Code::Unimplemented, _) => Some(UNIMPLEMENTED.into()),

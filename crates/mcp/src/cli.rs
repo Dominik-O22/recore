@@ -17,7 +17,9 @@ const FLAGS: [&str; 6] = ["pcode", "returns", "full", "addresses", "refused", "c
 pub fn usage() -> String {
     let mut text = String::from(
         "recore-mcp                               serve the Model Context Protocol on stdin and stdout\n\
-         recore-mcp <tool> <binary> [arguments]   run one tool and print its answer\n\n\
+         recore-mcp <tool> <binary> [arguments]   run one tool and print its answer\n\
+         recore-mcp lift --config <lift.toml> [--out <dir>]\n\
+         \x20                                        lift a 32-bit x86 program to Rust, as a cargo workspace\n\n\
          Plain arguments are what the tool looks up: a pattern, an address, a function name, or\n\
          several functions for `decompile`. Other arguments are options, such as --limit 20.\n\
          `recore-mcp <tool> --help` describes one tool and each of its options.\n\n",
