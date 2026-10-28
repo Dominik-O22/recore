@@ -818,12 +818,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "recore-machine"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "libc",
+]
+
+[[package]]
 name = "recore-mcp"
 version = "0.2.0"
 dependencies = [
  "anyhow",
  "recore",
  "recore-decomp",
+ "recore-machine",
  "regex",
  "serde",
  "serde_json",
