@@ -27,7 +27,7 @@ jobs:
           # The player is a workspace of its own; cpal plays through ALSA on Linux.
           - name: player
             workspace: player
-            run: sudo apt-get install -y libasound2-dev && cd player && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
+            run: sudo apt-get update && sudo apt-get install -y libasound2-dev && cd player && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
     env:
       # sccache caches each rustc and C++ compile by content, so the engine's 83 files and the crates
       # a change leaves alone come from the cache even though checkout touches every file.

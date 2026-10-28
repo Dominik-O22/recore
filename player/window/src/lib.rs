@@ -191,7 +191,7 @@ fn save_png(path: &std::path::Path, frame: &Frame) -> anyhow::Result<()> {
 }
 
 /// Runs `game` to its end on a stack deep enough for the lifted code: a thread of its own
-/// natively; wasm's one stack is sized when it is linked (tools/web.sh).
+/// natively; wasm's one stack is sized when the game's wasm build links it.
 pub fn on_game_stack(game: impl FnOnce() + Send + 'static) {
     #[cfg(not(target_family = "wasm"))]
     std::thread::Builder::new().name("game".into()).stack_size(1 << 30).spawn(game).expect("the game thread").join().ok();

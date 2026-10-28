@@ -1,6 +1,5 @@
-//! ole32, advapi32, and what a game can run without: window chrome, dialogs, the console, the
-//! DirectSound functions dsound.rs does not have, a light gun's driver, and the Miles functions
-//! miles.rs does not have, which answer 0.
+//! ole32, advapi32, and what a game can run without: window chrome, dialogs, the console, a
+//! light gun's driver, and the Miles functions miles.rs does not have, which answer 0.
 
 use recore_machine::{Cpu, Frame};
 
@@ -87,9 +86,6 @@ pub fn run(w: &mut Win32, c: &mut Cpu, dll: &str, name: &str, f: Frame) -> bool 
         (_, "RegSetValueExA") => c.ret(f, Some(0), 6),
         (_, "RegCloseKey") => c.ret(f, Some(0), 1),
         (_, "GetOpenFileNameA") => c.ret(f, Some(0), 1),
-        // The DirectSound functions lib.rs does not make an object for, DirectSoundCreate8 among
-        // them, fail with DSERR_NODRIVER, and the game goes on without them.
-        (d, _) if d.eq_ignore_ascii_case("dsound.dll") => c.ret(f, Some(0x8878_0078), 3),
         // gamebios.dll, an arcade port's light gun driver: no gun is attached. Its functions take
         // their arguments in registers.
         (d, _) if d.eq_ignore_ascii_case("gamebios.dll") => c.ret(f, Some(0), 0),

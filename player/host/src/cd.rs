@@ -1,7 +1,7 @@
 //! The CD's music, which the game plays through MCI command strings (`mciSendStringA`) in the
 //! time format tmsf: a position is a track, then minutes, seconds and frames (75 a second) into
 //! it. The audio tracks are Ogg Vorbis files of 44100 Hz stereo, trackNN.ogg in TT_CD (default
-//! cd, which scripts/cd_tracks.py writes from the disc image); track 1 is the game's data. Without
+//! cd, as a game's tools write them from its disc image); track 1 is the game's data. Without
 //! them the game finds no CD audio device and plays no music. A track is decoded when it first
 //! plays, which takes about a millisecond for each second of music.
 //!

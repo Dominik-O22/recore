@@ -47,7 +47,7 @@ fn relative(root: &str, cwd: &str, path: &str) -> String {
     let path = path.replace('/', "\\");
     let lower = path.to_lowercase();
     let root = root.to_lowercase();
-    let rest = if let Some(r) = lower.strip_prefix(&root) {
+    let rest = if let Some(r) = lower.strip_prefix(&root).filter(|r| r.is_empty() || r.starts_with('\\')) {
         path[path.len() - r.len()..].trim_start_matches('\\').to_string()
     } else if lower.len() > 1 && lower.as_bytes()[1] == b':' {
         path[2..].trim_start_matches('\\').to_string()
@@ -456,5 +456,6 @@ mod tests {
         assert_eq!(relative("C:\\GAME", "", "D:\\DATA\\a.bin"), "DATA\\a.bin");
         assert_eq!(relative("C:\\GAME", "DATA", ".\\a.bin"), "DATA\\a.bin");
         assert_eq!(relative("C:\\GAME", "DATA", "..\\b/../a.bin"), "a.bin");
+        assert_eq!(relative("C:\\GAME", "", "C:\\GAMES\\a.bin"), "GAMES\\a.bin");
     }
 }

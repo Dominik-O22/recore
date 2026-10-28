@@ -1,4 +1,4 @@
-//! The web page's audio worklet (web/src/audio.ts), which plays stereo frames from a ring the
+//! The web page's audio worklet, which plays stereo frames from a ring the
 //! game's worker fills: the mixer runs here, on the game's thread, and [`Audio::pump`] keeps the
 //! ring a little ahead of what the worklet has played.
 
