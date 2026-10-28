@@ -1318,3 +1318,109 @@ mod tests {
         assert_eq!(sets, [(0x1000, InstructionSet::A32), (0x100C, InstructionSet::Thumb)]);
     }
 }
+
+#[cfg(test)]
+mod exhaustive {
+    use super::*;
+    use crate::image::{Format, Machine};
+    use rayon::prelude::*;
+
+    const BASE: u64 = 0x10000;
+    const AT: usize = 0x1000;
+
+    /// Every 32-bit `word` at `AT` in `set`, decoded from `from` (an instruction before it may
+    /// sit in between), through every per-instruction query, from an empty state and from one
+    /// where each register holds a constant. Panics with the words that panicked.
+    fn every_word(set: InstructionSet, before: &[u8]) {
+        let section = Section { name: ".text".into(), addr: BASE, data: vec![0; 2 * AT], file_offset: None, executable: true, writable: false };
+        let mut image = Image::bare(String::new(), Format::Elf, Machine::Arm, BASE, vec![section]);
+        image.instruction_sets = vec![(BASE, set)];
+        image.data_in_code = true;
+        let from = AT - before.len();
+        std::panic::set_hook(Box::new(|_| {}));
+        let start = std::time::Instant::now();
+        let panics: Vec<(u32, String)> = (0..=u32::MAX >> 16)
+            .into_par_iter()
+            .flat_map_iter(|high| {
+                let mut bytes: Vec<u8> = (0..2 * AT).map(|i| (i * 37) as u8).collect();
+                bytes[from..AT].copy_from_slice(before);
+                let mut found = Vec::new();
+                for low in 0..=0xFFFF {
+                    let word = high << 16 | low;
+                    bytes[AT..AT + 4].copy_from_slice(&word.to_le_bytes());
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut decoder = Arm::decoder(&image, &bytes, BASE);
+                        Arm::seek(&mut decoder, from);
+                        let mut constant = State::default();
+                        for (r, value) in constant.registers.iter_mut().enumerate() {
+                            *value = Value::Const(word.rotate_left(r as u32));
+                        }
+                        while let Some(decoded) = Arm::decode_next(&mut decoder) {
+                            let at = decoded.addr;
+                            let Some(&insn) = decoded.insn else { break };
+                            if at < BASE + AT as u64 {
+                                continue;
+                            }
+                            for mut state in [State::default(), constant] {
+                                std::hint::black_box((
+                                    Arm::flow(&insn, &state, &image),
+                                    Arm::address_taken(&insn, &state, &image),
+                                    Arm::data_address(&insn, &state),
+                                    Arm::based_data_address(&insn, &state),
+                                    Arm::memory_reference(&insn, &state),
+                                    Arm::literal(&insn, &state),
+                                    Arm::offset_address(&insn, &state),
+                                    Arm::through_pointer(&insn, &state),
+                                    Arm::argument_write(&insn, &state),
+                                    Arm::field_use(&insn),
+                                    Arm::is_padding(&insn),
+                                    Arm::ends_code(&insn),
+                                    Arm::is_entry_marker(&insn),
+                                    Arm::opens_landing_pad(&insn),
+                                ));
+                                let branched = Arm::branch(&mut { state }, &insn);
+                                std::hint::black_box(Arm::after_jump(branched, &insn));
+                                Arm::step(&mut state, &insn);
+                            }
+                            break;
+                        }
+                    }));
+                    if let Err(error) = result {
+                        let message = error.downcast_ref::<String>().cloned().or_else(|| error.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+                        found.push((word, message));
+                    }
+                }
+                found
+            })
+            .collect();
+        let _ = std::panic::take_hook();
+        eprintln!("{set:?} after {before:02x?}: {} words in {:.1?}, {} panicked", 1u64 << 32, start.elapsed(), panics.len());
+        let mut by_message: std::collections::BTreeMap<&str, Vec<u32>> = Default::default();
+        for (word, message) in &panics {
+            by_message.entry(message).or_default().push(*word);
+        }
+        for (message, words) in &by_message {
+            eprintln!("{:>10} {message}: first {:08x}", words.len(), words[0]);
+        }
+        assert!(panics.is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn every_a32_word() {
+        every_word(InstructionSet::A32, &[]);
+    }
+
+    #[test]
+    #[ignore]
+    fn every_thumb_word() {
+        every_word(InstructionSet::Thumb, &[]);
+    }
+
+    /// After `ITTTE EQ`, so the word is the first of four conditional instructions.
+    #[test]
+    #[ignore]
+    fn every_thumb_word_in_an_it_block() {
+        every_word(InstructionSet::Thumb, &0xBF03u16.to_le_bytes());
+    }
+}
