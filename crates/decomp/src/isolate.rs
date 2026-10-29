@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use recore::image::{Format, Machine};
-use recore::report::{Analysis, CallTarget};
+use recore::report::{Analysis, CallSite, CallTarget};
 use serde::{Deserialize, Serialize};
 
 use recore::edits::Edits;
@@ -194,7 +194,8 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     edits.apply(&mut analysis);
     facts.names = crate::facts::function_names(&analysis);
     let aliases: HashSet<u64> = facts.import_aliases.iter().map(|alias| alias.0).collect();
-    let (calls, tail_callees) = call_graph(&analysis);
+    let calls = Calls::new(&analysis);
+    let tail_callees = calls.tail_callees();
     // A function that only jumps to another, as an incremental linker's stub does, is described
     // by what that one's debug information says.
     let importer = debug.as_ref().map(|debug| {
@@ -312,8 +313,8 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         /// Functions between one that takes a format and the library routine it ends in.
         const DEPTH: usize = 3;
         let library = |slot: &u64| analysis.imports.iter().find(|import| import.slot == *slot).is_some_and(|import| takes_argument_list(&import.name));
-        fn reaches(calls: &CallGraph, library: &dyn Fn(&u64) -> bool, entry: u64, depth: usize) -> bool {
-            calls.get(&entry).into_iter().flatten().any(|target| match target {
+        fn reaches(calls: &Calls, library: &dyn Fn(&u64) -> bool, entry: u64, depth: usize) -> bool {
+            calls.of(entry).any(|call| match &call.target {
                 CallTarget::Import(slot) => library(slot),
                 CallTarget::Function(callee) => depth > 0 && reaches(calls, library, *callee, depth - 1),
             })
@@ -342,12 +343,9 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     let hands_on_registers = image.machine == Machine::I8051;
     let callees_first = options.callees_first && !hands_on_registers;
     session.keep_prototypes(callees_first);
-    // What each function calls: with debug information, the functions whose prototypes its
-    // calls need.
-    let functions = |targets: &Vec<CallTarget>| targets.iter().filter_map(|target| if let CallTarget::Function(entry) = target { Some(*entry) } else { None }).collect();
-    let called: HashMap<u64, Vec<u64>> = if callees_first || importer.is_some() { calls.iter().map(|(&owner, targets)| (owner, functions(targets))).collect() } else { HashMap::new() };
-    let none = HashMap::new();
-    let callees = if callees_first { &called } else { &none };
+    // The functions the function at `entry` calls: with debug information, those whose
+    // prototypes its calls need.
+    let callees = |entry: u64| calls.of(entry).filter_map(|call| if let CallTarget::Function(callee) = call.target { Some(callee) } else { None });
     // A function that ends by jumping to another returns what that one returns, which the
     // engine only learns if the other is decompiled first: `tail_callees`.
     // A function jumped to takes its parameters from the function that jumps, which therefore
@@ -393,7 +391,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     // gone in first; and the arguments of the formats its calls pass.
     let mut prepare = |session: &mut Session, importer: &mut Option<crate::types::Importer>, edits: &Edits, entry: u64, with_callees: bool| {
         if let Some(importer) = importer {
-            let callees = called.get(&entry).into_iter().flatten().copied().filter(|_| with_callees);
+            let callees = callees(entry).filter(|_| with_callees);
             importer.functions(session, std::iter::once(entry).chain(callees));
             let given = if lazy_globals { importer.globals_at(session, referred(entry)) } else { Vec::new() };
             if !given.is_empty() {
@@ -424,7 +422,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         let request: Request = serde_json::from_str(&line?)?;
         let small = |callee: &u64| !known.contains(callee) && sizes.get(callee).is_some_and(|&size| size <= CALLEE_LIMIT);
         let unknown = |addr: u64| {
-            let mut pending: Vec<u64> = callees.get(&addr).into_iter().flatten().copied().filter(small).collect();
+            let mut pending: Vec<u64> = if callees_first { callees(addr).filter(small).collect() } else { Vec::new() };
             pending.sort_unstable();
             pending.dedup();
             // Then the functions it jumps to, each after the ones that one jumps to in turn.
@@ -651,28 +649,62 @@ fn tail_chain(tail_callees: &CallGraph, addr: u64, wanted: &impl Fn(&u64) -> boo
     }
 }
 
-/// What each function calls, by entry point, imports included: every call, and apart the jumps
-/// that leave the function for good.
+/// What each function calls, by entry point, imports included: the jumps that leave the
+/// function for good, as [`Calls::tail_callees`] lists them.
 type CallGraph = HashMap<u64, Vec<CallTarget>>;
 
-fn call_graph(analysis: &Analysis) -> (CallGraph, CallGraph) {
-    let mut extents: Vec<(u64, u64, u64)> =
-        analysis.functions.iter().flat_map(|f| f.ranges.iter().map(move |&(start, end)| (start, end, f.fragment_of.unwrap_or(f.addr)))).collect();
-    extents.sort_unstable();
-    let (mut all, mut tail) = (CallGraph::new(), CallGraph::new());
-    for call in &analysis.calls {
-        let index = extents.partition_point(|extent| extent.0 <= call.at);
-        if let Some(&(_, end, owner)) = index.checked_sub(1).map(|i| &extents[i])
-            && call.at < end
-            && call.target != CallTarget::Function(owner)
-        {
-            all.entry(owner).or_default().push(call.target);
-            if call.tail && !call.conditional {
+/// What each function calls, read off the analysis's calls in its code, where a map of them
+/// all would hold a large binary's millions of calls twice. A call is in the function whose
+/// range it lies in, of those that start last at or before it, and a call to the function
+/// itself counts for none.
+struct Calls<'a> {
+    /// Sorted by address.
+    calls: &'a [CallSite],
+    /// Every range of code, `(start, end, owner)`, sorted: `owner` is the entry of the function
+    /// the range is part of.
+    ranges: Vec<(u64, u64, u64)>,
+    /// Indexes into `ranges`, by owner and then by start.
+    by_owner: Vec<usize>,
+}
+
+impl<'a> Calls<'a> {
+    fn new(analysis: &'a Analysis) -> Calls<'a> {
+        let mut ranges: Vec<(u64, u64, u64)> =
+            analysis.functions.iter().flat_map(|f| f.ranges.iter().map(move |&(start, end)| (start, end, f.fragment_of.unwrap_or(f.addr)))).collect();
+        ranges.sort_unstable();
+        let mut by_owner: Vec<usize> = (0..ranges.len()).collect();
+        by_owner.sort_by_key(|&index| ranges[index].2);
+        Calls { calls: &analysis.calls, ranges, by_owner }
+    }
+
+    /// The calls in range `index`: up to its end, or to where the next range starts.
+    fn in_range(&self, index: usize) -> &'a [CallSite] {
+        let (start, end, _) = self.ranges[index];
+        let end = self.ranges.get(index + 1).map_or(end, |next| end.min(next.0));
+        let calls = self.calls;
+        &calls[calls.partition_point(|call| call.at < start)..calls.partition_point(|call| call.at < end.max(start))]
+    }
+
+    /// The calls of the function at `entry`, in address order.
+    fn of(&self, entry: u64) -> impl Iterator<Item = &'a CallSite> + '_ {
+        let first = self.by_owner.partition_point(|&index| self.ranges[index].2 < entry);
+        self.by_owner[first..]
+            .iter()
+            .take_while(move |&&index| self.ranges[index].2 == entry)
+            .flat_map(|&index| self.in_range(index))
+            .filter(move |call| call.target != CallTarget::Function(entry))
+    }
+
+    /// The jumps each function leaves by for good, by entry point.
+    fn tail_callees(&self) -> CallGraph {
+        let mut tail = CallGraph::new();
+        for (index, &(_, _, owner)) in self.ranges.iter().enumerate() {
+            for call in self.in_range(index).iter().filter(|call| call.tail && !call.conditional && call.target != CallTarget::Function(owner)) {
                 tail.entry(owner).or_default().push(call.target);
             }
         }
+        tail
     }
-    (all, tail)
 }
 
 /// A worker gets this long to load its binary and declare every function.
