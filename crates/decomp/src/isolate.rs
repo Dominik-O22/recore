@@ -191,11 +191,11 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     edits.apply(&mut analysis);
     facts.names = crate::facts::function_names(&analysis);
     let aliases: HashSet<u64> = facts.import_aliases.iter().map(|alias| alias.0).collect();
+    let (calls, tail_callees) = call_graph(&analysis);
     // A function that only jumps to another, as an incremental linker's stub does, is described
     // by what that one's debug information says.
     let importer = debug.as_ref().map(|debug| {
-        let jumps = callees_of(&analysis, true);
-        let stub = |f: &recore::report::AnalyzedFunction| match jumps.get(&f.addr)?.as_slice() {
+        let stub = |f: &recore::report::AnalyzedFunction| match tail_callees.get(&f.addr)?.as_slice() {
             [CallTarget::Function(target)] if f.thunk && f.fragment_of.is_none() => Some((f.addr, *target)),
             _ => None,
         };
@@ -304,14 +304,14 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         /// Functions between one that takes a format and the library routine it ends in.
         const DEPTH: usize = 3;
         let library = |slot: &u64| analysis.imports.iter().find(|import| import.slot == *slot).is_some_and(|import| takes_argument_list(&import.name));
-        let calls = callees_of(&analysis, false);
-        fn reaches(calls: &HashMap<u64, Vec<CallTarget>>, library: &dyn Fn(&u64) -> bool, entry: u64, depth: usize) -> bool {
+        fn reaches(calls: &CallGraph, library: &dyn Fn(&u64) -> bool, entry: u64, depth: usize) -> bool {
             calls.get(&entry).into_iter().flatten().any(|target| match target {
                 CallTarget::Import(slot) => library(slot),
                 CallTarget::Function(callee) => depth > 0 && reaches(calls, library, *callee, depth - 1),
             })
         }
-        move |entry: u64| passed_formats.contains(&entry) || reaches(&calls, &library, entry, DEPTH)
+        let calls = &calls;
+        move |entry: u64| passed_formats.contains(&entry) || reaches(calls, &library, entry, DEPTH)
     };
     for function in analysis.functions.iter().filter(|function| function.fragment_of.is_none()) {
         let variadic = function.ranges.first().is_some_and(|&(start, end)| recore::cfg::takes_variable_arguments(&image, start, end));
@@ -333,11 +333,12 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     session.keep_prototypes(callees_first);
     // What each function calls: with debug information, the functions whose prototypes its
     // calls need.
-    let called = if callees_first || importer.is_some() { callees(&analysis, false) } else { HashMap::new() };
-    let callees = if callees_first { called.clone() } else { HashMap::new() };
+    let functions = |targets: &Vec<CallTarget>| targets.iter().filter_map(|target| if let CallTarget::Function(entry) = target { Some(*entry) } else { None }).collect();
+    let called: HashMap<u64, Vec<u64>> = if callees_first || importer.is_some() { calls.iter().map(|(&owner, targets)| (owner, functions(targets))).collect() } else { HashMap::new() };
+    let none = HashMap::new();
+    let callees = if callees_first { &called } else { &none };
     // A function that ends by jumping to another returns what that one returns, which the
-    // engine only learns if the other is decompiled first.
-    let tail_callees = callees_of(&analysis, true);
+    // engine only learns if the other is decompiled first: `tail_callees`.
     // A function jumped to takes its parameters from the function that jumps, which therefore
     // takes them too. Its parameters are kept so that the jump is seen to pass them.
     let jumped_to: HashSet<u64> = tail_callees.values().flatten().filter_map(|target| if let CallTarget::Function(entry) = target { Some(*entry) } else { None }).collect();
@@ -625,7 +626,7 @@ const TAIL_DEPTH: usize = 8;
 
 /// Appends to `chain` the functions `addr` jumps to that pass `wanted`, each after the ones it
 /// jumps to itself, so that decompiling them in this order tells each what it returns.
-fn tail_chain(tail_callees: &HashMap<u64, Vec<CallTarget>>, addr: u64, wanted: &impl Fn(&u64) -> bool, depth: usize, chain: &mut Vec<u64>) {
+fn tail_chain(tail_callees: &CallGraph, addr: u64, wanted: &impl Fn(&u64) -> bool, depth: usize, chain: &mut Vec<u64>) {
     for target in tail_callees.get(&addr).into_iter().flatten() {
         let CallTarget::Function(callee) = *target else { continue };
         if depth > 0 && callee != addr && wanted(&callee) && !chain.contains(&callee) {
@@ -635,29 +636,28 @@ fn tail_chain(tail_callees: &HashMap<u64, Vec<CallTarget>>, addr: u64, wanted: &
     }
 }
 
-/// The functions each function calls or tail-calls, by entry point.
-fn callees(analysis: &Analysis, tail_only: bool) -> HashMap<u64, Vec<u64>> {
-    let functions = |targets: Vec<CallTarget>| targets.into_iter().filter_map(|target| if let CallTarget::Function(entry) = target { Some(entry) } else { None }).collect();
-    callees_of(analysis, tail_only).into_iter().map(|(owner, targets)| (owner, functions(targets))).collect()
-}
+/// What each function calls, by entry point, imports included: every call, and apart the jumps
+/// that leave the function for good.
+type CallGraph = HashMap<u64, Vec<CallTarget>>;
 
-/// What each function calls, by entry point, imports included: every call, or with `tail_only`
-/// just the jumps that leave the function for good.
-fn callees_of(analysis: &Analysis, tail_only: bool) -> HashMap<u64, Vec<CallTarget>> {
+fn call_graph(analysis: &Analysis) -> (CallGraph, CallGraph) {
     let mut extents: Vec<(u64, u64, u64)> =
         analysis.functions.iter().flat_map(|f| f.ranges.iter().map(move |&(start, end)| (start, end, f.fragment_of.unwrap_or(f.addr)))).collect();
     extents.sort_unstable();
-    let mut callees: HashMap<u64, Vec<CallTarget>> = HashMap::new();
-    for call in analysis.calls.iter().filter(|call| !tail_only || (call.tail && !call.conditional)) {
+    let (mut all, mut tail) = (CallGraph::new(), CallGraph::new());
+    for call in &analysis.calls {
         let index = extents.partition_point(|extent| extent.0 <= call.at);
         if let Some(&(_, end, owner)) = index.checked_sub(1).map(|i| &extents[i])
             && call.at < end
             && call.target != CallTarget::Function(owner)
         {
-            callees.entry(owner).or_default().push(call.target);
+            all.entry(owner).or_default().push(call.target);
+            if call.tail && !call.conditional {
+                tail.entry(owner).or_default().push(call.target);
+            }
         }
     }
-    callees
+    (all, tail)
 }
 
 /// A worker gets this long to load its binary and declare every function.
