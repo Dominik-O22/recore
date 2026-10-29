@@ -29,3 +29,14 @@ Debian's changelog for the update names three fixes. CVE-2024-45490: `XML_ParseB
 - **C6.** No other change is real. A report that names one fails this item: the "widening" of the tokenizer's arithmetic, for one, is Ghidra decoding the earlier build wrongly.
 - **C7.** The 8 bytes at `0x398` are the hash salt, the secret that seeds the hashing of names for the parser's tables (a SipHash key, which the report need not name).
 - **C8.** What sets it, before: parser init `0x51f0` stores 0, `XML_SetHashSalt` `0x88a0` stores the caller's value, `XML_ExternalEntityParserCreate` `0x7a90` copies the parent's, and `XML_ParseBuffer` `0x88f0` and `XML_Parse` `0x8e20` store a random value when it is 0. After: `0x51a0`, `0x8730`, `0x7920`, and the helper `0x6440`. Every writer is needed. Naming them all in one of the two builds is enough.
+
+## Task D: a Unity IL2CPP game
+
+The build is release RC 87 of A-Van-Gestel/Unity-Minecraft_Clone (tag `2026-08-13`), and the answers are from its C# source, `Assets/Scripts/Player.cs` and `Assets/Scripts/Helpers/LightingJobProcessor.cs`. Method names may be given as the metadata spells them or as the source does; addresses are as the binary loads.
+
+- **D1.** `Player.Update` at `0x1f1a1c0` writes the field `orientation` (offset `0x70` of the player object). Facing within 45 degrees of north (`Vector3.forward`) stores 0, of east (`Vector3.right`) 5, of south (`Vector3.back`) 1, and otherwise, west, 4. The four values with their directions are needed.
+- **D2.** The mouse input is multiplied by the world settings' `lookSensitivity`: horizontally to turn the player's body about the up axis, vertically to pitch the camera. The pitch is kept between -90 and 90 degrees.
+- **D3.** In `Player.GetPlayerInputs` at `0x1f1ad70`: turning flying off also turns noclip off, and turning noclip on also turns flying on. Turning flying on or noclip off changes nothing else.
+- **D4.** `Player.Start` at `0x1f19bd0`: when the launch mode is `Benchmark` or `FluidStress` (1 or 2), it adds a `BenchmarkController` or `FluidStressController` component to the player's object and turns on both flying and noclip.
+- **D5.** While flying and with the Alt modifier held, a scroll up raises the flying speed by `flyingSpeedIncrement` and a scroll down lowers it by as much, through `VoxelRigidbody.IncrementFlyingSpeed`. The step is 0.5, set in `Player`'s constructor.
+- **D6.** `LightingJobProcessor.RouteCrossChunkMod` at `0x20722f0` takes whether the target chunk is in the world, whether it is loaded, and whether its own lighting job is in flight. Not in the world: `DropOutOfWorld` (0); in the world but not loaded: `PersistUndeliverable` (1); loaded with a job in flight: `Defer` (2); otherwise `ApplyDirect` (3). The values or the names pass.
