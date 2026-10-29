@@ -366,14 +366,15 @@ class LazyScope : public ScopeInternal {
     facts.erase(said.first, said.second);
   }
 
-  // Declares the pending function at `at`, which must be one, with every pending function of
-  // its name, by address. The engine tells functions of one name apart by the order they were
-  // declared in, which this keeps the order of their addresses, as when all went in at once.
+  // Declares the pending function at `at`, which must be one, after the pending functions of
+  // its name below it, by address. The engine tells functions of one name apart by the order
+  // they were declared in, which this keeps the order of their addresses, as when all went in
+  // at once.
   void declare(map<Address, Pending>::iterator at) {
     if (at->second.name.empty()) return declare_one(at);
-    const string name = at->second.name;
-    for (auto named = pending_names.lower_bound({name, Address(Address::m_minimal)}); named != pending_names.end() && named->first == name;
-         named = pending_names.lower_bound({name, Address(Address::m_minimal)}))
+    const pair<string, Address> last = {at->second.name, at->first};
+    for (auto named = pending_names.lower_bound({last.first, Address(Address::m_minimal)}); named != pending_names.end() && *named <= last;
+         named = pending_names.lower_bound({last.first, Address(Address::m_minimal)}))
       declare_one(pending.find(named->second));
   }
 
@@ -391,7 +392,8 @@ class LazyScope : public ScopeInternal {
   }
 
   // The pending function of no name of its own that goes by `nm`, the name the engine gives it:
-  // `func_` and its address as the engine prints one, such as `func_0x00401000`.
+  // `func_` and its address as the engine prints one, such as `func_0x00401000`. A function
+  // given that same name outright is declared in its own turn, not by address with this one.
   map<Address, Pending>::iterator unnamed(const string &nm) const {
     LazyScope *self = const_cast<LazyScope *>(this);
     const string prefix = "func_0x";
@@ -472,8 +474,9 @@ class LazyScope : public ScopeInternal {
   }
   void findByName(const string &nm, vector<Symbol *> &res) const override {
     LazyScope *self = const_cast<LazyScope *>(this);
-    auto named = self->pending_names.lower_bound({nm, Address(Address::m_minimal)});
-    if (named != self->pending_names.end() && named->first == nm) self->declare(self->pending.find(named->second));
+    // Every function of the name, the last by address taking those before it along.
+    auto after = self->pending_names.lower_bound({nm, Address(Address::m_maximal)});
+    if (after != self->pending_names.begin() && prev(after)->first == nm) self->declare(self->pending.find(prev(after)->second));
     auto generated = unnamed(nm);
     if (generated != self->pending.end()) self->declare(generated);
     ScopeInternal::findByName(nm, res);
