@@ -201,12 +201,12 @@ pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
         by_size.sort_unstable();
         functions.push(by_size[by_size.len() / 2].1);
     }
-    // What recore keeps between runs it keeps under the cache directory, emptied before each
-    // binary's runs so that the first of them starts from nothing.
-    let cache = std::path::absolute("target/bench/cache")?;
+    // The analyses recore keeps between runs go here, emptied where a run is to start from
+    // nothing.
+    let cache = std::path::absolute("target/bench/analyses")?;
     let one_shot = |tool_name: &str, binary: &Path, function: u64| {
         let mut command = Command::new(&tool);
-        command.env("XDG_CACHE_HOME", &cache).arg(tool_name).arg(binary).arg(format!("{function:#x}"));
+        command.env(recore::cache::DIR_VAR, &cache).arg(tool_name).arg(binary).arg(format!("{function:#x}"));
         command
     };
     let mut rows: Vec<ColdRow> = Vec::new();
@@ -217,7 +217,7 @@ pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
         for (index, (binary, &function)) in binaries.iter().zip(&functions).enumerate() {
             let times = &mut times[index];
             let _ = std::fs::remove_dir_all(&cache);
-            times[0].push(timed(Command::new(&tool).env("XDG_CACHE_HOME", &cache).arg("summary").arg(binary))?);
+            times[0].push(timed(Command::new(&tool).env(recore::cache::DIR_VAR, &cache).arg("summary").arg(binary))?);
             let _ = std::fs::remove_dir_all(&cache);
             times[1].push(timed(&mut one_shot("xrefs", binary, function))?);
             times[2].push(timed(&mut one_shot("xrefs", binary, function))?);
@@ -229,7 +229,7 @@ pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
             let mut worker = Worker::new(
                 move || {
                     let mut command = Command::new(&tool);
-                    command.env("XDG_CACHE_HOME", &cache).arg("decompile-worker");
+                    command.env(recore::cache::DIR_VAR, &cache).arg("decompile-worker");
                     command
                 },
                 binary,
