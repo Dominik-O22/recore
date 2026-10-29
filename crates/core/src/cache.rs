@@ -80,7 +80,7 @@ pub fn analyze(path: &Path, image: &Image) -> Analysis {
 /// Where the analysis `key` names of the binary at `path` is kept: one file per binary and
 /// program, so that two programs that analyze one binary do not take turns replacing it.
 fn file(path: &Path, key: &Key) -> Option<PathBuf> {
-    let dir = std::env::var_os(DIR_VAR).map(PathBuf::from).or_else(|| Some(dir()?.join("analysis")))?;
+    let dir = std::env::var_os(DIR_VAR).filter(|dir| !dir.is_empty()).map(PathBuf::from).or_else(|| Some(dir()?.join("analysis")))?;
     let path = std::path::absolute(path).ok()?;
     let hash = rustc_hash::FxBuildHasher.hash_one((&path, key.program));
     Some(dir.join(format!("{}-{hash:016x}", path.file_name()?.to_string_lossy())))
@@ -127,22 +127,39 @@ fn write(file: &Path, key: &Key, analysis: &Analysis) {
     if written.is_err() {
         let _ = std::fs::remove_file(&partial);
     }
-    tidy(file.parent().expect("kept in a directory"), LIMIT);
+    tidy(file.parent().expect("kept in a directory"), LIMIT, file);
+}
+
+/// What a file named `name` in the directory is, judged by the names [`file`] and [`write`]
+/// give: `None` for one that is not recore's.
+fn kind(name: &str) -> Option<Kind> {
+    let is_analysis = |name: &str| name.rsplit_once('-').is_some_and(|(_, hash)| hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    match name.rsplit_once(".partial.") {
+        Some((analysis, process)) if is_analysis(analysis) && !process.is_empty() && process.bytes().all(|byte| byte.is_ascii_digit()) => Some(Kind::Partial),
+        _ => is_analysis(name).then_some(Kind::Analysis),
+    }
+}
+
+enum Kind {
+    Analysis,
+    /// One being written, or left by a process that died writing it.
+    Partial,
 }
 
 /// Removes partial files left in `dir` by processes that died writing them, and the least
-/// recently used analyses past `limit` bytes.
-fn tidy(dir: &Path, limit: u64) {
+/// recently used analyses past `limit` bytes, but never `written`, the one just kept.
+fn tidy(dir: &Path, limit: u64, written: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut kept: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
-    for (path, metadata) in entries.flatten().filter_map(|entry| Some((entry.path(), entry.metadata().ok()?))) {
+    for entry in entries.flatten() {
+        let (Some(kind), Ok(metadata)) = (kind(&entry.file_name().to_string_lossy()), entry.metadata()) else { continue };
         let used = metadata.modified().unwrap_or(UNIX_EPOCH);
-        if path.to_string_lossy().contains(".partial.") {
-            if used.elapsed().is_ok_and(|age| age > ABANDONED) {
-                let _ = std::fs::remove_file(&path);
+        match kind {
+            Kind::Partial if used.elapsed().is_ok_and(|age| age > ABANDONED) => {
+                let _ = std::fs::remove_file(entry.path());
             }
-        } else {
-            kept.push((used, metadata.len(), path));
+            Kind::Partial => {}
+            Kind::Analysis => kept.push((used, metadata.len(), entry.path())),
         }
     }
     kept.sort_unstable();
@@ -151,8 +168,9 @@ fn tidy(dir: &Path, limit: u64) {
         if total <= limit {
             break;
         }
-        let _ = std::fs::remove_file(path);
-        total -= len;
+        if path != written && std::fs::remove_file(&path).is_ok() {
+            total -= len;
+        }
     }
 }
 
@@ -178,21 +196,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Past the limit the least recently used analyses go, and so do partial files left long ago.
+    /// Past the limit the least recently used analyses go, and so do partial files left long
+    /// ago. Files that are not recore's stay.
     #[test]
     fn tidying_removes_the_least_recently_used_and_abandoned_partials() {
         let dir = std::env::current_exe().unwrap().with_file_name("cache-tidy-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let now = SystemTime::now();
-        for (name, age) in [("old", 300), ("used", 100), ("new", 0), ("a.partial.1", 2 * ABANDONED.as_secs()), ("b.partial.2", 10)] {
+        let old = "old.so-0000000000000001";
+        let files = [
+            (old, 300),
+            ("used.so-0000000000000002", 100),
+            ("new.so-0000000000000003", 0),
+            ("left.so-0000000000000004.partial.1", 2 * ABANDONED.as_secs()),
+            ("writing.so-0000000000000005.partial.2", 10),
+            ("notes.txt", 400),
+        ];
+        for (name, age) in files {
             std::fs::write(dir.join(name), [0u8; 10]).unwrap();
             std::fs::File::options().write(true).open(dir.join(name)).unwrap().set_modified(now - Duration::from_secs(age)).unwrap();
         }
-        tidy(&dir, 20);
+        tidy(&dir, 20, &dir.join("new.so-0000000000000003"));
         let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
         left.sort();
-        assert_eq!(left, ["b.partial.2", "new", "used"]);
+        assert_eq!(left, ["new.so-0000000000000003", "notes.txt", "used.so-0000000000000002", "writing.so-0000000000000005.partial.2"]);
+        // The one just written stays, however large.
+        tidy(&dir, 0, &dir.join("new.so-0000000000000003"));
+        assert!(dir.join("new.so-0000000000000003").exists() && !dir.join(old).exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

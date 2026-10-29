@@ -1,4 +1,4 @@
 # Tests start servers and decompiler processes, which keep the analyses they make here rather
-# than in the user's cache directory.
+# than in the user's cache directory. So does a program started with `cargo run`.
 [env]
 RECORE_CACHE_DIR = { value = "target/test-analyses", relative = true }
