@@ -855,6 +855,7 @@ dependencies = [
  "mimalloc",
  "object 0.40.0",
  "pdb2",
+ "rayon",
  "recore",
  "serde",
  "serde_json",

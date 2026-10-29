@@ -15,6 +15,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use recore::image::{Format, Machine};
 use recore::report::{Analysis, CallTarget};
 use serde::{Deserialize, Serialize};
@@ -313,13 +314,16 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         let calls = &calls;
         move |entry: u64| passed_formats.contains(&entry) || reaches(calls, &library, entry, DEPTH)
     };
-    for function in analysis.functions.iter().filter(|function| function.fragment_of.is_none()) {
-        let variadic = function.ranges.first().is_some_and(|&(start, end)| recore::cfg::takes_variable_arguments(&image, start, end));
-        if variadic {
-            session.saves_argument_registers(function.addr);
-        }
-        if variadic && hands_on_formats(function.addr) {
-            session.takes_variable_arguments(function.addr);
+    let variadic: Vec<u64> = analysis
+        .functions
+        .par_iter()
+        .filter(|function| function.fragment_of.is_none() && function.ranges.first().is_some_and(|&(start, end)| recore::cfg::takes_variable_arguments(&image, start, end)))
+        .map(|function| function.addr)
+        .collect();
+    for function in variadic {
+        session.saves_argument_registers(function);
+        if hands_on_formats(function) {
+            session.takes_variable_arguments(function);
         }
     }
 
