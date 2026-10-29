@@ -1457,8 +1457,8 @@ int rd_override_import_call(RdSession *session, uint64_t function, uint64_t call
   return guarded(err, errlen, [&] {
     auto found = session->slots.find(slot);
     if (found == session->slots.end()) throw LowlevelError("no import declared at this slot");
-    session->function(function)->getOverride().insertDeindirect(session->address(call),
-                                                                session->address(found->second));
+    Address at = session->address(call), import = session->address(found->second);
+    session->with_function(function, [at, import](Funcdata &fd) { fd.getOverride().insertDeindirect(at, import); });
   });
 }
 
@@ -1487,8 +1487,8 @@ int rd_allow_entry(RdSession *session, uint64_t function, uint64_t entry, char *
 int rd_override_call(RdSession *session, uint64_t function, uint64_t call, uint64_t target, char *err,
                      size_t errlen) {
   return guarded(err, errlen, [&] {
-    session->function(function)->getOverride().insertDeindirect(session->address(call),
-                                                                session->address(target));
+    Address at = session->address(call), callee = session->address(target);
+    session->with_function(function, [at, callee](Funcdata &fd) { fd.getOverride().insertDeindirect(at, callee); });
   });
 }
 
@@ -1738,7 +1738,8 @@ int rd_override_tail_call(RdSession *session, uint64_t function, uint64_t jump, 
 // cannot tell from the register alone when the code popped the return address into it.
 int rd_override_return(RdSession *session, uint64_t function, uint64_t jump, char *err, size_t errlen) {
   return guarded(err, errlen, [&] {
-    session->function(function)->getOverride().insertFlowOverride(session->address(jump), "return");
+    Address at = session->address(jump);
+    session->with_function(function, [at](Funcdata &fd) { fd.getOverride().insertFlowOverride(at, "return"); });
   });
 }
 
