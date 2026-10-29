@@ -74,8 +74,11 @@ pub struct ColdRow {
     #[serde(default)]
     pub first: Stat,
     /// The most memory that process held, in MiB.
+    #[serde(default, alias = "peak_mib")]
+    pub worker_mib: f64,
+    /// The most memory `summary` held, in MiB, analyzing with nothing kept from an earlier run.
     #[serde(default)]
-    pub peak_mib: f64,
+    pub analyzing_mib: f64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -185,11 +188,35 @@ pub fn phases(binary: &Path, runs: usize) -> Result<()> {
 
 /// Runs a program to its end and returns the wall time.
 fn timed(command: &mut Command) -> Result<f64> {
+    Ok(measured(command)?.0)
+}
+
+/// Runs a program to its end and returns the wall time and the most memory its process held,
+/// in bytes. That is read from /proc while it runs, every few milliseconds: what the kernel
+/// reports once it ends also counts this process's own, which the program started from.
+fn measured(command: &mut Command) -> Result<(f64, u64)> {
     let start = Instant::now();
-    let status = command.stdout(Stdio::null()).stderr(Stdio::null()).status()?;
+    let mut child = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    let status_file = format!("/proc/{}/status", child.id());
+    let ended = std::sync::atomic::AtomicBool::new(false);
+    let (status, peak) = std::thread::scope(|scope| {
+        let watch = scope.spawn(|| {
+            let mut peak = 0;
+            while !ended.load(std::sync::atomic::Ordering::Relaxed) {
+                let status = std::fs::read_to_string(&status_file).unwrap_or_default();
+                let kib = status.lines().find_map(|line| line.strip_prefix("VmHWM:")).and_then(|value| value.trim().strip_suffix("kB")?.trim().parse::<u64>().ok());
+                peak = peak.max(kib.unwrap_or(0) * 1024);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            peak
+        });
+        let status = child.wait();
+        ended.store(true, std::sync::atomic::Ordering::Relaxed);
+        (status, watch.join().expect("the watch does not panic"))
+    });
     let elapsed = ms(start);
-    ensure!(status.success(), "{command:?} failed");
-    Ok(elapsed)
+    ensure!(status?.success(), "{command:?} failed");
+    Ok((elapsed, peak))
 }
 
 pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
@@ -211,13 +238,15 @@ pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
     };
     let mut rows: Vec<ColdRow> = Vec::new();
     let mut times: Vec<[Vec<f64>; 6]> = binaries.iter().map(|_| Default::default()).collect();
-    let mut peaks = vec![0u64; binaries.len()];
+    let mut peaks = vec![(0u64, 0u64); binaries.len()];
     // In rounds, as the analysis suite does.
     for _ in 0..runs {
         for (index, (binary, &function)) in binaries.iter().zip(&functions).enumerate() {
             let times = &mut times[index];
             let _ = std::fs::remove_dir_all(&cache);
-            times[0].push(timed(Command::new(&tool).env(recore::cache::DIR_VAR, &cache).arg("summary").arg(binary))?);
+            let (summary, analyzing) = measured(Command::new(&tool).env(recore::cache::DIR_VAR, &cache).arg("summary").arg(binary))?;
+            times[0].push(summary);
+            peaks[index].1 = peaks[index].1.max(analyzing);
             let _ = std::fs::remove_dir_all(&cache);
             times[1].push(timed(&mut one_shot("xrefs", binary, function))?);
             times[2].push(timed(&mut one_shot("xrefs", binary, function))?);
@@ -238,13 +267,14 @@ pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
             let (record, _) = worker.decompile(function, SLOW * 30);
             ensure!(record.status == Status::Ok, "{} at {function:#x}: {}", binary.display(), record.message.unwrap_or_default());
             times[5].push(ms(start));
-            peaks[index] = peaks[index].max(worker.peak_bytes().unwrap_or(0));
+            peaks[index].0 = peaks[index].0.max(worker.peak_bytes().unwrap_or(0));
         }
     }
     let _ = std::fs::remove_dir_all(&cache);
-    for ((binary, function), (times, peak)) in binaries.iter().zip(functions).zip(times.into_iter().zip(peaks)) {
+    let mib = |bytes: u64| bytes as f64 / (1 << 20) as f64;
+    for ((binary, function), (times, (worker, analyzing))) in binaries.iter().zip(functions).zip(times.into_iter().zip(peaks)) {
         let [summary, xrefs, xrefs_again, decompile, decompile_again, first] = times.map(Stat::of);
-        rows.push(ColdRow { binary: name(binary), function, summary, xrefs, xrefs_again, decompile, decompile_again, first, peak_mib: peak as f64 / (1 << 20) as f64 });
+        rows.push(ColdRow { binary: name(binary), function, summary, xrefs, xrefs_again, decompile, decompile_again, first, worker_mib: mib(worker), analyzing_mib: mib(analyzing) });
     }
     Ok(rows)
 }
@@ -415,16 +445,17 @@ type Column = fn(&ColdRow) -> f64;
 
 pub fn print_cold(rows: &[ColdRow], before: Option<&[ColdRow]>) {
     let before_of = |binary: &str| before.and_then(|rows| rows.iter().find(|row| row.binary == binary));
-    let columns: [(&str, Column); 7] = [
+    let columns: [(&str, Column); 8] = [
         ("summary", |row| row.summary.min),
         ("xrefs", |row| row.xrefs.min),
         ("again", |row| row.xrefs_again.min),
         ("decompile", |row| row.decompile.min),
         ("again", |row| row.decompile_again.min),
         ("first", |row| row.first.min),
-        ("peak MiB", |row| row.peak_mib),
+        ("worker MiB", |row| row.worker_mib),
+        ("summary MiB", |row| row.analyzing_mib),
     ];
-    println!("\ncold: a new process to the answer, fastest run, ms; `again` reruns it at once, and `first` is a new decompiler process to its first function");
+    println!("\ncold: a new process to the answer, fastest run, ms; `again` reruns it at once, and `first` is a new decompiler process to its first function; MiB is the most that decompiler process and a `summary` with nothing kept held");
     print!("{:<46}", "binary");
     for (title, _) in &columns {
         print!(" {title:>9} {:>7}", "change");
