@@ -123,6 +123,11 @@ impl Types {
         Types { types: vec![Type::Void], functions: Vec::new(), globals: Vec::new(), pointer, names }
     }
 
+    /// Whether the engine has a type called `name` from the start, such as `uint4`.
+    pub fn is_taken(&self, name: &str) -> bool {
+        self.names.get(name).is_some_and(|known| known.2 == TAKEN)
+    }
+
     /// Adds a type that has no name of its own.
     pub fn add(&mut self, kind: Type) -> TypeId {
         self.types.push(kind);

@@ -33,8 +33,8 @@ struct WorkerOptions {
     /// recore's for PE images and raw firmware and the engine's otherwise.
     #[arg(long, value_enum, default_value = "auto")]
     jump_tables: JumpTablesArg,
-    /// Address-space limit per child process, in GiB. Past it the engine's allocations fail and
-    /// the function is reported as an error.
+    /// Address space per child process, in GiB, beyond what loading the binary took. Past it the
+    /// engine's allocations fail and the function is reported as an error.
     #[arg(long, default_value_t = 4)]
     memory_gb: u64,
     /// Decompile the functions a function calls before the function itself, so that its calls

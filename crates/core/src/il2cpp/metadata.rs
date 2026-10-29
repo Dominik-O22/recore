@@ -225,9 +225,12 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// The NUL-terminated string at `offset` in the string section.
+/// The NUL-terminated string at `offset` in the string section, up to a length no name reaches,
+/// so that rows of a damaged file that all point at one long run of bytes do not each copy it.
 fn string(strings: &[u8], offset: u32) -> String {
+    const LONGEST: usize = 1024;
     let bytes = strings.get(offset as usize..).unwrap_or_default();
+    let bytes = &bytes[..bytes.len().min(LONGEST)];
     let end = bytes.iter().position(|&byte| byte == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }

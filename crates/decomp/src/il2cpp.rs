@@ -44,13 +44,16 @@ impl<'a> Builder<'a> {
         // Every struct is named first, so that fields can refer to any of them. An enum is the
         // number its one instance field holds, with its members.
         for def in &il2cpp.types {
+            // A struct called as one of the engine's own types, as Unity.Mathematics has `uint4`,
+            // would be told from it only by a number.
+            let name = if builder.types.is_taken(&def.name) { format!("{}.{}", def.namespace, def.name) } else { def.name.clone() };
             let object = match enum_size(def) {
                 Some(size) => {
-                    let id = builder.types.named(Named::Enum, &def.name, size).0;
+                    let id = builder.types.named(Named::Enum, &name, size).0;
                     builder.types.set_values(id, def.members.clone());
                     id
                 }
-                None => builder.types.named(Named::Struct, &def.name, u64::from(def.instance_size)).0,
+                None => builder.types.named(Named::Struct, &name, u64::from(def.instance_size)).0,
             };
             builder.objects.push(object);
         }

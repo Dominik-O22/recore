@@ -232,22 +232,27 @@ impl Program {
         owners.iter().copied().find(|&entry| entry == addr).or_else(|| owners.first().copied()).with_context(|| format!("no function contains {addr:#x}"))
     }
 
-    /// The entry of the function called `name`: an exact match, or else the only function whose
-    /// name contains it.
+    /// The entry of the function called `name`: the only exact match, or else the only function
+    /// whose name contains it. Overloads share a name, and then the function is asked for by
+    /// address.
     pub fn function_named(&self, name: &str) -> Result<u64> {
         let named = || self.functions().filter_map(|f| Some((f.addr, f.name.as_deref()?)));
-        if let Some((entry, _)) = named().find(|&(_, candidate)| candidate == name) {
-            return Ok(entry);
+        let several = |found: &[(u64, &str)], how: &str| -> anyhow::Error {
+            let shown: Vec<String> = found.iter().take(10).map(|&(entry, _)| self.label(entry)).collect();
+            anyhow::anyhow!("`{name}` {how} {} functions: {}{}", found.len(), shown.join(" "), if found.len() > 10 { " ..." } else { "" })
+        };
+        let exact: Vec<(u64, &str)> = named().filter(|&(_, candidate)| candidate == name).collect();
+        match exact.as_slice() {
+            [(entry, _)] => return Ok(*entry),
+            [] => {}
+            found => return Err(several(found, "names")),
         }
         let lowered = name.to_lowercase();
         let partial: Vec<(u64, &str)> = named().filter(|(_, candidate)| candidate.to_lowercase().contains(&lowered)).collect();
         match partial.as_slice() {
             [(entry, _)] => Ok(*entry),
             [] => bail!("no function is named `{name}`; the `functions` tool lists the names this binary carries"),
-            several => {
-                let shown: Vec<String> = several.iter().take(10).map(|&(entry, _)| self.label(entry)).collect();
-                bail!("`{name}` matches {} functions: {}{}", several.len(), shown.join(" "), if several.len() > 10 { " ..." } else { "" })
-            }
+            found => Err(several(found, "matches")),
         }
     }
 }

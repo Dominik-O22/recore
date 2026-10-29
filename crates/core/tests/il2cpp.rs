@@ -50,6 +50,7 @@ fn a_unity_6_5_build_has_its_tables_found_by_what_they_hold() {
     assert_eq!(image.symbol_names[&0x1f1a1c0], "Player.Update");
     assert_eq!(image.symbol_names[&0x3634660], "List<int>.Add");
     assert_eq!(image.symbol_names[&0x4ba7200], "WorldLaunchState_TypeInfo");
+    assert_eq!(image.symbol_names[&0x4bd2010], "\"MeshGenerationBenchmark requires a World instance in the scene!\"");
     assert_eq!(field_offset(il2cpp, "Player", "_world"), Some(0x38));
     assert_eq!(field_offset(il2cpp, "Player", "orientation"), Some(0x70));
     let route = il2cpp.types.iter().find(|def| def.name == "LightingJobProcessor.CrossChunkModRoute").unwrap();

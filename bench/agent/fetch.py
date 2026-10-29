@@ -76,6 +76,8 @@ def main() -> None:
     pkgs = out / "pkgs"
     pkgs.mkdir(parents=True, exist_ok=True)
     for target in sys.argv[2:] or TARGETS:
+        if target not in TARGETS:
+            sys.exit(f"{target}: no such target; the targets are {', '.join(TARGETS)}")
         url, name, digest = TARGETS[target]
         data = member(package(pkgs, url), url, name)
         if sha256(data) != digest:
