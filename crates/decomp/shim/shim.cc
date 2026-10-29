@@ -345,6 +345,8 @@ class LazyScope : public ScopeInternal {
   };
   map<Address, Pending> pending;
   multimap<string, Address> pending_names;
+  // What was said of pending functions, done to each as it is declared.
+  multimap<Address, std::function<void(Funcdata &)>> facts;
 
   // Declares the pending function at `at`, which must be one.
   void declare(map<Address, Pending>::iterator at) {
@@ -364,6 +366,9 @@ class LazyScope : public ScopeInternal {
     }
     Funcdata *fd = addFunction(addr, function.name)->getFunction();
     if (function.noreturn) fd->getFuncProto().setNoReturn(true);
+    auto said = facts.equal_range(addr);
+    for (auto fact = said.first; fact != said.second; ++fact) fact->second(*fd);
+    facts.erase(said.first, said.second);
   }
 
   // Declares the pending functions whose symbol overlaps [addr, addr + size). A function's
@@ -381,6 +386,13 @@ class LazyScope : public ScopeInternal {
 
  public:
   explicit LazyScope(Architecture *g) : ScopeInternal(0, "", g) {}
+
+  // Does `fact` to the function at `addr` as it is declared, and says so, if it is pending.
+  bool when_declared(const Address &addr, std::function<void(Funcdata &)> &fact) {
+    if (pending.count(addr) == 0) return false;
+    facts.emplace(addr, std::move(fact));
+    return true;
+  }
 
   // Records a function to declare when it is looked for, under the name it is first given and
   // never returning if any declaration says so. One already declared is only marked.
@@ -586,6 +598,12 @@ struct RdSession {
     for (const pair<uint64_t, AddrSpace *> &mapped : spaces)
       if (addr.getSpace() == mapped.second) return mapped.first + addr.getOffset();
     return addr.getOffset();
+  }
+
+  // Does `fact` to the function at `offset`: now, created if it is new, or as it is declared if
+  // it is pending, so that saying something of every function declares none.
+  void with_function(uint64_t offset, std::function<void(Funcdata &)> fact) {
+    if (!static_cast<LazyScope *>(arch->symboltab->getGlobalScope())->when_declared(address(offset), fact)) fact(*function(offset));
   }
 
   // The function at `offset`, created if it is new: under `name`, or a generated name if empty.
@@ -1682,8 +1700,8 @@ int rd_add_pointer_table(RdSession *session, uint64_t addr, const char *name, si
 int rd_override_tail_call(RdSession *session, uint64_t function, uint64_t jump, char *err,
                           size_t errlen) {
   return guarded(err, errlen, [&] {
-    session->function(function)->getOverride().insertFlowOverride(session->address(jump),
-                                                                  "callreturn");
+    Address at = session->address(jump);
+    session->with_function(function, [at](Funcdata &fd) { fd.getOverride().insertFlowOverride(at, "callreturn"); });
   });
 }
 
