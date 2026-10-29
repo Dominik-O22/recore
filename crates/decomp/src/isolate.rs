@@ -171,7 +171,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     let (session, mut analysis, debug) = std::thread::scope(|scope| {
         let session = scope.spawn(|| Session::load(&image));
         let debug = scope.spawn(|| crate::types::load(binary, &image));
-        let analysis = recore::analyze(&image);
+        let analysis = recore::cache::analyze(binary, &image);
         (session.join().expect("loading does not panic"), analysis, debug.join().ok().flatten())
     });
     // The limit is on what the engine takes from here on. Loading a large binary, with its

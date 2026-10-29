@@ -47,10 +47,11 @@ fn start_worker(path: &Path) -> Worker {
 impl Binary {
     fn load(path: &Path, stamp: (SystemTime, u64)) -> Result<Binary> {
         let start = Instant::now();
-        // The child repeats the analysis for itself, at the same time as this process.
+        // The child loads the binary for itself, at the same time as this process: the analysis
+        // kept on disk if there is one, or its own.
         let worker = start_worker(path);
         let image = Image::load(path)?;
-        let mut analysis = recore::analyze(&image);
+        let mut analysis = recore::cache::analyze(path, &image);
         let analysis_ms = start.elapsed().as_secs_f64() * 1e3;
 
         let edits = Edits::load(path)?;
