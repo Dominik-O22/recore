@@ -4,12 +4,32 @@
 use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::Image;
 use crate::report::Analysis;
+
+/// Names the directory analyses are kept in, instead of `recore/analysis` in the user's cache
+/// directory.
+pub const DIR_VAR: &str = "RECORE_CACHE_DIR";
+
+/// The most bytes of analyses kept. Past it the least recently used go, and with them those of
+/// programs since rebuilt.
+const LIMIT: u64 = 2 << 30;
+
+/// A partial file this old was left by a process that died writing it.
+const ABANDONED: Duration = Duration::from_secs(3600);
+
+/// recore's directory in the user's cache directory, if there is a home to find it by.
+pub fn dir() -> Option<PathBuf> {
+    match (std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")) {
+        (Some(cache), _) => Some(PathBuf::from(cache).join("recore")),
+        (None, Some(home)) => Some(PathBuf::from(home).join(".cache/recore")),
+        (None, None) => None,
+    }
+}
 
 /// What an analysis was made from. A kept analysis is used only when all of it is unchanged.
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -46,7 +66,7 @@ impl Key {
 /// it was made from has changed, or a new one, which is then kept. Keeping is best effort: a
 /// file that cannot be read or written costs only the time to analyze.
 pub fn analyze(path: &Path, image: &Image) -> Analysis {
-    let Some((key, file)) = Key::of(path).zip(file(path)) else {
+    let Some((file, key)) = Key::of(path).and_then(|key| Some((file(path, &key)?, key))) else {
         return crate::analyze(image);
     };
     if let Some(analysis) = read(&file, &key) {
@@ -57,21 +77,18 @@ pub fn analyze(path: &Path, image: &Image) -> Analysis {
     analysis
 }
 
-/// Where the analysis of the binary at `path` is kept, one file per path.
-fn file(path: &Path) -> Option<PathBuf> {
-    let dir = match (std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")) {
-        (Some(cache), _) => PathBuf::from(cache).join("recore/analysis"),
-        (None, Some(home)) => PathBuf::from(home).join(".cache/recore/analysis"),
-        (None, None) => return None,
-    };
+/// Where the analysis `key` names of the binary at `path` is kept: one file per binary and
+/// program, so that two programs that analyze one binary do not take turns replacing it.
+fn file(path: &Path, key: &Key) -> Option<PathBuf> {
+    let dir = std::env::var_os(DIR_VAR).map(PathBuf::from).or_else(|| Some(dir()?.join("analysis")))?;
     let path = std::path::absolute(path).ok()?;
-    let hash = rustc_hash::FxBuildHasher.hash_one(&path);
+    let hash = rustc_hash::FxBuildHasher.hash_one((&path, key.program));
     Some(dir.join(format!("{}-{hash:016x}", path.file_name()?.to_string_lossy())))
 }
 
 /// Whether an analysis of the binary at `path` is kept that [`analyze`] would use.
 pub fn is_kept(path: &Path) -> bool {
-    Key::of(path).zip(file(path)).is_some_and(|(key, file)| open(&file, &key).is_some())
+    Key::of(path).is_some_and(|key| file(path, &key).is_some_and(|file| open(&file, &key).is_some()))
 }
 
 /// The file holds the key as JSON on its first line and the analysis after it in bitcode, a
@@ -83,10 +100,14 @@ fn open(file: &Path, key: &Key) -> Option<BufReader<std::fs::File>> {
     (serde_json::from_str::<Key>(&line).ok()? == *key).then_some(reader)
 }
 
+/// The analysis kept in `file`, which then counts as used last.
 fn read(file: &Path, key: &Key) -> Option<Analysis> {
+    let mut reader = open(file, key)?;
     let mut rest = Vec::new();
-    open(file, key)?.read_to_end(&mut rest).ok()?;
-    bitcode::decode(&rest).ok()
+    reader.read_to_end(&mut rest).ok()?;
+    let analysis = bitcode::decode(&rest).ok()?;
+    let _ = reader.get_ref().set_modified(SystemTime::now());
+    Some(analysis)
 }
 
 /// Writes through a file of this process's own, so that a reader never sees half an analysis
@@ -105,6 +126,33 @@ fn write(file: &Path, key: &Key, analysis: &Analysis) {
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&partial);
+    }
+    tidy(file.parent().expect("kept in a directory"), LIMIT);
+}
+
+/// Removes partial files left in `dir` by processes that died writing them, and the least
+/// recently used analyses past `limit` bytes.
+fn tidy(dir: &Path, limit: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut kept: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    for (path, metadata) in entries.flatten().filter_map(|entry| Some((entry.path(), entry.metadata().ok()?))) {
+        let used = metadata.modified().unwrap_or(UNIX_EPOCH);
+        if path.to_string_lossy().contains(".partial.") {
+            if used.elapsed().is_ok_and(|age| age > ABANDONED) {
+                let _ = std::fs::remove_file(&path);
+            }
+        } else {
+            kept.push((used, metadata.len(), path));
+        }
+    }
+    kept.sort_unstable();
+    let mut total: u64 = kept.iter().map(|file| file.1).sum();
+    for (_, len, path) in kept {
+        if total <= limit {
+            break;
+        }
+        let _ = std::fs::remove_file(path);
+        total -= len;
     }
 }
 
@@ -127,6 +175,24 @@ mod tests {
         assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&analysis).unwrap());
         let changed = Key { binary: (key.binary.0 + 1, key.binary.1), ..Key::of(&binary).unwrap() };
         assert!(read(&file, &changed).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Past the limit the least recently used analyses go, and so do partial files left long ago.
+    #[test]
+    fn tidying_removes_the_least_recently_used_and_abandoned_partials() {
+        let dir = std::env::current_exe().unwrap().with_file_name("cache-tidy-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        for (name, age) in [("old", 300), ("used", 100), ("new", 0), ("a.partial.1", 2 * ABANDONED.as_secs()), ("b.partial.2", 10)] {
+            std::fs::write(dir.join(name), [0u8; 10]).unwrap();
+            std::fs::File::options().write(true).open(dir.join(name)).unwrap().set_modified(now - Duration::from_secs(age)).unwrap();
+        }
+        tidy(&dir, 20);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["b.partial.2", "new", "used"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

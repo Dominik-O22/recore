@@ -333,12 +333,8 @@ mod languages {
 /// A directory holding the language files, which the engine reads by path. They are written
 /// out the first time, under the user's cache directory, and again only when they change.
 pub fn vendored_spec_dir() -> Result<PathBuf> {
-    let cache = match (std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")) {
-        (Some(cache), _) => PathBuf::from(cache),
-        (None, Some(home)) => PathBuf::from(home).join(".cache"),
-        (None, None) => std::env::temp_dir(),
-    };
-    let dir = cache.join(format!("recore/languages-{:016x}", languages::ID));
+    let cache = recore::cache::dir().unwrap_or_else(|| std::env::temp_dir().join("recore"));
+    let dir = cache.join(format!("languages-{:016x}", languages::ID));
     // One thread of this process writes; the process number keeps other processes apart.
     static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _writing = WRITING.lock();
