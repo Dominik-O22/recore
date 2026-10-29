@@ -39,3 +39,5 @@ corpus-pe/bin/node4__node-v4.9.1-x64.exe
 corpus-pe32/bin/dell__DELL_IspLibrary.dll
 # The largest public binary in the store, for what setting up costs on a large binary.
 corpus-large/bin/godot__godot
+# A public Unity IL2CPP build, with the metadata `bench/agent/fetch.py` pins beside it.
+il2cpp/GameAssembly.so

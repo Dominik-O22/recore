@@ -150,5 +150,9 @@
   "corpus/bin/htop__htop": {
     "analysis": 95242699,
     "diff": 130050577
+  },
+  "il2cpp/GameAssembly.so": {
+    "analysis": 25345877557,
+    "diff": 30510904236
   }
 }
