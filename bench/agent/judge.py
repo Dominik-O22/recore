@@ -11,6 +11,7 @@ from collections import Counter
 from pathlib import Path
 
 KEY = (Path(__file__).parent / "key.md").read_text()
+ITEM = re.compile(r"^- \*\*([A-Z]\d+)\.\*\*(.*)$", re.M)
 VERDICT = re.compile(r"^([A-Z]\d+)[.:]?\s+(PASS|FAIL)\W*(.*)$", re.M)
 TIMES = 3
 
@@ -39,11 +40,16 @@ def judge(key: str, report: str) -> dict[str, tuple[str, str]]:
 
 
 def main() -> None:
+    # An item written from the source can say what the binary does not, as D5 once named a call
+    # the build inlines, so each one names the address it was checked at.
+    unchecked = [item for item, text in ITEM.findall(KEY) if not re.search(r"0x[0-9a-f]+", text)]
+    if unchecked:
+        sys.exit(f"key.md: {', '.join(unchecked)} name no address where the binary was checked")
     for arg in sys.argv[1:]:
         dir = Path(arg)
         tasks = (dir / "tasks").read_text().strip() if (dir / "tasks").exists() else "ABC"
         key = key_for(tasks)
-        items = re.findall(r"^- \*\*([A-Z]\d+)\.\*\*", key, re.M)
+        items = [item for item, _ in ITEM.findall(key)]
         rounds = [judge(key, (dir / "report.md").read_text()) for _ in range(TIMES)]
         lines, passed = [], 0
         for item in items:

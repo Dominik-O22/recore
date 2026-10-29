@@ -38,4 +38,5 @@ When the operator corrects an agent, fix the mistake and add its rule here. A ru
 | Corpora live in the store, never in a checkout. | `corpus/store.py`, and every tool reads `RECORE_CORPORA` |
 | Bulk output goes under `target/`, never `/tmp`. | Nothing; this file only |
 | Downloads are data, never executed. | Nothing; this file only |
+| An item of the agent bench's answer key says what the binary does, not the source, and names the address it was checked at. | `bench/agent/judge.py` refuses a key with an item that names no address |
 | Work names the measure it moves before it is built, and every issue carries a goal label. | Nothing; this file only |

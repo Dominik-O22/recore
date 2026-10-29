@@ -7,7 +7,7 @@ A fresh Claude session gets binaries, one tool and no hints, and works a set of 
 - **libexpat 2.5.0-1 and 2.5.0-1+deb12u1**, from Debian 12: say what the security update changed.
 - **GameAssembly.so** of a Unity 6000.5 game built with IL2CPP, with its `global-metadata.dat`: say how its player moves and how it routes light between chunks. The game is public, with its C# source.
 
-[`key.md`](key.md) has the answers: 17 items for Tasks A to C, 6 for Task D. The prompts in [`prompts/`](prompts) are the ones the results in the top-level README came from.
+[`key.md`](key.md) has the answers: 17 items for Tasks A to C, 6 for Task D. Each item names the address in the binary where it was checked, since a build can differ from its source, and `judge.py` refuses a key with an item that names none. The prompts in [`prompts/`](prompts) are the ones the results in the top-level README came from.
 
 ## Run a session
 
