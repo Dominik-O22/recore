@@ -13,6 +13,7 @@ pub mod discover;
 pub mod edits;
 pub mod hardware;
 pub mod i8051;
+pub mod il2cpp;
 pub mod image;
 pub mod itanium;
 pub mod jumptable;

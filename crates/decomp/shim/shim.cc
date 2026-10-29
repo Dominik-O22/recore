@@ -1896,7 +1896,10 @@ static string add_types(RdSession *session, const char *xml) {
         Datatype *type = decode_type(arch, element->getChildren().at(0));
         SymbolEntry *old = global->findAddr(where, Address());
         if (old != nullptr) global->removeSymbol(old->getSymbol());
-        global->addSymbol(name, type, where, Address());
+        SymbolEntry *entry = global->addSymbol(name, type, where, Address());
+        // The type debug information gives holds; the engine would otherwise take one from the
+        // code's uses.
+        global->setAttribute(entry->getSymbol(), Varnode::typelock);
       } else {
         XmlDecode decoder(arch, element);
         arch->types->decodeType(decoder);

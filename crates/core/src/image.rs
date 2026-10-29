@@ -159,7 +159,8 @@ pub struct Image {
     /// the functions its trampolines reach, and the stubs they go through.
     pub exports: Vec<u64>,
     /// Names the image itself carries for addresses in it: exports, as written in the file. In
-    /// a raw image, what its layout says the trampoline tables and stubs are.
+    /// a raw image, what its layout says the trampoline tables and stubs are. In an IL2CPP
+    /// build, also its methods and usage slots, as its metadata names them.
     pub symbol_names: FxHashMap<u64, String>,
     /// `[start, end)` of every function the image describes: a frame description entry in
     /// `.eh_frame`, a PE `RUNTIME_FUNCTION`, a Mach-O function start up to the next one, or an
@@ -188,6 +189,9 @@ pub struct Image {
     /// by address: each holds up to the next. What comes before the first is in its set. Empty
     /// for every other machine.
     pub instruction_sets: Vec<(u64, InstructionSet)>,
+    /// The managed program of a Unity IL2CPP build, read from the `global-metadata.dat` that
+    /// ships with it.
+    pub il2cpp: Option<std::sync::Arc<crate::il2cpp::Il2Cpp>>,
 }
 
 impl Image {
@@ -215,6 +219,7 @@ impl Image {
             banking: Banking::default(),
             compiler: None,
             instruction_sets: Vec::new(),
+            il2cpp: None,
         }
     }
 
@@ -319,9 +324,22 @@ impl Image {
             banking: Banking::default(),
             compiler: None,
             instruction_sets: Vec::new(),
+            il2cpp: None,
         };
         if machine == Machine::Arm {
             crate::arm::load(&file, &mut image);
+        }
+        if let Some(metadata) = crate::il2cpp::find(path) {
+            // An IL2CPP build is analyzed without its metadata where that cannot be read.
+            match crate::il2cpp::load(&image, &metadata) {
+                Ok(il2cpp) => {
+                    for (addr, name) in il2cpp.function_names().into_iter().chain(il2cpp.usage_names()) {
+                        image.symbol_names.entry(addr).or_insert(name);
+                    }
+                    image.il2cpp = Some(std::sync::Arc::new(il2cpp));
+                }
+                Err(error) => eprintln!("IL2CPP metadata in {metadata:?}: {error:#}"),
+            }
         }
         Ok(image)
     }
