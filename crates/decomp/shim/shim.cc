@@ -334,8 +334,128 @@ class SectionSleigh : public Sleigh {
   }
 };
 
+// The global scope, which declares a function the first time the engine looks for it by its
+// address or name. A large program has hundreds of thousands of functions, and each declared
+// comes with a scope of its own for its locals: declaring all of them took seconds and
+// gigabytes, for a session that decompiles a few.
+class LazyScope : public ScopeInternal {
+  struct Pending {
+    string name;  // empty for the engine's own name
+    bool noreturn;
+  };
+  map<Address, Pending> pending;
+  multimap<string, Address> pending_names;
+
+  // Declares the pending function at `at`, which must be one.
+  void declare(map<Address, Pending>::iterator at) {
+    Address addr = at->first;
+    Pending function = std::move(at->second);
+    // Out of the table first, for adding the function looks up its address again.
+    pending.erase(at);
+    if (!function.name.empty()) {
+      auto named = pending_names.equal_range(function.name);
+      for (auto it = named.first; it != named.second; ++it)
+        if (it->second == addr) {
+          pending_names.erase(it);
+          break;
+        }
+    } else {
+      glb->nameFunction(addr, function.name);
+    }
+    Funcdata *fd = addFunction(addr, function.name)->getFunction();
+    if (function.noreturn) fd->getFuncProto().setNoReturn(true);
+  }
+
+  // Declares the pending functions whose symbol overlaps [addr, addr + size). A function's
+  // symbol covers the engine's least size for one from its entry: on ARM, the address a Thumb
+  // function's pointer holds, one past its entry, is in it.
+  void declare_range(const Address &addr, int4 size) const {
+    LazyScope *self = const_cast<LazyScope *>(this);
+    uintb reach = glb->min_funcsymbol_size - 1;
+    Address first(addr.getSpace(), addr.getOffset() - min(addr.getOffset(), reach));
+    for (auto at = self->pending.lower_bound(first);
+         at != self->pending.end() && at->first.getSpace() == addr.getSpace() && at->first.getOffset() - first.getOffset() < (uintb)size + reach;
+         at = self->pending.lower_bound(first))
+      self->declare(at);
+  }
+
+ public:
+  explicit LazyScope(Architecture *g) : ScopeInternal(0, "", g) {}
+
+  // Records a function to declare when it is looked for, under the name it is first given and
+  // never returning if any declaration says so. One already declared is only marked.
+  void defer(const Address &addr, const string &name, bool noreturn) {
+    if (Funcdata *fd = ScopeInternal::findFunction(addr)) {
+      if (noreturn) fd->getFuncProto().setNoReturn(true);
+      return;
+    }
+    auto found = pending.find(addr);
+    if (found != pending.end()) {
+      found->second.noreturn = found->second.noreturn || noreturn;
+      if (found->second.name.empty() && !name.empty()) {
+        found->second.name = name;
+        pending_names.emplace(name, addr);
+      }
+      return;
+    }
+    pending.emplace(addr, Pending{name, noreturn});
+    if (!name.empty()) pending_names.emplace(name, addr);
+  }
+
+  MapEntry *findAddr(const Address &addr, const Address &usepoint) const override {
+    declare_range(addr, 1);
+    return ScopeInternal::findAddr(addr, usepoint);
+  }
+  MapEntry *findContainer(const Address &addr, int4 size, const Address &usepoint) const override {
+    declare_range(addr, size);
+    return ScopeInternal::findContainer(addr, size, usepoint);
+  }
+  MapEntry *findClosestFit(const Address &addr, int4 size, const Address &usepoint) const override {
+    declare_range(addr, size);
+    return ScopeInternal::findClosestFit(addr, size, usepoint);
+  }
+  MapEntry *findOverlap(const Address &addr, int4 size) const override {
+    declare_range(addr, size);
+    return ScopeInternal::findOverlap(addr, size);
+  }
+  Funcdata *findFunction(const Address &addr) const override {
+    declare_range(addr, 1);
+    return ScopeInternal::findFunction(addr);
+  }
+  // The nearest symbol before or after `addr` may be a pending function: the nearest of those
+  // is declared, which the search then finds unless a symbol lies nearer still.
+  MapEntry *findSymbolBefore(const Address &addr, const Address &usepoint) const override {
+    LazyScope *self = const_cast<LazyScope *>(this);
+    auto after = self->pending.lower_bound(addr);
+    if (after != self->pending.begin() && prev(after)->first.getSpace() == addr.getSpace()) self->declare(prev(after));
+    return ScopeInternal::findSymbolBefore(addr, usepoint);
+  }
+  MapEntry *findSymbolAfter(const Address &addr, const Address &usepoint) const override {
+    LazyScope *self = const_cast<LazyScope *>(this);
+    auto after = self->pending.lower_bound(addr);
+    if (after != self->pending.end() && after->first.getSpace() == addr.getSpace()) self->declare(after);
+    return ScopeInternal::findSymbolAfter(addr, usepoint);
+  }
+  void findByName(const string &nm, vector<Symbol *> &res) const override {
+    LazyScope *self = const_cast<LazyScope *>(this);
+    for (auto named = self->pending_names.find(nm); named != self->pending_names.end(); named = self->pending_names.find(nm))
+      self->declare(self->pending.find(named->second));
+    ScopeInternal::findByName(nm, res);
+  }
+  bool isNameUsed(const string &nm, const Scope *op2) const override {
+    return pending_names.count(nm) != 0 || ScopeInternal::isNameUsed(nm, op2);
+  }
+};
+
 class SectionArchitecture : public SleighArchitecture {
   SectionImage *image;  // owned by Architecture::loader once buildLoader has run
+
+  Scope *buildDatabase(DocumentStorage &) override {
+    symboltab = new Database(this, true);
+    Scope *global = new LazyScope(this);
+    symboltab->attachScope(global, nullptr);
+    return global;
+  }
 
   void buildLoader(DocumentStorage &) override {
     collectSpecFiles(*errorstream);
@@ -1191,12 +1311,13 @@ void rd_call_skips(RdSession *session, uint64_t call, uint64_t len) { session->i
 
 // Declares a function start. Calls to it become calls to a known symbol, and with `noreturn`
 // flow stops after every call to it. A non-empty `name` is used if the function is new; the
-// engine keeps a function's name in more places than a rename reaches.
+// engine keeps a function's name in more places than a rename reaches. The engine sees the
+// function once it looks for it.
 int rd_add_function(RdSession *session, uint64_t addr, const char *name, int noreturn, char *err,
                     size_t errlen) {
   return guarded(err, errlen, [&] {
-    Funcdata *fd = session->function(addr, name);
-    if (noreturn) fd->getFuncProto().setNoReturn(true);
+    session->image->entries.insert(addr);
+    static_cast<LazyScope *>(session->arch->symboltab->getGlobalScope())->defer(session->address(addr), name, noreturn != 0);
   });
 }
 
