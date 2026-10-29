@@ -340,35 +340,41 @@ class SectionSleigh : public Sleigh {
 // gigabytes, for a session that decompiles a few.
 class LazyScope : public ScopeInternal {
   struct Pending {
-    string name;  // empty for the engine's own name
+    string name;  // the name it was first given; empty for the engine's own
     bool noreturn;
   };
   map<Address, Pending> pending;
-  multimap<string, Address> pending_names;
+  // The pending functions with a name, by name and then address.
+  set<pair<string, Address>> pending_names;
   // What was said of pending functions, done to each as it is declared.
   multimap<Address, std::function<void(Funcdata &)>> facts;
 
   // Declares the pending function at `at`, which must be one.
-  void declare(map<Address, Pending>::iterator at) {
+  void declare_one(map<Address, Pending>::iterator at) {
     Address addr = at->first;
     Pending function = std::move(at->second);
-    // Out of the table first, for adding the function looks up its address again.
+    // Out of the tables first, for adding the function looks up its address again.
     pending.erase(at);
-    if (!function.name.empty()) {
-      auto named = pending_names.equal_range(function.name);
-      for (auto it = named.first; it != named.second; ++it)
-        if (it->second == addr) {
-          pending_names.erase(it);
-          break;
-        }
-    } else {
+    if (function.name.empty())
       glb->nameFunction(addr, function.name);
-    }
+    else
+      pending_names.erase({function.name, addr});
     Funcdata *fd = addFunction(addr, function.name)->getFunction();
     if (function.noreturn) fd->getFuncProto().setNoReturn(true);
     auto said = facts.equal_range(addr);
     for (auto fact = said.first; fact != said.second; ++fact) fact->second(*fd);
     facts.erase(said.first, said.second);
+  }
+
+  // Declares the pending function at `at`, which must be one, with every pending function of
+  // its name, by address. The engine tells functions of one name apart by the order they were
+  // declared in, which this keeps the order of their addresses, as when all went in at once.
+  void declare(map<Address, Pending>::iterator at) {
+    if (at->second.name.empty()) return declare_one(at);
+    const string name = at->second.name;
+    for (auto named = pending_names.lower_bound({name, Address(Address::m_minimal)}); named != pending_names.end() && named->first == name;
+         named = pending_names.lower_bound({name, Address(Address::m_minimal)}))
+      declare_one(pending.find(named->second));
   }
 
   // Declares the pending functions whose symbol overlaps [addr, addr + size). A function's
@@ -384,6 +390,22 @@ class LazyScope : public ScopeInternal {
       self->declare(at);
   }
 
+  // The pending function of no name of its own that goes by `nm`, the name the engine gives it:
+  // `func_` and its address as the engine prints one, such as `func_0x00401000`.
+  map<Address, Pending>::iterator unnamed(const string &nm) const {
+    LazyScope *self = const_cast<LazyScope *>(this);
+    const string prefix = "func_0x";
+    if (nm.compare(0, prefix.size(), prefix) != 0 || nm.size() == prefix.size()) return self->pending.end();
+    char *end = nullptr;
+    uintb offset = strtoull(nm.c_str() + prefix.size(), &end, 16);
+    if (*end != 0) return self->pending.end();
+    auto found = self->pending.find(Address(glb->getDefaultCodeSpace(), offset));
+    if (found == self->pending.end() || !found->second.name.empty()) return self->pending.end();
+    string generated;
+    glb->nameFunction(found->first, generated);
+    return generated == nm ? found : self->pending.end();
+  }
+
  public:
   explicit LazyScope(Architecture *g) : ScopeInternal(0, "", g) {}
 
@@ -394,8 +416,9 @@ class LazyScope : public ScopeInternal {
     return true;
   }
 
-  // Records a function to declare when it is looked for, under the name it is first given and
-  // never returning if any declaration says so. One already declared is only marked.
+  // Records a function to declare when it is looked for, under the name it is first given, as
+  // a function declared at once keeps, and never returning if any declaration says so. One
+  // already declared is only marked.
   void defer(const Address &addr, const string &name, bool noreturn) {
     if (Funcdata *fd = ScopeInternal::findFunction(addr)) {
       if (noreturn) fd->getFuncProto().setNoReturn(true);
@@ -404,10 +427,6 @@ class LazyScope : public ScopeInternal {
     auto found = pending.find(addr);
     if (found != pending.end()) {
       found->second.noreturn = found->second.noreturn || noreturn;
-      if (found->second.name.empty() && !name.empty()) {
-        found->second.name = name;
-        pending_names.emplace(name, addr);
-      }
       return;
     }
     pending.emplace(addr, Pending{name, noreturn});
@@ -434,28 +453,35 @@ class LazyScope : public ScopeInternal {
     declare_range(addr, 1);
     return ScopeInternal::findFunction(addr);
   }
-  // The nearest symbol before or after `addr` may be a pending function: the nearest of those
-  // is declared, which the search then finds unless a symbol lies nearer still.
+  // The nearest symbol wholly before `addr`, or starting after it, may be a pending function:
+  // the nearest of those is declared, which the search then finds unless a symbol lies nearer.
   MapEntry *findSymbolBefore(const Address &addr, const Address &usepoint) const override {
     LazyScope *self = const_cast<LazyScope *>(this);
-    auto after = self->pending.lower_bound(addr);
-    if (after != self->pending.begin() && prev(after)->first.getSpace() == addr.getSpace()) self->declare(prev(after));
+    uintb reach = glb->min_funcsymbol_size - 1;
+    if (addr.getOffset() > reach) {
+      auto after = self->pending.lower_bound(Address(addr.getSpace(), addr.getOffset() - reach));
+      if (after != self->pending.begin() && prev(after)->first.getSpace() == addr.getSpace()) self->declare(prev(after));
+    }
     return ScopeInternal::findSymbolBefore(addr, usepoint);
   }
   MapEntry *findSymbolAfter(const Address &addr, const Address &usepoint) const override {
     LazyScope *self = const_cast<LazyScope *>(this);
-    auto after = self->pending.lower_bound(addr);
+    auto after = self->pending.upper_bound(addr);
     if (after != self->pending.end() && after->first.getSpace() == addr.getSpace()) self->declare(after);
     return ScopeInternal::findSymbolAfter(addr, usepoint);
   }
   void findByName(const string &nm, vector<Symbol *> &res) const override {
     LazyScope *self = const_cast<LazyScope *>(this);
-    for (auto named = self->pending_names.find(nm); named != self->pending_names.end(); named = self->pending_names.find(nm))
-      self->declare(self->pending.find(named->second));
+    auto named = self->pending_names.lower_bound({nm, Address(Address::m_minimal)});
+    if (named != self->pending_names.end() && named->first == nm) self->declare(self->pending.find(named->second));
+    auto generated = unnamed(nm);
+    if (generated != self->pending.end()) self->declare(generated);
     ScopeInternal::findByName(nm, res);
   }
   bool isNameUsed(const string &nm, const Scope *op2) const override {
-    return pending_names.count(nm) != 0 || ScopeInternal::isNameUsed(nm, op2);
+    auto named = pending_names.lower_bound({nm, Address(Address::m_minimal)});
+    if (named != pending_names.end() && named->first == nm) return true;
+    return unnamed(nm) != pending.end() || ScopeInternal::isNameUsed(nm, op2);
   }
 };
 

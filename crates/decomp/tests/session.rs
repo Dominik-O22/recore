@@ -28,6 +28,32 @@ fn noreturn_callee_ends_flow() {
 }
 
 #[test]
+fn a_prototype_by_the_engines_name_reaches_a_function_it_has_not_looked_at() {
+    // 0x1000: mov eax, edi; ret
+    let mut session = session(&[0x89, 0xf8, 0xc3]);
+    session.add_function(0x1000, false).unwrap();
+    session.declare("extern int4 func_0x00001000(int4 count);").unwrap();
+    let function = session.decompile(0x1000).unwrap();
+    assert!(function.c_text.contains("int4 func_0x00001000(int4 count)"), "{}", function.c_text);
+}
+
+#[test]
+fn of_two_functions_with_one_name_a_prototype_goes_to_the_first_by_address() {
+    // 0x1000 and 0x1010: mov eax, edi; ret
+    let mut code = vec![0x89, 0xf8, 0xc3];
+    code.resize(0x10, 0x90);
+    code.extend([0x89, 0xf8, 0xc3]);
+    let mut session = session(&code);
+    session.name_function(0x1000, "init").unwrap();
+    session.name_function(0x1010, "init").unwrap();
+    // The second is looked at first.
+    session.decompile(0x1010).unwrap();
+    session.declare("extern int4 init(int4 count);").unwrap();
+    let first = session.decompile(0x1000).unwrap();
+    assert!(first.c_text.contains("int4 init(int4 count)"), "{}", first.c_text);
+}
+
+#[test]
 fn flow_stops_at_another_function() {
     // 0x1000: call 0x1010, then fall through into 0x1005: mov eax, 7; ret. 0x1010: ret.
     let mut code = vec![0xe8, 0x0b, 0x00, 0x00, 0x00, 0xb8, 0x07, 0x00, 0x00, 0x00, 0xc3];
