@@ -218,9 +218,8 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     }
 
     // Types from debug information go in before the edits, which have the last word and may
-    // name them. The prototypes follow as functions are asked for.
+    // name them. Prototypes and globals follow as functions are asked for.
     if let Some(importer) = &mut importer {
-        importer.globals(&mut session);
         for text in edits.declarations.iter().chain(edits.types.values()) {
             importer.mentioned(&mut session, text);
         }
@@ -357,7 +356,36 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     let texts: HashSet<u64> = analysis.strings.iter().filter(|string| raw && !string.wide).map(|string| string.addr).collect();
     let formats = if raw { &texts } else { &conversions };
     let mut formatted: HashSet<u64> = HashSet::new();
-    let mut settle_formats = |session: &mut Session, entry: u64| {
+    // The pieces of each function apart from its entry, whose code is its own too.
+    let mut fragments: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+    for function in analysis.functions.iter().filter(|_| importer.is_some()) {
+        if let Some(owner) = function.fragment_of {
+            fragments.entry(owner).or_default().extend(&function.ranges);
+        }
+    }
+    // The data addresses the code of the function at `entry` refers to.
+    let referred = |entry: u64| -> Vec<u64> {
+        let own = analysis.functions.binary_search_by_key(&entry, |function| function.addr).map_or(&[][..], |index| &analysis.functions[index].ranges);
+        let refs = &analysis.data_refs;
+        own.iter()
+            .chain(fragments.get(&entry).into_iter().flatten())
+            .flat_map(|&(start, end)| &refs[refs.partition_point(|r| r.from < start)..refs.partition_point(|r| r.from < end)])
+            .map(|r| r.to)
+            .collect()
+    };
+    // Readies the session to decompile the function at `entry`: what the debug information says
+    // of it, of its callees with `with_callees`, and of the globals its code refers to, with the
+    // edits' names and types over those as they would be had every global gone in first; and
+    // the arguments of the formats its calls pass.
+    let mut prepare = |session: &mut Session, importer: &mut Option<crate::types::Importer>, edits: &Edits, entry: u64, with_callees: bool| {
+        if let Some(importer) = importer {
+            let callees = called.get(&entry).into_iter().flatten().copied().filter(|_| with_callees);
+            importer.functions(session, std::iter::once(entry).chain(callees));
+            let given: HashSet<u64> = importer.globals_at(session, referred(entry)).into_iter().collect();
+            for (addr, name, kind) in edits.globals(&analysis).into_iter().filter(|global| given.contains(&global.0)) {
+                let _ = session.add_global(addr, &name, kind);
+            }
+        }
         if !formatted.insert(entry) {
             return;
         }
@@ -410,10 +438,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Flow(addr) => {
-                if let Some(importer) = &mut importer {
-                    importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
-                }
-                settle_formats(&mut session, addr);
+                prepare(&mut session, &mut importer, &edits, addr, true);
                 session.keep_flow(true);
                 let flow = session.decompile(addr).map(|function| function.flow.unwrap_or_default());
                 session.keep_flow(false);
@@ -421,10 +446,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Addressed(addr) => {
-                if let Some(importer) = &mut importer {
-                    importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
-                }
-                settle_formats(&mut session, addr);
+                prepare(&mut session, &mut importer, &edits, addr, true);
                 session.keep_addresses(true);
                 let c_text = session.decompile(addr).map(|function| function.c_text);
                 session.keep_addresses(false);
@@ -432,10 +454,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Locals(addr) => {
-                if let Some(importer) = &mut importer {
-                    importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
-                }
-                settle_formats(&mut session, addr);
+                prepare(&mut session, &mut importer, &edits, addr, true);
                 send(&Event::Locals(session.decompile(addr).map(|function| function.locals).map_err(|error| error.to_string())))?;
                 continue;
             }
@@ -444,10 +463,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                     Some(found) => Some(found),
                     None => match auto_function(name) {
                         Some(function) => {
-                            if let Some(importer) = &mut importer {
-                                importer.functions(&mut session, std::iter::once(function).chain(called.get(&function).into_iter().flatten().copied()));
-                            }
-                            settle_formats(&mut session, function);
+                            prepare(&mut session, &mut importer, &edits, function, true);
                             let _ = session.decompile(function);
                             session.recovered(name)
                         }
@@ -458,10 +474,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Structs(addr) => {
-                if let Some(importer) = &mut importer {
-                    importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
-                }
-                settle_formats(&mut session, addr);
+                prepare(&mut session, &mut importer, &edits, addr, true);
                 let report = session.decompile(addr).map_err(|error| error.to_string()).map(|_| session.structs_of(addr).unwrap_or_default());
                 send(&Event::Structs(report))?;
                 continue;
@@ -506,11 +519,8 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         let keep = matches!(request, Request::Parameters(_)) && unknown(addr).iter().all(|callee| jumped_first.contains(callee));
         for target in jumped_first {
             session.keep_prototypes(!hands_on_registers);
-            if let Some(importer) = &mut importer {
-                importer.functions(&mut session, std::iter::once(target));
-            }
+            prepare(&mut session, &mut importer, &edits, target, false);
             // A failure here only leaves the caller as well off as it was.
-            settle_formats(&mut session, target);
             let _ = session.decompile(target);
             known.insert(target);
         }
@@ -520,11 +530,8 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             }
         }
         session.keep_prototypes(callees_first || (jumped_to.contains(&addr) && !hands_on_registers));
-        if let Some(importer) = &mut importer {
-            importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
-        }
         let start = Instant::now();
-        settle_formats(&mut session, addr);
+        prepare(&mut session, &mut importer, &edits, addr, true);
         let result = session.decompile(addr);
         known.insert(addr);
         let ms = start.elapsed().as_secs_f64() * 1e3;

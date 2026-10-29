@@ -609,11 +609,13 @@ pub struct Importer<'a> {
     stubs: HashMap<u64, u64>,
     /// The functions whose prototype has been handed over.
     given: HashSet<u64>,
+    /// The globals handed over, by index into [`Types::globals`].
+    given_globals: HashSet<usize>,
 }
 
 impl<'a> Importer<'a> {
     pub fn new(types: &'a Types, stubs: HashMap<u64, u64>) -> Importer<'a> {
-        Importer { types, writer: Writer::new(types), stubs, given: HashSet::new() }
+        Importer { types, writer: Writer::new(types), stubs, given: HashSet::new(), given_globals: HashSet::new() }
     }
 
     /// What the debug information says about the function at `addr`, or about the function it
@@ -633,13 +635,33 @@ impl<'a> Importer<'a> {
         }
     }
 
-    /// Gives `session` every global variable with its type. A function may refer to any of
-    /// them, and they are few next to the functions.
+    /// Gives `session` every global variable with its type.
     pub fn globals(&mut self, session: &mut crate::Session) {
-        for global in &self.types.globals {
-            self.writer.global(global);
+        for (index, global) in self.types.globals.iter().enumerate() {
+            if self.given_globals.insert(index) {
+                self.writer.global(global);
+            }
         }
         self.flush(session);
+    }
+
+    /// Gives `session` each global that holds one of `addrs` and was not given before, and says
+    /// where those start. Call it with the addresses a function's code refers to before
+    /// decompiling it: an IL2CPP build has a global for every type, method and string its code
+    /// looks up, and giving all of them would make every session wait for them.
+    pub fn globals_at(&mut self, session: &mut crate::Session, addrs: impl IntoIterator<Item = u64>) -> Vec<u64> {
+        let globals = &self.types.globals;
+        let mut given = Vec::new();
+        for addr in addrs {
+            let Some(index) = globals.partition_point(|global| global.addr <= addr).checked_sub(1) else { continue };
+            let global = &globals[index];
+            if addr < global.addr + self.types.size(global.kind).max(1) && self.given_globals.insert(index) {
+                self.writer.global(global);
+                given.push(global.addr);
+            }
+        }
+        self.flush(session);
+        given
     }
 
     /// Gives `session` the prototypes of the functions at `addrs` that have one and were not
