@@ -151,10 +151,29 @@ pub struct Il2Cpp {
     pub class_layout: Option<ClassLayout>,
 }
 
-/// The `global-metadata.dat` of the IL2CPP build whose code is the binary at `binary`: in the
-/// player's data directory, `<Game>_Data/il2cpp_data/Metadata/`, beside a Windows or Linux
-/// build's `GameAssembly`; in `assets/bin/Data/Managed/Metadata/` of an Android package, two
-/// directories above `lib/<abi>/libil2cpp.so`; or beside the binary itself.
+/// Gives `image`, loaded from `path`, the managed program and the names of its IL2CPP build, if
+/// it is one whose metadata can be found. Why the metadata could not be read goes to stderr:
+/// the binary is analyzed without it.
+#[inline(never)]
+pub(crate) fn attach(image: &mut Image, path: &Path) {
+    let Some(metadata) = find(path) else { return };
+    match load(image, &metadata) {
+        Ok(il2cpp) => {
+            // A name the file carries for an address keeps it.
+            for (addr, name) in il2cpp.function_names().into_iter().chain(il2cpp.usage_names()) {
+                image.symbol_names.entry(addr).or_insert(name);
+            }
+            image.il2cpp = Some(std::sync::Arc::new(il2cpp));
+        }
+        Err(error) => eprintln!("IL2CPP metadata in {metadata:?}: {error:#}"),
+    }
+}
+
+/// The `global-metadata.dat` of the IL2CPP build whose code is the binary at `binary`: beside
+/// it; in `assets/bin/Data/Managed/Metadata/` of an Android package, two directories above
+/// `lib/<abi>/libil2cpp.so`; or, for a binary Unity names `GameAssembly` or `libil2cpp`, in the
+/// player's data directory beside it, `<Game>_Data/il2cpp_data/Metadata/`. Other binaries cost
+/// two failed lookups and no listing of their directory.
 pub fn find(binary: &Path) -> Option<PathBuf> {
     const FILE: &str = "global-metadata.dat";
     let dir = binary.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -165,6 +184,10 @@ pub fn find(binary: &Path) -> Option<PathBuf> {
     let android = dir.join("../../assets/bin/Data/Managed/Metadata").join(FILE);
     if android.is_file() {
         return Some(android);
+    }
+    let stem = binary.file_stem()?.to_str()?;
+    if !matches!(stem, "GameAssembly" | "libil2cpp") {
+        return None;
     }
     std::fs::read_dir(dir)
         .ok()?

@@ -329,18 +329,7 @@ impl Image {
         if machine == Machine::Arm {
             crate::arm::load(&file, &mut image);
         }
-        if let Some(metadata) = crate::il2cpp::find(path) {
-            // An IL2CPP build is analyzed without its metadata where that cannot be read.
-            match crate::il2cpp::load(&image, &metadata) {
-                Ok(il2cpp) => {
-                    for (addr, name) in il2cpp.function_names().into_iter().chain(il2cpp.usage_names()) {
-                        image.symbol_names.entry(addr).or_insert(name);
-                    }
-                    image.il2cpp = Some(std::sync::Arc::new(il2cpp));
-                }
-                Err(error) => eprintln!("IL2CPP metadata in {metadata:?}: {error:#}"),
-            }
-        }
+        crate::il2cpp::attach(&mut image, path);
         Ok(image)
     }
 
