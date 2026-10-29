@@ -101,6 +101,11 @@ pub struct Types {
     /// At most one per address.
     pub functions: Vec<Function>,
     pub globals: Vec<Global>,
+    /// Whether code reaches each global by its own address, as an IL2CPP build's code reaches
+    /// its usage slots, so that the addresses a function's code refers to name every global it
+    /// needs. Code compiled from C or Rust also reaches globals through pointers the engine
+    /// reads from memory.
+    pub globals_by_reference: bool,
     /// Bytes in a pointer.
     pub pointer: u64,
     /// The named types so far, by name, with their kind and size. The engine knows a type by
@@ -120,7 +125,7 @@ impl Types {
         let sized = ["int", "uint", "float", "undefined", "wchar"].iter().flat_map(|base| [1, 2, 4, 8, 10, 16].map(|size| format!("{base}{size}")));
         let taken = ["void", "bool", "char", "code", "undefined"].map(String::from).into_iter().chain(sized);
         let names = taken.map(|name| (name, (VOID, Named::Typedef, TAKEN))).collect();
-        Types { types: vec![Type::Void], functions: Vec::new(), globals: Vec::new(), pointer, names }
+        Types { types: vec![Type::Void], functions: Vec::new(), globals: Vec::new(), globals_by_reference: false, pointer, names }
     }
 
     /// Whether the engine has a type called `name` from the start, such as `uint4`.
@@ -646,18 +651,21 @@ impl<'a> Importer<'a> {
     }
 
     /// Gives `session` each global that holds one of `addrs` and was not given before, and says
-    /// where those start. Call it with the addresses a function's code refers to before
-    /// decompiling it: an IL2CPP build has a global for every type, method and string its code
-    /// looks up, and giving all of them would make every session wait for them.
-    pub fn globals_at(&mut self, session: &mut crate::Session, addrs: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    /// where those lie. Call it with the addresses a function's code refers to before
+    /// decompiling it, where [`Types::globals_by_reference`] holds: an IL2CPP build has a global
+    /// for every type, method and string its code looks up, and giving all of them would make
+    /// every session wait for them. Its globals do not overlap, so the one before an address is
+    /// the only one that can hold it.
+    pub fn globals_at(&mut self, session: &mut crate::Session, addrs: impl IntoIterator<Item = u64>) -> Vec<std::ops::Range<u64>> {
         let globals = &self.types.globals;
         let mut given = Vec::new();
         for addr in addrs {
             let Some(index) = globals.partition_point(|global| global.addr <= addr).checked_sub(1) else { continue };
             let global = &globals[index];
-            if addr < global.addr + self.types.size(global.kind).max(1) && self.given_globals.insert(index) {
+            let extent = global.addr..global.addr + self.types.size(global.kind).max(1);
+            if extent.contains(&addr) && self.given_globals.insert(index) {
                 self.writer.global(global);
-                given.push(global.addr);
+                given.push(extent);
             }
         }
         self.flush(session);
