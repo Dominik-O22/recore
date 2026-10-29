@@ -13,6 +13,7 @@ pub mod dwarf;
 pub mod facts;
 mod ffi;
 pub mod flow;
+pub mod il2cpp;
 pub mod isolate;
 pub mod pdb;
 pub mod prototypes;

@@ -539,8 +539,8 @@ fn read_as_hex(text: &str) -> String {
 pub(crate) fn resolve_function(binary: &Binary, text: &str) -> Result<u64> {
     match (binary.program.function_named(text), parse_addr(text)) {
         (Ok(entry), _) => Ok(entry),
-        (Err(_), Some(addr)) => binary.program.function_at(addr),
-        (Err(error), None) => Err(error),
+        (Err(_), Some(addr)) if !binary.program.names_function(text) => binary.program.function_at(addr),
+        (Err(error), _) => Err(error),
     }
 }
 
@@ -688,7 +688,13 @@ fn describe_to(binary: &Binary, addr: u64, depth: usize) -> String {
     if let Some(name) = binary.program.image.symbol_names.get(&addr).filter(|_| binary.program.function(addr).is_none()) {
         let image = &binary.program.image;
         // A raw image carries no names: its layout gives them, with its machine or in a names file.
-        let source = if image.format == Format::Raw { "a name the layout gives" } else { "a name the file carries" };
+        let source = if image.format == Format::Raw {
+            "a name the layout gives"
+        } else if image.il2cpp.as_ref().is_some_and(|il2cpp| il2cpp.is_usage(addr)) {
+            "a usage slot the IL2CPP metadata names, which holds it once the runtime fills it in"
+        } else {
+            "a name the file carries"
+        };
         let bits: Vec<String> = recore::hardware::bits(image, addr).into_iter().map(|(bit, name)| format!("{name} is bit {bit:#x}")).collect();
         return format!("{name}, {source}{}{}", if bits.is_empty() { String::new() } else { format!(" ({})", bits.join(", ")) }, held());
     }
@@ -808,6 +814,17 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
         analysis.strings.len(),
         analysis.jump_tables.len(),
     )?;
+    if let Some(il2cpp) = &image.il2cpp {
+        writeln!(
+            out,
+            "Unity IL2CPP build, named from its global-metadata.dat (version {}): {} types, {} methods with code, {} generic method instances, {} usage slots. Methods take a trailing MethodInfo; `this->klass->Name` is a virtual call to the method of that name",
+            il2cpp.version,
+            il2cpp.types.len(),
+            il2cpp.methods.iter().filter(|method| method.addr.is_some()).count(),
+            il2cpp.generic_methods.len(),
+            il2cpp.usages.len(),
+        )?;
+    }
     if let Some(banking) = recore::i8051::banking_summary(image, analysis) {
         writeln!(out, "{banking}")?;
     }
@@ -1162,6 +1179,7 @@ fn decompile(binary: &mut Binary, args: Decompile) -> Result<String> {
     // is, for code the analysis did not make a function of.
     let resolve = |text: &String| match (binary.program.function_named(text), parse_addr(text)) {
         (Ok(entry), _) => Ok(entry),
+        (Err(error), _) if binary.program.names_function(text) => Err(error),
         (Err(_), Some(addr)) if binary.program.image.is_code(addr) => Ok(binary.program.function_at(addr).unwrap_or(addr)),
         (Err(_), Some(addr)) => bail!("{addr:#x} is not code"),
         (Err(error), None) => Err(error),

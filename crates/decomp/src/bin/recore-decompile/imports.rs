@@ -50,7 +50,7 @@ pub fn debug_info(binary: &Path) -> Result<()> {
     use recore_decomp::{Session, types};
     let image = recore::Image::load(binary)?;
     let analysis = recore::analyze(&image);
-    let Some(file) = types::debug_file(binary, &image) else {
+    let Some(file) = types::debug_file(binary, &image).or_else(|| image.il2cpp.as_ref().and(recore::il2cpp::find(binary))) else {
         println!("no debug information for {binary:?}");
         return Ok(());
     };

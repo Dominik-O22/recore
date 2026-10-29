@@ -322,8 +322,10 @@ pub fn symbols(binary: &mut Binary, args: Symbols) -> Result<String> {
     rows.extend(program.analysis.imports.iter().map(|import| (import.slot, "import slot", import.name.clone())));
     rows.extend(program.analysis.classes.iter().map(|class| (class.vtable, "vtable", format!("{}::vftable", class.name))));
     rows.extend(binary.edits.globals(&program.analysis).into_iter().map(|(addr, name, kind)| (addr, if kind.is_some() { "data, typed" } else { "data, named" }, name)));
-    // A name the file carries for something that is not a function: an exported variable.
-    rows.extend(program.image.symbol_names.iter().filter(|(addr, _)| program.function(**addr).is_none() && !binary.edits.names.contains_key(addr)).map(|(&addr, name)| (addr, "exported", name.clone())));
+    // A name the file carries for something that is not a function: an exported variable, or
+    // in an IL2CPP build a usage slot its metadata names.
+    let kind = |addr: u64| if program.image.il2cpp.as_ref().is_some_and(|il2cpp| il2cpp.is_usage(addr)) { "IL2CPP usage slot" } else { "exported" };
+    rows.extend(program.image.symbol_names.iter().filter(|(addr, _)| program.function(**addr).is_none() && !binary.edits.names.contains_key(addr)).map(|(&addr, name)| (addr, kind(addr), name.clone())));
     rows.retain(|(_, _, name)| matches(name, pattern.as_ref()));
     rows.sort();
     let limit = args.limit.unwrap_or(DEFAULT_LIMIT);

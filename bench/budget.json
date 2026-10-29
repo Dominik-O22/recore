@@ -24,27 +24,27 @@
     "diff": 97991687
   },
   "corpus-armel/bin/deb__cmake__ctest": {
-    "analysis": 7694039263,
+    "analysis": 7864177808,
     "diff": 5460893971
   },
   "corpus-armel/bin/deb__coreutils__expr": {
-    "analysis": 16302413,
+    "analysis": 16642367,
     "diff": 12315882
   },
   "corpus-armel/bin/deb__git__git-imap-send": {
-    "analysis": 1569838422,
+    "analysis": 1602346672,
     "diff": 887210224
   },
   "corpus-armel/bin/deb__gzip__gzip": {
-    "analysis": 38215203,
+    "analysis": 38902194,
     "diff": 32183796
   },
   "corpus-armel/bin/deb__openssh-client__ssh-agent": {
-    "analysis": 115969781,
+    "analysis": 118647680,
     "diff": 92678654
   },
   "corpus-armel/bin/deb__re2c__re2rust": {
-    "analysis": 488606037,
+    "analysis": 499354149,
     "diff": 318208895
   },
   "corpus-armhf/bin/deb__cmake__ctest": {

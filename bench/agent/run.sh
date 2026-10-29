@@ -1,23 +1,35 @@
 #!/usr/bin/env bash
-# One agent session on the three tasks of key.md with one tool: the targets fetched, the prompt
+# One agent session on a set of tasks of key.md with one tool: the targets fetched, the prompt
 # filled in, and the session recorded in <dir>/work/run.jsonl. The agent's report goes to
-# <dir>/report.md, and its cost to <dir>/stats.json.
-# Usage: bench/agent/run.sh <recore|ghidra> <model> <dir>, with <dir> outside any git repository.
+# <dir>/report.md, its cost to <dir>/stats.json, and the letters of its tasks to <dir>/tasks.
+# Usage: bench/agent/run.sh <recore|ghidra> <model> <dir> [abc|il2cpp], with <dir> outside any
+# git repository. `abc` is Tasks A to C, the default; `il2cpp` is Task D, for recore only.
 #   recore: RECORE_MCP names the binary, target/release/recore-mcp unless set.
 #   ghidra: GHIDRA_INSTALL_DIR names Ghidra, and pyghidra-mcp and ghidriff must be on the path. Ghidra
 #   analyzes the targets before the session starts, in <dir>/work/analysis.seconds.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-tool=$1 model=$2 dir=$(realpath -m "$3")
+tool=$1 model=$2 dir=$(realpath -m "$3") set=${4:-abc}
 mkdir -p "$dir/task" "$dir/work"
 # Claude Code shows a session the branch and recent commits of the repository it runs in.
 if git -C "$dir" rev-parse --git-dir > /dev/null 2>&1; then
   echo "$dir is inside a git repository, whose status the session would see; choose another directory" >&2
   exit 2
 fi
-python3 -I "$here/fetch.py" "$root/target/agent"
-cp "$root"/target/agent/{git.exe,python313.dll,libx-before.so,libx-after.so} "$dir/task/"
+case $set in
+  abc)
+    targets=(git.exe python313.dll libx-before.so libx-after.so) prompt=$tool tasks=ABC ;;
+  il2cpp)
+    [ "$tool" = recore ] || { echo "Task D runs with recore only" >&2; exit 2; }
+    targets=(GameAssembly.so Game_Data/il2cpp_data/Metadata/global-metadata.dat) prompt=$tool-il2cpp tasks=D ;;
+  *)
+    echo "the task set is abc or il2cpp" >&2
+    exit 2 ;;
+esac
+echo "$tasks" > "$dir/tasks"
+python3 -I "$here/fetch.py" "$root/target/agent" "${targets[@]}"
+(cd "$root/target/agent" && cp --parents "${targets[@]}" "$dir/task/")
 mcp=(--strict-mcp-config)
 case $tool in
   recore)
@@ -26,7 +38,7 @@ case $tool in
     cp "${RECORE_MCP:-$root/target/release/recore-mcp}" "$dir/bin/.recore-mcp"
     printf '#!/bin/sh\necho "$1" >> "%s/work/calls.log"\nexec "%s/bin/.recore-mcp" "$@"\n' "$dir" "$dir" > "$dir/bin/recore-mcp"
     chmod +x "$dir/bin/recore-mcp"
-    sed "s#{DIR}#$dir#g" "$here/prompts/recore.md" > "$dir/prompt.md" ;;
+    sed "s#{DIR}#$dir#g" "$here/prompts/$prompt.md" > "$dir/prompt.md" ;;
   ghidra)
     command -v pyghidra-mcp ghidriff > /dev/null || { echo "the Ghidra side needs pyghidra-mcp and ghidriff on the path" >&2; exit 2; }
     port=${PORT:-8765}
@@ -42,7 +54,7 @@ case $tool in
     echo $(($(date +%s) - start)) > "$dir/work/analysis.seconds"
     printf '{"mcpServers":{"ghidra":{"type":"http","url":"http://127.0.0.1:%s/mcp"}}}\n' "$port" > "$dir/mcp.json"
     mcp+=(--mcp-config "$dir/mcp.json")
-    sed "s#{DIR}#$dir#g; s#{GHIDRA}#$GHIDRA_INSTALL_DIR#g" "$here/prompts/ghidra.md" > "$dir/prompt.md" ;;
+    sed "s#{DIR}#$dir#g; s#{GHIDRA}#$GHIDRA_INSTALL_DIR#g" "$here/prompts/$prompt.md" > "$dir/prompt.md" ;;
   *)
     echo "the tool is recore or ghidra" >&2
     exit 2 ;;

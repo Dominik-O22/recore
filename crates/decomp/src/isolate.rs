@@ -43,8 +43,9 @@ pub struct Options {
     /// Send the C text back, not only its length.
     pub emit_c: bool,
     pub jump_tables: JumpTables,
-    /// Address-space limit in GiB. Past it the engine's allocations fail and the function is
-    /// reported as an error, instead of the machine going into swap.
+    /// Address space in GiB a child may take beyond what loading the binary took. Past it the
+    /// engine's allocations fail and the function is reported as an error, instead of the
+    /// machine going into swap.
     pub memory_gb: u64,
     /// Decompile the functions a function calls before the function itself, so that its calls
     /// pass at least the parameters those were found to take. Only done for 32-bit x86, where a
@@ -149,6 +150,13 @@ enum Request {
     Structs(u64),
 }
 
+/// The bytes of address space this process holds, where the system says.
+fn address_space() -> Option<u64> {
+    // The first number in `statm` is the size of the address space, in pages.
+    let pages = std::fs::read_to_string("/proc/self/statm").ok()?.split_whitespace().next()?.parse::<u64>().ok()?;
+    pages.checked_mul(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64)
+}
+
 /// Callees with more code than this, in bytes, are not decompiled ahead of their callers. The few
 /// large functions take most of the time, and leaving them out costs no measurable accuracy.
 const CALLEE_LIMIT: u64 = 4096;
@@ -157,10 +165,6 @@ const CALLEE_LIMIT: u64 = 4096;
 /// until stdin closes. `options` is the JSON that [`Worker::new`] passed along.
 pub fn serve(binary: &Path, options: &str) -> Result<()> {
     let options: Options = serde_json::from_str(options)?;
-    let bytes = options.memory_gb << 30;
-    // Failing to set the limit only loses the protection.
-    unsafe { libc::setrlimit(libc::RLIMIT_AS, &libc::rlimit { rlim_cur: bytes, rlim_max: bytes }) };
-
     let image = recore::Image::load(binary)?;
     // The engine reads its language files, and debug information is read if there is any,
     // while the analysis runs.
@@ -170,6 +174,14 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         let analysis = recore::analyze(&image);
         (session.join().expect("loading does not panic"), analysis, debug.join().ok().flatten())
     });
+    // The limit is on what the engine takes from here on. Loading a large binary, with its
+    // analysis and an IL2CPP build's metadata, takes gigabytes of its own, and is bounded by
+    // the binary. Where the system does not say how much that was, there is no limit: one
+    // counted from nothing could fail setup. Failing to set it only loses the protection.
+    if let Some(loaded) = address_space() {
+        let bytes = loaded.saturating_add(options.memory_gb << 30);
+        unsafe { libc::setrlimit(libc::RLIMIT_AS, &libc::rlimit { rlim_cur: bytes, rlim_max: bytes }) };
+    }
     let mut session = session?;
     let mut edits = Edits::load(binary)?;
     session.add_imports(&image, &analysis)?;
@@ -224,11 +236,13 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
     }
     // Data the image has a name for, such as a variable a library exports, goes by that name
-    // in the C. An edit, which follows, has the last word.
+    // in the C, unless the debug information gave it a type as well. An edit, which follows,
+    // has the last word.
+    let typed = |addr: u64| debug.as_ref().is_some_and(|debug| debug.globals.binary_search_by_key(&addr, |global| global.addr).is_ok());
     let is_function = |addr: u64| analysis.functions.binary_search_by_key(&addr, |function| function.addr).is_ok();
     // A Cortex-M's registers, the system's and a device's, are words.
     let register = (image.machine == Machine::Thumb).then_some("uint");
-    for (&addr, name) in image.symbol_names.iter().filter(|(addr, _)| !is_function(**addr) && !image.is_code(**addr)) {
+    for (&addr, name) in image.symbol_names.iter().filter(|(addr, _)| !is_function(**addr) && !image.is_code(**addr) && !typed(**addr)) {
         // One the engine does not take is only left without its name.
         let _ = session.add_global(addr, name, register.filter(|_| image.is_zero_filled(addr)));
     }

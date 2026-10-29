@@ -1430,6 +1430,7 @@ fn value(reading: &Reading, bits: Option<u32>) -> String {
 fn function_entry(binary: &Binary, function: &str) -> Result<u64> {
     match binary.program.function_named(function) {
         Ok(entry) => Ok(entry),
+        Err(error) if binary.program.names_function(function) => Err(error),
         Err(_) => parse_addr(function).filter(|&addr| binary.program.image.is_code(addr)).with_context(|| format!("`{function}` is neither a function of the binary nor an address in its code")),
     }
 }
