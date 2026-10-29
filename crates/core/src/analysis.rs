@@ -114,6 +114,12 @@ fn decode<A: Arch>(image: &Image, start: u64, end: u64, trim: bool, tables: &[(u
         }
         function.end = body_end;
     }
+    // Every function's controls are kept until analysis ends, in a vector grown by doubling.
+    // The few large ones hold most of the room left over; giving back a small one's costs more
+    // time than it saves.
+    if function.controls.capacity() - function.controls.len() >= 16 {
+        function.controls.shrink_to_fit();
+    }
     function
 }
 
@@ -625,7 +631,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         }
 
         _phase = phase::scope("noreturn");
-        let mut controls: Vec<Control> = functions.iter().chain(&chunks).flat_map(|f| f.controls.iter().copied()).collect();
+        let mut controls: Vec<Control> = Vec::with_capacity(functions.iter().chain(&chunks).map(|f| f.controls.len()).sum());
+        controls.extend(functions.iter().chain(&chunks).flat_map(|f| f.controls.iter().copied()));
         controls.par_sort_unstable_by_key(|c| c.addr);
         let mut extents: Vec<(u64, u64)> = functions.iter().chain(&chunks).map(|f| (f.start, f.end)).collect();
         extents.sort_unstable();
@@ -716,6 +723,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         // run on into it, are walked again: those with one in their extent, and those that
         // leave their extent, which may pass any.
         let mut noreturn: FxHashSet<u64> = terminal_callees.into_iter().filter(|target| starts.binary_search(target).is_ok()).collect();
+        // What only the call sites needed, which would otherwise last the round.
+        drop((sites, contested, jumped_to, goes_on));
         let mut open: Vec<Open> = functions
             .iter()
             .filter(|f| !noreturn.contains(&f.start))
@@ -794,6 +803,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     _phase = phase::scope("chunk ranges");
     let chunk_ranges: Vec<(u64, u64)> = chunks.iter().map(|c| (c.start, c.end)).collect();
     let extra_ranges: FxHashMap<u64, Vec<(u64, u64)>> = if chunks.is_empty() {
+        // The whole program's controls are a copy of the functions', needed no further.
+        drop((controls, extents));
         FxHashMap::default()
     } else {
         let program = Program { controls, starts: &starts, extents, imports: &imports, tables: &tables, pointer_slots: &pointer_slots, runs_on: A::RUNS_ON, frame_ends: &frame_ends };
