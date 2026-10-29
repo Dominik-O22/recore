@@ -66,11 +66,11 @@ fn file(path: &Path) -> Option<PathBuf> {
     };
     let path = std::path::absolute(path).ok()?;
     let hash = rustc_hash::FxBuildHasher.hash_one(&path);
-    Some(dir.join(format!("{}-{hash:016x}.json", path.file_name()?.to_string_lossy())))
+    Some(dir.join(format!("{}-{hash:016x}", path.file_name()?.to_string_lossy())))
 }
 
-/// The file holds the key on its first line and the analysis after it, so that a stale file is
-/// turned down without reading the rest.
+/// The file holds the key as JSON on its first line and the analysis after it in bitcode, which
+/// reads several times faster than JSON. A stale file is turned down without reading the rest.
 fn read(file: &Path, key: &Key) -> Option<Analysis> {
     let mut reader = BufReader::new(std::fs::File::open(file).ok()?);
     let mut line = String::new();
@@ -80,20 +80,20 @@ fn read(file: &Path, key: &Key) -> Option<Analysis> {
     }
     let mut rest = Vec::new();
     reader.read_to_end(&mut rest).ok()?;
-    serde_json::from_slice(&rest).ok()
+    bitcode::decode(&rest).ok()
 }
 
 /// Writes through a file of this process's own, so that a reader never sees half an analysis
 /// and two processes that analyzed at once each write a whole one. A file cut short by a crash
 /// fails to parse and is analyzed again.
 fn write(file: &Path, key: &Key, analysis: &Analysis) {
-    let partial = file.with_extension(format!("partial.{}", std::process::id()));
+    let partial = file.with_file_name(format!("{}.partial.{}", file.file_name().expect("named").to_string_lossy(), std::process::id()));
     let written = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(file.parent().expect("kept in a directory"))?;
         let mut out = std::io::BufWriter::new(std::fs::File::create(&partial)?);
         serde_json::to_writer(&mut out, key)?;
         out.write_all(b"\n")?;
-        serde_json::to_writer(&mut out, analysis)?;
+        out.write_all(&bitcode::encode(analysis))?;
         out.flush()?;
         std::fs::rename(&partial, file)
     })();
@@ -114,7 +114,7 @@ mod tests {
         let image = Image::load(&binary).unwrap();
         let analysis = crate::analyze(&image);
         let dir = binary.with_file_name("cache-test");
-        let file = dir.join("kept.json");
+        let file = dir.join("kept");
         let key = Key::of(&binary).unwrap();
         write(&file, &key, &analysis);
         let back = read(&file, &key).expect("read back");
