@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use recore::il2cpp::{Il2Cpp, Ty, TypeDef, Usage, display};
+use recore::il2cpp::{Il2Cpp, Names, Ty, TypeDef, Usage};
 
 use crate::types::{Base, Field, Function, Global, Named, Prototype, Type, TypeId, Types, VOID};
 
@@ -25,7 +25,7 @@ pub fn types(il2cpp: &Il2Cpp) -> Types {
 
 struct Builder<'a> {
     il2cpp: &'a Il2Cpp,
-    names: Vec<String>,
+    names: Names,
     types: Types,
     /// Per type definition: the struct of its objects or values, and that of its class record.
     objects: Vec<TypeId>,
@@ -38,7 +38,7 @@ struct Builder<'a> {
 impl<'a> Builder<'a> {
     fn new(il2cpp: &'a Il2Cpp) -> Builder<'a> {
         let mut types = Types::new(8);
-        let names = il2cpp.type_names();
+        let names = il2cpp.names();
         let method_info = opaque(&mut types, "Il2CppMethodInfo");
         let mut builder = Builder { il2cpp, names, types, objects: Vec::new(), classes: Vec::new(), built: HashMap::new(), method_info };
         // Every struct is named first, so that fields can refer to any of them. An enum is the
@@ -55,7 +55,7 @@ impl<'a> Builder<'a> {
             builder.objects.push(object);
         }
         for def in &il2cpp.types {
-            let size = il2cpp.class_layout.map_or(0, |layout| layout.vtable + 16 * def.vtable.len() as u64);
+            let size = il2cpp.class_layout.vtable + 16 * def.vtable.len() as u64;
             let class = builder.types.named(Named::Struct, &format!("{}_c", def.name), size).0;
             builder.classes.push(class);
         }
@@ -91,9 +91,7 @@ impl<'a> Builder<'a> {
         fields.dedup_by_key(|field| field.offset);
         self.types.set_fields(self.objects[index], fields);
 
-        let Some(layout) = self.il2cpp.class_layout else {
-            return;
-        };
+        let layout = self.il2cpp.class_layout;
         let mut members = Vec::new();
         if !statics.is_empty() {
             statics.sort_by_key(|field| field.offset);
@@ -179,7 +177,7 @@ impl<'a> Builder<'a> {
                 if self.il2cpp.types[*def as usize].is_value_type {
                     return None;
                 }
-                let name = display(ty, &self.names);
+                let name = self.names.display(ty);
                 let declared = match self.built.get(&name) {
                     Some(&id) => id,
                     None => {
@@ -191,7 +189,7 @@ impl<'a> Builder<'a> {
                 self.pointer(declared)
             }
             Ty::Array(element) => {
-                let name = display(ty, &self.names);
+                let name = self.names.display(ty);
                 if let Some(&id) = self.built.get(&name) {
                     return Some(self.pointer(id));
                 }
@@ -225,7 +223,9 @@ impl<'a> Builder<'a> {
 
     /// A pointer to the objects of the type definition `namespace.name`, or to nothing known.
     fn object_named(&mut self, namespace: &str, name: &str) -> TypeId {
-        let found = self.il2cpp.types.iter().position(|def| def.namespace == namespace && def.name == name);
+        // A name types of several namespaces share is qualified.
+        let qualified = format!("{namespace}.{name}");
+        let found = self.il2cpp.types.iter().position(|def| def.namespace == namespace && (def.name == name || def.name == qualified));
         let target = found.map_or(VOID, |index| self.objects[index]);
         self.pointer(target)
     }

@@ -19,6 +19,7 @@
 //! is for: `kind << 29 | index << 1 | 1`.
 
 mod metadata;
+mod tables;
 
 use std::path::{Path, PathBuf};
 
@@ -27,6 +28,7 @@ use rustc_hash::FxHashMap;
 
 use crate::image::Image;
 pub use metadata::Metadata;
+use tables::{Tables, code};
 
 /// The type a field, parameter or return value has, as the binary's type table spells it.
 #[derive(Debug, Clone, PartialEq)]
@@ -77,8 +79,14 @@ pub struct Field {
 /// A class, struct, enum or interface.
 #[derive(Debug, Clone)]
 pub struct TypeDef {
-    /// As C# spells it within its namespace, enclosing types first: `Outer.Inner<T>`.
+    /// As C# spells it within its namespace, enclosing types first: `Outer<T>.Inner`. A name
+    /// that types of several namespaces share is qualified by the namespace, and one that is
+    /// still not unique, such as a compiler's helper class in each assembly, numbered.
     pub name: String,
+    /// The name in parts, enclosing types first, each with how many of the type's generic
+    /// arguments are its own: `Dictionary<TKey,TValue>.KeyCollection` is `Dictionary` with 2
+    /// and `KeyCollection` with none.
+    pub parts: Vec<(String, usize)>,
     pub namespace: String,
     /// The type definition it derives from.
     pub parent: Option<u32>,
@@ -147,8 +155,7 @@ pub struct Il2Cpp {
     pub generic_methods: Vec<(u64, String)>,
     /// Usage slots by address, sorted.
     pub usages: Vec<(u64, Usage)>,
-    /// `None` where the binary's pointers are not 64 bits wide.
-    pub class_layout: Option<ClassLayout>,
+    pub class_layout: ClassLayout,
 }
 
 /// Gives `image`, loaded from `path`, the managed program and the names of its IL2CPP build, if
@@ -170,10 +177,10 @@ pub(crate) fn attach(image: &mut Image, path: &Path) {
 }
 
 /// The `global-metadata.dat` of the IL2CPP build whose code is the binary at `binary`: beside
-/// it; in `assets/bin/Data/Managed/Metadata/` of an Android package, two directories above
-/// `lib/<abi>/libil2cpp.so`; or, for a binary Unity names `GameAssembly` or `libil2cpp`, in the
-/// player's data directory beside it, `<Game>_Data/il2cpp_data/Metadata/`. Other binaries cost
-/// two failed lookups and no listing of their directory.
+/// it; for `GameAssembly`, in the player's data directory beside it,
+/// `<Game>_Data/il2cpp_data/Metadata/`; or for `libil2cpp`, in `assets/bin/Data/Managed/Metadata/`
+/// of an Android package, two directories above `lib/<abi>/libil2cpp.so`. Another binary costs
+/// one failed lookup.
 pub fn find(binary: &Path) -> Option<PathBuf> {
     const FILE: &str = "global-metadata.dat";
     let dir = binary.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -181,20 +188,18 @@ pub fn find(binary: &Path) -> Option<PathBuf> {
     if beside.is_file() {
         return Some(beside);
     }
-    let android = dir.join("../../assets/bin/Data/Managed/Metadata").join(FILE);
-    if android.is_file() {
-        return Some(android);
+    match binary.file_stem()?.to_str()? {
+        "libil2cpp" => Some(dir.join("../../assets/bin/Data/Managed/Metadata").join(FILE)).filter(|android| android.is_file()),
+        // The first in order, where a directory holds the data of several builds.
+        "GameAssembly" => std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with("_Data"))
+            .map(|entry| entry.path().join("il2cpp_data/Metadata").join(FILE))
+            .filter(|candidate| candidate.is_file())
+            .min(),
+        _ => None,
     }
-    let stem = binary.file_stem()?.to_str()?;
-    if !matches!(stem, "GameAssembly" | "libil2cpp") {
-        return None;
-    }
-    std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().ends_with("_Data"))
-        .map(|entry| entry.path().join("il2cpp_data/Metadata").join(FILE))
-        .find(|candidate| candidate.is_file())
 }
 
 /// Reads the managed program of the IL2CPP build whose code `image` is, from the metadata file
@@ -237,27 +242,6 @@ impl Words<'_> {
     }
 }
 
-/// Fields of the metadata registration, by offset in it.
-mod registration {
-    pub const GENERIC_INSTS_COUNT: u64 = 0x10;
-    pub const GENERIC_METHOD_TABLE_COUNT: u64 = 0x20;
-    pub const TYPES_COUNT: u64 = 0x30;
-    pub const METHOD_SPECS_COUNT: u64 = 0x40;
-    pub const FIELD_OFFSETS_COUNT: u64 = 0x50;
-    pub const FIELD_OFFSETS: u64 = 0x58;
-    pub const TYPE_SIZES: u64 = 0x68;
-}
-
-/// Fields of a code registration and a code generation module, by offset.
-mod code {
-    pub const GENERIC_METHOD_POINTERS_COUNT: u64 = 0x10;
-    pub const GENERIC_METHOD_POINTERS: u64 = 0x18;
-    /// From the module list's count.
-    pub const MODULES_COUNT: u64 = 0x78;
-    pub const MODULE_METHOD_COUNT: u64 = 0x8;
-    pub const MODULE_METHODS: u64 = 0x10;
-}
-
 /// Bytes in an object's header: its class and its monitor.
 const HEADER: u32 = 16;
 
@@ -269,219 +253,42 @@ const FIELD: u64 = 4;
 const LITERAL: u64 = 5;
 const METHOD_SPEC: u64 = 6;
 
-/// Where the binary keeps the tables the runtime reads, besides each method's code.
-#[derive(Debug, PartialEq)]
-struct Tables {
-    /// `Il2CppType *` by type index, and how many.
-    types: (u64, u64),
-    /// By type definition: a pointer to the offsets of its fields, null for a type without.
-    field_offsets: Option<u64>,
-    /// By type definition: a pointer to its instance, native, static and thread-static sizes.
-    sizes: Option<u64>,
-    /// `Il2CppGenericInst *` by index: a count of type arguments and a pointer to them.
-    generic_insts: Option<(u64, u64)>,
-    /// Method instances: a method definition, the instance of its class's type arguments and
-    /// that of its own, 12 bytes each.
-    method_specs: Option<(u64, u64)>,
-    /// Compiled method instances: the method instance, the index of its code, an invoker and an
-    /// adjustor thunk, 16 bytes each.
-    generic_method_table: Option<(u64, u64)>,
-    /// The code of compiled method instances, by index.
-    generic_method_pointers: Option<(u64, u64)>,
-}
-
-impl Tables {
-    /// The tables of version 39, which the metadata and code registrations point to.
-    fn registered(words: &Words, metadata: &Metadata, modules: &[(usize, u64)]) -> Option<Tables> {
-        let registration = find_registration(words, metadata.types.len() as u64)?;
-        let field = |offset: u64| words.pointer(registration + offset);
-        let counted = |offset: u64| Some((field(offset + 8)?, words.u64(registration + offset)?));
-        let code = code_registration(words, metadata, modules);
-        Some(Tables {
-            types: counted(registration::TYPES_COUNT)?,
-            field_offsets: field(registration::FIELD_OFFSETS),
-            sizes: field(registration::TYPE_SIZES),
-            generic_insts: counted(registration::GENERIC_INSTS_COUNT),
-            method_specs: counted(registration::METHOD_SPECS_COUNT),
-            generic_method_table: counted(registration::GENERIC_METHOD_TABLE_COUNT),
-            generic_method_pointers: code
-                .and_then(|code| Some((words.pointer(code + code::GENERIC_METHOD_POINTERS)?, words.u64(code + code::GENERIC_METHOD_POINTERS_COUNT)?))),
-        })
-    }
-
-    /// The tables of version 107, which nothing in data points to: the runtime refers to each
-    /// directly. Each is found by what it holds.
-    fn discovered(words: &Words, metadata: &Metadata) -> Option<Tables> {
-        let runs = relocated_runs(words);
-        let count = metadata.types.len() as u64;
-        let types = find_types(words, metadata, &runs)?;
-        // One size record per type definition, and every type has one.
-        let sizes = runs
-            .iter()
-            .find(|&&(start, length)| length == count && words.pointer(start).and_then(|record| words.u32(record)).is_some_and(|size| size > 0))
-            .map(|&(start, _)| start);
-        let field_offsets = find_field_offsets(words, metadata);
-        let generic_insts = runs
-            .iter()
-            .filter(|&&(start, length)| length > 16 && (0..16).all(|index| words.pointer(start + 8 * index).is_some_and(|inst| is_generic_inst(words, inst))))
-            .max_by_key(|&&(_, length)| length)
-            .copied();
-        let method_specs = generic_insts.and_then(|(_, insts)| find_method_specs(words, metadata, insts));
-        let size_records: rustc_hash::FxHashSet<u64> =
-            sizes.map_or_else(Default::default, |sizes| (0..count).filter_map(|index| words.entry(sizes, index)).collect());
-        let generic_method_table = method_specs.and_then(|(specs, spec_count)| {
-            // The table of compiled instances ends where the method instances start. Its rows
-            // name an instance each, and it begins after the last size record.
-            let mut start = specs;
-            while start >= 16 && !size_records.contains(&(start - 16)) {
-                let row = |at: u64| words.u32(start - 16 + at).map(|value| value as i32);
-                let (Some(spec), Some(code), Some(invoker), Some(adjustor)) = (row(0), row(4), row(8), row(12)) else {
-                    break;
-                };
-                if spec < 0 || spec as u64 >= spec_count || code < 0 || invoker < -1 || adjustor < -1 {
-                    break;
-                }
-                start -= 16;
-            }
-            (start < specs).then_some((start, (specs - start) / 16))
-        });
-        let generic_method_pointers = generic_method_table.and_then(|(table, rows)| {
-            let needed = (0..rows).filter_map(|row| words.u32(table + 16 * row + 4)).max()? as u64 + 1;
-            // An array of code in which an instance the build left out is null.
-            let is_code_or_null = |slot: u64| match words.relocated.get(&slot) {
-                Some(&target) => words.image.is_code(target),
-                None => words.u64(slot) == Some(0),
-            };
-            // Index 0 is no code, so the array opens with a null; the stretch of code that follows
-            // is the one closest to the length the table needs.
-            let mut stretches = Vec::new();
-            for &(start, _) in
-                runs.iter().filter(|&&(start, _)| words.u64(start - 8) == Some(0) && words.pointer(start).is_some_and(|code| words.image.is_code(code)))
-            {
-                if stretches.last().is_none_or(|&(array, length): &(u64, u64)| start >= array + 8 * length) {
-                    stretches.push((start - 8, 1 + (0..).take_while(|&index| is_code_or_null(start + 8 * index)).count() as u64));
-                }
-            }
-            stretches.into_iter().filter(|&(_, length)| length >= needed).min_by_key(|&(_, length)| length).map(|(array, _)| (array, needed))
-        });
-        Some(Tables { types, field_offsets, sizes, generic_insts, method_specs, generic_method_table, generic_method_pointers })
-    }
-}
-
-/// Runs of consecutive relocated pointers, as `(first slot, count)`.
-fn relocated_runs(words: &Words) -> Vec<(u64, u64)> {
-    let mut slots: Vec<u64> = words.relocated.keys().copied().collect();
-    slots.sort_unstable();
-    let mut runs: Vec<(u64, u64)> = Vec::new();
-    for slot in slots {
-        match runs.last_mut() {
-            Some((start, length)) if *start + 8 * *length == slot => *length += 1,
-            _ => runs.push((slot, 1)),
-        }
-    }
-    runs
-}
-
-/// The type table, found by the entry for each type definition's own type, which points to a
-/// type record whose data is that definition's index.
-fn find_types(words: &Words, metadata: &Metadata, runs: &[(u64, u64)]) -> Option<(u64, u64)> {
-    let count = metadata.types.len() as u64;
-    let mut votes: FxHashMap<u64, u32> = FxHashMap::default();
-    for (&slot, &record) in &words.relocated {
-        let (Some(data), Some(bits)) = (words.u64(record), words.u32(record + 8)) else {
-            continue;
-        };
-        if data >= count || !matches!((bits >> 16) & 0xff, 0x11 | 0x12) || bits & (1 << 29) != 0 {
-            continue;
-        }
-        if let Some(byval) = metadata.types[data as usize].byval {
-            *votes.entry(slot.wrapping_sub(8 * u64::from(byval))).or_default() += 1;
-        }
-    }
-    let (&table, _) = votes.iter().max_by_key(|&(&table, &votes)| (votes, std::cmp::Reverse(table)))?;
-    let &(start, length) = runs.iter().find(|&&(start, length)| start <= table && table < start + 8 * length)?;
-    Some((table, length - (table - start) / 8))
-}
-
-/// The field offset table: by type definition, a pointer for each type with fields and null
-/// for each without.
-fn find_field_offsets(words: &Words, metadata: &Metadata) -> Option<u64> {
-    let has_fields: Vec<bool> = metadata.types.iter().map(|def| def.field_count > 0).collect();
-    let first = has_fields.iter().position(|&has| has)? as u64;
-    let matches = |table: u64, step: usize| {
-        has_fields.iter().enumerate().step_by(step).all(|(index, &has)| words.relocated.contains_key(&(table + 8 * index as u64)) == has)
-    };
-    words.relocated.keys().map(|&slot| slot.wrapping_sub(8 * first)).find(|&table| matches(table, 97) && matches(table, 1))
-}
-
-/// Whether `inst` holds a generic instance: a count of type arguments and a pointer to them.
-fn is_generic_inst(words: &Words, inst: u64) -> bool {
-    words.u32(inst).is_some_and(|count| (1..=32).contains(&count)) && words.pointer(inst + 8).is_some()
-}
-
-/// The method instances: rows each of a method definition, the instance of its class's type
-/// arguments where the class is generic, and that of its own where the method is.
-fn find_method_specs(words: &Words, metadata: &Metadata, insts: u64) -> Option<(u64, u64)> {
-    let generic_owner = |method: &metadata::MethodDefinition| method.declaring.is_some_and(|owner| metadata.types[owner as usize].generic_container.is_some());
-    let valid = |at: u64| -> Option<bool> {
-        let row = |offset: u64| words.u32(at + offset).map(|value| value as i32);
-        let (method, class, own) = (row(0)?, row(4)?, row(8)?);
-        let method = metadata.methods.get(usize::try_from(method).ok()?)?;
-        let fits = |inst: i32| inst >= -1 && i64::from(inst) < insts as i64;
-        Some(fits(class) && fits(own) && (class >= 0 || own >= 0) && (class < 0 || generic_owner(method)) && (own < 0 || method.generic_container.is_some()))
-    };
-    let mut best: Option<(u64, u64)> = None;
-    for section in words.image.sections.iter().filter(|section| !section.executable && !section.writable) {
-        for phase in (0..12).step_by(4) {
-            let mut run: Option<(u64, u64)> = None;
-            for at in (section.addr + phase..section.end().saturating_sub(12)).step_by(12) {
-                if valid(at) == Some(true) {
-                    let (start, length) = run.get_or_insert((at, 0));
-                    *length += 1;
-                    if best.is_none_or(|(_, longest)| *length > longest) {
-                        best = Some((*start, *length));
-                    }
-                } else {
-                    run = None;
-                }
-            }
-        }
-    }
-    best.filter(|&(_, length)| length >= 16)
-}
-
 struct Builder<'a> {
     words: Words<'a>,
     metadata: &'a Metadata,
     tables: Tables,
     modules: Vec<(usize, u64)>,
+    /// Type records read so far, by address. Records refer to each other, the same ones from
+    /// many places, and in a damaged binary in a loop: one being read stands for no type.
+    read: std::cell::RefCell<FxHashMap<u64, Ty>>,
 }
 
 impl<'a> Builder<'a> {
     fn new(image: &'a Image, metadata: &'a Metadata) -> Result<Builder<'a>> {
         ensure!(image.machine.pointer_size() == 8, "IL2CPP builds are read for 64-bit code only");
         let words = Words { image, relocated: image.relative_targets.iter().copied().collect() };
-        let modules = find_modules(&words, metadata);
+        let modules = tables::find_modules(&words, metadata);
         let tables = if metadata.version >= 100 { Tables::discovered(&words, metadata) } else { Tables::registered(&words, metadata, &modules) };
         let tables = tables.context("the binary's type table is not where it was looked for")?;
-        Ok(Builder { words, metadata, tables, modules })
+        Ok(Builder { words, metadata, tables, modules, read: Default::default() })
     }
 
     fn build(&self) -> Result<Il2Cpp> {
         let metadata = self.metadata;
         let names = self.type_names();
-        let mut types: Vec<TypeDef> = metadata.types.iter().enumerate().map(|(index, def)| self.type_def(index as u32, def, &names[index])).collect();
-        // A class's objects hold its parents' fields before its own.
-        for index in 0..types.len() {
-            let mut inherited = Vec::new();
-            let mut parent = types[index].parent;
-            let mut depth = 0;
-            while let Some(base) = parent.filter(|_| depth < 64 && !types[index].is_value_type) {
-                inherited.splice(0..0, types[base as usize].fields.iter().filter(|field| !field.is_static).cloned().collect::<Vec<_>>());
-                parent = types[base as usize].parent;
-                depth += 1;
+        let mut types: Vec<TypeDef> = metadata.types.iter().enumerate().map(|(index, def)| self.type_def(index as u32, def, &names)).collect();
+        // A class's objects hold its ancestors' fields before its own, the root's first.
+        let own: Vec<Vec<Field>> = types.iter().map(|def| def.fields.iter().filter(|field| !field.is_static).cloned().collect()).collect();
+        let parents: Vec<Option<u32>> = types.iter().map(|def| def.parent).collect();
+        for (index, def) in types.iter_mut().enumerate().filter(|(_, def)| !def.is_value_type) {
+            let mut ancestors = Vec::new();
+            let mut parent = def.parent;
+            while let Some(base) = parent.filter(|&base| base as usize != index && !ancestors.contains(&base)) {
+                ancestors.push(base);
+                parent = parents[base as usize];
             }
-            types[index].fields.splice(0..0, inherited);
+            let inherited = ancestors.iter().rev().flat_map(|&base| own[base as usize].iter().cloned());
+            def.fields.splice(0..0, inherited.collect::<Vec<_>>());
         }
 
         // An enum's members are its constant fields, each of the type of its one instance field.
@@ -533,7 +340,7 @@ impl<'a> Builder<'a> {
         for (index, def) in metadata.types.iter().enumerate() {
             let mut vtable: Vec<Option<String>> = (0..u32::from(def.vtable_count))
                 .map(|slot| {
-                    let encoded = *metadata.vtable_methods.get((def.vtable_start? + slot) as usize)?;
+                    let encoded = *metadata.vtable_methods.get(def.vtable_start?.checked_add(slot)? as usize)?;
                     self.method_name(u64::from(encoded >> 29), u64::from(encoded & 0x1fff_ffff) >> 1, &names, &methods)
                 })
                 .collect();
@@ -541,7 +348,7 @@ impl<'a> Builder<'a> {
             for method in def.method_start.map_or(0..0, |start| start..start + u32::from(def.method_count)) {
                 let slot = usize::from(metadata.methods[method as usize].slot);
                 if let Some(entry @ None) = vtable.get_mut(slot) {
-                    *entry = Some(format!("{}.{}", names[index], methods[method as usize].name));
+                    *entry = Some(format!("{}.{}", names.names[index], methods[method as usize].name));
                 }
             }
             types[index].vtable = vtable;
@@ -553,13 +360,19 @@ impl<'a> Builder<'a> {
         // `klass + 0xb8`, the check before them at `klass + 0xe4` and virtual calls at
         // `klass + 0x138 + 16 * slot`. Version 107 keeps the static fields at `klass + 0xa0`.
         let static_fields = if metadata.version >= 100 { 0xa0 } else { 0xb8 };
-        let class_layout = Some(ClassLayout { static_fields, cctor_finished: 0xe4, vtable: 0x138 });
+        let class_layout = ClassLayout { static_fields, cctor_finished: 0xe4, vtable: 0x138 };
         Ok(Il2Cpp { version: metadata.version, types, methods, generic_methods, usages, class_layout })
     }
 
     /// The `Il2CppType` at `addr`, read to the depth of nested types it needs.
     fn ty_at(&self, addr: u64, depth: u32) -> Ty {
-        self.read_ty(addr, depth).unwrap_or(Ty::Unknown)
+        if let Some(ty) = self.read.borrow().get(&addr) {
+            return ty.clone();
+        }
+        self.read.borrow_mut().insert(addr, Ty::Unknown);
+        let ty = self.read_ty(addr, depth).unwrap_or(Ty::Unknown);
+        self.read.borrow_mut().insert(addr, ty.clone());
+        ty
     }
 
     fn read_ty(&self, addr: u64, depth: u32) -> Option<Ty> {
@@ -626,19 +439,16 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Each type definition's name, enclosing types first, with its generic parameters. A name
-    /// that types of several namespaces share is qualified by the namespace, and one that is
-    /// still not unique, such as a compiler's helper class in each assembly, numbered.
-    fn type_names(&self) -> Vec<String> {
+    /// Each type definition's name in parts, enclosing types first, as [`TypeDef::parts`] has
+    /// it, and with its own generic parameters.
+    fn type_names(&self) -> Names {
         let defs = &self.metadata.types;
-        let own: Vec<String> = defs
+        // A name says how many generic parameters are the type's own: `Dictionary`2`.
+        let own: Vec<(String, usize)> = defs
             .iter()
-            .map(|def| {
-                let base = def.name.split('`').next().unwrap_or(&def.name);
-                match self.generic_parameters(def.generic_container) {
-                    params if params.is_empty() => base.to_string(),
-                    params => format!("{base}<{}>", params.join(",")),
-                }
+            .map(|def| match def.name.split_once('`') {
+                Some((base, arity)) => (base.to_string(), arity.parse().unwrap_or(0)),
+                None => (def.name.clone(), 0),
             })
             .collect();
         let enclosing: Vec<Option<u32>> = defs
@@ -650,36 +460,39 @@ impl<'a> Builder<'a> {
             .collect();
         // A nested type's namespace is that of the type it is nested in, outermost.
         let mut namespaces = Vec::with_capacity(defs.len());
-        let mut names: Vec<String> = (0..defs.len())
+        let mut parts: Vec<Vec<(String, usize)>> = (0..defs.len())
             .map(|index| {
-                let mut parts = vec![own[index].as_str()];
+                let mut chain = vec![own[index].clone()];
                 let mut outermost = index;
-                while let Some(next) = enclosing[outermost].filter(|_| parts.len() < 16) {
-                    parts.push(&own[next as usize]);
+                while let Some(next) = enclosing[outermost].filter(|_| chain.len() < 16) {
+                    chain.push(own[next as usize].clone());
                     outermost = next as usize;
                 }
                 namespaces.push(defs[outermost].namespace.as_str());
-                parts.reverse();
-                parts.join(".")
+                chain.reverse();
+                chain
             })
             .collect();
-        let mut counts: FxHashMap<&str, usize> = FxHashMap::default();
-        names.iter().for_each(|name| *counts.entry(name.as_str()).or_default() += 1);
-        let shared: Vec<bool> = names.iter().map(|name| counts[name.as_str()] > 1).collect();
-        for (index, name) in names.iter_mut().enumerate() {
-            if shared[index] && !namespaces[index].is_empty() {
-                *name = format!("{}.{name}", namespaces[index]);
+        let params: Vec<Vec<String>> = defs.iter().map(|def| self.generic_parameters(def.generic_container)).collect();
+        let render = |parts: &[Vec<(String, usize)>]| -> Vec<String> { parts.iter().zip(&params).map(|(parts, params)| render(parts, params)).collect() };
+        let mut counts: FxHashMap<String, usize> = FxHashMap::default();
+        render(&parts).into_iter().for_each(|name| *counts.entry(name).or_default() += 1);
+        for (index, name) in render(&parts).into_iter().enumerate() {
+            if counts[&name] > 1 && !namespaces[index].is_empty() {
+                parts[index][0].0.insert_str(0, &format!("{}.", namespaces[index]));
             }
         }
         let mut seen: FxHashMap<String, usize> = FxHashMap::default();
-        for name in &mut names {
-            let count = seen.entry(name.clone()).or_default();
+        for (index, name) in render(&parts).into_iter().enumerate() {
+            let count = seen.entry(name).or_default();
             *count += 1;
-            if *count > 1 {
-                *name = format!("{name}_{count}");
+            if *count > 1
+                && let Some(last) = parts[index].last_mut()
+            {
+                last.0.push_str(&format!("_{count}"));
             }
         }
-        names
+        Names { names: render(&parts), parts }
     }
 
     fn generic_parameters(&self, container: Option<u32>) -> Vec<String> {
@@ -689,7 +502,7 @@ impl<'a> Builder<'a> {
         self.metadata.generic_parameters.iter().skip(start as usize).take(usize::from(count)).cloned().collect()
     }
 
-    fn type_def(&self, index: u32, def: &metadata::TypeDefinition, name: &str) -> TypeDef {
+    fn type_def(&self, index: u32, def: &metadata::TypeDefinition, names: &Names) -> TypeDef {
         let parent = match self.ty(def.parent) {
             Ty::Def(parent) | Ty::Generic(parent, _) if parent != index => Some(parent),
             _ => None,
@@ -718,7 +531,8 @@ impl<'a> Builder<'a> {
             .collect();
         let sizes = self.tables.sizes.and_then(|table| self.words.entry(table, u64::from(index)));
         TypeDef {
-            name: name.to_string(),
+            name: names.names[index as usize].clone(),
+            parts: names.parts[index as usize].clone(),
             namespace: def.namespace.clone(),
             parent,
             is_value_type: def.is_value_type(),
@@ -751,11 +565,11 @@ impl<'a> Builder<'a> {
     }
 
     /// The name of the method an encoded index refers to: a definition, or a generic instance.
-    fn method_name(&self, kind: u64, index: u64, names: &[String], methods: &[Method]) -> Option<String> {
+    fn method_name(&self, kind: u64, index: u64, names: &Names, methods: &[Method]) -> Option<String> {
         match kind {
             METHOD_DEF => {
                 let method = methods.get(index as usize)?;
-                Some(format!("{}.{}", names.get(method.owner as usize)?, method.name))
+                Some(format!("{}.{}", names.names.get(method.owner as usize)?, method.name))
             }
             METHOD_SPEC => self.spec_name(index, names, methods),
             _ => None,
@@ -763,9 +577,9 @@ impl<'a> Builder<'a> {
     }
 
     /// The name of method instance `index`: `List<int>.Add`, or `Enumerable.Select<int,string>`.
-    fn spec_name(&self, index: u64, names: &[String], methods: &[Method]) -> Option<String> {
+    fn spec_name(&self, index: u64, names: &Names, methods: &[Method]) -> Option<String> {
         let (specs, count) = self.tables.method_specs?;
-        ensure_some(index < count)?;
+        (index < count).then_some(())?;
         let spec = specs + 12 * index;
         let method = methods.get(self.words.u32(spec)? as usize)?;
         let (insts, _) = self.tables.generic_insts?;
@@ -774,16 +588,16 @@ impl<'a> Builder<'a> {
             (inst >= 0).then(|| self.words.entry(insts, inst as u64).map_or_else(Vec::new, |inst| self.generic_args(inst, 0)))
         };
         let owner = match args(spec + 4) {
-            Some(class_args) => display(&Ty::Generic(method.owner, class_args), names),
-            None => names.get(method.owner as usize)?.clone(),
+            Some(class_args) => names.display(&Ty::Generic(method.owner, class_args)),
+            None => names.names.get(method.owner as usize)?.clone(),
         };
         let method_args =
-            args(spec + 8).map(|args| format!("<{}>", args.iter().map(|arg| display(arg, names)).collect::<Vec<_>>().join(","))).unwrap_or_default();
+            args(spec + 8).map(|args| format!("<{}>", args.iter().map(|arg| names.display(arg)).collect::<Vec<_>>().join(","))).unwrap_or_default();
         Some(format!("{owner}.{}{method_args}", method.name))
     }
 
     /// The code of each generic method instance the build compiled, with its name.
-    fn generic_methods(&self, names: &[String], methods: &[Method]) -> Vec<(u64, String)> {
+    fn generic_methods(&self, names: &Names, methods: &[Method]) -> Vec<(u64, String)> {
         let (Some((pointers, pointer_count)), Some((table, count))) = (self.tables.generic_method_pointers, self.tables.generic_method_table) else {
             return Vec::new();
         };
@@ -792,20 +606,23 @@ impl<'a> Builder<'a> {
             .filter_map(|entry| {
                 let at = table + 16 * entry;
                 let (spec, code) = (u64::from(self.words.u32(at)?), u64::from(self.words.u32(at + 4)?));
-                ensure_some(code < pointer_count)?;
+                (code < pointer_count).then_some(())?;
                 Some((self.words.entry(pointers, code)?, self.spec_name(spec, names, methods)?))
             })
             .collect()
     }
 
     /// Usage slots: words in writable data that hold an encoded usage the program has.
-    fn usages(&self, names: &[String], methods: &[Method]) -> Vec<(u64, Usage)> {
+    fn usages(&self, names: &Names, methods: &[Method]) -> Vec<(u64, Usage)> {
         let metadata = self.metadata;
         let spec_count = self.tables.method_specs.map_or(0, |(_, count)| count);
         let type_count = self.tables.types.1;
         let mut usages = Vec::new();
         for section in self.words.image.sections.iter().filter(|section| section.writable && !section.executable) {
-            for (slot, bytes) in (section.addr..).step_by(8).zip(section.data.as_chunks::<8>().0) {
+            // Slots are pointers, at addresses that are multiples of 8.
+            let skip = (section.addr.next_multiple_of(8) - section.addr) as usize;
+            let start = section.addr + skip as u64;
+            for (slot, bytes) in (start..).step_by(8).zip(section.data.get(skip..).unwrap_or_default().as_chunks::<8>().0) {
                 let word = u64::from_le_bytes(*bytes);
                 if word & 1 == 0 || word >> 32 != 0 || self.words.relocated.contains_key(&slot) {
                     continue;
@@ -833,10 +650,11 @@ impl<'a> Builder<'a> {
                             Ty::Def(def) | Ty::Generic(def, _) => def,
                             _ => continue,
                         };
-                        let Some(field) = metadata.types[def as usize].field_start.and_then(|start| metadata.fields.get((start + position) as usize)) else {
+                        let Some(field) = metadata.types[def as usize].field_start.and_then(|start| metadata.fields.get(start.checked_add(position)? as usize))
+                        else {
                             continue;
                         };
-                        Usage::Field(format!("{}.{}", display(&owner, names), field.name))
+                        Usage::Field(format!("{}.{}", names.display(&owner), field.name))
                     }
                     LITERAL => match metadata.string_literals.get(index as usize) {
                         Some(text) => Usage::Literal(text.clone()),
@@ -851,10 +669,6 @@ impl<'a> Builder<'a> {
     }
 }
 
-fn ensure_some(condition: bool) -> Option<()> {
-    condition.then_some(())
-}
-
 fn strip_by_ref(ty: Ty) -> Ty {
     match ty {
         Ty::ByRef(inner) => *inner,
@@ -862,100 +676,74 @@ fn strip_by_ref(ty: Ty) -> Ty {
     }
 }
 
-/// Each code generation module with the index of its image, found by the pointer to the
-/// image's name that opens it, and checked by its count of methods.
-fn find_modules(words: &Words, metadata: &Metadata) -> Vec<(usize, u64)> {
-    let images: FxHashMap<&str, usize> = metadata.images.iter().enumerate().map(|(index, image)| (image.name.as_str(), index)).collect();
-    let mut found: FxHashMap<usize, u64> = FxHashMap::default();
-    for (&slot, &target) in &words.relocated {
-        let Some(&image) = words.text(target).and_then(|name| images.get(name)) else {
-            continue;
+/// How C# writes the types of a build: `int`, `string`, `List<int>`,
+/// `Dictionary<int,string>.KeyCollection[]`.
+pub struct Names {
+    /// Each type definition's name with its own generic parameters.
+    names: Vec<String>,
+    /// And in parts, as [`TypeDef::parts`] has it.
+    parts: Vec<Vec<(String, usize)>>,
+}
+
+impl Names {
+    /// The name of type definition `def`.
+    pub fn name(&self, def: u32) -> &str {
+        self.names.get(def as usize).map_or("?", String::as_str)
+    }
+
+    pub fn display(&self, ty: &Ty) -> String {
+        match ty {
+            Ty::Void => "void".into(),
+            Ty::Bool => "bool".into(),
+            Ty::Char => "char".into(),
+            Ty::I8 => "sbyte".into(),
+            Ty::U8 => "byte".into(),
+            Ty::I16 => "short".into(),
+            Ty::U16 => "ushort".into(),
+            Ty::I32 => "int".into(),
+            Ty::U32 => "uint".into(),
+            Ty::I64 => "long".into(),
+            Ty::U64 => "ulong".into(),
+            Ty::F32 => "float".into(),
+            Ty::F64 => "double".into(),
+            Ty::IntPtr => "IntPtr".into(),
+            Ty::UIntPtr => "UIntPtr".into(),
+            Ty::String => "string".into(),
+            Ty::Object => "object".into(),
+            Ty::Def(def) => self.name(*def).to_string(),
+            Ty::Generic(def, args) => match self.parts.get(*def as usize) {
+                Some(parts) => render(parts, &args.iter().map(|arg| self.display(arg)).collect::<Vec<_>>()),
+                None => "?".into(),
+            },
+            Ty::Array(element) => format!("{}[]", self.display(element)),
+            Ty::Pointer(target) => format!("{}*", self.display(target)),
+            Ty::ByRef(target) => format!("ref {}", self.display(target)),
+            Ty::Param(name) => name.clone(),
+            Ty::Unknown => "?".into(),
+        }
+    }
+}
+
+/// A name in parts with the generic arguments given out to the parts they belong to:
+/// `Dictionary<int,string>.KeyCollection`. Arguments the parts do not account for go to the
+/// last.
+fn render(parts: &[(String, usize)], args: &[String]) -> String {
+    let owned: usize = parts.iter().map(|(_, arity)| arity).sum();
+    let mut args = args.iter().map(String::as_str);
+    let last = parts.len().saturating_sub(1);
+    let mut out = Vec::with_capacity(parts.len());
+    for (index, (name, arity)) in parts.iter().enumerate() {
+        let take = if owned == args.len() {
+            *arity
+        } else if index == last {
+            usize::MAX
+        } else {
+            0
         };
-        let methods = image_methods(metadata, image);
-        let count = words.u32(slot + code::MODULE_METHOD_COUNT).unwrap_or(0) as usize;
-        if count >= methods / 2 && count <= methods.max(1) * 2 && words.pointer(slot + code::MODULE_METHODS).is_some() {
-            found.insert(image, slot);
-        }
+        let own: Vec<&str> = args.by_ref().take(take).collect();
+        out.push(if own.is_empty() { name.clone() } else { format!("{name}<{}>", own.join(",")) });
     }
-    let mut modules: Vec<(usize, u64)> = found.into_iter().collect();
-    modules.sort_unstable();
-    modules
-}
-
-fn image_methods(metadata: &Metadata, image: usize) -> usize {
-    let image = &metadata.images[image];
-    let start = image.type_start.unwrap_or(0) as usize;
-    metadata.types.iter().skip(start).take(image.type_count as usize).map(|def| usize::from(def.method_count)).sum()
-}
-
-/// The code registration of version 39: what holds the count of modules and then the list of
-/// them, before which it lists the code of generic method instances.
-fn code_registration(words: &Words, metadata: &Metadata, modules: &[(usize, u64)]) -> Option<u64> {
-    let is_module: rustc_hash::FxHashSet<u64> = modules.iter().map(|&(_, module)| module).collect();
-    let &(_, first) = modules.first()?;
-    let listed = words.relocated.iter().find(|&(_, &target)| target == first).map(|(&slot, _)| slot)?;
-    // The first module found need not be the first listed; step back to the list's start.
-    let mut start = listed;
-    while words.pointer(start - 8).is_some_and(|module| is_module.contains(&module)) {
-        start -= 8;
-    }
-    let field = words.relocated.iter().find(|&(_, &target)| target == start).map(|(&slot, _)| slot)?;
-    (words.u64(field - 8)? as usize == metadata.images.len()).then(|| field - 8 - code::MODULES_COUNT)
-}
-
-/// The metadata registration, found by its counts of field offset arrays and of type sizes,
-/// which are next to each other and each the number of type definitions.
-fn find_registration(words: &Words, type_count: u64) -> Option<u64> {
-    words
-        .image
-        .sections
-        .iter()
-        .filter(|section| !section.executable)
-        .find_map(|section| {
-            let start = section.addr.next_multiple_of(8);
-            (start..section.end().saturating_sub(32)).step_by(8).find(|&at| {
-                words.u64(at) == Some(type_count)
-                    && words.u64(at + 16) == Some(type_count)
-                    && words.pointer(at + 8).is_some()
-                    && words.pointer(at + 24).is_some()
-            })
-        })
-        .map(|at| at - registration::FIELD_OFFSETS_COUNT)
-}
-
-/// A type as C# writes it: `int`, `string`, `List<int>`, `Outer.Inner[]`.
-pub fn display(ty: &Ty, names: &[String]) -> String {
-    let name = |def: u32| names.get(def as usize).cloned().unwrap_or_else(|| "?".into());
-    match ty {
-        Ty::Void => "void".into(),
-        Ty::Bool => "bool".into(),
-        Ty::Char => "char".into(),
-        Ty::I8 => "sbyte".into(),
-        Ty::U8 => "byte".into(),
-        Ty::I16 => "short".into(),
-        Ty::U16 => "ushort".into(),
-        Ty::I32 => "int".into(),
-        Ty::U32 => "uint".into(),
-        Ty::I64 => "long".into(),
-        Ty::U64 => "ulong".into(),
-        Ty::F32 => "float".into(),
-        Ty::F64 => "double".into(),
-        Ty::IntPtr => "IntPtr".into(),
-        Ty::UIntPtr => "UIntPtr".into(),
-        Ty::String => "string".into(),
-        Ty::Object => "object".into(),
-        Ty::Def(def) => name(*def),
-        Ty::Generic(def, args) => {
-            let base = name(*def);
-            let base = base.split('<').next().unwrap_or(&base).to_string();
-            format!("{base}<{}>", args.iter().map(|arg| display(arg, names)).collect::<Vec<_>>().join(","))
-        }
-        Ty::Array(element) => format!("{}[]", display(element, names)),
-        Ty::Pointer(target) => format!("{}*", display(target, names)),
-        Ty::ByRef(target) => format!("ref {}", display(target, names)),
-        Ty::Param(name) => name.clone(),
-        Ty::Unknown => "?".into(),
-    }
+    out.join(".")
 }
 
 impl Il2Cpp {
@@ -964,9 +752,9 @@ impl Il2Cpp {
         self.usages.binary_search_by_key(&addr, |(slot, _)| *slot).is_ok()
     }
 
-    /// The names of type definitions, by index.
-    pub fn type_names(&self) -> Vec<String> {
-        self.types.iter().map(|def| def.name.clone()).collect()
+    /// How C# writes the types of the build.
+    pub fn names(&self) -> Names {
+        Names { names: self.types.iter().map(|def| def.name.clone()).collect(), parts: self.types.iter().map(|def| def.parts.clone()).collect() }
     }
 
     /// A function name for the code at each method's address, and for each generic method
@@ -989,13 +777,13 @@ impl Il2Cpp {
     /// type, `Player.Update_MethodInfo` for a method, `Player.speed_FieldInfo` for a field,
     /// and the text in quotes for a string literal.
     pub fn usage_names(&self) -> Vec<(u64, String)> {
-        let names = self.type_names();
+        let names = self.names();
         self.usages
             .iter()
             .map(|(slot, usage)| {
                 let name = match usage {
-                    Usage::Class(ty) => format!("{}_TypeInfo", display(ty, &names)),
-                    Usage::Type(ty) => format!("typeof({})", display(ty, &names)),
+                    Usage::Class(ty) => format!("{}_TypeInfo", names.display(ty)),
+                    Usage::Type(ty) => format!("typeof({})", names.display(ty)),
                     Usage::Method(method) => format!("{method}_MethodInfo"),
                     Usage::Field(field) => format!("{field}_FieldInfo"),
                     Usage::Literal(text) => {
