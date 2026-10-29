@@ -71,6 +71,10 @@
     "analysis": 352405570,
     "diff": 325027947
   },
+  "corpus-large/bin/godot__godot": {
+    "analysis": 59609035734,
+    "diff": 58995378722
+  },
   "corpus-pe/bin/git__git-remote-https.exe": {
     "analysis": 920128787,
     "diff": 1109055266

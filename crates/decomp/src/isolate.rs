@@ -942,6 +942,13 @@ impl Worker {
         ready
     }
 
+    /// The most memory the running child has held at once, in bytes, if one is running.
+    pub fn peak_bytes(&self) -> Option<u64> {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", self.process.as_ref()?.child.id())).ok()?;
+        let kib = status.lines().find_map(|line| line.strip_prefix("VmHWM:"))?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+        Some(kib << 10)
+    }
+
     /// The child, started now if the last one is gone. A child can also have died while idle,
     /// which is not the doing of the function asked for next.
     fn process(&mut self) -> Result<&mut Process, Failure> {

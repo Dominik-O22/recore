@@ -25,7 +25,8 @@ struct Args {
 enum Suite {
     /// Loading and analyzing each binary in this process.
     Analysis,
-    /// From a new process to the answer: `recore-mcp summary` and `recore-mcp decompile`.
+    /// From a new process to the answer: `recore-mcp summary`, `xrefs` and `decompile`, and a new
+    /// decompiler process to its first function, with the most memory it held.
     Cold,
     /// A sample of each binary's functions through the decompiler, one after another.
     Decompile,
