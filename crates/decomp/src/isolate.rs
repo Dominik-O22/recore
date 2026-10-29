@@ -775,14 +775,21 @@ impl Worker {
     /// work. `command` must build a program that ends up calling [`serve`] with the two arguments
     /// appended here: the binary's path and the options as JSON.
     pub fn new(command: impl Fn() -> Command + Send + 'static, binary: &Path, options: &Options) -> Worker {
+        let mut worker = Worker::idle(command, binary, options);
+        worker.process = Process::start((worker.command)()).ok();
+        worker
+    }
+
+    /// As [`Worker::new`], but the child is started by the first request, for a caller that may
+    /// make none.
+    pub fn idle(command: impl Fn() -> Command + Send + 'static, binary: &Path, options: &Options) -> Worker {
         let (binary, json) = (binary.to_path_buf(), serde_json::to_string(options).expect("plain data"));
         let command = move || {
             let mut command = command();
             command.arg(&binary).arg(&json);
             command
         };
-        let process = Process::start(command()).ok();
-        Worker { command: Box::new(command), options: options.clone(), process, avoid: HashSet::new() }
+        Worker { command: Box::new(command), options: options.clone(), process: None, avoid: HashSet::new() }
     }
 
     /// Decompiles one function. If the child dies or exceeds `timeout`, the record says so.

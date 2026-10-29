@@ -69,17 +69,23 @@ fn file(path: &Path) -> Option<PathBuf> {
     Some(dir.join(format!("{}-{hash:016x}", path.file_name()?.to_string_lossy())))
 }
 
-/// The file holds the key as JSON on its first line and the analysis after it in bitcode, which
-/// reads several times faster than JSON. A stale file is turned down without reading the rest.
-fn read(file: &Path, key: &Key) -> Option<Analysis> {
+/// Whether an analysis of the binary at `path` is kept that [`analyze`] would use.
+pub fn is_kept(path: &Path) -> bool {
+    Key::of(path).zip(file(path)).is_some_and(|(key, file)| open(&file, &key).is_some())
+}
+
+/// The file holds the key as JSON on its first line and the analysis after it in bitcode, a
+/// quarter the size of JSON. A stale file is turned down without reading the rest.
+fn open(file: &Path, key: &Key) -> Option<BufReader<std::fs::File>> {
     let mut reader = BufReader::new(std::fs::File::open(file).ok()?);
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
-    if serde_json::from_str::<Key>(&line).ok()? != *key {
-        return None;
-    }
+    (serde_json::from_str::<Key>(&line).ok()? == *key).then_some(reader)
+}
+
+fn read(file: &Path, key: &Key) -> Option<Analysis> {
     let mut rest = Vec::new();
-    reader.read_to_end(&mut rest).ok()?;
+    open(file, key)?.read_to_end(&mut rest).ok()?;
     bitcode::decode(&rest).ok()
 }
 

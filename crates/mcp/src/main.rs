@@ -61,7 +61,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut cache = Cache::default();
+    let mut cache = Cache::new(true);
     let mut out = std::io::stdout().lock();
     for line in std::io::stdin().lock().lines() {
         let line = line?;

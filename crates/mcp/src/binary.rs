@@ -30,28 +30,32 @@ pub struct Binary {
     found_names: Vec<Option<String>>,
     /// Time spent loading and analyzing.
     pub analysis_ms: f64,
-    /// Started when the binary is loaded, so it sets up while the first queries are answered.
+    /// Started when the binary is loaded, so it sets up while the first queries are answered,
+    /// or by the first request, for a tool run from the shell that may make none.
     worker: Worker,
 }
 
-fn start_worker(path: &Path) -> Worker {
+/// The decompiler process for the binary at `path`, started now or by its first request.
+fn worker(path: &Path, start: bool) -> Worker {
     let command = || {
         // Without the path of this program no child starts, and each decompilation reports that.
         let mut command = Command::new(std::env::current_exe().unwrap_or_default());
         command.arg(crate::WORKER_ARG);
         command
     };
-    Worker::new(command, path, &Options::default())
+    if start { Worker::new(command, path, &Options::default()) } else { Worker::idle(command, path, &Options::default()) }
 }
 
 impl Binary {
-    fn load(path: &Path, stamp: (SystemTime, u64)) -> Result<Binary> {
+    fn load(path: &Path, stamp: (SystemTime, u64), start_worker: bool) -> Result<Binary> {
         let start = Instant::now();
-        // The child loads the binary for itself, at the same time as this process: the analysis
-        // kept on disk if there is one, or its own.
-        let worker = start_worker(path);
+        // A child started now reads the analysis kept on disk at the same time as this process.
+        // Without one it is started once this process has kept its own, so the binary is
+        // analyzed once.
+        let early = (start_worker && recore::cache::is_kept(path)).then(|| worker(path, true));
         let image = Image::load(path)?;
         let mut analysis = recore::cache::analyze(path, &image);
+        let worker = early.unwrap_or_else(|| worker(path, start_worker));
         let analysis_ms = start.elapsed().as_secs_f64() * 1e3;
 
         let edits = Edits::load(path)?;
@@ -143,12 +147,19 @@ impl Binary {
 }
 
 /// The binaries a session has touched, most recently used first.
-#[derive(Default)]
 pub struct Cache {
     binaries: Vec<Binary>,
+    /// Whether each binary's decompiler process starts as the binary loads: in a server, and for
+    /// a tool run from the shell whose answer comes from it. Otherwise the first request
+    /// starts it.
+    start_workers: bool,
 }
 
 impl Cache {
+    pub fn new(start_workers: bool) -> Cache {
+        Cache { binaries: Vec::new(), start_workers }
+    }
+
     /// The binary at `path`, analyzed now unless it was before and the file has not changed.
     pub fn get(&mut self, path: &Path) -> Result<&mut Binary> {
         let metadata = std::fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
@@ -158,7 +169,7 @@ impl Cache {
             stale => {
                 // Dropping a binary ends its decompiler process.
                 stale.map(|index| self.binaries.remove(index));
-                Binary::load(path, stamp).with_context(|| format!("cannot load {}", path.display()))?
+                Binary::load(path, stamp, self.start_workers).with_context(|| format!("cannot load {}", path.display()))?
             }
         };
         self.binaries.insert(0, binary);

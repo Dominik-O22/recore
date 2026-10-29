@@ -109,7 +109,7 @@ pub fn run(config: &Path, out: Option<&Path>) -> Result<String> {
     let base = std::path::absolute(config.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
     let exe = resolve(&base, &config_file.exe);
     let out = out.map_or_else(|| resolve(&base, &config_file.out), |o| resolve(&std::env::current_dir().unwrap_or_default(), o));
-    let mut cache = Cache::default();
+    let mut cache = Cache::new(false);
     let roots = roots(&mut cache, &exe)?;
     let abi = config_file.x87.as_ref().map_or_else(X87Abi::default, |x| X87Abi { runtime: x.runtime, helpers: x.helpers.iter().map(|h| (h.at, (h.takes, h.net))).collect() });
     let program = lift(cache.get(&exe)?, &roots, &abi)?;
