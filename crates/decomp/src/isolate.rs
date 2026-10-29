@@ -165,6 +165,8 @@ const CALLEE_LIMIT: u64 = 4096;
 /// The child side: loads `binary`, then answers each request on stdin with one line on stdout,
 /// until stdin closes. `options` is the JSON that [`Worker::new`] passed along.
 pub fn serve(binary: &Path, options: &str) -> Result<()> {
+    // Setting up frees much of what it builds, and the process lives on.
+    let _give_back = crate::GiveBackFreed::after(0);
     let options: Options = serde_json::from_str(options)?;
     let image = recore::Image::load(binary)?;
     // The engine reads its language files, and debug information is read if there is any,

@@ -52,9 +52,14 @@ impl Binary {
         // A child started now reads the analysis kept on disk at the same time as this process.
         // Without one it is started once this process has kept its own, so the binary is
         // analyzed once.
-        let early = (start_worker && recore::cache::is_kept(path)).then(|| worker(path, true));
+        let kept = recore::cache::is_kept(path);
+        let early = (start_worker && kept).then(|| worker(path, true));
+        // Analysis frees most of what it builds, some of it to allocate again at once: 10 ms
+        // gives back the rest and leaves analysis as fast as without.
+        let give_back = (!kept).then(|| recore_decomp::GiveBackFreed::after(10));
         let image = Image::load(path)?;
         let mut analysis = recore::cache::analyze(path, &image);
+        drop(give_back);
         let worker = early.unwrap_or_else(|| worker(path, start_worker));
         let analysis_ms = start.elapsed().as_secs_f64() * 1e3;
 
@@ -62,6 +67,8 @@ impl Binary {
         let found_names = analysis.functions.iter().map(|function| function.name.clone()).collect();
         edits.apply(&mut analysis);
         let program = Program::new(image, analysis);
+        // What loading freed would otherwise be held while queries are answered.
+        recore_decomp::give_back_freed_memory();
         Ok(Binary { path: path.to_path_buf(), stamp, program, edits, found_names, analysis_ms, worker })
     }
 
