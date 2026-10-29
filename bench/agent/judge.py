@@ -11,7 +11,7 @@ from collections import Counter
 from pathlib import Path
 
 KEY = (Path(__file__).parent / "key.md").read_text()
-VERDICT = re.compile(r"^([A-Z]\d+):?\s+(PASS|FAIL)\W*(.*)$", re.M)
+VERDICT = re.compile(r"^([A-Z]\d+)[.:]?\s+(PASS|FAIL)\W*(.*)$", re.M)
 TIMES = 3
 
 PROMPT = """You score a report on reverse engineering tasks against an answer key. For each item of the key, in order, write one line: the item's id, PASS or FAIL, and a short reason quoting the report. Follow the key's own rules for passing. Write nothing else.

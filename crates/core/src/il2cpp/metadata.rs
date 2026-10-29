@@ -326,7 +326,7 @@ pub fn parse(data: &[u8]) -> Result<Metadata> {
     let vtable_methods = reader.rows(Table::VtableMethods, |row| row.u32())?;
     let field_refs = reader.rows(Table::FieldRefs, |row| {
         let size = row.bytes.len();
-        Ok((row.index(type_width)?, row.take(size - type_width)?))
+        Ok((row.index(type_width)?, row.take(size.saturating_sub(type_width))?))
     })?;
     let generic_parameters = reader.rows(Table::GenericParameters, |row| {
         row.index(container_width)?;
@@ -364,6 +364,15 @@ pub fn parse(data: &[u8]) -> Result<Metadata> {
         Ok((field, row.u32()? as usize))
     })?;
     let default_value_data = reader.section(Table::FieldAndParameterDefaultValueData)?.to_vec();
+
+    // Rows index each other; one that points past a table means the file is not as read.
+    let within = |start: Option<u32>, count: u16, len: usize| start.is_none_or(|start| start as usize + usize::from(count) <= len);
+    ensure!(
+        types.iter().all(|def| within(def.method_start, def.method_count, methods.len()) && within(def.field_start, def.field_count, fields.len())),
+        "a type's methods or fields lie past their table"
+    );
+    ensure!(methods.iter().all(|method| method.declaring.is_some_and(|owner| (owner as usize) < types.len())), "a method's type lies past its table");
+    ensure!(field_default_values.iter().all(|&(field, _)| (field as usize) < fields.len()), "a default value's field lies past its table");
 
     Ok(Metadata {
         version,
