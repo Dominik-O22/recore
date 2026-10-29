@@ -150,11 +150,11 @@ enum Request {
     Structs(u64),
 }
 
-/// The bytes of address space this process holds; 0 where the system does not say.
-fn address_space() -> u64 {
+/// The bytes of address space this process holds, where the system says.
+fn address_space() -> Option<u64> {
     // The first number in `statm` is the size of the address space, in pages.
-    let pages = std::fs::read_to_string("/proc/self/statm").ok().and_then(|statm| statm.split_whitespace().next()?.parse::<u64>().ok());
-    pages.map_or(0, |pages| pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64)
+    let pages = std::fs::read_to_string("/proc/self/statm").ok()?.split_whitespace().next()?.parse::<u64>().ok()?;
+    pages.checked_mul(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64)
 }
 
 /// Callees with more code than this, in bytes, are not decompiled ahead of their callers. The few
@@ -176,9 +176,12 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     });
     // The limit is on what the engine takes from here on. Loading a large binary, with its
     // analysis and an IL2CPP build's metadata, takes gigabytes of its own, and is bounded by
-    // the binary. Failing to set the limit only loses the protection.
-    let bytes = address_space().saturating_add(options.memory_gb << 30);
-    unsafe { libc::setrlimit(libc::RLIMIT_AS, &libc::rlimit { rlim_cur: bytes, rlim_max: bytes }) };
+    // the binary. Where the system does not say how much that was, there is no limit: one
+    // counted from nothing could fail setup. Failing to set it only loses the protection.
+    if let Some(loaded) = address_space() {
+        let bytes = loaded.saturating_add(options.memory_gb << 30);
+        unsafe { libc::setrlimit(libc::RLIMIT_AS, &libc::rlimit { rlim_cur: bytes, rlim_max: bytes }) };
+    }
     let mut session = session?;
     let mut edits = Edits::load(binary)?;
     session.add_imports(&image, &analysis)?;

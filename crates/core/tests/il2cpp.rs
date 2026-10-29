@@ -18,6 +18,26 @@ fn il2cpp(image: &Image) -> &Il2Cpp {
     image.il2cpp.as_deref().expect("the build's metadata is read")
 }
 
+/// A class's objects hold its parent's fields, each once, and then its own. A field may still
+/// share a name with one of its ancestors' that it hides.
+fn assert_fields_inherited_once(il2cpp: &Il2Cpp) {
+    let instance =
+        |def: &recore::il2cpp::TypeDef| def.fields.iter().filter(|field| !field.is_static).map(|field| (field.name.clone(), field.offset)).collect::<Vec<_>>();
+    for def in il2cpp.types.iter().filter(|def| !def.is_value_type) {
+        let Some(parent) = def.parent else {
+            continue;
+        };
+        let (fields, inherited) = (instance(def), instance(&il2cpp.types[parent as usize]));
+        assert!(fields.starts_with(&inherited), "{} does not start with the fields of {}", def.name, il2cpp.types[parent as usize].name);
+        assert!(
+            !fields[inherited.len()..].starts_with(&inherited) || inherited.is_empty(),
+            "{} repeats the fields of {}",
+            def.name,
+            il2cpp.types[parent as usize].name
+        );
+    }
+}
+
 fn field_offset(il2cpp: &Il2Cpp, class: &str, field: &str) -> Option<u32> {
     let class = il2cpp.types.iter().find(|def| def.name == class)?;
     class.fields.iter().find(|found| found.name == field)?.offset
@@ -38,6 +58,7 @@ fn fishing_planet_names_methods_fields_vtables_and_usage_slots() {
     // The state a state machine's method returns, which the code loads from a usage slot.
     assert_eq!(image.symbol_names[&0x98f1d08], "typeof(PlayerThrowInOneHand)");
     assert!(il2cpp.generic_methods.len() > 200_000);
+    assert_fields_inherited_once(il2cpp);
 }
 
 #[test]
@@ -49,6 +70,8 @@ fn a_unity_6_5_build_has_its_tables_found_by_what_they_hold() {
     assert_eq!(il2cpp.version, 107);
     assert_eq!(image.symbol_names[&0x1f1a1c0], "Player.Update");
     assert_eq!(image.symbol_names[&0x3634660], "List<int>.Add");
+    // A type nested in a generic type, with the outer type's arguments on the outer part.
+    assert_eq!(image.symbol_names[&0x303ce40], "List<GpuUpdaterStaged<ushort>.CopyInfo>.Enumerator.MoveNext");
     assert_eq!(image.symbol_names[&0x4ba7200], "WorldLaunchState_TypeInfo");
     assert_eq!(image.symbol_names[&0x4bd2010], "\"MeshGenerationBenchmark requires a World instance in the scene!\"");
     assert_eq!(field_offset(il2cpp, "Player", "_world"), Some(0x38));
@@ -58,6 +81,7 @@ fn a_unity_6_5_build_has_its_tables_found_by_what_they_hold() {
     assert_eq!(members, [("DropOutOfWorld", 0), ("PersistUndeliverable", 1), ("Defer", 2), ("ApplyDirect", 3)]);
     let tags = il2cpp.types.iter().find(|def| def.name == "BlockTags").unwrap();
     assert!(tags.members.contains(&("DEBUG".to_string(), 1 << 16)));
+    assert_fields_inherited_once(il2cpp);
     let step = il2cpp.types.iter().find(|def| def.name == "WorldMigrationStep").unwrap();
     // An abstract method's slot, which the vtable table leaves empty.
     assert_eq!(step.vtable[4].as_deref(), Some("WorldMigrationStep.get_SourceWorldVersion"));

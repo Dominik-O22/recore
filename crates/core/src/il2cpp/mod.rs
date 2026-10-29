@@ -83,10 +83,6 @@ pub struct TypeDef {
     /// that types of several namespaces share is qualified by the namespace, and one that is
     /// still not unique, such as a compiler's helper class in each assembly, numbered.
     pub name: String,
-    /// The name in parts, enclosing types first, each with how many of the type's generic
-    /// arguments are its own: `Dictionary<TKey,TValue>.KeyCollection` is `Dictionary` with 2
-    /// and `KeyCollection` with none.
-    pub parts: Vec<(String, usize)>,
     pub namespace: String,
     /// The type definition it derives from.
     pub parent: Option<u32>,
@@ -156,6 +152,8 @@ pub struct Il2Cpp {
     /// Usage slots by address, sorted.
     pub usages: Vec<(u64, Usage)>,
     pub class_layout: ClassLayout,
+    /// How C# writes the build's types.
+    pub names: Names,
 }
 
 /// Gives `image`, loaded from `path`, the managed program and the names of its IL2CPP build, if
@@ -245,6 +243,11 @@ impl Words<'_> {
 /// Bytes in an object's header: its class and its monitor.
 const HEADER: u32 = 16;
 
+/// Deeper than any real build goes: classes deriving from classes, and types nested in type
+/// arguments.
+const MAX_ANCESTORS: usize = 64;
+const MAX_NESTING: u32 = 32;
+
 /// Kinds of usage slot.
 const CLASS: u64 = 1;
 const TYPE: u64 = 2;
@@ -283,7 +286,8 @@ impl<'a> Builder<'a> {
         for (index, def) in types.iter_mut().enumerate().filter(|(_, def)| !def.is_value_type) {
             let mut ancestors = Vec::new();
             let mut parent = def.parent;
-            while let Some(base) = parent.filter(|&base| base as usize != index && !ancestors.contains(&base)) {
+            // Damaged metadata can chain every type into one line of parents.
+            while let Some(base) = parent.filter(|&base| base as usize != index && !ancestors.contains(&base) && ancestors.len() < MAX_ANCESTORS) {
                 ancestors.push(base);
                 parent = parents[base as usize];
             }
@@ -361,7 +365,7 @@ impl<'a> Builder<'a> {
         // `klass + 0x138 + 16 * slot`. Version 107 keeps the static fields at `klass + 0xa0`.
         let static_fields = if metadata.version >= 100 { 0xa0 } else { 0xb8 };
         let class_layout = ClassLayout { static_fields, cctor_finished: 0xe4, vtable: 0x138 };
-        Ok(Il2Cpp { version: metadata.version, types, methods, generic_methods, usages, class_layout })
+        Ok(Il2Cpp { version: metadata.version, types, methods, generic_methods, usages, class_layout, names })
     }
 
     /// The `Il2CppType` at `addr`, read to the depth of nested types it needs.
@@ -376,7 +380,9 @@ impl<'a> Builder<'a> {
     }
 
     fn read_ty(&self, addr: u64, depth: u32) -> Option<Ty> {
-        if depth > 8 {
+        // Past a depth no real type nests to, the file is damaged, and the read stops to spare
+        // the stack. What was read stays in the memo, so deep nesting costs no more than wide.
+        if depth > MAX_NESTING {
             return Some(Ty::Unknown);
         }
         let data = self.words.pointer(addr).unwrap_or(0);
@@ -439,8 +445,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Each type definition's name in parts, enclosing types first, as [`TypeDef::parts`] has
-    /// it, and with its own generic parameters.
+    /// Each type definition's name, whole and in parts, with its own generic parameters.
     fn type_names(&self) -> Names {
         let defs = &self.metadata.types;
         // A name says how many generic parameters are the type's own: `Dictionary`2`.
@@ -474,16 +479,16 @@ impl<'a> Builder<'a> {
             })
             .collect();
         let params: Vec<Vec<String>> = defs.iter().map(|def| self.generic_parameters(def.generic_container)).collect();
-        let render = |parts: &[Vec<(String, usize)>]| -> Vec<String> { parts.iter().zip(&params).map(|(parts, params)| render(parts, params)).collect() };
+        let render_all = |parts: &[Vec<(String, usize)>]| -> Vec<String> { parts.iter().zip(&params).map(|(parts, params)| render(parts, params)).collect() };
         let mut counts: FxHashMap<String, usize> = FxHashMap::default();
-        render(&parts).into_iter().for_each(|name| *counts.entry(name).or_default() += 1);
-        for (index, name) in render(&parts).into_iter().enumerate() {
+        render_all(&parts).into_iter().for_each(|name| *counts.entry(name).or_default() += 1);
+        for (index, name) in render_all(&parts).into_iter().enumerate() {
             if counts[&name] > 1 && !namespaces[index].is_empty() {
                 parts[index][0].0.insert_str(0, &format!("{}.", namespaces[index]));
             }
         }
         let mut seen: FxHashMap<String, usize> = FxHashMap::default();
-        for (index, name) in render(&parts).into_iter().enumerate() {
+        for (index, name) in render_all(&parts).into_iter().enumerate() {
             let count = seen.entry(name).or_default();
             *count += 1;
             if *count > 1
@@ -492,7 +497,7 @@ impl<'a> Builder<'a> {
                 last.0.push_str(&format!("_{count}"));
             }
         }
-        Names { names: render(&parts), parts }
+        Names { names: render_all(&parts), parts }
     }
 
     fn generic_parameters(&self, container: Option<u32>) -> Vec<String> {
@@ -532,7 +537,6 @@ impl<'a> Builder<'a> {
         let sizes = self.tables.sizes.and_then(|table| self.words.entry(table, u64::from(index)));
         TypeDef {
             name: names.names[index as usize].clone(),
-            parts: names.parts[index as usize].clone(),
             namespace: def.namespace.clone(),
             parent,
             is_value_type: def.is_value_type(),
@@ -550,7 +554,7 @@ impl<'a> Builder<'a> {
     fn method(&self, method: &metadata::MethodDefinition) -> Method {
         let params = (0..u32::from(method.parameter_count))
             .map(|position| {
-                let param = method.parameter_start.and_then(|start| self.metadata.parameters.get((start + position) as usize));
+                let param = method.parameter_start.and_then(|start| self.metadata.parameters.get(start.checked_add(position)? as usize));
                 param.map_or_else(|| (format!("arg{position}"), Ty::Unknown), |param| (param.name.clone(), self.ty(param.kind)))
             })
             .collect();
@@ -678,10 +682,13 @@ fn strip_by_ref(ty: Ty) -> Ty {
 
 /// How C# writes the types of a build: `int`, `string`, `List<int>`,
 /// `Dictionary<int,string>.KeyCollection[]`.
+#[derive(Debug)]
 pub struct Names {
     /// Each type definition's name with its own generic parameters.
     names: Vec<String>,
-    /// And in parts, as [`TypeDef::parts`] has it.
+    /// The same in parts, enclosing types first, each with how many of the type's generic
+    /// arguments are its own: `Dictionary<TKey,TValue>.KeyCollection` is `Dictionary` with 2
+    /// and `KeyCollection` with none.
     parts: Vec<Vec<(String, usize)>>,
 }
 
@@ -728,12 +735,12 @@ impl Names {
 /// `Dictionary<int,string>.KeyCollection`. Arguments the parts do not account for go to the
 /// last.
 fn render(parts: &[(String, usize)], args: &[String]) -> String {
-    let owned: usize = parts.iter().map(|(_, arity)| arity).sum();
+    let fits = parts.iter().map(|(_, arity)| arity).sum::<usize>() == args.len();
     let mut args = args.iter().map(String::as_str);
     let last = parts.len().saturating_sub(1);
     let mut out = Vec::with_capacity(parts.len());
     for (index, (name, arity)) in parts.iter().enumerate() {
-        let take = if owned == args.len() {
+        let take = if fits {
             *arity
         } else if index == last {
             usize::MAX
@@ -750,11 +757,6 @@ impl Il2Cpp {
     /// Whether `addr` is a usage slot.
     pub fn is_usage(&self, addr: u64) -> bool {
         self.usages.binary_search_by_key(&addr, |(slot, _)| *slot).is_ok()
-    }
-
-    /// How C# writes the types of the build.
-    pub fn names(&self) -> Names {
-        Names { names: self.types.iter().map(|def| def.name.clone()).collect(), parts: self.types.iter().map(|def| def.parts.clone()).collect() }
     }
 
     /// A function name for the code at each method's address, and for each generic method
@@ -777,7 +779,7 @@ impl Il2Cpp {
     /// type, `Player.Update_MethodInfo` for a method, `Player.speed_FieldInfo` for a field,
     /// and the text in quotes for a string literal.
     pub fn usage_names(&self) -> Vec<(u64, String)> {
-        let names = self.names();
+        let names = &self.names;
         self.usages
             .iter()
             .map(|(slot, usage)| {
@@ -793,5 +795,20 @@ impl Il2Cpp {
                 (*slot, name)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render;
+
+    #[test]
+    fn generic_arguments_go_to_the_parts_they_belong_to() {
+        let parts = |parts: &[(&str, usize)]| parts.iter().map(|&(name, arity)| (name.to_string(), arity)).collect::<Vec<_>>();
+        let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert_eq!(render(&parts(&[("Dictionary", 2), ("KeyCollection", 0)]), &args(&["int", "string"])), "Dictionary<int,string>.KeyCollection");
+        assert_eq!(render(&parts(&[("Outer", 1), ("Middle", 1), ("Inner", 0)]), &args(&["int", "string"])), "Outer<int>.Middle<string>.Inner");
+        // Arguments the parts do not account for go to the last.
+        assert_eq!(render(&parts(&[("List", 1), ("Enumerator", 0)]), &args(&["int", "bool"])), "List.Enumerator<int,bool>");
     }
 }

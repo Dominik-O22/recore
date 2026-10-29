@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use recore::il2cpp::{Il2Cpp, Names, Ty, TypeDef, Usage};
+use recore::il2cpp::{Il2Cpp, Ty, TypeDef, Usage};
 
 use crate::types::{Base, Field, Function, Global, Named, Prototype, Type, TypeId, Types, VOID};
 
@@ -25,7 +25,6 @@ pub fn types(il2cpp: &Il2Cpp) -> Types {
 
 struct Builder<'a> {
     il2cpp: &'a Il2Cpp,
-    names: Names,
     types: Types,
     /// Per type definition: the struct of its objects or values, and that of its class record.
     objects: Vec<TypeId>,
@@ -38,15 +37,15 @@ struct Builder<'a> {
 impl<'a> Builder<'a> {
     fn new(il2cpp: &'a Il2Cpp) -> Builder<'a> {
         let mut types = Types::new(8);
-        let names = il2cpp.names();
         let method_info = opaque(&mut types, "Il2CppMethodInfo");
-        let mut builder = Builder { il2cpp, names, types, objects: Vec::new(), classes: Vec::new(), built: HashMap::new(), method_info };
+        let mut builder = Builder { il2cpp, types, objects: Vec::new(), classes: Vec::new(), built: HashMap::new(), method_info };
         // Every struct is named first, so that fields can refer to any of them. An enum is the
         // number its one instance field holds, with its members.
         for def in &il2cpp.types {
             // A struct called as one of the engine's own types, as Unity.Mathematics has `uint4`,
             // would be told from it only by a number.
-            let name = if builder.types.is_taken(&def.name) { format!("{}.{}", def.namespace, def.name) } else { def.name.clone() };
+            let name =
+                if builder.types.is_taken(&def.name) && !def.namespace.is_empty() { format!("{}.{}", def.namespace, def.name) } else { def.name.clone() };
             let object = match enum_size(def) {
                 Some(size) => {
                     let id = builder.types.named(Named::Enum, &name, size).0;
@@ -180,7 +179,7 @@ impl<'a> Builder<'a> {
                 if self.il2cpp.types[*def as usize].is_value_type {
                     return None;
                 }
-                let name = self.names.display(ty);
+                let name = self.il2cpp.names.display(ty);
                 let declared = match self.built.get(&name) {
                     Some(&id) => id,
                     None => {
@@ -192,7 +191,7 @@ impl<'a> Builder<'a> {
                 self.pointer(declared)
             }
             Ty::Array(element) => {
-                let name = self.names.display(ty);
+                let name = self.il2cpp.names.display(ty);
                 if let Some(&id) = self.built.get(&name) {
                     return Some(self.pointer(id));
                 }

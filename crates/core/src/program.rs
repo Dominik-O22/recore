@@ -232,16 +232,28 @@ impl Program {
         owners.iter().copied().find(|&entry| entry == addr).or_else(|| owners.first().copied()).with_context(|| format!("no function contains {addr:#x}"))
     }
 
+    /// Whether some function is called exactly `name`, so that `name` is not to be read as an
+    /// address even where it would parse as one.
+    pub fn names_function(&self, name: &str) -> bool {
+        self.functions().any(|f| f.name.as_deref() == Some(name))
+    }
+
     /// The entry of the function called `name`: the only exact match, or else the only function
-    /// whose name contains it. Overloads share a name, and then the function is asked for by
-    /// address.
+    /// whose name contains it. A stub that jumps to a function often carries its name, and
+    /// then the function is meant. Overloads share a name, and then the function is asked for
+    /// by address.
     pub fn function_named(&self, name: &str) -> Result<u64> {
         let named = || self.functions().filter_map(|f| Some((f.addr, f.name.as_deref()?)));
         let several = |found: &[(u64, &str)], how: &str| -> anyhow::Error {
             let shown: Vec<String> = found.iter().take(10).map(|&(entry, _)| self.label(entry)).collect();
-            anyhow::anyhow!("`{name}` {how} {} functions: {}{}", found.len(), shown.join(" "), if found.len() > 10 { " ..." } else { "" })
+            let more = if found.len() > 10 { " ..." } else { "" };
+            anyhow::anyhow!("`{name}` {how} {} functions: {}{more}; ask for one by address, which `functions --pattern` lists with each one's size", found.len(), shown.join(" "))
         };
-        let exact: Vec<(u64, &str)> = named().filter(|&(_, candidate)| candidate == name).collect();
+        let mut exact: Vec<(u64, &str)> = named().filter(|&(_, candidate)| candidate == name).collect();
+        let bodies: Vec<(u64, &str)> = exact.iter().copied().filter(|&(entry, _)| !self.function(entry).is_some_and(|f| f.thunk)).collect();
+        if !bodies.is_empty() {
+            exact = bodies;
+        }
         match exact.as_slice() {
             [(entry, _)] => return Ok(*entry),
             [] => {}
@@ -259,7 +271,31 @@ impl Program {
 
 #[cfg(test)]
 mod tests {
-    use super::Pattern;
+    use super::{Pattern, Program};
+    use crate::report::AnalyzedFunction;
+
+    /// A program of 16-byte functions at 0, 0x10 and so on, each named and a thunk or not.
+    fn program(functions: &[(&str, bool)]) -> Program {
+        let layout: crate::layout::Layout = toml::from_str("machine = \"8051\"\nentry = [0]\nregion = []").unwrap();
+        let section = crate::image::Section { name: String::new(), addr: 0, data: vec![0x22; 16 * functions.len()], file_offset: None, executable: true, writable: false };
+        let image = layout.image(String::new(), vec![section], None).unwrap();
+        let mut analysis = crate::analyze(&image);
+        analysis.functions = functions
+            .iter()
+            .zip((0..).step_by(16))
+            .map(|(&(name, thunk), addr)| AnalyzedFunction { addr, ranges: vec![(addr, addr + 16)], noreturn: false, thunk, origin: Default::default(), name: Some(name.into()), fragment_of: None, runs_on: None })
+            .collect();
+        Program::new(image, analysis)
+    }
+
+    #[test]
+    fn a_name_a_stub_shares_is_its_function_and_one_overloads_share_is_asked_for_by_address() {
+        let program = program(&[("Create", false), ("Create", true), ("Raycast", false), ("Raycast", false)]);
+        assert_eq!(program.function_named("Create").unwrap(), 0);
+        let error = program.function_named("Raycast").unwrap_err().to_string();
+        assert!(error.starts_with("`Raycast` names 2 functions: 0x20(Raycast) 0x30(Raycast);"), "{error}");
+        assert!(program.names_function("Raycast") && !program.names_function("Ray"));
+    }
 
     #[test]
     fn a_pattern_finds_what_it_spells_as_well_as_what_it_matches() {

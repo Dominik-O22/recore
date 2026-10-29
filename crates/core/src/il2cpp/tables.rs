@@ -84,10 +84,12 @@ impl Tables {
             .max_by_key(|&&(_, length)| length)
             .copied();
         let method_specs = generic_insts.and_then(|(_, insts)| find_method_specs(words, metadata, insts));
-        let generic_method_table = method_specs.zip(sizes).and_then(|((specs, spec_count), sizes)| {
+        let generic_method_table = method_specs.and_then(|(specs, spec_count)| {
             // The table of compiled instances ends where the method instances start. Its rows
-            // name an instance each, and it begins after the last size record.
-            let size_records: FxHashSet<u64> = (0..count).filter_map(|index| words.entry(sizes, index)).collect();
+            // name an instance each, and it begins after the last size record, or failing that
+            // at the first row that cannot be one.
+            let size_records: FxHashSet<u64> =
+                sizes.map_or_else(FxHashSet::default, |sizes| (0..count).filter_map(|index| words.entry(sizes, index)).collect());
             let mut start = specs;
             while start >= 16 && !size_records.contains(&(start - 16)) {
                 let row = |at: u64| words.u32(start - 16 + at).map(|value| value as i32);

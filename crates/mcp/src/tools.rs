@@ -539,8 +539,8 @@ fn read_as_hex(text: &str) -> String {
 pub(crate) fn resolve_function(binary: &Binary, text: &str) -> Result<u64> {
     match (binary.program.function_named(text), parse_addr(text)) {
         (Ok(entry), _) => Ok(entry),
-        (Err(_), Some(addr)) => binary.program.function_at(addr),
-        (Err(error), None) => Err(error),
+        (Err(_), Some(addr)) if !binary.program.names_function(text) => binary.program.function_at(addr),
+        (Err(error), _) => Err(error),
     }
 }
 
@@ -1179,6 +1179,7 @@ fn decompile(binary: &mut Binary, args: Decompile) -> Result<String> {
     // is, for code the analysis did not make a function of.
     let resolve = |text: &String| match (binary.program.function_named(text), parse_addr(text)) {
         (Ok(entry), _) => Ok(entry),
+        (Err(error), _) if binary.program.names_function(text) => Err(error),
         (Err(_), Some(addr)) if binary.program.image.is_code(addr) => Ok(binary.program.function_at(addr).unwrap_or(addr)),
         (Err(_), Some(addr)) => bail!("{addr:#x} is not code"),
         (Err(error), None) => Err(error),
