@@ -381,7 +381,8 @@ impl<'a> Builder<'a> {
 
     fn read_ty(&self, addr: u64, depth: u32) -> Option<Ty> {
         // Past a depth no real type nests to, the file is damaged, and the read stops to spare
-        // the stack. What was read stays in the memo, so deep nesting costs no more than wide.
+        // the stack. What was read stays in the memo, so deep nesting costs no more than wide,
+        // and a record first reached that deep keeps its cut-off reading.
         if depth > MAX_NESTING {
             return Some(Ty::Unknown);
         }
