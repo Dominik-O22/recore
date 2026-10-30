@@ -45,12 +45,13 @@ pub use mimalloc::MiMalloc;
 /// `mi_option_purge_delay` in `mimalloc.h`, which the bindings leave unnamed.
 const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
 
-/// While it lives, [`MiMalloc`] gives memory back to the system a few milliseconds after it is
-/// freed, where by default it keeps it for up to ten seconds in case it is wanted again. For
+/// While it lives, [`MiMalloc`] gives memory back to the system `ms` milliseconds after it is
+/// freed, where by default it keeps it for a second in case it is wanted again. For
 /// work that frees much of what it builds, as analysis and a decompiler process's setup do:
 /// held all the while, it would sit beside the memory still in use. What is given back and
 /// soon allocated again costs a page fault for each page, so a short process that frees and
 /// allocates again does better without: a query that reads a kept analysis is 20 ms slower.
+/// The delay is the whole process's, so two of these must not overlap.
 pub struct GiveBackFreed(std::ffi::c_long);
 
 impl GiveBackFreed {
@@ -66,7 +67,7 @@ impl GiveBackFreed {
 
 impl Drop for GiveBackFreed {
     fn drop(&mut self) {
-        // SAFETY: as in `new`.
+        // SAFETY: as in `after`.
         unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, self.0) };
     }
 }

@@ -166,7 +166,7 @@ const CALLEE_LIMIT: u64 = 4096;
 /// until stdin closes. `options` is the JSON that [`Worker::new`] passed along.
 pub fn serve(binary: &Path, options: &str) -> Result<()> {
     // Setting up frees much of what it builds, and the process lives on.
-    let _give_back = crate::GiveBackFreed::after(0);
+    let give_back = crate::GiveBackFreed::after(0);
     let options: Options = serde_json::from_str(options)?;
     let image = recore::Image::load(binary)?;
     // The engine reads its language files, and debug information is read if there is any,
@@ -417,6 +417,9 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         out.write_all(b"\n")?;
         Ok(out.flush()?)
     };
+    // Decompiling frees and allocates again at once, which pages given back would slow.
+    drop(give_back);
+    crate::give_back_freed_memory();
     send(&Event::Ready)?;
     for line in std::io::stdin().lock().lines() {
         let request: Request = serde_json::from_str(&line?)?;
