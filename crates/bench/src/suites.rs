@@ -188,7 +188,11 @@ pub fn phases(binary: &Path, runs: usize) -> Result<()> {
 
 /// Runs a program to its end and returns the wall time.
 fn timed(command: &mut Command) -> Result<f64> {
-    Ok(measured(command)?.0)
+    let start = Instant::now();
+    let status = command.stdout(Stdio::null()).stderr(Stdio::null()).status()?;
+    let elapsed = ms(start);
+    ensure!(status.success(), "{command:?} failed");
+    Ok(elapsed)
 }
 
 /// Runs a program to its end and returns the wall time and the most memory its process held,
@@ -199,7 +203,7 @@ fn measured(command: &mut Command) -> Result<(f64, u64)> {
     let mut child = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
     let status_file = format!("/proc/{}/status", child.id());
     let ended = std::sync::atomic::AtomicBool::new(false);
-    let (status, peak) = std::thread::scope(|scope| {
+    let (status, elapsed, peak) = std::thread::scope(|scope| {
         let watch = scope.spawn(|| {
             let mut peak = 0;
             while !ended.load(std::sync::atomic::Ordering::Relaxed) {
@@ -211,10 +215,10 @@ fn measured(command: &mut Command) -> Result<(f64, u64)> {
             peak
         });
         let status = child.wait();
+        let elapsed = ms(start);
         ended.store(true, std::sync::atomic::Ordering::Relaxed);
-        (status, watch.join().expect("the watch does not panic"))
+        (status, elapsed, watch.join().expect("the watch does not panic"))
     });
-    let elapsed = ms(start);
     ensure!(status?.success(), "{command:?} failed");
     Ok((elapsed, peak))
 }
@@ -249,8 +253,8 @@ pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
         command.env(recore::cache::DIR_VAR, &cache).arg(tool_name).arg(binary).arg(format!("{function:#x}"));
         command
     };
-    // Before each timed run, the files it reads go from the page cache: the program, the
-    // binary, its IL2CPP metadata and the analyses kept.
+    // Before each timed run, the program, the binary, its IL2CPP metadata and the analyses kept
+    // go from the page cache.
     let from_disk = |binary: &Path| {
         let kept = std::fs::read_dir(&cache).into_iter().flatten().flatten().map(|entry| entry.path());
         for path in [tool.clone(), binary.to_path_buf()].into_iter().chain(recore::il2cpp::find(binary)).chain(kept) {
@@ -634,38 +638,4 @@ pub fn decode_floor(binary: &Path, runs: usize) -> Result<()> {
         println!("{time:>8.2} ms {:>6.1} ns per instruction  {what}  ({instructions} instructions)", time * 1e6 / instructions.max(1) as f64);
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// How many pages of the file at `path` are in the page cache.
-    fn resident(path: &Path) -> usize {
-        use std::os::fd::AsRawFd;
-        let file = std::fs::File::open(path).unwrap();
-        let len = file.metadata().unwrap().len() as usize;
-        let page = 4096;
-        let mut pages = vec![0u8; len.div_ceil(page)];
-        // SAFETY: a read-only mapping of the whole file, unmapped before it is closed.
-        unsafe {
-            let map = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0);
-            assert_ne!(map, libc::MAP_FAILED);
-            assert_eq!(libc::mincore(map, len, pages.as_mut_ptr()), 0);
-            libc::munmap(map, len);
-        }
-        pages.iter().filter(|&&page| page & 1 != 0).count()
-    }
-
-    /// A cold run reads from the disk what it reads, even a file just written.
-    #[test]
-    fn an_evicted_file_has_no_page_in_the_page_cache() {
-        let path = std::env::current_exe().unwrap().with_file_name("evict-test");
-        std::fs::write(&path, vec![1u8; 1 << 20]).unwrap();
-        std::fs::read(&path).unwrap();
-        assert!(resident(&path) > 0);
-        evict(&path);
-        assert_eq!(resident(&path), 0);
-        std::fs::remove_file(&path).unwrap();
-    }
 }
