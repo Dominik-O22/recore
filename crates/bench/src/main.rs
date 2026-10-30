@@ -97,9 +97,8 @@ enum Command {
         #[arg(long)]
         collapsed: Option<PathBuf>,
     },
-    /// Counts the instructions `recore-mcp` executes on each binary of the set for what an agent
-    /// waits for, and fails where they grew past `bench/budget.json`. Lowers the budget where
-    /// they shrank.
+    /// Counts the instructions of what an agent waits for on each binary of the set, and fails
+    /// where they grew past `bench/budget.json`. Lowers the budget where they shrank.
     Ratchet {
         /// The list of binaries, one path per line, relative to the corpora's directory.
         #[arg(long, default_value = "bench/set.txt")]

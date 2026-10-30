@@ -29,16 +29,12 @@ use crate::work::Counter;
 /// How far a count may move, in percent of its budget, and still be the same.
 const SLACK: u128 = 1;
 
-/// A count this close to its budget is the same whatever the percentage: 70 microseconds at
-/// most, which on the smallest counts is more than 1%, and they move by 0.3M with the machine's
-/// load.
-const FLOOR: u64 = 1_000_000;
-
 /// Functions decompiled per binary. `bench/functions.json` keeps which, so that a change to what
 /// the analysis finds does not swap them for others and move the count by itself.
 const FUNCTIONS: usize = 24;
 
-/// What a function may take. One that takes longer is a failed call, which fails the run.
+/// What a function may take. One that takes longer is a failed call, which fails the run. A
+/// decompiler process replaced on the way to a call that then succeeds shows only as growth.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
 const NOT_ALLOWED: &str = "the kernel lets this process count no instructions; /proc/sys/kernel/perf_event_paranoid must be 2 or less";
@@ -101,9 +97,6 @@ impl Ratchet {
             let now = *now;
             let change = now as f64 / (*limit).max(1) as f64 - 1.0;
             shown.push(format!("{:>10.1} {:>+6.1}%", now as f64 / 1e6, change * 100.0));
-            if now.abs_diff(*limit) <= FLOOR {
-                continue;
-            }
             // In whole numbers, which put a count exactly `SLACK` off still inside it.
             let (percent, budget) = (u128::from(now) * 100, u128::from((*limit).max(1)));
             if percent > budget * (100 + SLACK) {
@@ -195,7 +188,8 @@ impl Server {
     fn call(&mut self, tool: &str, mut arguments: Value) -> Result<()> {
         arguments["path"] = json!(self.binary);
         let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": tool, "arguments": arguments } });
-        writeln!(self.stdin, "{request}")?;
+        // In one write: a line in pieces is read in as many pieces as the scheduler makes of it.
+        self.stdin.write_all(format!("{request}\n").as_bytes())?;
         let mut line = String::new();
         ensure!(self.replies.read_line(&mut line)? > 0, "recore-mcp ended during `{tool}`");
         let reply: Value = serde_json::from_str(&line).with_context(|| format!("the reply to `{tool}`"))?;
@@ -205,6 +199,13 @@ impl Server {
 
     fn decompile(&mut self, function: u64) -> Result<()> {
         self.call("decompile", json!({ "functions": [format!("{function:#x}")], "timeout": TIMEOUT.as_secs() }))
+    }
+
+    fn look_up(&mut self, function: u64) -> Result<()> {
+        let function = format!("{function:#x}");
+        self.call("function", json!({ "addr": function }))?;
+        self.call("xrefs", json!({ "addr": function }))?;
+        self.call("disassemble", json!({ "function": function }))
     }
 }
 
@@ -216,18 +217,18 @@ impl Drop for Server {
 }
 
 /// The binary's functions at even steps through their sizes, smallest first, as the set takes
-/// binaries, leaving out those with no code and those the decompiler fails on. The largest few,
-/// which take most of the time and so would hide the rest, fall past the last step.
+/// binaries, leaving out those with no code and those a tool of [`count`]'s fails on. The largest
+/// few, which take most of the time and so would hide the rest, fall past the last step.
 fn choose(program: &Program, mut server: Server) -> Vec<u64> {
     let mut by_size: Vec<(u64, u64)> = program.sizes().into_iter().filter(|&(_, size)| size > 0).map(|(entry, size)| (size, entry)).collect();
     by_size.sort_unstable();
     let step = by_size.len().div_ceil(FUNCTIONS).max(1);
-    by_size.into_iter().step_by(step).map(|(_, entry)| entry).filter(|&entry| server.decompile(entry).is_ok()).collect()
+    by_size.into_iter().step_by(step).map(|(_, entry)| entry).filter(|&entry| server.decompile(entry).and_then(|()| server.look_up(entry)).is_ok()).collect()
 }
 
 /// Counts [`Work`] for `binary`, decompiling `functions`, or functions it chooses if there are
-/// none, and prints it as JSON for [`run`]. Analyses go to a directory of the bench's, which
-/// starts each count empty for the first call to have nothing kept.
+/// none, and prints it as JSON for [`run`]. What `recore-mcp` keeps goes to a directory that
+/// each count starts empty: the first call has nothing kept, and no edits a run left behind apply.
 pub fn count(binary: &Path, functions: Vec<u64>) -> Result<()> {
     let program = Program::load(binary)?;
     let tool = crate::suites::sibling("recore-mcp")?;
@@ -235,7 +236,7 @@ pub fn count(binary: &Path, functions: Vec<u64>) -> Result<()> {
     let recore_mcp = || {
         let mut command = Command::new(&tool);
         // Rayon's work on one thread, so that the count does not depend on how it was split.
-        command.env(recore::cache::DIR_VAR, &kept).env("RAYON_NUM_THREADS", "1").env_remove(recore_decomp::types::DEBUG_VAR);
+        command.env(recore::cache::DIR_VAR, &kept).env(recore::edits::DIR_VAR, &kept).env("RAYON_NUM_THREADS", "1").env_remove(recore_decomp::types::DEBUG_VAR);
         command
     };
     let functions = if functions.is_empty() { choose(&program, Server::start(recore_mcp(), binary)?) } else { functions };
@@ -266,10 +267,8 @@ pub fn count(binary: &Path, functions: Vec<u64>) -> Result<()> {
     let decompiled = read()?;
     server.call("functions", json!({}))?;
     server.call("strings", json!({}))?;
-    for function in functions.iter().map(|function| format!("{function:#x}")) {
-        server.call("function", json!({ "addr": function }))?;
-        server.call("xrefs", json!({ "addr": function }))?;
-        server.call("disassemble", json!({ "function": function }))?;
+    for &function in &functions {
+        server.look_up(function)?;
     }
     let looked_up = read()?;
     drop(server);
@@ -330,16 +329,6 @@ mod tests {
         for analysis in [990_000_000, 1_000_000_000, 1_010_000_000] {
             let (budget, moved) = finish_with(analysis, false).unwrap();
             assert_eq!((budget["a"], moved.as_str()), (LIMIT, "0 raised, 0 lowered, 0 added"), "{analysis}");
-        }
-    }
-
-    #[test]
-    fn a_small_count_may_move_by_more_than_one_percent_up_to_the_floor() {
-        let small = Work { analysis: 10_000_000, ..LIMIT };
-        for (analysis, moved) in [(10_900_000, "0 raised, 0 lowered, 0 added"), (9_100_000, "0 raised, 0 lowered, 0 added"), (8_900_000, "0 raised, 1 lowered, 0 added")] {
-            let mut ratchet = Ratchet::new(BTreeMap::from([("a".to_string(), small)]), false);
-            ratchet.hold("a", Work { analysis, ..LIMIT });
-            assert_eq!(ratchet.finish().unwrap().1, moved, "{analysis}");
         }
     }
 

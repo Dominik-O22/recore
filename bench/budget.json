@@ -12,7 +12,7 @@
     "again": 4457448,
     "setup": 376104715,
     "decompile": 235379446,
-    "lookups": 29305142,
+    "lookups": 28808598,
     "diff": 4407733
   },
   "corpus-arm64/bin/deb__git__git-imap-send": {
@@ -60,7 +60,7 @@
     "again": 5972939,
     "setup": 213684775,
     "decompile": 520394416,
-    "lookups": 31466516,
+    "lookups": 30995003,
     "diff": 12366349
   },
   "corpus-armel/bin/deb__git__git-imap-send": {
@@ -108,7 +108,7 @@
     "again": 6282373,
     "setup": 213659162,
     "decompile": 309030913,
-    "lookups": 30492790,
+    "lookups": 30028673,
     "diff": 13514960
   },
   "corpus-armhf/bin/deb__git__git-imap-send": {
@@ -180,7 +180,7 @@
     "again": 8569750,
     "setup": 490851303,
     "decompile": 273801570,
-    "lookups": 37052925,
+    "lookups": 36530172,
     "diff": 140284080
   },
   "corpus-pe/bin/obs__obs-browser.dll": {
@@ -228,7 +228,7 @@
     "again": 5245026,
     "setup": 360820888,
     "decompile": 489758511,
-    "lookups": 33529169,
+    "lookups": 33023118,
     "diff": 42018258
   },
   "corpus-pe32/bin/php83__php_ldap.dll": {
