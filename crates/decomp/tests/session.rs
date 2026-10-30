@@ -273,6 +273,19 @@ fn data_flow_links_the_return_value_to_the_parameters() {
 }
 
 #[test]
+fn data_flow_keeps_its_numbers_past_a_value_inside_a_register() {
+    use recore_decomp::flow::Kind;
+    // mov rax, rdi; mov al, 1; add rax, rsi; ret
+    let code = [0x48, 0x89, 0xf8, 0xb0, 0x01, 0x48, 0x01, 0xf0, 0xc3];
+    let mut session = session(&code);
+    session.keep_flow(true);
+    let flow = session.decompile(0x1000).unwrap().flow.unwrap();
+    // The bytes of rax that `mov al` leaves alone are a value at an offset into the register.
+    assert!(flow.values.values().any(|value| value.kind == Kind::Temp("RAX+1".to_string())), "{flow:?}");
+    assert!(flow.ops.iter().all(|op| (0x1000..0x1000 + code.len() as u64).contains(&op.addr)), "{:?}", flow.ops);
+}
+
+#[test]
 fn a_function_that_jumps_to_another_returns_what_that_one_returns() {
     use recore::report::CallTarget;
     // 0x1000: jmp 0x1010. 0x1010: mov eax, 7; ret.
