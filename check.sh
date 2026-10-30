@@ -7,7 +7,7 @@
 # with recore built at <ref>, and `recore-corpus compare` prints each count that moved, with
 # the binaries it moved in. It fails when a total got worse.
 #
-# Last, `recore-bench ratchet` counts the instructions analysis and `diff` execute on the
+# Last, `recore-bench ratchet` counts the instructions of what an agent waits for on the
 # benchmark set, and fails when a count grew past bench/budget.json.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -17,7 +17,7 @@ if [ "${1:-}" = --against ]; then
   shift 2
 fi
 # Only the crates the loop needs; other crates may be mid-change.
-cargo build --release -q -p recore -p recore-corpus -p recore-bench
+cargo build --release -q -p recore -p recore-corpus -p recore-bench -p recore-mcp
 # Only crates/*/tests may name the program a test needs. CI runs this scan with the other
 # tests; the loop runs it first, so a leaked name fails before the corpora are scored.
 cargo test --release -q -p recore --test general_naming
