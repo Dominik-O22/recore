@@ -33,6 +33,9 @@ const SLACK: u128 = 1;
 /// the analysis finds does not swap them for others and move the count by itself.
 const FUNCTIONS: usize = 24;
 
+/// Functions per binary `trace` follows, which takes the longest of the tools on some of them.
+const TRACED: usize = 3;
+
 /// What a function may take. One that takes longer is a failed call: `choose` leaves it out, and
 /// in a count it fails the run. A decompiler process replaced on the way to a call that then
 /// succeeds shows only as growth.
@@ -52,15 +55,27 @@ struct Work {
     setup: u64,
     /// `decompile` of the rest of the chosen functions, one call each.
     decompile: u64,
-    /// `functions`, `strings`, and `function`, `xrefs` and `disassemble` of each chosen function.
+    /// What the analysis answers: `functions`, `strings`, `imports`, `classes`, `symbols` and
+    /// `unnamed`, and `function`, `xrefs`, `disassemble`, `addr` and `bytes` of each chosen function.
     lookups: u64,
+    /// What the decompiler answers apart from C: `structs` and `pcode` of each chosen function,
+    /// and `trace` of the first [`TRACED`] with both a parameter and a value to follow.
+    dataflow: u64,
     /// Comparing the binary with itself, in this process: `recore-mcp diff` refuses that.
     diff: u64,
 }
 
 impl Work {
-    fn counts(&mut self) -> [(&'static str, &mut u64); 6] {
-        [("analysis", &mut self.analysis), ("again", &mut self.again), ("setup", &mut self.setup), ("decompile", &mut self.decompile), ("lookups", &mut self.lookups), ("diff", &mut self.diff)]
+    fn counts(&mut self) -> [(&'static str, &mut u64); 7] {
+        [
+            ("analysis", &mut self.analysis),
+            ("again", &mut self.again),
+            ("setup", &mut self.setup),
+            ("decompile", &mut self.decompile),
+            ("lookups", &mut self.lookups),
+            ("dataflow", &mut self.dataflow),
+            ("diff", &mut self.diff),
+        ]
     }
 }
 
@@ -146,7 +161,7 @@ pub fn run(binaries: &[PathBuf], path: &Path, accept: bool) -> Result<()> {
     if present.is_empty() {
         bail!("none of the {} binaries of the set is in {}", binaries.len(), crate::corpora().display());
     }
-    let header: Vec<String> = Work { analysis: 0, again: 0, setup: 0, decompile: 0, lookups: 0, diff: 0 }.counts().map(|(what, _)| format!("{:>18}", format!("{what} M"))).into();
+    let header: Vec<String> = Work { analysis: 0, again: 0, setup: 0, decompile: 0, lookups: 0, dataflow: 0, diff: 0 }.counts().map(|(what, _)| format!("{:>18}", format!("{what} M"))).into();
     println!("{:<46} {}", "binary", header.join(" "));
     for binary in present {
         let name = crate::suites::name(binary);
@@ -206,7 +221,27 @@ impl Server {
         let function = format!("{function:#x}");
         self.call("function", json!({ "addr": function }))?;
         self.call("xrefs", json!({ "addr": function }))?;
-        self.call("disassemble", json!({ "function": function }))
+        self.call("disassemble", json!({ "function": function }))?;
+        self.call("addr", json!({ "addr": function }))?;
+        self.call("bytes", json!({ "addr": function }))
+    }
+
+    fn data_flow(&mut self, function: u64) -> Result<()> {
+        let function = format!("{function:#x}");
+        self.call("structs", json!({ "function": function }))?;
+        self.call("pcode", json!({ "function": function }))
+    }
+
+    /// Follows the function's first parameter and its return value, and says whether it has
+    /// both. Saying that it lacks one is an answer, where any other error is a failed call.
+    fn trace(&mut self, function: u64) -> Result<bool> {
+        let function = format!("{function:#x}");
+        let mut has = |arguments: Value, none: &str| match self.call("trace", arguments) {
+            Ok(()) => Ok(true),
+            Err(error) if error.to_string().contains(none) => Ok(false),
+            Err(error) => Err(error),
+        };
+        Ok(has(json!({ "function": function, "param": 1 }), "has no parameter 1")? & has(json!({ "function": function, "returns": true }), "returns no value")?)
     }
 }
 
@@ -224,7 +259,7 @@ fn choose(program: &Program, mut server: Server) -> Vec<u64> {
     let mut by_size: Vec<(u64, u64)> = program.sizes().into_iter().filter(|&(_, size)| size > 0).map(|(entry, size)| (size, entry)).collect();
     by_size.sort_unstable();
     let step = by_size.len().div_ceil(FUNCTIONS).max(1);
-    by_size.into_iter().step_by(step).map(|(_, entry)| entry).filter(|&entry| server.decompile(entry).and_then(|()| server.look_up(entry)).is_ok()).collect()
+    by_size.into_iter().step_by(step).map(|(_, entry)| entry).filter(|&entry| server.decompile(entry).and_then(|()| server.look_up(entry)).and_then(|()| server.data_flow(entry)).is_ok()).collect()
 }
 
 /// Counts [`Work`] for `binary`, decompiling `functions`, or functions it chooses if there are
@@ -266,17 +301,28 @@ pub fn count(binary: &Path, functions: Vec<u64>) -> Result<()> {
         server.decompile(function)?;
     }
     let decompiled = read()?;
-    server.call("functions", json!({}))?;
-    server.call("strings", json!({}))?;
+    for tool in ["functions", "strings", "imports", "classes", "symbols", "unnamed"] {
+        server.call(tool, json!({}))?;
+    }
     for &function in &functions {
         server.look_up(function)?;
     }
     let looked_up = read()?;
+    for &function in &functions {
+        server.data_flow(function)?;
+    }
+    let mut traced = 0;
+    for &function in &functions {
+        if traced < TRACED {
+            traced += usize::from(server.trace(function)?);
+        }
+    }
+    let flowed = read()?;
     drop(server);
     let _ = std::fs::remove_dir_all(&kept);
 
     let (_, diff) = crate::work::instructions(|| recore::diff::diff(&program, &program));
-    let work = Work { analysis, again, setup: set_up - start, decompile: decompiled - set_up, lookups: looked_up - decompiled, diff: diff.context(NOT_ALLOWED)? };
+    let work = Work { analysis, again, setup: set_up - start, decompile: decompiled - set_up, lookups: looked_up - decompiled, dataflow: flowed - looked_up, diff: diff.context(NOT_ALLOWED)? };
     println!("{}", serde_json::to_string(&Counted { work, functions })?);
     Ok(())
 }
@@ -285,7 +331,7 @@ pub fn count(binary: &Path, functions: Vec<u64>) -> Result<()> {
 mod tests {
     use super::*;
 
-    const LIMIT: Work = Work { analysis: 1_000_000_000, again: 1_000_000_000, setup: 1_000_000_000, decompile: 1_000_000_000, lookups: 1_000_000_000, diff: 1_000_000_000 };
+    const LIMIT: Work = Work { analysis: 1_000_000_000, again: 1_000_000_000, setup: 1_000_000_000, decompile: 1_000_000_000, lookups: 1_000_000_000, dataflow: 1_000_000_000, diff: 1_000_000_000 };
 
     /// Holds one count of the binary `a`, whose budget is [`LIMIT`], and finishes.
     fn finish_with(analysis: u64, accept: bool) -> Result<(BTreeMap<String, Work>, String)> {
@@ -296,7 +342,7 @@ mod tests {
 
     #[test]
     fn every_count_is_held_to_its_budget() {
-        for index in 0..6 {
+        for index in 0..7 {
             let mut now = LIMIT;
             let (what, count) = now.counts().into_iter().nth(index).expect("a count");
             *count = 1_020_000_000;
