@@ -33,8 +33,9 @@ const SLACK: u128 = 1;
 /// the analysis finds does not swap them for others and move the count by itself.
 const FUNCTIONS: usize = 24;
 
-/// What a function may take. One that takes longer is a failed call, which fails the run. A
-/// decompiler process replaced on the way to a call that then succeeds shows only as growth.
+/// What a function may take. One that takes longer is a failed call: `choose` leaves it out, and
+/// in a count it fails the run. A decompiler process replaced on the way to a call that then
+/// succeeds shows only as growth.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
 const NOT_ALLOWED: &str = "the kernel lets this process count no instructions; /proc/sys/kernel/perf_event_paranoid must be 2 or less";
@@ -227,8 +228,8 @@ fn choose(program: &Program, mut server: Server) -> Vec<u64> {
 }
 
 /// Counts [`Work`] for `binary`, decompiling `functions`, or functions it chooses if there are
-/// none, and prints it as JSON for [`run`]. What `recore-mcp` keeps goes to a directory that
-/// each count starts empty: the first call has nothing kept, and no edits a run left behind apply.
+/// none, and prints it as JSON for [`run`]. What `recore-mcp` keeps goes to a directory emptied
+/// before counting: the first call has nothing kept, and no edits a run left behind apply.
 pub fn count(binary: &Path, functions: Vec<u64>) -> Result<()> {
     let program = Program::load(binary)?;
     let tool = crate::suites::sibling("recore-mcp")?;
