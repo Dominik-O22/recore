@@ -33,7 +33,9 @@ const SLACK: u128 = 1;
 /// the analysis finds does not swap them for others and move the count by itself.
 const FUNCTIONS: usize = 24;
 
-/// Functions per binary `trace` follows, which takes the longest of the tools on some of them.
+/// `trace` goes through the chosen functions until this many had both a parameter and a value to
+/// follow: it takes the longest of the tools on some of them, and few small ones have both. Which
+/// these are is not kept, so a change to what the decompiler recovers can swap them.
 const TRACED: usize = 3;
 
 /// What a function may take. One that takes longer is a failed call: `choose` leaves it out, and
@@ -55,11 +57,11 @@ struct Work {
     setup: u64,
     /// `decompile` of the rest of the chosen functions, one call each.
     decompile: u64,
-    /// What the analysis answers: `functions`, `strings`, `imports`, `classes`, `symbols` and
-    /// `unnamed`, and `function`, `xrefs`, `disassemble`, `addr` and `bytes` of each chosen function.
+    /// `functions`, `strings`, `imports`, `classes`, `symbols` and `unnamed`, and `function`,
+    /// `xrefs`, `disassemble`, `addr` and `bytes` of each chosen function.
     lookups: u64,
-    /// What the decompiler answers apart from C: `structs` and `pcode` of each chosen function,
-    /// and `trace` of the first [`TRACED`] with both a parameter and a value to follow.
+    /// `structs` and `pcode` of each chosen function, and `trace` as [`TRACED`] says. Apart from
+    /// `lookups` because its cost is in the decompiler, which would hide a slower lookup.
     dataflow: u64,
     /// Comparing the binary with itself, in this process: `recore-mcp diff` refuses that.
     diff: u64,
@@ -228,8 +230,8 @@ impl Server {
 
     fn data_flow(&mut self, function: u64) -> Result<()> {
         let function = format!("{function:#x}");
-        self.call("structs", json!({ "function": function }))?;
-        self.call("pcode", json!({ "function": function }))
+        self.call("structs", json!({ "function": function, "timeout": TIMEOUT.as_secs() }))?;
+        self.call("pcode", json!({ "function": function, "timeout": TIMEOUT.as_secs() }))
     }
 
     /// Follows the function's first parameter and its return value, and says whether it has
@@ -241,7 +243,7 @@ impl Server {
             Err(error) if error.to_string().contains(none) => Ok(false),
             Err(error) => Err(error),
         };
-        Ok(has(json!({ "function": function, "param": 1 }), "has no parameter 1")? & has(json!({ "function": function, "returns": true }), "returns no value")?)
+        Ok(has(json!({ "function": function, "param": 1, "timeout": TIMEOUT.as_secs() }), "has no parameter 1")? & has(json!({ "function": function, "returns": true, "timeout": TIMEOUT.as_secs() }), "returns no value")?)
     }
 }
 
@@ -259,7 +261,7 @@ fn choose(program: &Program, mut server: Server) -> Vec<u64> {
     let mut by_size: Vec<(u64, u64)> = program.sizes().into_iter().filter(|&(_, size)| size > 0).map(|(entry, size)| (size, entry)).collect();
     by_size.sort_unstable();
     let step = by_size.len().div_ceil(FUNCTIONS).max(1);
-    by_size.into_iter().step_by(step).map(|(_, entry)| entry).filter(|&entry| server.decompile(entry).and_then(|()| server.look_up(entry)).and_then(|()| server.data_flow(entry)).is_ok()).collect()
+    by_size.into_iter().step_by(step).map(|(_, entry)| entry).filter(|&entry| server.decompile(entry).and_then(|()| server.look_up(entry)).and_then(|()| server.data_flow(entry)).and_then(|()| server.trace(entry)).is_ok()).collect()
 }
 
 /// Counts [`Work`] for `binary`, decompiling `functions`, or functions it chooses if there are
