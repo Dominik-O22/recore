@@ -219,6 +219,19 @@ fn measured(command: &mut Command) -> Result<(f64, u64)> {
     Ok((elapsed, peak))
 }
 
+/// Drops `path` from the page cache, so that the next read of it comes from the disk: what a
+/// run before left there would otherwise make a cold run look warm, and a build that reads a
+/// file another left look faster. A file this user can read but not write is still dropped;
+/// one some process has mapped keeps the pages it uses.
+fn evict(path: &Path) {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = std::fs::File::open(path) else { return };
+    // Pages not yet written out stay.
+    let _ = file.sync_data();
+    // SAFETY: advice about a file this function holds open.
+    unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+}
+
 pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
     let tool = sibling("recore-mcp")?;
     let mut functions = Vec::new();
@@ -236,6 +249,14 @@ pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
         command.env(recore::cache::DIR_VAR, &cache).arg(tool_name).arg(binary).arg(format!("{function:#x}"));
         command
     };
+    // Before each timed run, the files it reads go from the page cache: the program, the
+    // binary, its IL2CPP metadata and the analyses kept.
+    let from_disk = |binary: &Path| {
+        let kept = std::fs::read_dir(&cache).into_iter().flatten().flatten().map(|entry| entry.path());
+        for path in [tool.clone(), binary.to_path_buf()].into_iter().chain(recore::il2cpp::find(binary)).chain(kept) {
+            evict(&path);
+        }
+    };
     let mut rows: Vec<ColdRow> = Vec::new();
     let mut times: Vec<[Vec<f64>; 6]> = binaries.iter().map(|_| Default::default()).collect();
     let mut peaks = vec![(0u64, 0u64); binaries.len()];
@@ -244,15 +265,21 @@ pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
         for (index, (binary, &function)) in binaries.iter().zip(&functions).enumerate() {
             let times = &mut times[index];
             let _ = std::fs::remove_dir_all(&cache);
+            from_disk(binary);
             let (summary, analyzing) = measured(Command::new(&tool).env(recore::cache::DIR_VAR, &cache).arg("summary").arg(binary))?;
             times[0].push(summary);
             peaks[index].1 = peaks[index].1.max(analyzing);
             let _ = std::fs::remove_dir_all(&cache);
+            from_disk(binary);
             times[1].push(timed(&mut one_shot("xrefs", binary, function))?);
+            from_disk(binary);
             times[2].push(timed(&mut one_shot("xrefs", binary, function))?);
             let _ = std::fs::remove_dir_all(&cache);
+            from_disk(binary);
             times[3].push(timed(&mut one_shot("decompile", binary, function))?);
+            from_disk(binary);
             times[4].push(timed(&mut one_shot("decompile", binary, function))?);
+            from_disk(binary);
             let (tool, cache) = (tool.clone(), cache.clone());
             let start = Instant::now();
             let mut worker = Worker::new(
@@ -455,7 +482,7 @@ pub fn print_cold(rows: &[ColdRow], before: Option<&[ColdRow]>) {
         ("worker MiB", |row| row.worker_mib),
         ("summary MiB", |row| row.analyzing_mib),
     ];
-    println!("\ncold: a new process to the answer, fastest run, ms; `again` reruns it at once, and `first` is a new decompiler process to its first function; MiB is the most that decompiler process and a `summary` with nothing kept held");
+    println!("\ncold: a new process to the answer, fastest run, ms; `again` reruns it at once, and `first` is a new decompiler process to its first function, each reading its files from the disk; MiB is the most that decompiler process and a `summary` with nothing kept held");
     print!("{:<46}", "binary");
     for (title, _) in &columns {
         print!(" {title:>9} {:>7}", "change");
@@ -607,4 +634,38 @@ pub fn decode_floor(binary: &Path, runs: usize) -> Result<()> {
         println!("{time:>8.2} ms {:>6.1} ns per instruction  {what}  ({instructions} instructions)", time * 1e6 / instructions.max(1) as f64);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// How many pages of the file at `path` are in the page cache.
+    fn resident(path: &Path) -> usize {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(path).unwrap();
+        let len = file.metadata().unwrap().len() as usize;
+        let page = 4096;
+        let mut pages = vec![0u8; len.div_ceil(page)];
+        // SAFETY: a read-only mapping of the whole file, unmapped before it is closed.
+        unsafe {
+            let map = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0);
+            assert_ne!(map, libc::MAP_FAILED);
+            assert_eq!(libc::mincore(map, len, pages.as_mut_ptr()), 0);
+            libc::munmap(map, len);
+        }
+        pages.iter().filter(|&&page| page & 1 != 0).count()
+    }
+
+    /// A cold run reads from the disk what it reads, even a file just written.
+    #[test]
+    fn an_evicted_file_has_no_page_in_the_page_cache() {
+        let path = std::env::current_exe().unwrap().with_file_name("evict-test");
+        std::fs::write(&path, vec![1u8; 1 << 20]).unwrap();
+        std::fs::read(&path).unwrap();
+        assert!(resident(&path) > 0);
+        evict(&path);
+        assert_eq!(resident(&path), 0);
+        std::fs::remove_file(&path).unwrap();
+    }
 }
