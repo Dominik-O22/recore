@@ -7,6 +7,7 @@ pub mod analysis;
 pub mod arch;
 pub mod arm;
 pub mod arm64;
+pub mod cache;
 pub mod cfg;
 pub mod diff;
 pub mod discover;

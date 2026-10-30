@@ -56,12 +56,29 @@ pub struct AnalysisRow {
 #[derive(Serialize, Deserialize)]
 pub struct ColdRow {
     pub binary: String,
-    /// The function decompiled: the one of middle size.
+    /// The function decompiled and looked up: the one of middle size.
     pub function: u64,
     /// `recore-mcp summary`, from process start to exit.
     pub summary: Stat,
-    /// `recore-mcp decompile` of the one function, from process start to exit.
+    /// `recore-mcp xrefs` of the function, with nothing kept from an earlier run, and then again.
+    #[serde(default)]
+    pub xrefs: Stat,
+    #[serde(default)]
+    pub xrefs_again: Stat,
+    /// `recore-mcp decompile` of the function, with nothing kept from an earlier run.
     pub decompile: Stat,
+    /// The same right after, with what the runs before kept.
+    #[serde(default)]
+    pub decompile_again: Stat,
+    /// From starting a decompiler process to its answer for the function, after the runs above.
+    #[serde(default)]
+    pub first: Stat,
+    /// The most memory that process held, in MiB.
+    #[serde(default, alias = "peak_mib")]
+    pub worker_mib: f64,
+    /// The most memory `summary` held, in MiB, analyzing with nothing kept from an earlier run.
+    #[serde(default)]
+    pub analyzing_mib: f64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -178,6 +195,47 @@ fn timed(command: &mut Command) -> Result<f64> {
     Ok(elapsed)
 }
 
+/// Runs a program to its end and returns the wall time and the most memory its process held,
+/// in bytes. That is read from /proc while it runs, every few milliseconds: what the kernel
+/// reports once it ends also counts this process's own, which the program started from.
+fn measured(command: &mut Command) -> Result<(f64, u64)> {
+    let start = Instant::now();
+    let mut child = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    let status_file = format!("/proc/{}/status", child.id());
+    let ended = std::sync::atomic::AtomicBool::new(false);
+    let (status, elapsed, peak) = std::thread::scope(|scope| {
+        let watch = scope.spawn(|| {
+            let mut peak = 0;
+            while !ended.load(std::sync::atomic::Ordering::Relaxed) {
+                let status = std::fs::read_to_string(&status_file).unwrap_or_default();
+                let kib = status.lines().find_map(|line| line.strip_prefix("VmHWM:")).and_then(|value| value.trim().strip_suffix("kB")?.trim().parse::<u64>().ok());
+                peak = peak.max(kib.unwrap_or(0) * 1024);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            peak
+        });
+        let status = child.wait();
+        let elapsed = ms(start);
+        ended.store(true, std::sync::atomic::Ordering::Relaxed);
+        (status, elapsed, watch.join().expect("the watch does not panic"))
+    });
+    ensure!(status?.success(), "{command:?} failed");
+    Ok((elapsed, peak))
+}
+
+/// Drops `path` from the page cache, so that the next read of it comes from the disk: what a
+/// run before left there would otherwise make a cold run look warm, and a build that reads a
+/// file another left look faster. A file this user can read but not write is still dropped;
+/// one some process has mapped keeps the pages it uses.
+fn evict(path: &Path) {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = std::fs::File::open(path) else { return };
+    // Pages not yet written out stay.
+    let _ = file.sync_data();
+    // SAFETY: advice about a file this function holds open.
+    unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+}
+
 pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
     let tool = sibling("recore-mcp")?;
     let mut functions = Vec::new();
@@ -187,16 +245,69 @@ pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
         by_size.sort_unstable();
         functions.push(by_size[by_size.len() / 2].1);
     }
-    let mut times: Vec<(Vec<f64>, Vec<f64>)> = vec![Default::default(); binaries.len()];
+    // The analyses recore keeps between runs go here, emptied where a run is to start from
+    // nothing.
+    let cache = std::path::absolute("target/bench/analyses")?;
+    let one_shot = |tool_name: &str, binary: &Path, function: u64| {
+        let mut command = Command::new(&tool);
+        command.env(recore::cache::DIR_VAR, &cache).arg(tool_name).arg(binary).arg(format!("{function:#x}"));
+        command
+    };
+    // Before each timed run, the program, the binary, its IL2CPP metadata and the analyses kept
+    // go from the page cache.
+    let from_disk = |binary: &Path| {
+        let kept = std::fs::read_dir(&cache).into_iter().flatten().flatten().map(|entry| entry.path());
+        for path in [tool.clone(), binary.to_path_buf()].into_iter().chain(recore::il2cpp::find(binary)).chain(kept) {
+            evict(&path);
+        }
+    };
+    let mut rows: Vec<ColdRow> = Vec::new();
+    let mut times: Vec<[Vec<f64>; 6]> = binaries.iter().map(|_| Default::default()).collect();
+    let mut peaks = vec![(0u64, 0u64); binaries.len()];
     // In rounds, as the analysis suite does.
     for _ in 0..runs {
-        for ((binary, function), times) in binaries.iter().zip(&functions).zip(&mut times) {
-            times.0.push(timed(Command::new(&tool).arg("summary").arg(binary))?);
-            times.1.push(timed(Command::new(&tool).arg("decompile").arg(binary).arg(format!("{function:#x}")))?);
+        for (index, (binary, &function)) in binaries.iter().zip(&functions).enumerate() {
+            let times = &mut times[index];
+            let _ = std::fs::remove_dir_all(&cache);
+            from_disk(binary);
+            let (summary, analyzing) = measured(Command::new(&tool).env(recore::cache::DIR_VAR, &cache).arg("summary").arg(binary))?;
+            times[0].push(summary);
+            peaks[index].1 = peaks[index].1.max(analyzing);
+            let _ = std::fs::remove_dir_all(&cache);
+            from_disk(binary);
+            times[1].push(timed(&mut one_shot("xrefs", binary, function))?);
+            from_disk(binary);
+            times[2].push(timed(&mut one_shot("xrefs", binary, function))?);
+            let _ = std::fs::remove_dir_all(&cache);
+            from_disk(binary);
+            times[3].push(timed(&mut one_shot("decompile", binary, function))?);
+            from_disk(binary);
+            times[4].push(timed(&mut one_shot("decompile", binary, function))?);
+            from_disk(binary);
+            let (tool, cache) = (tool.clone(), cache.clone());
+            let start = Instant::now();
+            let mut worker = Worker::new(
+                move || {
+                    let mut command = Command::new(&tool);
+                    command.env(recore::cache::DIR_VAR, &cache).arg("decompile-worker");
+                    command
+                },
+                binary,
+                &Options::default(),
+            );
+            let (record, _) = worker.decompile(function, SLOW * 30);
+            ensure!(record.status == Status::Ok, "{} at {function:#x}: {}", binary.display(), record.message.unwrap_or_default());
+            times[5].push(ms(start));
+            peaks[index].0 = peaks[index].0.max(worker.peak_bytes().unwrap_or(0));
         }
     }
-    let rows = binaries.iter().zip(functions).zip(times);
-    Ok(rows.map(|((binary, function), (summary, decompile))| ColdRow { binary: name(binary), function, summary: Stat::of(summary), decompile: Stat::of(decompile) }).collect())
+    let _ = std::fs::remove_dir_all(&cache);
+    let mib = |bytes: u64| bytes as f64 / (1 << 20) as f64;
+    for ((binary, function), (times, (worker, analyzing))) in binaries.iter().zip(functions).zip(times.into_iter().zip(peaks)) {
+        let [summary, xrefs, xrefs_again, decompile, decompile_again, first] = times.map(Stat::of);
+        rows.push(ColdRow { binary: name(binary), function, summary, xrefs, xrefs_again, decompile, decompile_again, first, worker_mib: mib(worker), analyzing_mib: mib(analyzing) });
+    }
+    Ok(rows)
 }
 
 /// At most `count` of the binary's functions, evenly spaced by address.
@@ -360,35 +471,46 @@ pub fn print_analysis(rows: &[AnalysisRow], before: Option<&[AnalysisRow]>) {
     );
 }
 
+/// A column of the cold table: what it reads from a row.
+type Column = fn(&ColdRow) -> f64;
+
 pub fn print_cold(rows: &[ColdRow], before: Option<&[ColdRow]>) {
     let before_of = |binary: &str| before.and_then(|rows| rows.iter().find(|row| row.binary == binary));
-    println!("\ncold: a new process to the answer, fastest run, ms");
-    println!("{:<46} {:>9} {:>7} {:>10} {:>7} {:>8}", "binary", "summary", "change", "decompile", "change", "noise");
+    let columns: [(&str, Column); 8] = [
+        ("summary", |row| row.summary.min),
+        ("xrefs", |row| row.xrefs.min),
+        ("again", |row| row.xrefs_again.min),
+        ("decompile", |row| row.decompile.min),
+        ("again", |row| row.decompile_again.min),
+        ("first", |row| row.first.min),
+        ("worker MiB", |row| row.worker_mib),
+        ("summary MiB", |row| row.analyzing_mib),
+    ];
+    println!("\ncold: a new process to the answer, fastest run, ms; `again` reruns it at once, and `first` is a new decompiler process to its first function, each reading its files from the disk; MiB is the most that decompiler process and a `summary` with nothing kept held");
+    print!("{:<46}", "binary");
+    for (title, _) in &columns {
+        print!(" {title:>9} {:>7}", "change");
+    }
+    println!(" {:>8}", "noise");
+    // Each column's value and its change.
+    let line = |label: &str, cells: Vec<(f64, String)>, noise: f64| {
+        print!("{label:<46}");
+        for (now, change) in cells {
+            print!(" {now:>9.1} {change:>7}");
+        }
+        println!(" {:>7.1}%", noise * 100.0);
+    };
     for row in rows {
         let old = before_of(&row.binary);
-        println!(
-            "{:<46} {:>9.1} {:>7} {:>10.1} {:>7} {:>7.1}%",
-            short(&row.binary),
-            row.summary.min,
-            change(row.summary.min, old.map(|b| b.summary.min)),
-            row.decompile.min,
-            change(row.decompile.min, old.map(|b| b.decompile.min)),
-            row.decompile.noise() * 100.0,
-        );
+        line(short(&row.binary), columns.iter().map(|(_, column)| (column(row), change(column(row), old.map(column)))).collect(), row.decompile.noise());
     }
     // Only the rows both runs have count towards the change of a total.
     let shared: Vec<(&ColdRow, &ColdRow)> = rows.iter().filter_map(|row| Some((row, before_of(&row.binary)?))).collect();
-    let summary = |row: &ColdRow| row.summary.min;
-    let decompile = |row: &ColdRow| row.decompile.min;
-    println!(
-        "{:<46} {:>9.1} {:>7} {:>10.1} {:>7} {:>7.1}%",
-        "total",
-        rows.iter().map(summary).sum::<f64>(),
-        change(shared.iter().map(|pair| summary(pair.0)).sum(), before.map(|_| shared.iter().map(|pair| summary(pair.1)).sum())),
-        rows.iter().map(decompile).sum::<f64>(),
-        change(shared.iter().map(|pair| decompile(pair.0)).sum(), before.map(|_| shared.iter().map(|pair| decompile(pair.1)).sum())),
-        typical_noise(rows.iter().map(|r| r.decompile.noise()).collect()),
-    );
+    let totals = columns.iter().map(|(_, column)| {
+        let (now, old): (f64, f64) = shared.iter().map(|(row, old)| (column(row), column(old))).fold((0.0, 0.0), |sum, pair| (sum.0 + pair.0, sum.1 + pair.1));
+        (rows.iter().map(column).sum(), change(now, before.map(|_| old)))
+    });
+    line("total", totals.collect(), typical_noise(rows.iter().map(|r| r.decompile.noise()).collect()) / 100.0);
 }
 
 pub fn print_decompile(rows: &[DecompileRow], before: Option<&[DecompileRow]>) {

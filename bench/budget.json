@@ -71,6 +71,10 @@
     "analysis": 352405570,
     "diff": 325027947
   },
+  "corpus-large/bin/godot__godot": {
+    "analysis": 59609035734,
+    "diff": 58995378722
+  },
   "corpus-pe/bin/git__git-remote-https.exe": {
     "analysis": 920128787,
     "diff": 1109055266
@@ -108,7 +112,7 @@
     "diff": 4177163201
   },
   "corpus-pe32/bin/obs__inject-helper32.exe": {
-    "analysis": 40377542,
+    "analysis": 40786494,
     "diff": 43498412
   },
   "corpus-pe32/bin/php83__php_ldap.dll": {
@@ -146,5 +150,9 @@
   "corpus/bin/htop__htop": {
     "analysis": 95242699,
     "diff": 130050577
+  },
+  "il2cpp/GameAssembly.so": {
+    "analysis": 25345877557,
+    "diff": 30510904236
   }
 }

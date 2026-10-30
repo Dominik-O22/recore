@@ -15,8 +15,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use recore::image::{Format, Machine};
-use recore::report::{Analysis, CallTarget};
+use recore::report::{Analysis, CallSite, CallTarget};
 use serde::{Deserialize, Serialize};
 
 use recore::edits::Edits;
@@ -164,6 +165,8 @@ const CALLEE_LIMIT: u64 = 4096;
 /// The child side: loads `binary`, then answers each request on stdin with one line on stdout,
 /// until stdin closes. `options` is the JSON that [`Worker::new`] passed along.
 pub fn serve(binary: &Path, options: &str) -> Result<()> {
+    // Setting up frees much of what it builds, and the process lives on.
+    let give_back = crate::GiveBackFreed::after(0);
     let options: Options = serde_json::from_str(options)?;
     let image = recore::Image::load(binary)?;
     // The engine reads its language files, and debug information is read if there is any,
@@ -171,7 +174,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     let (session, mut analysis, debug) = std::thread::scope(|scope| {
         let session = scope.spawn(|| Session::load(&image));
         let debug = scope.spawn(|| crate::types::load(binary, &image));
-        let analysis = recore::analyze(&image);
+        let analysis = recore::cache::analyze(binary, &image);
         (session.join().expect("loading does not panic"), analysis, debug.join().ok().flatten())
     });
     // The limit is on what the engine takes from here on. Loading a large binary, with its
@@ -191,11 +194,12 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     edits.apply(&mut analysis);
     facts.names = crate::facts::function_names(&analysis);
     let aliases: HashSet<u64> = facts.import_aliases.iter().map(|alias| alias.0).collect();
+    let calls = Calls::new(&analysis);
+    let tail_callees = calls.tail_callees();
     // A function that only jumps to another, as an incremental linker's stub does, is described
     // by what that one's debug information says.
     let importer = debug.as_ref().map(|debug| {
-        let jumps = callees_of(&analysis, true);
-        let stub = |f: &recore::report::AnalyzedFunction| match jumps.get(&f.addr)?.as_slice() {
+        let stub = |f: &recore::report::AnalyzedFunction| match tail_callees.get(&f.addr)?.as_slice() {
             [CallTarget::Function(target)] if f.thunk && f.fragment_of.is_none() => Some((f.addr, *target)),
             _ => None,
         };
@@ -218,9 +222,13 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     }
 
     // Types from debug information go in before the edits, which have the last word and may
-    // name them. The prototypes follow as functions are asked for.
+    // name them. Prototypes follow as functions are asked for, and so do globals where a
+    // function's references name all it needs.
+    let lazy_globals = debug.as_ref().is_some_and(|debug| debug.globals_by_reference);
     if let Some(importer) = &mut importer {
-        importer.globals(&mut session);
+        if !lazy_globals {
+            importer.globals(&mut session);
+        }
         for text in edits.declarations.iter().chain(edits.types.values()) {
             importer.mentioned(&mut session, text);
         }
@@ -271,11 +279,27 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
     }
 
+    // Each function's fragments, as indexes into the analysis's functions, in order.
+    let mut fragments_of: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (index, function) in analysis.functions.iter().enumerate() {
+        if let Some(owner) = function.fragment_of {
+            fragments_of.entry(owner).or_default().push(index);
+        }
+    }
     // The calls in the function at `entry` that pass text `is_text` accepts, as `(call, callee,
     // position, text)`: the first argument of each that is such text.
     let text_calls = |entry: u64, is_text: &dyn Fn(u64) -> bool| -> Vec<(u64, CallTarget, usize, u64)> {
-        let body: Vec<(u64, u64)> = analysis.functions.iter().filter(|function| function.fragment_of.unwrap_or(function.addr) == entry).flat_map(|function| function.ranges.iter().copied()).collect();
-        let calls: Vec<&recore::report::CallSite> = analysis.calls.iter().filter(|call| body.iter().any(|&(start, end)| (start..end).contains(&call.at))).collect();
+        // The ranges of the function and of its fragments, in the order of the functions.
+        let own = analysis.functions.binary_search_by_key(&entry, |function| function.addr).ok().filter(|&index| analysis.functions[index].fragment_of.is_none());
+        let mut pieces: Vec<usize> = own.into_iter().chain(fragments_of.get(&entry).into_iter().flatten().copied()).collect();
+        pieces.sort_unstable();
+        let body: Vec<(u64, u64)> = pieces.into_iter().flat_map(|index| analysis.functions[index].ranges.iter().copied()).collect();
+        // Each call in the body once, in address order.
+        let all = &analysis.calls;
+        let mut found: Vec<usize> = body.iter().flat_map(|&(start, end)| all.partition_point(|call| call.at < start)..all.partition_point(|call| call.at < end)).collect();
+        found.sort_unstable();
+        found.dedup();
+        let calls: Vec<&CallSite> = found.into_iter().map(|index| &all[index]).collect();
         let sites: Vec<u64> = calls.iter().map(|call| call.at).collect();
         recore::cfg::text_arguments(&image, &body, &sites, is_text)
             .into_iter()
@@ -305,22 +329,25 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         /// Functions between one that takes a format and the library routine it ends in.
         const DEPTH: usize = 3;
         let library = |slot: &u64| analysis.imports.iter().find(|import| import.slot == *slot).is_some_and(|import| takes_argument_list(&import.name));
-        let calls = callees_of(&analysis, false);
-        fn reaches(calls: &HashMap<u64, Vec<CallTarget>>, library: &dyn Fn(&u64) -> bool, entry: u64, depth: usize) -> bool {
-            calls.get(&entry).into_iter().flatten().any(|target| match target {
+        fn reaches(calls: &Calls, library: &dyn Fn(&u64) -> bool, entry: u64, depth: usize) -> bool {
+            calls.of(entry).any(|call| match &call.target {
                 CallTarget::Import(slot) => library(slot),
                 CallTarget::Function(callee) => depth > 0 && reaches(calls, library, *callee, depth - 1),
             })
         }
-        move |entry: u64| passed_formats.contains(&entry) || reaches(&calls, &library, entry, DEPTH)
+        let calls = &calls;
+        move |entry: u64| passed_formats.contains(&entry) || reaches(calls, &library, entry, DEPTH)
     };
-    for function in analysis.functions.iter().filter(|function| function.fragment_of.is_none()) {
-        let variadic = function.ranges.first().is_some_and(|&(start, end)| recore::cfg::takes_variable_arguments(&image, start, end));
-        if variadic {
-            session.saves_argument_registers(function.addr);
-        }
-        if variadic && hands_on_formats(function.addr) {
-            session.takes_variable_arguments(function.addr);
+    let variadic: Vec<u64> = analysis
+        .functions
+        .par_iter()
+        .filter(|function| function.fragment_of.is_none() && function.ranges.first().is_some_and(|&(start, end)| recore::cfg::takes_variable_arguments(&image, start, end)))
+        .map(|function| function.addr)
+        .collect();
+    for function in variadic {
+        session.saves_argument_registers(function);
+        if hands_on_formats(function) {
+            session.takes_variable_arguments(function);
         }
     }
 
@@ -332,13 +359,11 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     let hands_on_registers = image.machine == Machine::I8051;
     let callees_first = options.callees_first && !hands_on_registers;
     session.keep_prototypes(callees_first);
-    // What each function calls: with debug information, the functions whose prototypes its
-    // calls need.
-    let called = if callees_first || importer.is_some() { callees(&analysis, false) } else { HashMap::new() };
-    let callees = if callees_first { called.clone() } else { HashMap::new() };
+    // The functions the function at `entry` calls: with debug information, those whose
+    // prototypes its calls need.
+    let callees = |entry: u64| calls.of(entry).filter_map(|call| if let CallTarget::Function(callee) = call.target { Some(callee) } else { None });
     // A function that ends by jumping to another returns what that one returns, which the
-    // engine only learns if the other is decompiled first.
-    let tail_callees = callees_of(&analysis, true);
+    // engine only learns if the other is decompiled first: `tail_callees`.
     // A function jumped to takes its parameters from the function that jumps, which therefore
     // takes them too. Its parameters are kept so that the jump is seen to pass them.
     let jumped_to: HashSet<u64> = tail_callees.values().flatten().filter_map(|target| if let CallTarget::Function(entry) = target { Some(*entry) } else { None }).collect();
@@ -357,7 +382,40 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     let texts: HashSet<u64> = analysis.strings.iter().filter(|string| raw && !string.wide).map(|string| string.addr).collect();
     let formats = if raw { &texts } else { &conversions };
     let mut formatted: HashSet<u64> = HashSet::new();
-    let mut settle_formats = |session: &mut Session, entry: u64| {
+    // The pieces of each function apart from its entry, whose code is its own too.
+    let mut fragments: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+    if lazy_globals {
+        for function in &analysis.functions {
+            if let Some(owner) = function.fragment_of {
+                fragments.entry(owner).or_default().extend(&function.ranges);
+            }
+        }
+    }
+    // The data addresses the code of the function at `entry` refers to.
+    let referred = |entry: u64| -> Vec<u64> {
+        let own = analysis.functions.binary_search_by_key(&entry, |function| function.addr).map_or(&[][..], |index| &analysis.functions[index].ranges);
+        let refs = &analysis.data_refs;
+        own.iter()
+            .chain(fragments.get(&entry).into_iter().flatten())
+            .flat_map(|&(start, end)| &refs[refs.partition_point(|r| r.from < start)..refs.partition_point(|r| r.from < end)])
+            .map(|r| r.to)
+            .collect()
+    };
+    // Readies the session to decompile the function at `entry`: what the debug information says
+    // of it, of its callees with `with_callees`, and of the globals its code refers to if those
+    // go in lazily, with the edits' names and types over them as they would be had every global
+    // gone in first; and the arguments of the formats its calls pass.
+    let mut prepare = |session: &mut Session, importer: &mut Option<crate::types::Importer>, edits: &Edits, entry: u64, with_callees: bool| {
+        if let Some(importer) = importer {
+            let callees = callees(entry).filter(|_| with_callees);
+            importer.functions(session, std::iter::once(entry).chain(callees));
+            let given = if lazy_globals { importer.globals_at(session, referred(entry)) } else { Vec::new() };
+            if !given.is_empty() {
+                for (addr, name, kind) in edits.globals(&analysis).into_iter().filter(|global| given.iter().any(|extent| extent.contains(&global.0))) {
+                    let _ = session.add_global(addr, &name, kind);
+                }
+            }
+        }
         if !formatted.insert(entry) {
             return;
         }
@@ -375,12 +433,15 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         out.write_all(b"\n")?;
         Ok(out.flush()?)
     };
+    // Decompiling frees and allocates again at once, which pages given back would slow.
+    drop(give_back);
+    crate::give_back_freed_memory();
     send(&Event::Ready)?;
     for line in std::io::stdin().lock().lines() {
         let request: Request = serde_json::from_str(&line?)?;
         let small = |callee: &u64| !known.contains(callee) && sizes.get(callee).is_some_and(|&size| size <= CALLEE_LIMIT);
         let unknown = |addr: u64| {
-            let mut pending: Vec<u64> = callees.get(&addr).into_iter().flatten().copied().filter(small).collect();
+            let mut pending: Vec<u64> = if callees_first { callees(addr).filter(small).collect() } else { Vec::new() };
             pending.sort_unstable();
             pending.dedup();
             // Then the functions it jumps to, each after the ones that one jumps to in turn.
@@ -410,10 +471,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Flow(addr) => {
-                if let Some(importer) = &mut importer {
-                    importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
-                }
-                settle_formats(&mut session, addr);
+                prepare(&mut session, &mut importer, &edits, addr, true);
                 session.keep_flow(true);
                 let flow = session.decompile(addr).map(|function| function.flow.unwrap_or_default());
                 session.keep_flow(false);
@@ -421,10 +479,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Addressed(addr) => {
-                if let Some(importer) = &mut importer {
-                    importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
-                }
-                settle_formats(&mut session, addr);
+                prepare(&mut session, &mut importer, &edits, addr, true);
                 session.keep_addresses(true);
                 let c_text = session.decompile(addr).map(|function| function.c_text);
                 session.keep_addresses(false);
@@ -432,10 +487,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Locals(addr) => {
-                if let Some(importer) = &mut importer {
-                    importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
-                }
-                settle_formats(&mut session, addr);
+                prepare(&mut session, &mut importer, &edits, addr, true);
                 send(&Event::Locals(session.decompile(addr).map(|function| function.locals).map_err(|error| error.to_string())))?;
                 continue;
             }
@@ -444,10 +496,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                     Some(found) => Some(found),
                     None => match auto_function(name) {
                         Some(function) => {
-                            if let Some(importer) = &mut importer {
-                                importer.functions(&mut session, std::iter::once(function).chain(called.get(&function).into_iter().flatten().copied()));
-                            }
-                            settle_formats(&mut session, function);
+                            prepare(&mut session, &mut importer, &edits, function, true);
                             let _ = session.decompile(function);
                             session.recovered(name)
                         }
@@ -458,10 +507,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Structs(addr) => {
-                if let Some(importer) = &mut importer {
-                    importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
-                }
-                settle_formats(&mut session, addr);
+                prepare(&mut session, &mut importer, &edits, addr, true);
                 let report = session.decompile(addr).map_err(|error| error.to_string()).map(|_| session.structs_of(addr).unwrap_or_default());
                 send(&Event::Structs(report))?;
                 continue;
@@ -506,11 +552,8 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         let keep = matches!(request, Request::Parameters(_)) && unknown(addr).iter().all(|callee| jumped_first.contains(callee));
         for target in jumped_first {
             session.keep_prototypes(!hands_on_registers);
-            if let Some(importer) = &mut importer {
-                importer.functions(&mut session, std::iter::once(target));
-            }
+            prepare(&mut session, &mut importer, &edits, target, false);
             // A failure here only leaves the caller as well off as it was.
-            settle_formats(&mut session, target);
             let _ = session.decompile(target);
             known.insert(target);
         }
@@ -520,11 +563,8 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             }
         }
         session.keep_prototypes(callees_first || (jumped_to.contains(&addr) && !hands_on_registers));
-        if let Some(importer) = &mut importer {
-            importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
-        }
         let start = Instant::now();
-        settle_formats(&mut session, addr);
+        prepare(&mut session, &mut importer, &edits, addr, true);
         let result = session.decompile(addr);
         known.insert(addr);
         let ms = start.elapsed().as_secs_f64() * 1e3;
@@ -618,7 +658,7 @@ const TAIL_DEPTH: usize = 8;
 
 /// Appends to `chain` the functions `addr` jumps to that pass `wanted`, each after the ones it
 /// jumps to itself, so that decompiling them in this order tells each what it returns.
-fn tail_chain(tail_callees: &HashMap<u64, Vec<CallTarget>>, addr: u64, wanted: &impl Fn(&u64) -> bool, depth: usize, chain: &mut Vec<u64>) {
+fn tail_chain(tail_callees: &CallGraph, addr: u64, wanted: &impl Fn(&u64) -> bool, depth: usize, chain: &mut Vec<u64>) {
     for target in tail_callees.get(&addr).into_iter().flatten() {
         let CallTarget::Function(callee) = *target else { continue };
         if depth > 0 && callee != addr && wanted(&callee) && !chain.contains(&callee) {
@@ -628,29 +668,62 @@ fn tail_chain(tail_callees: &HashMap<u64, Vec<CallTarget>>, addr: u64, wanted: &
     }
 }
 
-/// The functions each function calls or tail-calls, by entry point.
-fn callees(analysis: &Analysis, tail_only: bool) -> HashMap<u64, Vec<u64>> {
-    let functions = |targets: Vec<CallTarget>| targets.into_iter().filter_map(|target| if let CallTarget::Function(entry) = target { Some(entry) } else { None }).collect();
-    callees_of(analysis, tail_only).into_iter().map(|(owner, targets)| (owner, functions(targets))).collect()
+/// What each function calls, by entry point, imports included: the jumps that leave the
+/// function for good, as [`Calls::tail_callees`] lists them.
+type CallGraph = HashMap<u64, Vec<CallTarget>>;
+
+/// What each function calls, read off the analysis's calls in its code, where a map of them
+/// all would hold a large binary's millions of calls twice. A call is in the function whose
+/// range it lies in, of those that start last at or before it, and a call to the function
+/// itself counts for none.
+struct Calls<'a> {
+    /// Sorted by address.
+    calls: &'a [CallSite],
+    /// Every range of code, `(start, end, owner)`, sorted: `owner` is the entry of the function
+    /// the range is part of.
+    ranges: Vec<(u64, u64, u64)>,
+    /// Indexes into `ranges`, by owner and then by start.
+    by_owner: Vec<usize>,
 }
 
-/// What each function calls, by entry point, imports included: every call, or with `tail_only`
-/// just the jumps that leave the function for good.
-fn callees_of(analysis: &Analysis, tail_only: bool) -> HashMap<u64, Vec<CallTarget>> {
-    let mut extents: Vec<(u64, u64, u64)> =
-        analysis.functions.iter().flat_map(|f| f.ranges.iter().map(move |&(start, end)| (start, end, f.fragment_of.unwrap_or(f.addr)))).collect();
-    extents.sort_unstable();
-    let mut callees: HashMap<u64, Vec<CallTarget>> = HashMap::new();
-    for call in analysis.calls.iter().filter(|call| !tail_only || (call.tail && !call.conditional)) {
-        let index = extents.partition_point(|extent| extent.0 <= call.at);
-        if let Some(&(_, end, owner)) = index.checked_sub(1).map(|i| &extents[i])
-            && call.at < end
-            && call.target != CallTarget::Function(owner)
-        {
-            callees.entry(owner).or_default().push(call.target);
-        }
+impl<'a> Calls<'a> {
+    fn new(analysis: &'a Analysis) -> Calls<'a> {
+        let mut ranges: Vec<(u64, u64, u64)> =
+            analysis.functions.iter().flat_map(|f| f.ranges.iter().map(move |&(start, end)| (start, end, f.fragment_of.unwrap_or(f.addr)))).collect();
+        ranges.sort_unstable();
+        let mut by_owner: Vec<usize> = (0..ranges.len()).collect();
+        by_owner.sort_by_key(|&index| ranges[index].2);
+        Calls { calls: &analysis.calls, ranges, by_owner }
     }
-    callees
+
+    /// The calls in range `index`: up to its end, or to where the next range starts.
+    fn in_range(&self, index: usize) -> &'a [CallSite] {
+        let (start, end, _) = self.ranges[index];
+        let end = self.ranges.get(index + 1).map_or(end, |next| end.min(next.0));
+        let calls = self.calls;
+        &calls[calls.partition_point(|call| call.at < start)..calls.partition_point(|call| call.at < end.max(start))]
+    }
+
+    /// The calls of the function at `entry`, in address order.
+    fn of(&self, entry: u64) -> impl Iterator<Item = &'a CallSite> + '_ {
+        let first = self.by_owner.partition_point(|&index| self.ranges[index].2 < entry);
+        self.by_owner[first..]
+            .iter()
+            .take_while(move |&&index| self.ranges[index].2 == entry)
+            .flat_map(|&index| self.in_range(index))
+            .filter(move |call| call.target != CallTarget::Function(entry))
+    }
+
+    /// The jumps each function leaves by for good, by entry point.
+    fn tail_callees(&self) -> CallGraph {
+        let mut tail = CallGraph::new();
+        for (index, &(_, _, owner)) in self.ranges.iter().enumerate() {
+            for call in self.in_range(index).iter().filter(|call| call.tail && !call.conditional && call.target != CallTarget::Function(owner)) {
+                tail.entry(owner).or_default().push(call.target);
+            }
+        }
+        tail
+    }
 }
 
 /// A worker gets this long to load its binary and declare every function.
@@ -775,14 +848,21 @@ impl Worker {
     /// work. `command` must build a program that ends up calling [`serve`] with the two arguments
     /// appended here: the binary's path and the options as JSON.
     pub fn new(command: impl Fn() -> Command + Send + 'static, binary: &Path, options: &Options) -> Worker {
+        let mut worker = Worker::idle(command, binary, options);
+        worker.process = Process::start((worker.command)()).ok();
+        worker
+    }
+
+    /// As [`Worker::new`], but the child is started by the first request, for a caller that may
+    /// make none.
+    pub fn idle(command: impl Fn() -> Command + Send + 'static, binary: &Path, options: &Options) -> Worker {
         let (binary, json) = (binary.to_path_buf(), serde_json::to_string(options).expect("plain data"));
         let command = move || {
             let mut command = command();
             command.arg(&binary).arg(&json);
             command
         };
-        let process = Process::start(command()).ok();
-        Worker { command: Box::new(command), options: options.clone(), process, avoid: HashSet::new() }
+        Worker { command: Box::new(command), options: options.clone(), process: None, avoid: HashSet::new() }
     }
 
     /// Decompiles one function. If the child dies or exceeds `timeout`, the record says so.
@@ -940,6 +1020,13 @@ impl Worker {
             self.process = None;
         }
         ready
+    }
+
+    /// The most memory the running child has held at once, in bytes, if one is running.
+    pub fn peak_bytes(&self) -> Option<u64> {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", self.process.as_ref()?.child.id())).ok()?;
+        let kib = status.lines().find_map(|line| line.strip_prefix("VmHWM:"))?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+        Some(kib << 10)
     }
 
     /// The child, started now if the last one is gone. A child can also have died while idle,

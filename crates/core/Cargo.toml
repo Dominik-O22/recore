@@ -6,6 +6,7 @@ license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.104"
+bitcode = "0.6.9"
 clap = { version = "4.6.7", features = ["derive"] }
 cpp_demangle = "0.5.1"
 gimli = "0.34.0"

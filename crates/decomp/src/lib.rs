@@ -42,6 +42,42 @@ pub use structs::{ObjectReport, StructReport};
 /// well to make it the Rust side's too.
 pub use mimalloc::MiMalloc;
 
+/// `mi_option_purge_delay` in `mimalloc.h`, which the bindings leave unnamed.
+const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
+/// While it lives, [`MiMalloc`] gives memory back to the system `ms` milliseconds after it is
+/// freed, where by default it keeps it for a second in case it is wanted again. For
+/// work that frees much of what it builds, as analysis and a decompiler process's setup do:
+/// held all the while, it would sit beside the memory still in use. What is given back and
+/// soon allocated again costs a page fault for each page, so a short process that frees and
+/// allocates again does better without: a query that reads a kept analysis is 20 ms slower.
+/// The delay is the whole process's, so two of these must not overlap.
+pub struct GiveBackFreed(std::ffi::c_long);
+
+impl GiveBackFreed {
+    pub fn after(ms: std::ffi::c_long) -> GiveBackFreed {
+        // SAFETY: reads and stores an option that mimalloc reads each time it purges.
+        unsafe {
+            let before = libmimalloc_sys::mi_option_get(PURGE_DELAY);
+            libmimalloc_sys::mi_option_set(PURGE_DELAY, ms);
+            GiveBackFreed(before)
+        }
+    }
+}
+
+impl Drop for GiveBackFreed {
+    fn drop(&mut self) {
+        // SAFETY: as in `after`.
+        unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, self.0) };
+    }
+}
+
+/// Gives back to the system the memory [`MiMalloc`] holds that has been freed so far.
+pub fn give_back_freed_memory() {
+    // SAFETY: a call mimalloc makes safe from any thread.
+    unsafe { libmimalloc_sys::mi_collect(true) };
+}
+
 /// Bytes mapped at a virtual address.
 pub struct Section<'a> {
     pub addr: u64,
@@ -333,12 +369,8 @@ mod languages {
 /// A directory holding the language files, which the engine reads by path. They are written
 /// out the first time, under the user's cache directory, and again only when they change.
 pub fn vendored_spec_dir() -> Result<PathBuf> {
-    let cache = match (std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")) {
-        (Some(cache), _) => PathBuf::from(cache),
-        (None, Some(home)) => PathBuf::from(home).join(".cache"),
-        (None, None) => std::env::temp_dir(),
-    };
-    let dir = cache.join(format!("recore/languages-{:016x}", languages::ID));
+    let cache = recore::cache::dir().unwrap_or_else(|| std::env::temp_dir().join("recore"));
+    let dir = cache.join(format!("languages-{:016x}", languages::ID));
     // One thread of this process writes; the process number keeps other processes apart.
     static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _writing = WRITING.lock();
