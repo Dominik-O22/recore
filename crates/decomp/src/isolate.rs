@@ -279,11 +279,27 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
     }
 
+    // Each function's fragments, as indexes into the analysis's functions, in order.
+    let mut fragments_of: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (index, function) in analysis.functions.iter().enumerate() {
+        if let Some(owner) = function.fragment_of {
+            fragments_of.entry(owner).or_default().push(index);
+        }
+    }
     // The calls in the function at `entry` that pass text `is_text` accepts, as `(call, callee,
     // position, text)`: the first argument of each that is such text.
     let text_calls = |entry: u64, is_text: &dyn Fn(u64) -> bool| -> Vec<(u64, CallTarget, usize, u64)> {
-        let body: Vec<(u64, u64)> = analysis.functions.iter().filter(|function| function.fragment_of.unwrap_or(function.addr) == entry).flat_map(|function| function.ranges.iter().copied()).collect();
-        let calls: Vec<&recore::report::CallSite> = analysis.calls.iter().filter(|call| body.iter().any(|&(start, end)| (start..end).contains(&call.at))).collect();
+        // The ranges of the function and of its fragments, in the order of the functions.
+        let own = analysis.functions.binary_search_by_key(&entry, |function| function.addr).ok().filter(|&index| analysis.functions[index].fragment_of.is_none());
+        let mut pieces: Vec<usize> = own.into_iter().chain(fragments_of.get(&entry).into_iter().flatten().copied()).collect();
+        pieces.sort_unstable();
+        let body: Vec<(u64, u64)> = pieces.into_iter().flat_map(|index| analysis.functions[index].ranges.iter().copied()).collect();
+        // Each call in the body once, in address order.
+        let all = &analysis.calls;
+        let mut found: Vec<usize> = body.iter().flat_map(|&(start, end)| all.partition_point(|call| call.at < start)..all.partition_point(|call| call.at < end)).collect();
+        found.sort_unstable();
+        found.dedup();
+        let calls: Vec<&CallSite> = found.into_iter().map(|index| &all[index]).collect();
         let sites: Vec<u64> = calls.iter().map(|call| call.at).collect();
         recore::cfg::text_arguments(&image, &body, &sites, is_text)
             .into_iter()
