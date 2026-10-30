@@ -1,275 +1,314 @@
 {
   "corpus-arm64/bin/deb__cmake__ctest": {
-    "analysis": 2833187188,
-    "again": 76798691,
-    "setup": 736387730,
-    "decompile": 2447143591,
-    "diff": 1941769031
+    "analysis": 2833292953,
+    "again": 76795588,
+    "setup": 808652634,
+    "decompile": 2506361412,
+    "lookups": 255595429,
+    "diff": 1941838527
   },
   "corpus-arm64/bin/deb__coreutils__seq": {
-    "analysis": 10836396,
-    "again": 4456813,
-    "setup": 369884707,
-    "decompile": 234863572,
-    "diff": 4406317
+    "analysis": 10835999,
+    "again": 4457448,
+    "setup": 376104715,
+    "decompile": 235379446,
+    "lookups": 29305142,
+    "diff": 4407733
   },
   "corpus-arm64/bin/deb__git__git-imap-send": {
-    "analysis": 517265850,
-    "again": 22330711,
-    "setup": 469633828,
-    "decompile": 2445764600,
-    "diff": 280474180
+    "analysis": 517247523,
+    "again": 22330645,
+    "setup": 489969932,
+    "decompile": 2450547779,
+    "lookups": 71710661,
+    "diff": 280472204
   },
   "corpus-arm64/bin/deb__gzip__gzip": {
-    "analysis": 17136879,
-    "again": 4890199,
-    "setup": 371866251,
-    "decompile": 768837291,
-    "diff": 7760598
+    "analysis": 17135715,
+    "again": 4890388,
+    "setup": 378471419,
+    "decompile": 769869197,
+    "lookups": 61470728,
+    "diff": 7761750
   },
   "corpus-arm64/bin/deb__openssh-client__ssh-agent": {
-    "analysis": 48979841,
-    "again": 6470649,
-    "setup": 396978021,
-    "decompile": 674506440,
-    "diff": 32074581
+    "analysis": 48979385,
+    "again": 6469810,
+    "setup": 404946161,
+    "decompile": 675362743,
+    "lookups": 55528908,
+    "diff": 32076825
   },
   "corpus-arm64/bin/deb__re2c__re2rust": {
-    "analysis": 138859821,
-    "again": 8899828,
-    "setup": 388174916,
-    "decompile": 1171268916,
-    "diff": 94032086
+    "analysis": 138840063,
+    "again": 8896684,
+    "setup": 398273208,
+    "decompile": 1174152253,
+    "lookups": 64550601,
+    "diff": 94032397
   },
   "corpus-armel/bin/deb__cmake__ctest": {
-    "analysis": 7723725359,
-    "again": 905180361,
-    "setup": 1412862666,
-    "decompile": 1264026143,
-    "diff": 5482266490
+    "analysis": 7723754546,
+    "again": 905178928,
+    "setup": 2312300430,
+    "decompile": 1323374401,
+    "lookups": 256012552,
+    "diff": 5483185069
   },
   "corpus-armel/bin/deb__coreutils__expr": {
-    "analysis": 20638349,
-    "again": 5973075,
-    "setup": 204270071,
-    "decompile": 521755418,
-    "diff": 12370300
+    "analysis": 20634258,
+    "again": 5972939,
+    "setup": 213684775,
+    "decompile": 520394416,
+    "lookups": 31466516,
+    "diff": 12366349
   },
   "corpus-armel/bin/deb__git__git-imap-send": {
-    "analysis": 1580493531,
-    "again": 95402039,
-    "setup": 385433980,
-    "decompile": 1674124334,
-    "diff": 885981348
+    "analysis": 1580489441,
+    "again": 95400972,
+    "setup": 482543387,
+    "decompile": 1675350472,
+    "lookups": 66675506,
+    "diff": 885985015
   },
   "corpus-armel/bin/deb__gzip__gzip": {
-    "analysis": 42755270,
-    "again": 10173394,
-    "setup": 210173768,
-    "decompile": 1495220472,
-    "diff": 32361611
+    "analysis": 42754689,
+    "again": 10171702,
+    "setup": 223732359,
+    "decompile": 1494112105,
+    "lookups": 61154874,
+    "diff": 32365394
   },
   "corpus-armel/bin/deb__openssh-client__ssh-agent": {
-    "analysis": 121755026,
-    "again": 15754815,
-    "setup": 238785842,
-    "decompile": 1248128721,
-    "diff": 92613841
+    "analysis": 121751907,
+    "again": 15754787,
+    "setup": 257778457,
+    "decompile": 1247263154,
+    "lookups": 54140256,
+    "diff": 92609733
   },
   "corpus-armel/bin/deb__re2c__re2rust": {
-    "analysis": 492357626,
-    "again": 58699879,
-    "setup": 273690731,
-    "decompile": 1415689244,
-    "diff": 318764542
+    "analysis": 492337744,
+    "again": 58699813,
+    "setup": 335355534,
+    "decompile": 1416857545,
+    "lookups": 63745721,
+    "diff": 318657794
   },
   "corpus-armhf/bin/deb__cmake__ctest": {
-    "analysis": 10080957110,
-    "again": 934202389,
-    "setup": 1542552202,
-    "decompile": 5657322526,
-    "diff": 5566327662
+    "analysis": 10080872668,
+    "again": 934198603,
+    "setup": 3028514080,
+    "decompile": 5159601184,
+    "lookups": 252043909,
+    "diff": 5566590054
   },
   "corpus-armhf/bin/deb__coreutils__expr": {
-    "analysis": 22966786,
-    "again": 6283244,
-    "setup": 204688531,
-    "decompile": 309594781,
-    "diff": 13515550
+    "analysis": 22965236,
+    "again": 6282373,
+    "setup": 213659162,
+    "decompile": 309030913,
+    "lookups": 30492790,
+    "diff": 13514960
   },
   "corpus-armhf/bin/deb__git__git-imap-send": {
-    "analysis": 1670393917,
-    "again": 109830301,
-    "setup": 428882022,
-    "decompile": 1802147043,
-    "diff": 899562817
+    "analysis": 1670401596,
+    "again": 109828351,
+    "setup": 539993888,
+    "decompile": 5444363135,
+    "lookups": 65700730,
+    "diff": 899598745
   },
   "corpus-armhf/bin/deb__gzip__gzip": {
-    "analysis": 44872718,
-    "again": 11236111,
-    "setup": 211813075,
-    "decompile": 2590257160,
-    "diff": 31548591
+    "analysis": 44868724,
+    "again": 11234883,
+    "setup": 225742856,
+    "decompile": 2590364643,
+    "lookups": 64424113,
+    "diff": 31548520
   },
   "corpus-armhf/bin/deb__openssh-client__ssh-agent": {
-    "analysis": 136589941,
-    "again": 17764641,
-    "setup": 243915945,
-    "decompile": 765399094,
-    "diff": 94853795
+    "analysis": 136601573,
+    "again": 17764151,
+    "setup": 264205336,
+    "decompile": 765320072,
+    "lookups": 54971118,
+    "diff": 94900631
   },
   "corpus-armhf/bin/deb__re2c__re2rust": {
-    "analysis": 351036309,
-    "again": 55340521,
-    "setup": 276363295,
-    "decompile": 1054231298,
-    "diff": 325326683
+    "analysis": 351034322,
+    "again": 55340410,
+    "setup": 333994489,
+    "decompile": 1056148682,
+    "lookups": 59724134,
+    "diff": 325197962
   },
   "corpus-large/bin/godot__godot": {
-    "analysis": 60203357377,
-    "again": 990200958,
-    "setup": 4680230530,
-    "decompile": 2856180534,
-    "diff": 58678549991
+    "analysis": 60212066166,
+    "again": 989678984,
+    "setup": 5594087020,
+    "decompile": 3691585214,
+    "lookups": 3880256965,
+    "diff": 58678869630
   },
   "corpus-pe/bin/git__git-remote-https.exe": {
-    "analysis": 939225663,
-    "again": 25712020,
-    "setup": 574314162,
-    "decompile": 859496693,
-    "diff": 1095795642
+    "analysis": 939236889,
+    "again": 25711814,
+    "setup": 597765270,
+    "decompile": 864726155,
+    "lookups": 70094269,
+    "diff": 1095799821
   },
   "corpus-pe/bin/mingw__bzip2.exe": {
-    "analysis": 27241419,
-    "again": 4598826,
-    "setup": 407865774,
-    "decompile": 1535942244,
-    "diff": 42004249
+    "analysis": 27238538,
+    "again": 4595876,
+    "setup": 412425833,
+    "decompile": 1539492701,
+    "lookups": 63809706,
+    "diff": 42006622
   },
   "corpus-pe/bin/node4__node-v4.9.1-x64.exe": {
-    "analysis": 4073044716,
-    "again": 82439374,
-    "setup": 941291369,
-    "decompile": 2323862960,
-    "diff": 4376408015
+    "analysis": 4073076288,
+    "again": 82439014,
+    "setup": 1016759261,
+    "decompile": 2401132244,
+    "lookups": 279810447,
+    "diff": 4376235662
   },
   "corpus-pe/bin/obs__frontend-tools.dll": {
-    "analysis": 116917547,
-    "again": 8571050,
-    "setup": 482028053,
-    "decompile": 263859671,
-    "diff": 140283154
+    "analysis": 116932119,
+    "again": 8569750,
+    "setup": 490851303,
+    "decompile": 273801570,
+    "lookups": 37052925,
+    "diff": 140284080
   },
   "corpus-pe/bin/obs__obs-browser.dll": {
-    "analysis": 296619209,
-    "again": 10952851,
-    "setup": 467722877,
-    "decompile": 726195147,
-    "diff": 324023515
+    "analysis": 297166867,
+    "again": 10950186,
+    "setup": 478279156,
+    "decompile": 736281480,
+    "lookups": 51724415,
+    "diff": 324012637
   },
   "corpus-pe/bin/php83__php_ldap.dll": {
-    "analysis": 86885406,
-    "again": 6386784,
-    "setup": 428868503,
-    "decompile": 851040411,
-    "diff": 94592191
+    "analysis": 86880655,
+    "again": 6386906,
+    "setup": 435395322,
+    "decompile": 853626055,
+    "lookups": 47063733,
+    "diff": 94592747
   },
   "corpus-pe32/bin/dell__DELL_IspLibrary.dll": {
-    "analysis": 89430433,
-    "again": 6987147,
-    "setup": 404296240,
-    "decompile": 548669953,
-    "diff": 105461952
+    "analysis": 89345204,
+    "again": 6989791,
+    "setup": 411258192,
+    "decompile": 553441339,
+    "lookups": 100428081,
+    "diff": 105461829
   },
   "corpus-pe32/bin/mingw__mujs.exe": {
-    "analysis": 169055852,
-    "again": 6593567,
-    "setup": 439738542,
-    "decompile": 1704728613,
-    "diff": 162682485
+    "analysis": 169064826,
+    "again": 6593157,
+    "setup": 446099354,
+    "decompile": 1707760503,
+    "lookups": 97708497,
+    "diff": 162683868
   },
   "corpus-pe32/bin/node4__node-v4.9.1-x86.exe": {
-    "analysis": 4409939327,
-    "again": 84920524,
-    "setup": 3629964147,
-    "decompile": 957164463,
-    "diff": 4100436924
+    "analysis": 4409892532,
+    "again": 84920605,
+    "setup": 3709857420,
+    "decompile": 1060961836,
+    "lookups": 314627672851,
+    "diff": 4100096022
   },
   "corpus-pe32/bin/obs__inject-helper32.exe": {
-    "analysis": 44359812,
-    "again": 5246199,
-    "setup": 355423982,
-    "decompile": 485299853,
-    "diff": 42017514
+    "analysis": 44350974,
+    "again": 5245026,
+    "setup": 360820888,
+    "decompile": 489758511,
+    "lookups": 33529169,
+    "diff": 42018258
   },
   "corpus-pe32/bin/php83__php_ldap.dll": {
-    "analysis": 82185754,
-    "again": 6506879,
-    "setup": 396594320,
-    "decompile": 1117343723,
-    "diff": 95879031
+    "analysis": 82098834,
+    "again": 6504756,
+    "setup": 402929205,
+    "decompile": 1120329102,
+    "lookups": 66566143,
+    "diff": 95879163
   },
   "corpus-pe32/bin/php83__php_opcache.dll": {
-    "analysis": 228484853,
-    "again": 8336956,
-    "setup": 541824971,
-    "decompile": 1936186454,
-    "diff": 309112241
+    "analysis": 228475406,
+    "again": 8338130,
+    "setup": 553667255,
+    "decompile": 1936479279,
+    "lookups": 92551940,
+    "diff": 309111812
   },
   "corpus-pe32/bin/py__libcrypto-3.dll": {
-    "analysis": 1741742514,
-    "again": 50483605,
-    "setup": 1300614230,
-    "decompile": 628438720,
-    "diff": 1391016843
+    "analysis": 1741747272,
+    "again": 50482793,
+    "setup": 1352882191,
+    "decompile": 772409424,
+    "lookups": 794702553,
+    "diff": 1390997761
   },
   "corpus/bin/binutils__strip": {
-    "analysis": 41189672,
-    "again": 5031383,
-    "setup": 414471588,
-    "decompile": 2483023258,
-    "diff": 43419650
+    "analysis": 41189148,
+    "again": 5031373,
+    "setup": 440046256,
+    "decompile": 2466580787,
+    "lookups": 86569584,
+    "diff": 43419709
   },
   "corpus/bin/deb__cmake__ctest": {
-    "analysis": 4426647681,
-    "again": 83822395,
-    "setup": 868756561,
-    "decompile": 1615428325,
-    "diff": 6221456507
+    "analysis": 4426514562,
+    "again": 83821632,
+    "setup": 945236935,
+    "decompile": 1681403737,
+    "lookups": 265326596,
+    "diff": 6221267463
   },
   "corpus/bin/deb__fish__fish_key_reader": {
-    "analysis": 331651666,
-    "again": 9711226,
-    "setup": 663756727,
-    "decompile": 2731684745,
-    "diff": 358636414
+    "analysis": 330904996,
+    "again": 9709493,
+    "setup": 672851065,
+    "decompile": 2629124272,
+    "lookups": 119800821,
+    "diff": 358638453
   },
   "corpus/bin/diffutils__cmp": {
-    "analysis": 14641650,
-    "again": 4318693,
-    "setup": 407436444,
-    "decompile": 1691281480,
-    "diff": 10526412
+    "analysis": 14614195,
+    "again": 4320360,
+    "setup": 411752656,
+    "decompile": 1693847911,
+    "lookups": 54789467,
+    "diff": 10528211
   },
   "corpus/bin/fd__fd": {
-    "analysis": 1043062148,
-    "again": 19054807,
-    "setup": 480435643,
-    "decompile": 1851538334,
-    "diff": 1188751440
+    "analysis": 1040721650,
+    "again": 19052978,
+    "setup": 497897281,
+    "decompile": 1808755510,
+    "lookups": 207346888,
+    "diff": 1188748446
   },
   "corpus/bin/htop__htop": {
-    "analysis": 100006702,
-    "again": 7479734,
-    "setup": 435144864,
-    "decompile": 845599749,
-    "diff": 128121836
+    "analysis": 99775234,
+    "again": 7479888,
+    "setup": 442460707,
+    "decompile": 853218551,
+    "lookups": 63865984,
+    "diff": 128119946
   },
   "il2cpp/GameAssembly.so": {
-    "analysis": 25312365040,
-    "again": 4350974472,
-    "setup": 8523573964,
-    "decompile": 1642544857,
-    "diff": 29731594160
+    "analysis": 25311931718,
+    "again": 4350935776,
+    "setup": 12866795937,
+    "decompile": 3630438291,
+    "lookups": 3474860939,
+    "diff": 29731257028
   }
 }

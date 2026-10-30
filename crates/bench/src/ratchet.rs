@@ -1,37 +1,44 @@
 //! A limit on the instructions recore executes that only tightens: `recore-bench ratchet`.
 //!
 //! `bench/budget.json` holds, for each binary of the set, the instructions of what an agent
-//! waits for; [`Work`] lists them. All but `diff` run `recore-mcp`, the program agents run, with
-//! its decompiler process, so that work done only there is counted too. A run
-//! fails when a count grew past its budget by more than [`SLACK`] percent, and lowers the budget
-//! where a count shrank by as much, so the next change is held to the faster code. Counted
-//! instructions do not move with the machine's load, but they do with the compiler and with the
-//! processor, where a library picks its code by what the processor has: a budget is kept on one
-//! machine. They leave out the kernel and do not see how work is shared among threads, which
-//! `recore-bench run` times. Each binary is counted in a process of its own, because in one
-//! process the allocator's state after the binaries before it moved a count by up to 2%.
+//! waits for; [`Work`] lists them. All but `diff` run `recore-mcp`, the program agents run, so
+//! that its tools and its decompiler process are counted with what they call. A run fails when a
+//! count grew past its budget by more than [`SLACK`] percent, and lowers the budget where a
+//! count shrank by as much, so the next change is held to the faster code. Counted instructions
+//! do not move with the machine's load, but they do with the compiler and with the processor,
+//! where a library picks its code by what the processor has: a budget is kept on one machine.
+//! They add up the work of every process and leave out the kernel, so they do not see time spent
+//! in page faults or on the disk, or how work is shared among threads, which `recore-bench run`
+//! times. Nor do they see the largest few functions of a binary or tools other than the ones
+//! [`count`] calls. Each binary is counted in a process of its own, because in one process the
+//! allocator's state after the binaries before it moved a count by up to 2%.
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use recore::program::Program;
-use recore_decomp::isolate::{Options, Status, Worker};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::work::Counter;
 
 /// How far a count may move, in percent of its budget, and still be the same.
 const SLACK: u128 = 1;
 
+/// A count this close to its budget is the same whatever the percentage: 70 microseconds at
+/// most, which on the smallest counts is more than 1%, and they move by 0.3M with the machine's
+/// load.
+const FLOOR: u64 = 1_000_000;
+
 /// Functions decompiled per binary. `bench/functions.json` keeps which, so that a change to what
 /// the analysis finds does not swap them for others and move the count by itself.
 const FUNCTIONS: usize = 24;
 
-/// A function that takes longer makes the run fail: its decompiler process would be killed at a
-/// point that depends on the machine, and so would the count.
+/// What a function may take. One that takes longer is a failed call, which fails the run.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
 const NOT_ALLOWED: &str = "the kernel lets this process count no instructions; /proc/sys/kernel/perf_event_paranoid must be 2 or less";
@@ -41,19 +48,22 @@ const NOT_ALLOWED: &str = "the kernel lets this process count no instructions; /
 struct Work {
     /// `summary` with nothing kept: the first call on a binary, which analyzes it.
     analysis: u64,
-    /// `summary` again: what every later call starts with.
+    /// `summary` again in a new process: what each command run on its own starts with.
     again: u64,
-    /// A new decompiler process, until it can take a function.
+    /// A new server's first `decompile`, of the smallest of the binary's chosen functions: the
+    /// binary read back and a decompiler process set up.
     setup: u64,
-    /// The binary's chosen functions, asked of that process one after another.
+    /// `decompile` of the rest of the chosen functions, one call each.
     decompile: u64,
+    /// `functions`, `strings`, and `function`, `xrefs` and `disassemble` of each chosen function.
+    lookups: u64,
     /// Comparing the binary with itself, in this process: `recore-mcp diff` refuses that.
     diff: u64,
 }
 
 impl Work {
-    fn counts(&mut self) -> [(&'static str, &mut u64); 5] {
-        [("analysis", &mut self.analysis), ("again", &mut self.again), ("setup", &mut self.setup), ("decompile", &mut self.decompile), ("diff", &mut self.diff)]
+    fn counts(&mut self) -> [(&'static str, &mut u64); 6] {
+        [("analysis", &mut self.analysis), ("again", &mut self.again), ("setup", &mut self.setup), ("decompile", &mut self.decompile), ("lookups", &mut self.lookups), ("diff", &mut self.diff)]
     }
 }
 
@@ -91,6 +101,9 @@ impl Ratchet {
             let now = *now;
             let change = now as f64 / (*limit).max(1) as f64 - 1.0;
             shown.push(format!("{:>10.1} {:>+6.1}%", now as f64 / 1e6, change * 100.0));
+            if now.abs_diff(*limit) <= FLOOR {
+                continue;
+            }
             // In whole numbers, which put a count exactly `SLACK` off still inside it.
             let (percent, budget) = (u128::from(now) * 100, u128::from((*limit).max(1)));
             if percent > budget * (100 + SLACK) {
@@ -139,7 +152,7 @@ pub fn run(binaries: &[PathBuf], path: &Path, accept: bool) -> Result<()> {
     if present.is_empty() {
         bail!("none of the {} binaries of the set is in {}", binaries.len(), crate::corpora().display());
     }
-    let header: Vec<String> = Work { analysis: 0, again: 0, setup: 0, decompile: 0, diff: 0 }.counts().map(|(what, _)| format!("{:>18}", format!("{what} M"))).into();
+    let header: Vec<String> = Work { analysis: 0, again: 0, setup: 0, decompile: 0, lookups: 0, diff: 0 }.counts().map(|(what, _)| format!("{:>18}", format!("{what} M"))).into();
     println!("{:<46} {}", "binary", header.join(" "));
     for binary in present {
         let name = crate::suites::name(binary);
@@ -162,41 +175,81 @@ pub fn run(binaries: &[PathBuf], path: &Path, accept: bool) -> Result<()> {
     Ok(())
 }
 
-/// The binary's functions at even steps through their sizes, as the set takes binaries. The
-/// largest few, which take most of the time and so would hide the rest, fall past the last step.
-fn choose(program: &Program) -> Vec<u64> {
-    let mut by_size: Vec<(u64, u64)> = program.sizes().into_iter().map(|(entry, size)| (size, entry)).collect();
+/// A `recore-mcp` server with one client, as an agent has it.
+struct Server {
+    child: Child,
+    stdin: ChildStdin,
+    replies: BufReader<ChildStdout>,
+    binary: String,
+}
+
+impl Server {
+    fn start(mut command: Command, binary: &Path) -> Result<Server> {
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().context("starting recore-mcp")?;
+        let (stdin, stdout) = (child.stdin.take().context("no stdin")?, child.stdout.take().context("no stdout")?);
+        Ok(Server { child, stdin, replies: BufReader::new(stdout), binary: binary.display().to_string() })
+    }
+
+    /// Calls a tool on the binary. An error from it is an error here: a call that failed did
+    /// not do the work its count stands for, and a lower count would pass for a faster program.
+    fn call(&mut self, tool: &str, mut arguments: Value) -> Result<()> {
+        arguments["path"] = json!(self.binary);
+        let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": tool, "arguments": arguments } });
+        writeln!(self.stdin, "{request}")?;
+        let mut line = String::new();
+        ensure!(self.replies.read_line(&mut line)? > 0, "recore-mcp ended during `{tool}`");
+        let reply: Value = serde_json::from_str(&line).with_context(|| format!("the reply to `{tool}`"))?;
+        ensure!(reply["result"]["isError"] == false, "`{tool}` {arguments}: {line}");
+        Ok(())
+    }
+
+    fn decompile(&mut self, function: u64) -> Result<()> {
+        self.call("decompile", json!({ "functions": [format!("{function:#x}")], "timeout": TIMEOUT.as_secs() }))
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The binary's functions at even steps through their sizes, smallest first, as the set takes
+/// binaries, leaving out those with no code and those the decompiler fails on. The largest few,
+/// which take most of the time and so would hide the rest, fall past the last step.
+fn choose(program: &Program, mut server: Server) -> Vec<u64> {
+    let mut by_size: Vec<(u64, u64)> = program.sizes().into_iter().filter(|&(_, size)| size > 0).map(|(entry, size)| (size, entry)).collect();
     by_size.sort_unstable();
     let step = by_size.len().div_ceil(FUNCTIONS).max(1);
-    by_size.into_iter().step_by(step).map(|(_, entry)| entry).collect()
+    by_size.into_iter().step_by(step).map(|(_, entry)| entry).filter(|&entry| server.decompile(entry).is_ok()).collect()
 }
 
 /// Counts [`Work`] for `binary`, decompiling `functions`, or functions it chooses if there are
-/// none, and prints it as JSON for [`run`]. What `recore-mcp` keeps goes to a directory of this
-/// count's, because edits a person made to the binary would change what is counted.
+/// none, and prints it as JSON for [`run`]. Analyses go to a directory of the bench's, which
+/// starts each count empty for the first call to have nothing kept.
 pub fn count(binary: &Path, functions: Vec<u64>) -> Result<()> {
     let program = Program::load(binary)?;
-    let functions = if functions.is_empty() { choose(&program) } else { functions };
     let tool = crate::suites::sibling("recore-mcp")?;
     let kept = std::path::absolute("target/bench/count")?;
+    let recore_mcp = || {
+        let mut command = Command::new(&tool);
+        // Rayon's work on one thread, so that the count does not depend on how it was split.
+        command.env(recore::cache::DIR_VAR, &kept).env("RAYON_NUM_THREADS", "1").env_remove(recore_decomp::types::DEBUG_VAR);
+        command
+    };
+    let functions = if functions.is_empty() { choose(&program, Server::start(recore_mcp(), binary)?) } else { functions };
+    let (first, rest) = functions.split_first().with_context(|| format!("no function of {} to decompile", binary.display()))?;
     let _ = std::fs::remove_dir_all(&kept);
     std::fs::create_dir_all(&kept)?;
-    let recore_mcp = {
-        let kept = kept.clone();
-        move || {
-            let mut command = Command::new(&tool);
-            // On one thread, so that the count does not depend on how the work was split.
-            command.env(recore::cache::DIR_VAR, &kept).env(recore::edits::DIR_VAR, &kept).env("RAYON_NUM_THREADS", "1");
-            command
-        }
-    };
+
     let counter = Counter::new().context(NOT_ALLOWED)?;
     counter.start();
     let read = || counter.read().context("reading the instruction counter");
     let summary = || -> Result<u64> {
         let before = read()?;
         let mut command = recore_mcp();
-        let status = command.arg("summary").arg(binary).stdout(Stdio::null()).stderr(Stdio::null()).status()?;
+        let status = command.arg("summary").arg(binary).stdout(Stdio::null()).status()?;
         ensure!(status.success(), "{command:?} failed");
         Ok(read()? - before)
     };
@@ -204,28 +257,26 @@ pub fn count(binary: &Path, functions: Vec<u64>) -> Result<()> {
     let again = summary()?;
 
     let start = read()?;
-    let recore_mcp = recore_mcp.clone();
-    let mut worker = Worker::new(
-        move || {
-            let mut command = recore_mcp();
-            command.arg("decompile-worker");
-            command
-        },
-        binary,
-        &Options::default(),
-    );
-    ensure!(worker.ready(), "no decompiler for {}", binary.display());
-    let ready = read()?;
-    for &function in &functions {
-        let (record, _) = worker.decompile(function, TIMEOUT);
-        ensure!(record.status != Status::Timeout, "{} at {function:#x} took over {TIMEOUT:?}", binary.display());
+    let mut server = Server::start(recore_mcp(), binary)?;
+    server.decompile(*first)?;
+    let set_up = read()?;
+    for &function in rest {
+        server.decompile(function)?;
     }
-    let done = read()?;
-    drop(worker);
+    let decompiled = read()?;
+    server.call("functions", json!({}))?;
+    server.call("strings", json!({}))?;
+    for function in functions.iter().map(|function| format!("{function:#x}")) {
+        server.call("function", json!({ "addr": function }))?;
+        server.call("xrefs", json!({ "addr": function }))?;
+        server.call("disassemble", json!({ "function": function }))?;
+    }
+    let looked_up = read()?;
+    drop(server);
     let _ = std::fs::remove_dir_all(&kept);
 
     let (_, diff) = crate::work::instructions(|| recore::diff::diff(&program, &program));
-    let work = Work { analysis, again, setup: ready - start, decompile: done - ready, diff: diff.context(NOT_ALLOWED)? };
+    let work = Work { analysis, again, setup: set_up - start, decompile: decompiled - set_up, lookups: looked_up - decompiled, diff: diff.context(NOT_ALLOWED)? };
     println!("{}", serde_json::to_string(&Counted { work, functions })?);
     Ok(())
 }
@@ -234,7 +285,7 @@ pub fn count(binary: &Path, functions: Vec<u64>) -> Result<()> {
 mod tests {
     use super::*;
 
-    const LIMIT: Work = Work { analysis: 1_000_000, again: 1_000_000, setup: 1_000_000, decompile: 1_000_000, diff: 1_000_000 };
+    const LIMIT: Work = Work { analysis: 1_000_000_000, again: 1_000_000_000, setup: 1_000_000_000, decompile: 1_000_000_000, lookups: 1_000_000_000, diff: 1_000_000_000 };
 
     /// Holds one count of the binary `a`, whose budget is [`LIMIT`], and finishes.
     fn finish_with(analysis: u64, accept: bool) -> Result<(BTreeMap<String, Work>, String)> {
@@ -245,10 +296,10 @@ mod tests {
 
     #[test]
     fn every_count_is_held_to_its_budget() {
-        for index in 0..5 {
+        for index in 0..6 {
             let mut now = LIMIT;
             let (what, count) = now.counts().into_iter().nth(index).expect("a count");
-            *count = 1_020_000;
+            *count = 1_020_000_000;
             let mut ratchet = Ratchet::new(BTreeMap::from([("a".to_string(), LIMIT)]), false);
             ratchet.hold("a", now);
             let error = ratchet.finish().unwrap_err().to_string();
@@ -258,27 +309,37 @@ mod tests {
 
     #[test]
     fn a_count_that_grew_more_than_one_percent_fails_the_run_and_is_named() {
-        let error = finish_with(1_010_100, false).unwrap_err().to_string();
-        assert!(error.contains("a: analysis 1.0M -> 1.0M (+1.0%)"), "{error}");
+        let error = finish_with(1_010_100_000, false).unwrap_err().to_string();
+        assert!(error.contains("a: analysis 1000.0M -> 1010.1M (+1.0%)"), "{error}");
     }
 
     #[test]
     fn accepting_a_count_that_grew_raises_its_budget_to_it() {
-        let (budget, moved) = finish_with(1_010_100, true).unwrap();
-        assert_eq!((budget["a"].analysis, moved.as_str()), (1_010_100, "1 raised, 0 lowered, 0 added"));
+        let (budget, moved) = finish_with(1_010_100_000, true).unwrap();
+        assert_eq!((budget["a"].analysis, moved.as_str()), (1_010_100_000, "1 raised, 0 lowered, 0 added"));
     }
 
     #[test]
     fn a_count_that_shrank_more_than_one_percent_lowers_its_budget() {
-        let (budget, moved) = finish_with(989_900, false).unwrap();
-        assert_eq!((budget["a"], moved.as_str()), (Work { analysis: 989_900, ..LIMIT }, "0 raised, 1 lowered, 0 added"));
+        let (budget, moved) = finish_with(989_900_000, false).unwrap();
+        assert_eq!((budget["a"], moved.as_str()), (Work { analysis: 989_900_000, ..LIMIT }, "0 raised, 1 lowered, 0 added"));
     }
 
     #[test]
     fn a_count_within_one_percent_either_way_leaves_its_budget() {
-        for analysis in [990_000, 1_000_000, 1_010_000] {
+        for analysis in [990_000_000, 1_000_000_000, 1_010_000_000] {
             let (budget, moved) = finish_with(analysis, false).unwrap();
             assert_eq!((budget["a"], moved.as_str()), (LIMIT, "0 raised, 0 lowered, 0 added"), "{analysis}");
+        }
+    }
+
+    #[test]
+    fn a_small_count_may_move_by_more_than_one_percent_up_to_the_floor() {
+        let small = Work { analysis: 10_000_000, ..LIMIT };
+        for (analysis, moved) in [(10_900_000, "0 raised, 0 lowered, 0 added"), (9_100_000, "0 raised, 0 lowered, 0 added"), (8_900_000, "0 raised, 1 lowered, 0 added")] {
+            let mut ratchet = Ratchet::new(BTreeMap::from([("a".to_string(), small)]), false);
+            ratchet.hold("a", Work { analysis, ..LIMIT });
+            assert_eq!(ratchet.finish().unwrap().1, moved, "{analysis}");
         }
     }
 

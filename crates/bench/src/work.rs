@@ -21,9 +21,12 @@ struct Attr {
 
 const HARDWARE: u32 = 0;
 const INSTRUCTIONS: u64 = 1;
-/// Start stopped, count threads started later too, and leave out the kernel and hypervisor.
+/// Start stopped, count threads and processes started later too, and leave out the kernel and
+/// hypervisor.
 const FLAGS: u64 = 1 | 1 << 1 | 1 << 5 | 1 << 6;
 const ENABLE: libc::c_ulong = 0x2400;
+/// `PERF_FLAG_FD_CLOEXEC`: a process started keeps counting without the descriptor.
+const CLOSE_ON_EXEC: libc::c_ulong = 1 << 3;
 
 /// A counter of the instructions this thread, the threads it starts and the processes it starts
 /// execute in user mode. What a process does in the kernel is left out: between two runs of the
@@ -34,7 +37,7 @@ impl Counter {
     /// A stopped counter. `None` where the kernel does not allow one.
     pub fn new() -> Option<Counter> {
         let attr = Attr { kind: HARDWARE, size: size_of::<Attr>() as u32, config: INSTRUCTIONS, sample_period: 0, sample_type: 0, read_format: 0, flags: FLAGS, rest: [0; 10] };
-        let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, &attr, 0, -1, -1, 0) };
+        let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, &attr, 0, -1, -1, CLOSE_ON_EXEC) };
         (fd >= 0).then(|| Counter(unsafe { OwnedFd::from_raw_fd(fd as i32) }))
     }
 
