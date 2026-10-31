@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// The allocator `recore-mcp` runs on, which changes how many instructions the same work takes.
+#[global_allocator]
+static ALLOCATOR: recore_decomp::MiMalloc = recore_decomp::MiMalloc;
+
 #[derive(Parser)]
 struct Args {
     #[command(subcommand)]
@@ -93,9 +97,8 @@ enum Command {
         #[arg(long)]
         collapsed: Option<PathBuf>,
     },
-    /// Counts the instructions analyzing each binary of the set and diffing it against itself
-    /// execute, and fails where they grew past `bench/budget.json`. Lowers the budget where
-    /// they shrank.
+    /// Counts the instructions of what an agent waits for on each binary of the set, and fails
+    /// where they grew past `bench/budget.json`. Lowers the budget where they shrank.
     Ratchet {
         /// The list of binaries, one path per line, relative to the corpora's directory.
         #[arg(long, default_value = "bench/set.txt")]
@@ -109,7 +112,11 @@ enum Command {
     /// Counts the instructions of one binary for `ratchet`, which runs each binary in a
     /// process of its own, and prints them as JSON.
     #[command(hide = true)]
-    Count { binary: PathBuf },
+    Count {
+        binary: PathBuf,
+        /// The functions to decompile; chosen here if there are none.
+        functions: Vec<u64>,
+    },
 }
 
 fn saved(name: &str) -> PathBuf {
@@ -180,6 +187,6 @@ fn main() -> Result<()> {
         Command::DecodeFloor { binary, runs } => suites::decode_floor(&binary, runs),
         Command::Profile { what, binary, functions, seconds, top, collapsed } => profile::run(what, &binary, &functions, seconds, top, collapsed.as_deref()),
         Command::Ratchet { set, budget, accept } => ratchet::run(&binaries(&set, None)?, &budget, accept),
-        Command::Count { binary } => ratchet::count(&binary),
+        Command::Count { binary, functions } => ratchet::count(&binary, functions),
     }
 }

@@ -119,7 +119,7 @@ pub(crate) fn name(binary: &Path) -> String {
 }
 
 /// A program built next to this one.
-fn sibling(program: &str) -> Result<PathBuf> {
+pub(crate) fn sibling(program: &str) -> Result<PathBuf> {
     let path = std::env::current_exe()?.with_file_name(program);
     ensure!(path.exists(), "{} is not built; run `cargo build --release`", path.display());
     Ok(path)
