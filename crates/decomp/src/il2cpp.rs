@@ -20,6 +20,7 @@ pub fn types(il2cpp: &Il2Cpp) -> Types {
     builder.functions();
     builder.globals();
     builder.types.finish();
+    builder.types.globals_by_reference = true;
     builder.types
 }
 

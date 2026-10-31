@@ -30,33 +30,45 @@ pub struct Binary {
     found_names: Vec<Option<String>>,
     /// Time spent loading and analyzing.
     pub analysis_ms: f64,
-    /// Started when the binary is loaded, so it sets up while the first queries are answered.
+    /// Started when the binary is loaded, so it sets up while the first queries are answered,
+    /// or by the first request, for a tool run from the shell that may make none.
     worker: Worker,
 }
 
-fn start_worker(path: &Path) -> Worker {
+/// The decompiler process for the binary at `path`, started now or by its first request.
+fn worker(path: &Path, start: bool) -> Worker {
     let command = || {
         // Without the path of this program no child starts, and each decompilation reports that.
         let mut command = Command::new(std::env::current_exe().unwrap_or_default());
         command.arg(crate::WORKER_ARG);
         command
     };
-    Worker::new(command, path, &Options::default())
+    if start { Worker::new(command, path, &Options::default()) } else { Worker::idle(command, path, &Options::default()) }
 }
 
 impl Binary {
-    fn load(path: &Path, stamp: (SystemTime, u64)) -> Result<Binary> {
+    fn load(path: &Path, stamp: (SystemTime, u64), start_worker: bool) -> Result<Binary> {
         let start = Instant::now();
-        // The child repeats the analysis for itself, at the same time as this process.
-        let worker = start_worker(path);
+        // A child started now reads the analysis kept on disk at the same time as this process.
+        // Without one it is started once this process has kept its own, so the binary is
+        // analyzed once.
+        let kept = recore::cache::is_kept(path);
+        let early = (start_worker && kept).then(|| worker(path, true));
+        // Analysis frees most of what it builds, some of it to allocate again at once: 10 ms
+        // gives back the rest and leaves analysis as fast as without.
+        let give_back = (!kept).then(|| recore_decomp::GiveBackFreed::after(10));
         let image = Image::load(path)?;
-        let mut analysis = recore::analyze(&image);
+        let mut analysis = recore::cache::analyze(path, &image);
+        drop(give_back);
+        let worker = early.unwrap_or_else(|| worker(path, start_worker));
         let analysis_ms = start.elapsed().as_secs_f64() * 1e3;
 
         let edits = Edits::load(path)?;
         let found_names = analysis.functions.iter().map(|function| function.name.clone()).collect();
         edits.apply(&mut analysis);
         let program = Program::new(image, analysis);
+        // What loading freed would otherwise be held while queries are answered.
+        recore_decomp::give_back_freed_memory();
         Ok(Binary { path: path.to_path_buf(), stamp, program, edits, found_names, analysis_ms, worker })
     }
 
@@ -142,12 +154,19 @@ impl Binary {
 }
 
 /// The binaries a session has touched, most recently used first.
-#[derive(Default)]
 pub struct Cache {
     binaries: Vec<Binary>,
+    /// Whether each binary's decompiler process starts as the binary loads: in a server, and for
+    /// a tool run from the shell whose answer comes from it. Otherwise the first request
+    /// starts it.
+    start_workers: bool,
 }
 
 impl Cache {
+    pub fn new(start_workers: bool) -> Cache {
+        Cache { binaries: Vec::new(), start_workers }
+    }
+
     /// The binary at `path`, analyzed now unless it was before and the file has not changed.
     pub fn get(&mut self, path: &Path) -> Result<&mut Binary> {
         let metadata = std::fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
@@ -157,7 +176,7 @@ impl Cache {
             stale => {
                 // Dropping a binary ends its decompiler process.
                 stale.map(|index| self.binaries.remove(index));
-                Binary::load(path, stamp).with_context(|| format!("cannot load {}", path.display()))?
+                Binary::load(path, stamp, self.start_workers).with_context(|| format!("cannot load {}", path.display()))?
             }
         };
         self.binaries.insert(0, binary);

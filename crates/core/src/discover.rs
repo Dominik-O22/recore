@@ -273,6 +273,10 @@ struct Explorer<'a, A: Arch> {
     jumps: Vec<(u64, u64)>,
     /// Addresses still to decode.
     pending: Vec<Pending<A>>,
+    /// Entry points queued while `pending` was empty, which come off after all of it. Every
+    /// entry point is queued before any is decoded, and a large binary's would each take a
+    /// register state in `pending`.
+    entries: Vec<u64>,
     /// Untrusted addresses, decoded only once nothing trusted is left, so that a real path gets
     /// to shared code first and with the right state.
     deferred: Vec<Pending<A>>,
@@ -402,8 +406,12 @@ impl<'a, A: Arch> Explorer<'a, A> {
             }
             let before = self.starts.insert(addr, origin);
             debug_assert!(before.is_none());
-            self.pending.push(Pending::entry(addr));
+            self.queue_entry(addr);
         }
+    }
+
+    fn queue_entry(&mut self, addr: u64) {
+        if self.pending.is_empty() { self.entries.push(addr) } else { self.pending.push(Pending::entry(addr)) }
     }
 
     fn queue(&mut self, pending: Pending<A>) {
@@ -454,6 +462,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// Decodes from every pending address until control flow ends or reaches known code.
     fn drain(&mut self, decoders: &mut Decoders<'a, A>) {
         loop {
+            if self.pending.is_empty()
+                && let Some(addr) = self.entries.pop()
+            {
+                self.pending.push(Pending::entry(addr));
+            }
             // Most branch targets have been decoded by the time their turn comes. Those are
             // looked at where they lie: taking one off the queue copies its whole state.
             let queue = if self.pending.is_empty() { &mut self.deferred } else { &mut self.pending };
@@ -1572,7 +1585,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     if is_start {
                         self.add_start(addr, if marked { Origin::GapEndbr } else { Origin::GapAligned });
                     } else {
-                        self.pending.push(Pending::entry(addr));
+                        self.queue_entry(addr);
                     }
                     found = true;
                     self.drain(decoders);
@@ -1605,7 +1618,13 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
         let first = explore::<A>(image, frames, &pointers, FxHashMap::default(), rejected.clone());
         let lengths = first.learned_lengths();
         debug_assert!(first.recording || !lengths.is_empty());
-        if lengths.is_empty() { first } else { explore::<A>(image, frames, &pointers, lengths, rejected.clone()) }
+        if lengths.is_empty() {
+            first
+        } else {
+            // Its maps of the code are as large as the second pass's.
+            drop(first);
+            explore::<A>(image, frames, &pointers, lengths, rejected.clone())
+        }
     };
     let mut explorer = run(&FxHashSet::default());
     // Where an address taken is weak evidence, one that turns out to lie inside other code was
@@ -1714,6 +1733,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         referenced: FxHashSet::default(),
         jumps: Vec::new(),
         pending: Vec::new(),
+        entries: Vec::new(),
         deferred: Vec::new(),
         tables: Vec::new(),
         unresolved: BTreeSet::new(),

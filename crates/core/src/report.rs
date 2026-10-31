@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(bitcode::Encode, bitcode::Decode, Serialize, Deserialize, Debug, Clone)]
 pub struct AnalyzedFunction {
     pub addr: u64,
     /// Body as `[start, end)` ranges.
@@ -29,7 +29,7 @@ pub struct AnalyzedFunction {
 }
 
 /// The evidence that first identified a function entry point.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(bitcode::Encode, bitcode::Decode, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
     #[default]
@@ -57,7 +57,7 @@ pub enum Origin {
 }
 
 /// Where a call or tail call goes.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(bitcode::Encode, bitcode::Decode, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CallTarget {
     /// A function in this binary, by entry address.
@@ -67,7 +67,7 @@ pub enum CallTarget {
 }
 
 /// A direct call, a call through an import slot, or a jump that leaves its function.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(bitcode::Encode, bitcode::Decode, Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct CallSite {
     /// Address of the call or jump instruction.
     pub at: u64,
@@ -84,7 +84,7 @@ pub struct CallSite {
 }
 
 /// A function provided by another library, reached through a slot the loader fills in.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(bitcode::Encode, bitcode::Decode, Serialize, Deserialize, Debug, Clone)]
 pub struct Import {
     pub slot: u64,
     pub name: String,
@@ -93,7 +93,7 @@ pub struct Import {
 }
 
 /// A text string found in the image's data.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(bitcode::Encode, bitcode::Decode, Serialize, Deserialize, Debug, Clone)]
 pub struct StringLiteral {
     pub addr: u64,
     pub text: String,
@@ -103,7 +103,7 @@ pub struct StringLiteral {
 }
 
 /// An instruction that refers to data at a fixed address.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(bitcode::Encode, bitcode::Decode, Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct DataRef {
     /// Address of the instruction.
     pub from: u64,
@@ -115,7 +115,7 @@ pub struct DataRef {
 }
 
 /// An indirect jump resolved to the code addresses it can reach.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(bitcode::Encode, bitcode::Decode, Serialize, Deserialize, Debug, Clone)]
 pub struct JumpTable {
     /// Address of the indirect jump instruction.
     pub jump: u64,
@@ -123,7 +123,7 @@ pub struct JumpTable {
     pub targets: Vec<u64>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(bitcode::Encode, bitcode::Decode, Serialize, Deserialize, Debug, Clone)]
 pub struct Analysis {
     pub name: String,
     pub functions: Vec<AnalyzedFunction>,
@@ -160,7 +160,7 @@ pub struct Analysis {
 
 /// A Swift class, struct or enum as the image's metadata describes it. A class is also among
 /// the Objective-C classes when the image is built for Apple's runtime.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(bitcode::Encode, bitcode::Decode, Serialize, Deserialize, Debug, Clone)]
 pub struct SwiftType {
     /// Qualified by module and enclosing types: `Shapes.Shape.Corner`.
     pub name: String,
@@ -184,7 +184,7 @@ pub struct SwiftType {
 }
 
 /// A stored property of a Swift type, or a case of an enum.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(bitcode::Encode, bitcode::Decode, Serialize, Deserialize, Debug, Clone)]
 pub struct Field {
     pub name: String,
     /// The type as Swift writes it. `None` for an enum case without a payload, and for a type
@@ -195,7 +195,7 @@ pub struct Field {
 
 /// A class as the image describes it: a C++ class by its vtable and type information, or an
 /// Objective-C class or category by its metadata.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(bitcode::Encode, bitcode::Decode, Serialize, Deserialize, Debug, Clone)]
 pub struct Class {
     /// An Objective-C category is named `Class(Category)`.
     pub name: String,
@@ -214,7 +214,7 @@ pub struct Class {
 
 /// A call to the Objective-C runtime's dispatcher, which picks the method by the receiver's
 /// class and the selector.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(bitcode::Encode, bitcode::Decode, Serialize, Deserialize, Debug, Clone)]
 pub struct MessageSend {
     /// Address of the call or jump instruction.
     pub at: u64,

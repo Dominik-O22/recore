@@ -128,7 +128,7 @@ pub fn run(tool: &str, binary: &str, rest: &[String]) -> Result<String> {
         return tool_usage(tool).ok_or_else(|| anyhow::anyhow!("there is no tool `{tool}`\n\n{}", usage()));
     }
     let arguments = arguments(tool, binary, rest)?;
-    match tools::call(&mut Cache::default(), tool, arguments) {
+    match tools::call(&mut Cache::new(tool == "decompile"), tool, arguments) {
         Some(answer) => answer,
         None => bail!("there is no tool `{tool}`\n\n{}", usage()),
     }

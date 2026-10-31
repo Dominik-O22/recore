@@ -204,6 +204,9 @@ impl Facts {
         // shares with other functions. What happens in a range is a fact about each function
         // that has it, and about the owner if the function is itself a fragment.
         let mut stub_names: Vec<(u64, String)> = Vec::new();
+        // Each jump table by its jump, to find those in a range.
+        let mut jumps: Vec<(u64, usize)> = analysis.jump_tables.iter().enumerate().map(|(index, table)| (table.jump, index)).collect();
+        jumps.sort_unstable();
         for function in &analysis.functions {
             let owner = function.fragment_of.unwrap_or(function.addr);
             for &(start, end) in &function.ranges {
@@ -260,8 +263,8 @@ impl Facts {
                     }
                 }
 
-                let jumps = analysis.jump_tables.iter().enumerate().filter(|(_, table)| (start..end).contains(&table.jump));
-                facts.jump_tables.extend(jumps.map(|(index, _)| (owner, index)));
+                let first = jumps.partition_point(|&(jump, _)| jump < start);
+                facts.jump_tables.extend(jumps[first..].iter().take_while(|&&(jump, _)| jump < end).map(|&(_, index)| (owner, index)));
             }
         }
         facts.purges = recore::cfg::stack_purges(image, analysis);
