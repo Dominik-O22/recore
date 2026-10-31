@@ -23,7 +23,7 @@
     "setup": 489961811,
     "decompile": 2449898507,
     "lookups": 103126821,
-    "dataflow": 3824736029,
+    "dataflow": 4194553492,
     "diff": 280469992
   },
   "corpus-arm64/bin/deb__gzip__gzip": {
@@ -167,7 +167,7 @@
     "setup": 5587325708,
     "decompile": 3688542436,
     "lookups": 6767931515,
-    "dataflow": 19059341091,
+    "dataflow": 8024483054,
     "diff": 58678032478
   },
   "corpus-pe/bin/git__git-remote-https.exe": {
