@@ -308,6 +308,27 @@ fn a_jump_to_an_import_reads_as_a_call_to_it() {
 }
 
 #[test]
+fn a_tool_sees_what_a_function_returns_by_jumping_before_it_is_decompiled() {
+    // Nothing in `say` shows that it returns what `puts` does but the jump it ends with.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/tail.so");
+    let mut client = Client::start();
+    let first = client.tool("trace", json!({ "path": path, "function": "say", "returns": true }));
+    client.tool("decompile", json!({ "path": path, "functions": ["say"] })).unwrap();
+    assert!(first.is_ok(), "{first:?}");
+    assert_eq!(first, client.tool("trace", json!({ "path": path, "function": "say", "returns": true })));
+}
+
+#[test]
+fn a_chain_of_jumps_decompiled_for_a_caller_keeps_what_it_returns() {
+    // The caller 0x401030 has 0x401020 decompiled ahead of it, and that the 0x401010 it jumps to,
+    // which jumps to 0x401000.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/chain.elf");
+    let mut client = Client::start();
+    client.tool("decompile", json!({ "path": path, "functions": ["0x401030"] })).unwrap();
+    client.tool("trace", json!({ "path": path, "function": "0x401020", "returns": true })).unwrap();
+}
+
+#[test]
 fn memory_the_file_has_no_bytes_for_takes_a_name() {
     // An 8051 program: SETB 0xAF; MOV DPTR, #0x8100; MOVX @DPTR, A; RET.
     let dir = edits_dir();
