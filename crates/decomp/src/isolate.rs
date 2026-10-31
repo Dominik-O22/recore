@@ -366,6 +366,16 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             let _ = session.format_call(entry, at, target, position, format);
         }
     };
+    // A function that ends by jumping to another returns what that one returns, which the engine
+    // does not see. Said before every decompilation, so that what a function returns does not
+    // depend on which tool asked first.
+    let settle_return = |session: &mut Session, entry: u64| {
+        for &callee in tail_callees.get(&entry).into_iter().flatten() {
+            if session.returns_like(entry, callee) {
+                break;
+            }
+        }
+    };
     // Results of functions decompiled ahead of a caller that are as good as asked for.
     let mut ready: HashMap<u64, Event> = HashMap::new();
 
@@ -410,6 +420,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Flow(addr) => {
+                settle_return(&mut session, addr);
                 if let Some(importer) = &mut importer {
                     importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
                 }
@@ -421,6 +432,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Addressed(addr) => {
+                settle_return(&mut session, addr);
                 if let Some(importer) = &mut importer {
                     importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
                 }
@@ -432,6 +444,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Locals(addr) => {
+                settle_return(&mut session, addr);
                 if let Some(importer) = &mut importer {
                     importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
                 }
@@ -444,6 +457,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                     Some(found) => Some(found),
                     None => match auto_function(name) {
                         Some(function) => {
+                            settle_return(&mut session, function);
                             if let Some(importer) = &mut importer {
                                 importer.functions(&mut session, std::iter::once(function).chain(called.get(&function).into_iter().flatten().copied()));
                             }
@@ -458,6 +472,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Structs(addr) => {
+                settle_return(&mut session, addr);
                 if let Some(importer) = &mut importer {
                     importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
                 }
@@ -505,6 +520,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         // out as it would when asked for, so the result is kept for then.
         let keep = matches!(request, Request::Parameters(_)) && unknown(addr).iter().all(|callee| jumped_first.contains(callee));
         for target in jumped_first {
+            settle_return(&mut session, target);
             session.keep_prototypes(!hands_on_registers);
             if let Some(importer) = &mut importer {
                 importer.functions(&mut session, std::iter::once(target));
@@ -514,11 +530,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             let _ = session.decompile(target);
             known.insert(target);
         }
-        for &callee in tail_callees.get(&addr).into_iter().flatten() {
-            if session.returns_like(addr, callee) {
-                break;
-            }
-        }
+        settle_return(&mut session, addr);
         session.keep_prototypes(callees_first || (jumped_to.contains(&addr) && !hands_on_registers));
         if let Some(importer) = &mut importer {
             importer.functions(&mut session, std::iter::once(addr).chain(called.get(&addr).into_iter().flatten().copied()));
