@@ -9,6 +9,10 @@
 #
 # Last, `recore-bench ratchet` counts the instructions of what an agent waits for on the
 # benchmark set, and fails when a count grew past bench/budget.json.
+#
+# With a base, `recore-bench cost` then fails when the largest binaries took more than 10% more
+# time or 10% more memory with this build than with the base's. RECORE_COST_ACCEPTED=1 lets a
+# change past that which its description says is worth it.
 set -euo pipefail
 cd "$(dirname "$0")"
 # What the run below is of, for the status it leaves on that commit.
@@ -28,12 +32,13 @@ corpora="${RECORE_CORPORA:-$HOME/recore-corpora}"
 # kept by commit, so the next comparison against the same commit only analyzes this checkout.
 if [ -n "$against" ]; then
   base="target/against/recore-$against"
-  if [ ! -x "$base" ]; then
+  if [ ! -x "$base-mcp" ]; then
     src=target/against/src
     git worktree remove --force "$src" 2>/dev/null || true
     git worktree add -q --detach "$src" "$against"
-    CARGO_TARGET_DIR="$PWD/target/against/build" cargo build --release -q -p recore --manifest-path "$src/Cargo.toml"
+    CARGO_TARGET_DIR="$PWD/target/against/build" cargo build --release -q -p recore -p recore-mcp --manifest-path "$src/Cargo.toml"
     cp target/against/build/release/recore "$base"
+    cp target/against/build/release/recore-mcp "$base-mcp"
     git worktree remove --force "$src"
   fi
 fi
@@ -80,6 +85,9 @@ for in in "$corpora"/*/; do
 done
 if ! ./target/release/recore-bench ratchet; then
   worse+=("bench/budget.json")
+fi
+if [ -n "$against" ] && ! ./target/release/recore-bench cost --base "$base-mcp" ${RECORE_COST_ACCEPTED:+--accept}; then
+  worse+=("time or memory")
 fi
 if [ ${#worse[@]} -gt 0 ]; then
   echo "worse${against:+ than $against}: ${worse[*]}" >&2

@@ -195,21 +195,26 @@ fn timed(command: &mut Command) -> Result<f64> {
     Ok(elapsed)
 }
 
-/// Runs a program to its end and returns the wall time and the most memory its process held,
-/// in bytes. That is read from /proc while it runs, every few milliseconds: what the kernel
-/// reports once it ends also counts this process's own, which the program started from.
-fn measured(command: &mut Command) -> Result<(f64, u64)> {
+/// The most memory the process has held, in bytes.
+fn high_water(pid: u32) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    let kib = status.lines().find_map(|line| line.strip_prefix("VmHWM:")).and_then(|value| value.trim().strip_suffix("kB")?.trim().parse::<u64>().ok());
+    kib.unwrap_or(0) * 1024
+}
+
+/// Runs a program to its end and returns the wall time and the most that `memory` said of it, in
+/// bytes. That is read from /proc while it runs, every few milliseconds: what the kernel reports
+/// once it ends also counts this process's own, which the program started from.
+pub(crate) fn measured(command: &mut Command, memory: impl Fn(u32) -> u64 + Sync) -> Result<(f64, u64)> {
     let start = Instant::now();
     let mut child = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
-    let status_file = format!("/proc/{}/status", child.id());
+    let pid = child.id();
     let ended = std::sync::atomic::AtomicBool::new(false);
     let (status, elapsed, peak) = std::thread::scope(|scope| {
         let watch = scope.spawn(|| {
             let mut peak = 0;
             while !ended.load(std::sync::atomic::Ordering::Relaxed) {
-                let status = std::fs::read_to_string(&status_file).unwrap_or_default();
-                let kib = status.lines().find_map(|line| line.strip_prefix("VmHWM:")).and_then(|value| value.trim().strip_suffix("kB")?.trim().parse::<u64>().ok());
-                peak = peak.max(kib.unwrap_or(0) * 1024);
+                peak = peak.max(memory(pid));
                 std::thread::sleep(Duration::from_millis(2));
             }
             peak
@@ -227,7 +232,7 @@ fn measured(command: &mut Command) -> Result<(f64, u64)> {
 /// run before left there would otherwise make a cold run look warm, and a build that reads a
 /// file another left look faster. A file this user can read but not write is still dropped;
 /// one some process has mapped keeps the pages it uses.
-fn evict(path: &Path) {
+pub(crate) fn evict(path: &Path) {
     use std::os::fd::AsRawFd;
     let Ok(file) = std::fs::File::open(path) else { return };
     // Pages not yet written out stay.
@@ -270,7 +275,7 @@ pub fn cold(binaries: &[PathBuf], runs: usize) -> Result<Vec<ColdRow>> {
             let times = &mut times[index];
             let _ = std::fs::remove_dir_all(&cache);
             from_disk(binary);
-            let (summary, analyzing) = measured(Command::new(&tool).env(recore::cache::DIR_VAR, &cache).arg("summary").arg(binary))?;
+            let (summary, analyzing) = measured(Command::new(&tool).env(recore::cache::DIR_VAR, &cache).arg("summary").arg(binary), high_water)?;
             times[0].push(summary);
             peaks[index].1 = peaks[index].1.max(analyzing);
             let _ = std::fs::remove_dir_all(&cache);
