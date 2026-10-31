@@ -5,6 +5,7 @@
 //! Every number is the fastest of several runs, because noise on a quiet machine only ever adds
 //! time. The median is kept beside it, and the gap between the two is reported as the noise.
 
+mod cost;
 mod profile;
 mod ratchet;
 mod suites;
@@ -109,6 +110,19 @@ enum Command {
         #[arg(long)]
         accept: bool,
     },
+    /// Holds the time and memory of the set's largest binaries, with the kernel and every core
+    /// in them, against a `recore-mcp` built at the base.
+    Cost {
+        /// The base's `recore-mcp`.
+        #[arg(long)]
+        base: PathBuf,
+        /// The list of binaries, one path per line, relative to the corpora's directory.
+        #[arg(long, default_value = "bench/set.txt")]
+        set: PathBuf,
+        /// Lets past the limits a change worth what it costs.
+        #[arg(long)]
+        accept: bool,
+    },
     /// Counts the instructions of one binary for `ratchet`, which runs each binary in a
     /// process of its own, and prints them as JSON.
     #[command(hide = true)]
@@ -187,6 +201,7 @@ fn main() -> Result<()> {
         Command::DecodeFloor { binary, runs } => suites::decode_floor(&binary, runs),
         Command::Profile { what, binary, functions, seconds, top, collapsed } => profile::run(what, &binary, &functions, seconds, top, collapsed.as_deref()),
         Command::Ratchet { set, budget, accept } => ratchet::run(&binaries(&set, None)?, &budget, accept),
+        Command::Cost { base, set, accept } => cost::run(&binaries(&set, None)?, &base, accept),
         Command::Count { binary, functions } => ratchet::count(&binary, functions),
     }
 }
