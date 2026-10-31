@@ -19,6 +19,7 @@ Before you build anything, name the measure a change should move and how far. Th
 - **The player is apart.** `player/` is its own Cargo workspace: the host, window and audio that lifted games run on (player/README.md). recore's build, tests and `check.sh` never compile it, and it moves none of the three measures. In `player/`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` are what CI runs. A change to it says which games' smoke scripts it ran, and that their frames still match.
 - **Outputs go under `target/`.** `check.sh` writes to `target/corpus/<corpus>`. Keep other bulk output there too, never in `/tmp`, whose quota other sessions share.
 - **Build and test.** `cargo build --release`, `cargo test --profile ci --workspace` and `cargo clippy --profile ci --workspace --all-targets -- -D warnings` (what CI runs), and `./check.sh` to analyze and score every corpus present.
+- **`main` takes a commit only after `./check.sh --against <base>` passed on it.** The run leaves a `check` status on the commit, so push first and run on a clean tree. Any new commit needs a new run. CI gives the status itself to a change that touches only `player/`, Markdown or `.coderabbit.yaml`, which `check.sh` does not read.
 - **Say what a change did with `./check.sh --against main`.** It prints each count that moved and the binaries it moved in, and fails when a total got worse. Quote those counts in the PR, losses included. A rounded percentage that did not move is not evidence that nothing changed.
 - **Instructions executed only go down.** `check.sh` ends with `recore-bench ratchet`, which counts the instructions analysis and `diff` execute on `bench/set.txt` and fails when one grew more than 1% past `bench/budget.json`. Where they shrank it lowers the budget: commit that with the change. A change that is worth a cost raises the budget with `recore-bench ratchet --accept` and says in its PR what grew and why.
 - **Ghidra.** `ghidra/run-reference.sh <ghidra-home> <out-dir>` runs it over a corpus. Ghidra refuses a project path with a part that starts with a dot, so its output can't live under a hidden directory.
@@ -31,10 +32,10 @@ When the operator corrects an agent, fix the mistake and add its rule here. A ru
 | Rule | Enforced by |
 | --- | --- |
 | Only `crates/*/tests` may name the programs recore was tuned on, each test gated on an env var that points at the binary. | `crates/core/tests/general_naming.rs`, in CI and first in `check.sh` |
-| A change states every corpus count it moved, from a base that was built, not assumed. | `./check.sh --against <ref>` fails on a worse total. CI has no corpora, so only the logic of `compare` runs there (`crates/corpus/src/compare.rs` tests). |
+| A change states every corpus count it moved, from a base that was built, not assumed. | `./check.sh --against <ref>` fails on a worse total, and `main` requires the `check` status of a run that passed. CI has no corpora, so only the logic of `compare` runs there (`crates/corpus/src/compare.rs` tests). |
 | Every corpus in the store is scored. | `check.sh` takes every corpus with `truth/` in it. |
 | Never tune against the held-out corpora. | `check.sh` skips `*-holdout`. Scoring one by hand is still possible. |
-| A change executes no more instructions than `bench/budget.json` allows, unless its PR says why the cost is worth it. | `recore-bench ratchet`, last in `check.sh`. CI has no corpora. |
+| A change executes no more instructions than `bench/budget.json` allows, unless its PR says why the cost is worth it. | `recore-bench ratchet`, last in `check.sh`, and the `budget` check, which fails a PR that raises a number in that file without a line starting `Budget:` in its description. |
 | Corpora live in the store, never in a checkout. | `corpus/store.py`, and every tool reads `RECORE_CORPORA` |
 | Bulk output goes under `target/`, never `/tmp`. | Nothing; this file only |
 | Downloads are data, never executed. | Nothing; this file only |

@@ -11,6 +11,8 @@
 # benchmark set, and fails when a count grew past bench/budget.json.
 set -euo pipefail
 cd "$(dirname "$0")"
+# What the run below is of, for the status it leaves on that commit.
+head="$(git rev-parse HEAD)" uncommitted="$(git status --porcelain)"
 against=
 if [ "${1:-}" = --against ]; then
   against="$(git rev-parse --verify "${2:?--against takes a git ref}^{commit}")"
@@ -82,4 +84,11 @@ fi
 if [ ${#worse[@]} -gt 0 ]; then
   echo "worse${against:+ than $against}: ${worse[*]}" >&2
   exit 1
+fi
+# `main` takes a commit only with this status, so it says that this run passed on that commit. A
+# budget this run lowered is left to commit, and the commit then needs a run of its own.
+if [ -z "$against" ] || [ -n "$uncommitted$(git status --porcelain)" ] || [ "$head" != "$(git rev-parse HEAD)" ]; then
+  echo "no check status: that takes --against, on a commit with nothing left to commit" >&2
+elif ! gh api --silent "repos/{owner}/{repo}/statuses/$head" -f state=success -f context=check -f description="passed against ${against:0:12}"; then
+  echo "no check status: GitHub has to know $head, so push before the run" >&2
 fi

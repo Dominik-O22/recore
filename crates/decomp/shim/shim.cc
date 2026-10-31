@@ -1173,8 +1173,10 @@ static void dump_flow(const RdSession *session, Funcdata *fd, ostream &out) {
     else if (symbol != nullptr)
       out << "local\t" << symbol->getName();
     else {
-      out << "temp\t";
-      vn->printRawNoMarkup(out);
+      // The engine can leave its stream in decimal, as it does after an offset into a register.
+      ostringstream place;
+      vn->printRawNoMarkup(place);
+      out << "temp\t" << place.str();
     }
     out << "\n";
     return id;

@@ -1,0 +1,40 @@
+name: pr
+
+# `edited`, so that a description that gains its `Budget:` line is read again.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  # What can be said of a change without the corpora. The checkout is the change merged into its
+  # base, so HEAD^1 is the base.
+  budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: A budget that grew says why
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          grew="$(git show HEAD^1:bench/budget.json | jq -r --slurpfile head bench/budget.json '. as $base | $head[0] | paths(numbers) as $path | select(getpath($path) > ($base | getpath($path) // infinite)) | $path | join(" ")')"
+          if [ -n "$grew" ] && ! grep -Eq '^Budget: .+' <<<"$BODY"; then
+            echo "::error::bench/budget.json grew, so the description needs a line that starts with Budget: and says why"
+            echo "$grew"
+            exit 1
+          fi
+      # `main` requires the status that a run of check.sh leaves. It reads none of these.
+      - name: A change check.sh does not read needs no run of it
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if ! git diff --no-renames --name-only HEAD^1 HEAD | grep -Ev '^player/|\.md$|^\.coderabbit\.yaml$' | grep -q .; then
+            gh api --silent "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=success -f context=check -f description="touches nothing check.sh reads"
+          fi
