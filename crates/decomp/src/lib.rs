@@ -15,6 +15,7 @@ mod ffi;
 pub mod flow;
 pub mod il2cpp;
 pub mod isolate;
+mod mangled;
 pub mod pdb;
 pub mod prototypes;
 mod structs;
@@ -518,6 +519,13 @@ impl Session {
     pub fn pops_its_arguments(&mut self, name: &str) -> Result<()> {
         let name = CString::new(name)?;
         check(|err, len| unsafe { ffi::rd_pops_its_arguments(self.raw.as_ptr(), name.as_ptr(), err, len) != 0 })
+    }
+
+    /// Leaves what the declared function `name` returns for each call to show, so that its
+    /// declaration says only what it takes.
+    pub fn open_return(&mut self, name: &str) -> Result<()> {
+        let name = CString::new(name)?;
+        check(|err, len| unsafe { ffi::rd_open_return(self.raw.as_ptr(), name.as_ptr(), err, len) != 0 })
     }
 
     /// Declares that the GOT entry at `slot` points to the imported function `name`. Indirect

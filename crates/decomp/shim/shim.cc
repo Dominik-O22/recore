@@ -1430,6 +1430,15 @@ int rd_pops_its_arguments(RdSession *session, const char *name, char *err, size_
   });
 }
 
+// Leaves what the declared function `name` returns for each call to show.
+int rd_open_return(RdSession *session, const char *name, char *err, size_t errlen) {
+  return guarded(err, errlen, [&] {
+    Funcdata *fd = session->arch->symboltab->getGlobalScope()->queryFunction(name);
+    if (fd == nullptr) throw LowlevelError("no function of this name");
+    fd->getFuncProto().setOutputLock(false);
+  });
+}
+
 // Declares that the code at `addr` only forwards to the import behind `slot`: a PLT stub or an
 // import thunk. It gets the import's name and, if one was declared, its prototype, so calls
 // to it read like calls to the import.
@@ -1445,6 +1454,7 @@ int rd_alias_import(RdSession *session, uint64_t addr, uint64_t slot, char *err,
       proto.getPieces(pieces);
       pieces.name = alias->getName();
       alias->getFuncProto().setPieces(pieces);
+      alias->getFuncProto().setOutputLock(proto.isOutputLocked());
       if (proto.getExtraPop() != ProtoModel::extrapop_unknown) alias->getFuncProto().setExtraPop(proto.getExtraPop());
     }
     if (proto.isNoReturn()) alias->getFuncProto().setNoReturn(true);

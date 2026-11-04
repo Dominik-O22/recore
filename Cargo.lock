@@ -856,6 +856,7 @@ dependencies = [
  "anyhow",
  "cc",
  "clap",
+ "cpp_demangle 0.5.1",
  "ghidra-decompiler-sys",
  "gimli 0.34.0",
  "libc",
