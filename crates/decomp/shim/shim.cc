@@ -567,6 +567,7 @@ struct RdSession {
   bool kept_are_lower_bounds = true;  // see rd_keep_prototypes_exact
   bool result_in_first_argument = false;  // see rd_result_in_first_argument
   bool stack_aggregates = false;  // see rd_stack_aggregates
+  bool pushes_scratch_register = false;  // see rd_pushes_scratch_register
   bool want_flow = false;
   bool want_addresses = false;
   set<uint64_t> kept;  // functions whose prototype this session locked
@@ -747,6 +748,75 @@ static bool only_spills_register_param(Funcdata *fd) {
   const Varnode *vn = fd->findVarnodeInput(spilled->getSize(), spilled->getAddress());
   set<const Varnode *> seen;
   return vn != nullptr && !vn->hasNoDescend() && never_read(vn, seen);
+}
+
+// Whether `vn` goes nowhere but into the arguments that calls take on the stack, through copies
+// and merges, and does go into one.
+static bool only_stack_argument(Funcdata *fd, const Varnode *vn, set<const Varnode *> &seen, bool &passed) {
+  if (!seen.insert(vn).second) return true;
+  AddrSpace *stack = fd->getArch()->getStackSpace();
+  for (auto it = vn->beginDescend(); it != vn->endDescend(); ++it) {
+    PcodeOp *op = *it;
+    switch (op->code()) {
+      case CPUI_INDIRECT:
+        // The value as it stands after a call that may change its storage: the call is free to
+        // leave it as it was, as it does a pushed slot.
+        if (op->getIn(0) == vn && !only_stack_argument(fd, op->getOut(), seen, passed)) return false;
+        break;
+      case CPUI_COPY:
+      case CPUI_MULTIEQUAL:
+        if (!only_stack_argument(fd, op->getOut(), seen, passed)) return false;
+        break;
+      case CPUI_CALL:
+      case CPUI_CALLIND: {
+        // The call's prototype may not be settled, so where the argument goes is where the
+        // value stands as the call reads it. A callee whose parameters are known takes what
+        // the caller stores for it, which may be the caller's own register parameter.
+        FuncCallSpecs *fc = fd->getCallSpecs(op);
+        if (op->getSlot(vn) < 1 || vn->getSpace() != stack || (fc != nullptr && fc->isInputLocked())) return false;
+        passed = true;
+        break;
+      }
+      default:
+        return false;
+    }
+  }
+  return true;
+}
+
+// The prototype without the register parameters that exist only because the prologue pushes
+// the register to keep the stack aligned, as GCC's `push {r3, lr}` does on 32-bit ARM. The
+// pushed value sits where a call's first stack argument goes, so every call whose callee is not
+// known passes it, and the engine takes the register for a parameter. A function that passes its
+// own argument on to an unknown callee passes it in the register it came in, so a register that
+// only ever becomes such a stack argument was not one. The registers before it that the
+// function does not read go too, as they were parameters only because it was.
+static bool pushed_for_alignment(Funcdata *fd, PrototypePieces &pieces) {
+  const FuncProto &proto = fd->getFuncProto();
+  AddrSpace *stack = fd->getArch()->getStackSpace();
+  int4 keep = proto.numParams();
+  for (int4 i = 0; i < proto.numParams(); ++i)
+    if (proto.getParam(i)->getAddress().getSpace() == stack) return false;
+  bool pushed = false;
+  while (keep > 1) {
+    const ProtoParameter *param = proto.getParam(keep - 1);
+    const Varnode *vn = fd->findVarnodeInput(param->getSize(), param->getAddress());
+    set<const Varnode *> seen;
+    bool passed = false;
+    if (vn != nullptr && !vn->hasNoDescend() && !(only_stack_argument(fd, vn, seen, passed) && passed)) break;
+    pushed |= passed;
+    keep -= 1;
+  }
+  if (!pushed) return false;
+  pieces.model = nullptr;  // the one recovered
+  pieces.name = fd->getName();
+  pieces.outtype = proto.getOutputType();
+  pieces.firstVarArgSlot = -1;
+  for (int4 i = 0; i < keep; ++i) {
+    pieces.intypes.push_back(proto.getParam(i)->getType());
+    pieces.innames.push_back("");
+  }
+  return true;
 }
 
 // Whether a register parameter exists only because the function stores the register and never
@@ -1801,6 +1871,10 @@ void rd_keep_prototypes(RdSession *session, int keep) { session->keep_prototypes
 // x86-64 System V does: stack slots a function reads beyond its parameters become parameters.
 void rd_stack_aggregates(RdSession *session, int on) { session->stack_aggregates = on != 0; }
 
+// Whether compilers push an argument register only to keep the stack aligned, as GCC does on
+// 32-bit ARM: see `pushed_for_alignment`.
+void rd_pushes_scratch_register(RdSession *session, int on) { session->pushes_scratch_register = on != 0; }
+
 // Puts a note on an instruction of `function`. The C of the function prints it as a comment
 // where that instruction's code is, if the instruction has any left after simplification.
 int rd_add_comment(RdSession *session, uint64_t function, uint64_t addr, const char *text, char *err,
@@ -2613,6 +2687,15 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       arch->clearAnalysis(fd);
       fd->getFuncProto().setModel(arch->defaultfp);
       fd->getFuncProto().setModelLock(true);
+      root->reset(*fd);
+      if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
+    }
+
+    PrototypePieces aligned;
+    if (session->pushes_scratch_register && !fd->getFuncProto().isInputLocked() && pushed_for_alignment(fd, aligned)) {
+      arch->clearAnalysis(fd);
+      fd->getFuncProto().setPieces(aligned);
+      fd->getFuncProto().setOutputLock(false);
       root->reset(*fd);
       if (root->perform(*fd) < 0) throw LowlevelError("decompilation stopped at a breakpoint");
     }

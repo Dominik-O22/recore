@@ -420,6 +420,7 @@ impl Session {
         unsafe { ffi::rd_functions_run_on(raw.as_ptr(), target.functions_run_on().into()) };
         unsafe { ffi::rd_result_in_first_argument(raw.as_ptr(), target.result_in_first_argument().into()) };
         unsafe { ffi::rd_stack_aggregates(raw.as_ptr(), target.passes_aggregates_on_stack().into()) };
+        unsafe { ffi::rd_pushes_scratch_register(raw.as_ptr(), matches!(target, Target::Thumb | Target::Arm).into()) };
         // The session frees the engine's side if a space is not there.
         let structs = NonNull::from(Box::leak(Box::<structs::Registry>::default()));
         unsafe { ffi::rd_set_struct_hooks(raw.as_ptr(), structs.as_ptr().cast(), structs::plan_hook, structs::wrapped_hook) };
