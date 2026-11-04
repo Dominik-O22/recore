@@ -947,7 +947,8 @@ fn thumb_only(insns: &[Insn]) -> Option<Vec<thumb::Insn>> {
 
 /// Each PLT stub of `section` with the slot it jumps through. GNU ld's stub is A32: `ADD IP, PC,
 /// #a; ADD IP, IP, #b; LDR PC, [IP, #c]!`. A Thumb caller that cannot `BLX` reaches it through
-/// `BX PC; NOP` right before it.
+/// `BX PC` right before it, followed by `NOP` or by a branch back to the `BX PC`, as in Debian's
+/// armhf builds.
 fn plt_stubs(section: &Section) -> Vec<(u64, u64)> {
     let words: Vec<u32> = section.data.as_chunks::<4>().0.iter().map(|word| u32::from_le_bytes(*word)).collect();
     let mut stubs = Vec::new();
@@ -959,7 +960,7 @@ fn plt_stubs(section: &Section) -> Vec<(u64, u64)> {
         let at = section.addr + 4 * index as u64;
         let slot = at + 8 + u64::from(rotated(window[0])) + u64::from(rotated(window[1])) + u64::from(window[2] & 0xFFF);
         stubs.push((at, slot));
-        if index > 0 && words[index - 1] == 0x46C0_4778 {
+        if index > 0 && words[index - 1] & 0xFFFF == 0x4778 {
             stubs.push((at - 4, slot));
         }
     }
@@ -1182,6 +1183,35 @@ mod tests {
         }
         image.data_in_code = true;
         image
+    }
+
+    #[test]
+    fn a_thumb_caller_reaches_a_plt_stub_through_bx_pc_and_any_filler() {
+        // Two GNU ld stubs, `ADD IP, PC, #0; ADD IP, IP, #0x1000; LDR PC, [IP, #0x10]!`, the
+        // second with `BX PC; B .-2` before it and the first with `BX PC; NOP`.
+        let stub = [0xE28F_C600, 0xE28C_CA01, 0xE5BC_F010];
+        let words: Vec<u32> = [&[0x46C0_4778][..], &stub, &[0xE7FD_4778], &stub].concat();
+        let data = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let section = Section { name: ".plt".into(), addr: 0x1000, data, file_offset: None, executable: true, writable: false };
+        let stubs = plt_stubs(&section);
+        assert_eq!(stubs, [(0x1004, 0x201C), (0x1000, 0x201C), (0x1014, 0x202C), (0x1010, 0x202C)]);
+    }
+
+    #[test]
+    fn a_tail_jump_into_the_plt_keeps_the_start_it_crosses() {
+        // A PLT stub reached through `BX PC; B .-2`, then a Thumb function that only a pointer in
+        // data names: `MOVS R0, #0; B.W` back to the `BX PC`.
+        let plt: Vec<u8> = [0xE7FD_4778, 0xE28F_C600, 0xE28C_CA01, 0xE5BC_F010].iter().flat_map(|word: &u32| word.to_le_bytes()).collect();
+        let text: Vec<u8> = [0x2000u16, 0xF7FF, 0xBFF5].iter().flat_map(|half| half.to_le_bytes()).collect();
+        let section = |name: &str, addr, data| Section { name: name.into(), addr, data, file_offset: None, executable: true, writable: false };
+        let mut image = Image::bare(String::new(), Format::Elf, Machine::Arm, 0x1010, vec![section(".plt", 0x1000, plt), section(".text", 0x1010, text)]);
+        image.exports.clear();
+        image.entry = 0;
+        image.instruction_sets = vec![(0x1000, InstructionSet::Thumb), (0x1004, InstructionSet::A32), (0x1010, InstructionSet::Thumb)];
+        image.relative_targets = vec![(0x3000, 0x1010)];
+        image.data_in_code = true;
+        let functions = crate::analysis::analyze(&image).functions;
+        assert!(functions.iter().any(|function| function.addr == 0x1010), "{:?}", functions.iter().map(|function| function.addr).collect::<Vec<_>>());
     }
 
     /// The length and the control flow of each instruction of `image`, stepping the state.

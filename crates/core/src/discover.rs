@@ -902,7 +902,9 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 continue;
             }
             let mut crossed = self.starts.range(low + 1..=high);
-            if crossed.clone().all(|(&addr, &origin)| self.evidence(addr, origin) < Evidence::Pointer) {
+            // So does a tail jump to an import through its PLT stub.
+            let to_stub = || self.image.section_at(to).is_some_and(|section| section.is_stubs());
+            if crossed.clone().all(|(&addr, &origin)| self.evidence(addr, origin) < Evidence::Pointer) && !to_stub() {
                 demoted.extend(crossed.by_ref().map(|(&addr, _)| addr));
             }
         }
