@@ -2519,9 +2519,11 @@ static bool mentions_recovered(const RdSession *session, const Datatype *type) {
 
 // The recovered structs that `fd`'s code reaches past the end of: through a field at or past
 // the end, or by stepping a pointer to one that is no element of an array. Each means that
-// `gather` missed a value the engine typed.
+// `gather` missed a value the engine typed. The `paramid` style stops before there are high
+// variables to type, so nothing wraps there.
 static set<string> wrapped(const RdSession *session, Funcdata *fd) {
   set<string> names;
+  if (!fd->isHighOn()) return names;
   for (auto it = fd->beginOpAlive(); it != fd->endOpAlive(); ++it) {
     const PcodeOp *op = *it;
     if (op->code() != CPUI_PTRSUB && op->code() != CPUI_PTRADD) continue;
