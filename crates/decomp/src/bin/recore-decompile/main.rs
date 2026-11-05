@@ -93,6 +93,13 @@ enum Command {
         /// Functions per child process.
         #[arg(long, default_value_t = 1000)]
         shard: usize,
+        /// Decompile only this many functions of each binary, chosen from its debug file in
+        /// `--debug-dir`, the same each run. Binaries without one are left out.
+        #[arg(long, requires = "debug_dir")]
+        sample: Option<usize>,
+        /// Where `<name>.debug` of each binary is, for `--sample`.
+        #[arg(long, requires = "sample")]
+        debug_dir: Option<PathBuf>,
         #[command(flatten)]
         worker: WorkerOptions,
     },
@@ -113,10 +120,15 @@ enum Command {
         #[command(flatten)]
         worker: WorkerOptions,
     },
-    /// Compares the parameter counts of a `corpus` run with DWARF in `<debug-dir>/<name>.debug`.
+    /// Compares the parameter counts of a `corpus` run, and whether each function returns a
+    /// value, with DWARF in `<debug-dir>/<name>.debug`.
     Params {
         out_dir: PathBuf,
         debug_dir: PathBuf,
+        /// Another `corpus` run of the same functions, by the build to compare with. Prints each
+        /// count that moved over the functions both runs decompiled, and fails when one fell.
+        #[arg(long)]
+        against: Option<PathBuf>,
         #[arg(long, default_value_t = std::thread::available_parallelism().map_or(1, usize::from))]
         jobs: usize,
         /// Mismatches to print.
@@ -178,13 +190,17 @@ static ALLOCATOR: recore_decomp::MiMalloc = recore_decomp::MiMalloc;
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Corpus { bin_dir, out_dir, jobs, timeout, shard, worker } => {
-            run::corpus(&run::Config { bin_dir, out_dir, jobs, timeout: Duration::from_secs_f64(timeout), shard, worker: (&worker).into() })
+        Command::Corpus { bin_dir, out_dir, jobs, timeout, shard, sample, debug_dir, worker } => {
+            let sample = sample.zip(debug_dir);
+            run::corpus(&run::Config { bin_dir, out_dir, jobs, timeout: Duration::from_secs_f64(timeout), shard, worker: (&worker).into(), sample })
         }
         Command::Function { binary, functions, all, jobs, timeout, worker } => {
             run::functions(&binary, &functions, all, jobs, Duration::from_secs_f64(timeout), &(&worker).into())
         }
-        Command::Params { out_dir, debug_dir, jobs, list } => params::compare(&out_dir, &debug_dir, jobs, list),
+        Command::Params { out_dir, debug_dir, against, jobs, list } => match against {
+            Some(base) => params::against(&base, &out_dir, &debug_dir, jobs),
+            None => params::compare(&out_dir, &debug_dir, jobs, list),
+        },
         Command::Structs { corpora, tuning, sample, jobs, timeout, cases } => {
             let tuning = match tuning {
                 Some(list) => std::fs::read_to_string(list)?.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')).map(String::from).collect(),

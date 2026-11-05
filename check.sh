@@ -7,6 +7,10 @@
 # with recore built at <ref>, and `recore-corpus compare` prints each count that moved, with
 # the binaries it moved in. It fails when a total got worse.
 #
+# Where a corpus has DWARF, the decompiler's signatures are scored too: a fixed sample of each
+# binary's functions, each one's parameter count and whether it returns a value, held against the
+# base's decompiler on the same functions with `recore-decompile params --against`.
+#
 # Last, `recore-bench ratchet` counts the instructions of what an agent waits for on the
 # benchmark set, and fails when a count grew past bench/budget.json.
 #
@@ -23,7 +27,7 @@ if [ "${1:-}" = --against ]; then
   shift 2
 fi
 # Only the crates the loop needs; other crates may be mid-change.
-cargo build --release -q -p recore -p recore-corpus -p recore-bench -p recore-mcp
+cargo build --release -q -p recore -p recore-corpus -p recore-bench -p recore-mcp -p recore-decomp
 # Only crates/*/tests may name the program a test needs. CI runs this scan with the other
 # tests; the loop runs it first, so a leaked name fails before the corpora are scored.
 cargo test --release -q -p recore --test general_naming
@@ -32,13 +36,14 @@ corpora="${RECORE_CORPORA:-$HOME/recore-corpora}"
 # kept by commit, so the next comparison against the same commit only analyzes this checkout.
 if [ -n "$against" ]; then
   base="target/against/recore-$against"
-  if [ ! -x "$base-mcp" ]; then
+  if [ ! -x "$base-mcp" ] || [ ! -x "$base-decompile" ]; then
     src=target/against/src
     git worktree remove --force "$src" 2>/dev/null || true
     git worktree add -q --detach "$src" "$against"
-    CARGO_TARGET_DIR="$PWD/target/against/build" cargo build --release -q -p recore -p recore-mcp --manifest-path "$src/Cargo.toml"
+    CARGO_TARGET_DIR="$PWD/target/against/build" cargo build --release -q -p recore -p recore-mcp -p recore-decomp --manifest-path "$src/Cargo.toml"
     cp target/against/build/release/recore "$base"
     cp target/against/build/release/recore-mcp "$base-mcp"
+    cp target/against/build/release/recore-decompile "$base-decompile"
     git worktree remove --force "$src"
   fi
 fi
@@ -53,6 +58,32 @@ analyze() {
     touch "$out/against-$against/$variant/done"
   fi
 }
+# signatures <corpus>: decompiles the sample of each binary with this checkout's decompiler and
+# the base's, scores it, and compares the two over the functions both decompiled in time. Shards
+# of 25 split the largest binaries over several processes.
+signatures() {
+  local in="$1" sample=(--sample "$SIGNATURE_SAMPLE" --debug-dir "$1/debug" --timeout 5 --shard 25)
+  # A report left from an earlier run would pass for this one's.
+  rm -rf "$out/signatures"
+  ./target/release/recore-decompile corpus "$in/bin" "$out/signatures" "${sample[@]}" >"$out/signatures.log" 2>&1
+  ./target/release/recore-decompile params "$out/signatures" "$in/debug" | sed -n '1p;3p'
+  if [ -n "$against" ] && [[ "$("$base-decompile" corpus --help)" != *--sample* ]]; then
+    echo "$out/signatures: the base's decompiler takes no --sample, so nothing to compare with"
+  elif [ -n "$against" ]; then
+    # Kept by commit, and made again if this checkout samples differently.
+    local base_out="$out/against-$against/signatures"
+    if [ "$(cat "$base_out/done" 2>/dev/null)" != "${sample[*]}" ]; then
+      rm -rf "$base_out"
+      "$base-decompile" corpus "$in/bin" "$base_out" "${sample[@]}" >"$out/against-$against/signatures.log" 2>&1
+      echo "${sample[*]}" > "$base_out/done"
+    fi
+    echo "$out/signatures against $base_out"
+    ./target/release/recore-decompile params "$out/signatures" "$in/debug" --against "$base_out" || worse+=("$out/signatures")
+  fi
+}
+# Functions of each binary whose signatures are scored: enough to see a change that reaches many
+# functions, few enough to keep the run short.
+SIGNATURE_SAMPLE=100
 worse=()
 # Every corpus in the store that has truth, so a new corpus is scored without a change here.
 for in in "$corpora"/*/; do
@@ -81,6 +112,12 @@ for in in "$corpora"/*/; do
     for dir in "${dirs[@]}"; do
       ./target/release/recore-corpus --corpus "$in" compare "$out/against-$against/${dir##*/}" "$dir" || worse+=("$dir")
     done
+  fi
+  # The decompiler's signatures against the debug files: the parameter count of every so many
+  # functions of each binary, and whether it returns a value. corpus-large holds the largest
+  # programs for timing, whose setup alone takes longer than every other corpus's sample.
+  if compgen -G "$in/debug/*.debug" >/dev/null && [ "$corpus" != corpus-large ]; then
+    signatures "$in"
   fi
 done
 if ! ./target/release/recore-bench ratchet; then

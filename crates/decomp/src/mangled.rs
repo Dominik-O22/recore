@@ -66,6 +66,19 @@ fn declaration(name: &str, function: &Function, classes: &HashSet<&str>, target:
     Some(format!("extern {word} {name}({params});"))
 }
 
+/// Whether the mangled name `name` is of a constructor or a destructor.
+pub fn is_structor(name: &str) -> bool {
+    let bare = || Symbol::new(name).ok()?.demangle_with_options(&DemangleOptions::new().no_return_type().no_params()).ok();
+    name.starts_with("_Z") && bare().is_some_and(|bare| structor(&bare))
+}
+
+/// Whether the demangled name `bare`, without its parameters, is of a constructor or destructor.
+fn structor(bare: &str) -> bool {
+    let (scope, last) = split_scope(bare);
+    let unqualified = |component: &str| component.split('<').next().unwrap_or(component).trim().to_string();
+    !scope.is_empty() && (last.starts_with('~') || unqualified(last) == unqualified(split_scope(scope).1))
+}
+
 fn read(name: &str) -> Option<Function> {
     if !name.starts_with("_Z") {
         return None;
@@ -78,10 +91,8 @@ fn read(name: &str) -> Option<Function> {
     let list = full.strip_prefix(&bare)?.strip_prefix('(')?;
     let close = closing(list)?;
     let (list, qualifiers) = (&list[..close], &list[close + 1..]);
-    let (scope, last) = split_scope(&bare);
-    let unqualified = |component: &str| component.split('<').next().unwrap_or(component).trim().to_string();
-    let constructor = !scope.is_empty() && unqualified(last) == unqualified(split_scope(scope).1);
-    let member = constructor || last.starts_with('~') || !qualifiers.trim().is_empty();
+    let (scope, _) = split_scope(&bare);
+    let member = structor(&bare) || !qualifiers.trim().is_empty();
     let mut params = Vec::new();
     let mut variadic = false;
     for param in top_level(list, ',').into_iter().map(str::trim).filter(|param| !param.is_empty()) {

@@ -16,6 +16,10 @@ pub struct Function {
     /// Source-level parameters: `DW_TAG_formal_parameter` children of the `DW_TAG_subprogram`.
     pub params: usize,
     pub variadic: bool,
+    /// Whether the source says the function returns a value. `None` where the entry that says
+    /// so is in a supplementary file, which this does not read, and for a constructor or
+    /// destructor on 32-bit ARM, which returns `this` though its source returns nothing.
+    pub returns_value: Option<bool>,
     /// Whether the function's unit is C. Rust's compiler builtins list no parameters for the
     /// functions that only call one inlined into them.
     pub c: bool,
@@ -49,9 +53,13 @@ impl DebugInfo {
         })?;
 
         let mut functions = BTreeMap::new();
-        let mut units = dwarf.units();
-        while let Some(header) = units.next()? {
-            let unit = dwarf.unit(header)?;
+        // All of them first: a function's abstract instance may be in another unit.
+        let mut headers = dwarf.units();
+        let mut units = Vec::new();
+        while let Some(header) = headers.next()? {
+            units.push(dwarf.unit(header)?);
+        }
+        for (index, unit) in units.iter().enumerate() {
             let c = {
                 let mut entries = unit.entries();
                 let root = entries.next_dfs()?;
@@ -70,12 +78,12 @@ impl DebugInfo {
                     gimli::DW_TAG_subprogram => {
                         let addr = match entry.attr_value(gimli::DW_AT_low_pc) {
                             Some(gimli::AttributeValue::Addr(addr)) => Some(addr),
-                            Some(gimli::AttributeValue::DebugAddrIndex(index)) => dwarf.address(&unit, index).ok(),
+                            Some(gimli::AttributeValue::DebugAddrIndex(index)) => dwarf.address(unit, index).ok(),
                             _ => None,
                         }
                         .filter(|&addr| addr != 0);
                         if let Some(addr) = addr {
-                            functions.insert(addr, Function { params: 0, variadic: false, c });
+                            functions.insert(addr, Function { params: 0, variadic: false, returns_value: returns_value(&units, index, entry), c });
                         }
                         open.push((entry.depth(), addr));
                     }
@@ -94,8 +102,43 @@ impl DebugInfo {
                 }
             }
         }
+        // ARM's C++ ABI has constructors and destructors return `this`, which their debug
+        // information does not say. A Thumb function's symbol has the low bit set.
+        if debug.architecture() == object::Architecture::Arm {
+            let symbols: &BTreeMap<u64, String> = &symbols;
+            for (addr, function) in &mut functions {
+                if [*addr, addr | 1].iter().any(|at| symbols.get(at).is_some_and(|name| crate::mangled::is_structor(name))) {
+                    function.returns_value = None;
+                }
+            }
+        }
         Ok(DebugInfo { functions, symbols })
     }
+}
+
+/// Whether the subprogram `entry` of `units[unit]` returns a value: whether it, or the
+/// declaration or abstract instance it completes, has a type. `None` where that entry is in a
+/// supplementary file, which this does not read.
+fn returns_value<R: gimli::Reader>(units: &[gimli::Unit<R>], mut unit: usize, entry: &gimli::DebuggingInformationEntry<R>) -> Option<bool> {
+    let mut entry = entry.clone();
+    // A concrete instance points at its abstract one, which may complete a declaration. After
+    // link-time optimization the abstract one is often in another unit.
+    for _ in 0..4 {
+        if entry.attr_value(gimli::DW_AT_type).is_some() {
+            return Some(true);
+        }
+        let offset = match entry.attr_value(gimli::DW_AT_abstract_origin).or_else(|| entry.attr_value(gimli::DW_AT_specification)) {
+            Some(gimli::AttributeValue::UnitRef(offset)) => offset,
+            Some(gimli::AttributeValue::DebugInfoRef(offset)) => {
+                unit = units.partition_point(|candidate| candidate.header.offset().0 <= offset.0).checked_sub(1)?;
+                offset.to_unit_offset(&units[unit].header)?
+            }
+            Some(_) => return None,
+            None => return Some(false),
+        };
+        entry = units[unit].entry(offset).ok()?;
+    }
+    None
 }
 
 type Slice<'a> = gimli::EndianSlice<'a, gimli::LittleEndian>;
