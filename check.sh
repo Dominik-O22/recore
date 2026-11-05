@@ -22,6 +22,27 @@ if [ "${1:-}" = --against ]; then
   against="$(git rev-parse --verify "${2:?--against takes a git ref}^{commit}")"
   shift 2
 fi
+# The status stands for what the change does to what it lands on, so a run posts it only against
+# where the change leaves main, or in a stack the pushed tip of the branch below it. `why_not`
+# says why a run will not post it, before the run, so that a wrong base costs no wait.
+why_not=
+if [ -n "$against" ]; then
+  GIT_TERMINAL_PROMPT=0 git fetch -q origin || echo "could not fetch origin: judging the base by the refs already here" >&2
+  # A branch below this one in a stack: pushed under another name than this branch, on HEAD's
+  # history, and no older than the fork.
+  below() {
+    [ -n "$(git branch -r --points-at "$against" --format='%(refname:short)' | grep -vxF "origin/$(git branch --show-current)")" ] &&
+      git merge-base --is-ancestor "$fork" "$against" && git merge-base --is-ancestor "$against" HEAD
+  }
+  if ! fork="$(git merge-base HEAD origin/main 2>/dev/null)"; then
+    why_not="there is no origin/main to judge the base by"
+  elif [ "$against" = "$head" ]; then
+    why_not="the base is HEAD itself"
+  elif [ "$against" != "$fork" ] && ! below; then
+    why_not="${against:0:12} is neither where HEAD leaves origin/main (${fork:0:12}) nor the pushed tip of a branch it stacks on"
+  fi
+  [ -z "$why_not" ] || echo "this run will post no check status: $why_not" >&2
+fi
 # Only the crates the loop needs; other crates may be mid-change.
 cargo build --release -q -p recore -p recore-corpus -p recore-bench -p recore-mcp
 # Only crates/*/tests may name the program a test needs. CI runs this scan with the other
@@ -97,6 +118,8 @@ fi
 # budget this run lowered is left to commit, and the commit then needs a run of its own.
 if [ -z "$against" ] || [ -n "$uncommitted$(git status --porcelain)" ] || [ "$head" != "$(git rev-parse HEAD)" ]; then
   echo "no check status: that takes --against, on a commit with nothing left to commit" >&2
+elif [ -n "$why_not" ]; then
+  echo "no check status: $why_not" >&2
 elif ! gh api --silent "repos/{owner}/{repo}/statuses/$head" -f state=success -f context=check -f description="passed against ${against:0:12}"; then
   echo "no check status: GitHub has to know $head, so push before the run" >&2
 fi
