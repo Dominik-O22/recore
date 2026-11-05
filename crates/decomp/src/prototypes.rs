@@ -6,7 +6,8 @@
 //! prototypes of Ghidra's type archives with types reduced to numbers, strings and pointers:
 //! `data/win32.protos` from the 32-bit Windows archive, `data/clib.protos` from the 64-bit C
 //! library archive (glibc and what Linux programs commonly link) and `data/macos.protos` from
-//! the macOS archive. `ghidra/ExportPrototypes.java` writes those files.
+//! the macOS archive. `ghidra/ExportPrototypes.java` writes those files. A C++ import that none
+//! of them lists takes the parameters its mangled name gives.
 
 use std::collections::HashSet;
 
@@ -14,7 +15,7 @@ use anyhow::Result;
 
 use recore::image::Format;
 
-use crate::{Session, Target};
+use crate::{Session, Target, mangled};
 
 /// How many words of arguments a 32-bit `__stdcall` function pops, from its decorated name:
 /// `_name@n` pops `n` bytes. A DLL that exports its functions so names them, and no table needs
@@ -368,7 +369,9 @@ pub fn known() -> impl Iterator<Item = &'static str> {
 
 /// Where [`declare`] takes the prototype of the import `name` of an image of `format` from:
 /// `table` for the C runtime and Win32 ones written by hand, `added table` for the glibc and
-/// language runtime ones, `archive`, or `None` if it has none.
+/// language runtime ones, `archive`, `mangled name` for a C++ function whose name says what it
+/// takes, or `None` if it has none. A mangled name counts as it would on x86-64, so this also
+/// names the ones that 32-bit ARM and Windows leave undeclared.
 pub fn source(format: Format, name: &str) -> Option<&'static str> {
     let listed = |table: &[&str]| table.iter().any(|prototype| name_of(prototype) == name);
     if listed(C_RUNTIME) || listed(WIN32) {
@@ -376,7 +379,7 @@ pub fn source(format: Format, name: &str) -> Option<&'static str> {
     } else if listed(GLIBC) || listed(RUNTIME) {
         Some("added table")
     } else {
-        archived(format, name).map(|_| "archive")
+        archived(format, name).map(|_| "archive").or_else(|| (!mangled::declarations(&[name], Target::X86_64Gcc).is_empty()).then_some("mangled name"))
     }
 }
 
@@ -389,7 +392,8 @@ fn name_of(prototype: &str) -> &str {
 /// Gives every import in `imports` that the tables or the archives of `format` know its
 /// prototype. The imports must already be declared in the session.
 pub fn declare<'a>(session: &mut Session, target: Target, format: Format, imports: impl Iterator<Item = &'a str>) -> Result<()> {
-    let mut wanted: HashSet<&str> = imports.collect();
+    let imports: Vec<&str> = imports.collect();
+    let mut wanted: HashSet<&str> = imports.iter().copied().collect();
     let pointer = if target.pointer_bytes() == 4 { "uint4" } else { "uint8" };
     let long = if format == Format::Pe || target.pointer_bytes() == 4 { "4" } else { "8" };
     for declaration in TYPES {
@@ -408,10 +412,20 @@ pub fn declare<'a>(session: &mut Session, target: Target, format: Format, import
     }
     let mut wanted: Vec<&str> = wanted.into_iter().collect();
     wanted.sort_unstable();
-    for (convention, prototype) in wanted.into_iter().filter_map(|name| archived(format, name)) {
+    let mut unknown = Vec::new();
+    for name in wanted {
+        let Some((convention, prototype)) = archived(format, name) else {
+            unknown.push(name);
+            continue;
+        };
         // One prototype the parser rejects must not cost the session the rest.
         if session.declare(&declaration(target, convention, prototype)).is_ok() && windows32 && matches!(convention, "stdcall" | "fastcall") {
             session.pops_its_arguments(name_of(prototype))?;
+        }
+    }
+    for (name, declaration) in mangled::declarations(&imports, target) {
+        if unknown.binary_search(&name).is_ok() && session.declare(&declaration).is_ok() {
+            session.open_return(name)?;
         }
     }
     Ok(())
