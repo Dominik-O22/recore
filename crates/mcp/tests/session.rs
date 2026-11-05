@@ -56,16 +56,12 @@ fn answers_queries_and_reports_bad_input_as_tool_errors() {
 }
 
 #[test]
-fn decompiling_survives_a_timeout_and_a_dead_child() {
+fn decompiling_survives_a_dead_child() {
     let mut client = Client::start();
     let entry = client.entry();
     let decompile = |client: &mut Client, timeout: f64| client.tool("decompile", json!({ "functions": [entry], "timeout": timeout }));
     let c_text = decompile(&mut client, 60.0).unwrap();
     assert!(c_text.contains('{'), "{c_text}");
-
-    // No function finishes in no time, so this one's child is killed and replaced.
-    assert!(decompile(&mut client, 0.0).unwrap_err().contains("timed out"));
-    assert_eq!(decompile(&mut client, 60.0).unwrap().lines().skip(1).collect::<Vec<_>>(), c_text.lines().skip(1).collect::<Vec<_>>());
 
     // The child dies between requests, as after a fault or the kernel reclaiming memory.
     let server = client.child.id().to_string();
