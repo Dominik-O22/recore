@@ -140,7 +140,7 @@ Decompiled function signatures against PDB records, 8 binaries per corpus:
 
 Each tool's percentages are over the functions it decompiled, and recore decompiles more of them. On the 8,523 32-bit functions both decompiled, recore gets the parameters of 87.1% right and Ghidra 86.1%.
 
-Against DWARF, on six programs of each Linux ARM corpus, recore gets the parameter count right for 72.3% of armhf functions and 72.7% of armel ones, and for 75.8% of arm64 ones on the same programs. In C code that is 85.2%, 85.0% and 92.7%. A 64-bit argument takes two registers on 32-bit ARM, which is part of the gap.
+Against DWARF, on six programs of each Linux ARM corpus, recore gets the parameter count right for 73.4% of armhf functions and 73.0% of armel ones, and for 76.1% of arm64 ones on the same programs. In C code that is 86.5%, 85.0% and 92.5%. Most of the gap is in C++. A function that returns a class in memory takes the address to write it to as a hidden argument, which on 32-bit ARM looks the same as a constructor's `this`, and many functions never read a parameter they declare, such as `this` in a virtual function that returns a constant.
 
 References from code to data have no ground truth, so they are scored against Ghidra's own, on 11 binaries: recore finds 96.6% of them on Linux x86-64, 91.8% on Windows x86, 96.0% on Windows x86-64 and 85.2% on Linux AArch64. Most of the rest are a later element or field of an object recore refers to the start of, which Ghidra reaches by following a loop or a constant index.
 
