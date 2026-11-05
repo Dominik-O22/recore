@@ -56,7 +56,7 @@
   "corpus-armel/bin/deb__cmake__ctest": {
     "analysis": 7723754129,
     "again": 905180349,
-    "setup": 2312277688,
+    "setup": 2339484524,
     "decompile": 1300696048,
     "lookups": 418998905,
     "dataflow": 2137127992,
@@ -113,7 +113,7 @@
     "setup": 2875383089,
     "decompile": 5066217008,
     "lookups": 408473107,
-    "dataflow": 2843852963,
+    "dataflow": 2621689100,
     "diff": 5566261206
   },
   "corpus-armhf/bin/deb__coreutils__expr": {

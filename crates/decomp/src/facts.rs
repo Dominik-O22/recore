@@ -65,9 +65,11 @@ pub struct Facts {
     /// and what it calls leave as they were, though the calling convention lets a call change
     /// them.
     pub kept_registers: Vec<(u64, String)>,
-    /// Functions of SDCC code that return nothing: SDCC returns a value in `DPL` and the
-    /// registers after it, and these have not set `DPL` when they return. What a function
-    /// last passed to a call would else pass for what it returns.
+    /// Functions that return nothing, whatever they leave where a value is returned. Functions
+    /// of SDCC code: SDCC returns a value in `DPL` and the registers after it, and these have
+    /// not set `DPL` when they return. And the functions the loader calls through `.init_array`
+    /// and `.fini_array`, ignoring their results: a static constructor that ends by calling
+    /// `__cxa_atexit` would else seem to return what that returns.
     pub returns_nothing: Vec<u64>,
     /// `(function, storage)`: where a function takes its arguments and leaves its result, as
     /// [`crate::Session::set_storage`] takes it: a library routine as [`recore::library::Routine::storage`] has it, and a
@@ -197,6 +199,7 @@ impl Facts {
                 }
             }
         }
+        facts.returns_nothing.extend(startup_functions(image, analysis));
         let mut entries: Vec<u64> = facts.functions.iter().map(|f| f.0).collect();
         entries.sort_unstable();
         let x86 = matches!(image.machine, Machine::X86 | Machine::X86_64);
@@ -406,6 +409,22 @@ pub struct Loaded<'a> {
     pub code: bool,
 }
 
+/// The functions that `.init_array` and `.fini_array` list, which the loader calls before and
+/// after the program and whose results it ignores. A pointer to Thumb code has its low bit set.
+fn startup_functions(image: &Image, analysis: &Analysis) -> Vec<u64> {
+    let tables: Vec<&recore::image::Section> = image.sections.iter().filter(|section| matches!(section.name.as_str(), ".init_array" | ".fini_array")).collect();
+    let in_table = |slot: u64| tables.iter().any(|table| (table.addr..table.end()).contains(&slot));
+    let width = crate::Target::of(image).pointer_bytes();
+    // A position-independent program's tables are filled in by relocations, another's are in
+    // the file.
+    let relocated = image.relative_targets.iter().filter(|&&(slot, _)| in_table(slot)).map(|&(_, target)| target);
+    let stored = tables.iter().flat_map(|table| table.data.chunks_exact(width)).map(|word| word.iter().rev().fold(0u64, |value, &byte| value << 8 | u64::from(byte)));
+    let is_function = |addr: u64| analysis.functions.binary_search_by_key(&addr, |function| function.addr).is_ok_and(|index| analysis.functions[index].fragment_of.is_none());
+    let thumb = matches!(image.machine, Machine::Arm | Machine::Thumb);
+    let entries = relocated.chain(stored).map(|target| if thumb { target & !1 } else { target });
+    entries.filter(|&addr| addr != 0 && is_function(addr)).collect::<std::collections::BTreeSet<u64>>().into_iter().collect()
+}
+
 /// The image's sections after loading. Relative relocations are applied, so that pointer tables
 /// and GOT entries for local functions hold their real targets; in the file they are zero or an
 /// addend. Slots bound to imports get whatever address the other library ends up at, so each is
@@ -448,4 +467,23 @@ pub fn loaded(image: &Image) -> Vec<Loaded<'_>> {
         }
     }
     pieces
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use recore::image::{Format, Image, Machine, Section};
+
+    use super::startup_functions;
+
+    #[test]
+    fn what_init_array_lists_is_a_startup_function() {
+        // 0x1000: call 0x1010; ret. 0x1010: ret. `.init_array` lists 0x1010 in the file.
+        let mut code = vec![0xe8, 0x0b, 0x00, 0x00, 0x00, 0xc3];
+        code.resize(0x10, 0xcc);
+        code.push(0xc3);
+        let section = |name: &str, addr, data, executable| Section { name: name.into(), addr, data, file_offset: None, executable, writable: !executable };
+        let sections = vec![section(".text", 0x1000, code, true), section(".init_array", 0x2000, 0x1010u64.to_le_bytes().to_vec(), false)];
+        let image = Image::bare(String::new(), Format::Elf, Machine::X86_64, 0x1000, sections);
+        assert_eq!(startup_functions(&image, &recore::analyze(&image)), [0x1010]);
+    }
 }
