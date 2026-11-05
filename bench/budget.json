@@ -86,7 +86,7 @@
     "setup": 223735308,
     "decompile": 1493988567,
     "lookups": 68881053,
-    "dataflow": 2492786235,
+    "dataflow": 1804790653,
     "diff": 32364556
   },
   "corpus-armel/bin/deb__openssh-client__ssh-agent": {
@@ -101,7 +101,7 @@
   "corpus-armel/bin/deb__re2c__re2rust": {
     "analysis": 492338073,
     "again": 58700944,
-    "setup": 335354709,
+    "setup": 338987699,
     "decompile": 1398014954,
     "lookups": 76877735,
     "dataflow": 45971491808,
@@ -113,7 +113,7 @@
     "setup": 2875383089,
     "decompile": 5066217008,
     "lookups": 408473107,
-    "dataflow": 2616716609,
+    "dataflow": 2843852963,
     "diff": 5566261206
   },
   "corpus-armhf/bin/deb__coreutils__expr": {
