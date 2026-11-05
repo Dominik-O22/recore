@@ -19,6 +19,9 @@ pub struct Config {
     pub timeout: Duration,
     pub shard: usize,
     pub worker: Options,
+    /// Decompile only this many functions of each binary, the same each run: every so many of
+    /// those the debug file `<dir>/<name>.debug` lists. Binaries without one are left out.
+    pub sample: Option<(usize, PathBuf)>,
 }
 
 /// One binary's functions and the results collected for it so far.
@@ -59,7 +62,11 @@ pub fn corpus(config: &Config) -> Result<()> {
     // The parent analyzes each binary only to learn which functions exist. Each child repeats
     // the analysis, which costs far less than shipping the result to it would save.
     let planned: Mutex<Vec<Binary>> = Mutex::new(Vec::new());
-    for_each(&paths, config.jobs, |path| match plan(path) {
+    let functions_of = |path: &PathBuf| match &config.sample {
+        Some((count, debug_dir)) => sampled(path, *count, debug_dir),
+        None => plan(path),
+    };
+    for_each(&paths, config.jobs, |path| match functions_of(path) {
         Ok(binary) => planned.lock().unwrap().push(binary),
         Err(error) => eprintln!("{}: skipped: {error:#}", path.display()),
     });
@@ -113,6 +120,19 @@ fn plan(path: &Path) -> Result<Binary> {
         records: Vec::new(),
         c_text: Vec::new(),
     })
+}
+
+/// Every so many of the functions that the debug file of the binary at `path` lists, up to
+/// `count` of them. They come from the debug file and not from the analysis, so that a change
+/// to the analysis does not change which functions are decompiled.
+fn sampled(path: &Path, count: usize, debug_dir: &Path) -> Result<Binary> {
+    let name = path.file_name().context("no file name")?.to_string_lossy().into_owned();
+    let debug = debug_dir.join(format!("{name}.debug"));
+    anyhow::ensure!(debug.exists(), "no debug file");
+    let listed: Vec<u64> = recore_decomp::dwarf::DebugInfo::load(&debug)?.functions.into_keys().collect();
+    let taken = count.min(listed.len());
+    let functions = (0..taken).map(|index| listed[index * listed.len() / taken]).collect();
+    Ok(Binary { name, path: path.to_path_buf(), functions, fragments: 0, pending: 0, records: Vec::new(), c_text: Vec::new() })
 }
 
 /// Writes the reports of a binary whose shards are all done, and returns its records.
