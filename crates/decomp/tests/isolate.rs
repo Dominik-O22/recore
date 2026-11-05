@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use recore_decomp::isolate::{Options, Status, Worker};
@@ -9,24 +10,28 @@ use recore_decomp::isolate::{Options, Status, Worker};
 /// The runner itself is the binary to decompile, so the tests need no corpus.
 const RUNNER: &str = env!("CARGO_BIN_EXE_recore-decompile");
 
-fn worker() -> Worker {
-    let command = || {
-        let mut command = Command::new(RUNNER);
-        command.arg("worker");
-        command
-    };
-    Worker::new(command, Path::new(RUNNER), &Options::default())
-}
-
 fn entry() -> u64 {
     recore::Image::load(Path::new(RUNNER)).unwrap().entry
 }
 
 #[test]
 fn returns_c_and_reports_a_timeout() {
-    let mut worker = worker();
-    // No function finishes in no time at all. Setup does not count towards the limit.
-    let (record, _) = worker.decompile(entry(), Duration::ZERO);
+    // The first child is ready and then never answers, so the limit is all that ends the wait.
+    // Every child after it is a real one.
+    let started = AtomicBool::new(false);
+    let command = move || {
+        if started.swap(true, Ordering::Relaxed) {
+            let mut command = Command::new(RUNNER);
+            command.arg("worker");
+            return command;
+        }
+        let mut command = Command::new("sh");
+        command.args(["-c", r#"echo '"Ready"'; read line; exec sleep 600"#]);
+        command
+    };
+    let options = Options { callees_first: false, ..Options::default() };
+    let mut worker = Worker::new(command, Path::new(RUNNER), &options);
+    let (record, _) = worker.decompile(entry(), Duration::from_millis(200));
     assert_eq!(record.status, Status::Timeout);
 
     // The child that ran out of time is replaced.
