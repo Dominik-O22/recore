@@ -42,6 +42,22 @@ fn a_branch_through_the_return_address_popped_off_the_stack_returns() {
     assert!(c.contains("return CONCAT44(unaff_lr,7);") && !c.contains("UNRECOVERED"), "{c}");
 }
 
+#[test]
+fn a_register_pushed_to_keep_the_stack_aligned_is_no_parameter() {
+    // PUSH {R3-R5, LR}; MOV R4, R0; MOV R5, R1; then until the callee returns 0: LDR R2, [R4];
+    // MOV R0, R5; MOVS R3, #0; BLX R2. Then POP {R3-R5, PC}. R3 is pushed only to keep the stack
+    // aligned, where a call's first stack argument would be.
+    #[rustfmt::skip]
+    let code = [
+        0x38, 0xb5, 0x04, 0x46, 0x0d, 0x46,
+        0x22, 0x68, 0x28, 0x46, 0x00, 0x23, 0x90, 0x47, 0x00, 0x28, 0xf9, 0xd1,
+        0x38, 0xbd,
+    ];
+    let c = decompiled(&code, &[0], 0);
+    let signature = c.lines().find(|line| line.contains("func_0x00000000(")).unwrap_or_else(|| panic!("no signature in {c}"));
+    assert!(signature.contains("param_2") && !signature.contains("param_3"), "{c}");
+}
+
 /// The C of the functions at `addrs` of tests/data/variadic.bin, as `recore-decompile` gives it.
 fn decompiled_firmware(addrs: &[u64]) -> Vec<String> {
     let runner = env!("CARGO_BIN_EXE_recore-decompile");
