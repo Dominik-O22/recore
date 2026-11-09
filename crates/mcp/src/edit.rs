@@ -7,9 +7,10 @@ use recore::edits::Edits;
 use recore::program::{Pattern, matches};
 use recore::structs::{Recovered, Slot, auto_function, field_name};
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::binary::{Binary, QUICK};
-use crate::tools::{DEFAULT_LIMIT, addr_arg, describe, resolve_function, shown};
+use crate::tools::{DEFAULT_LIMIT, addr_arg, describe, options, resolve_function, schema, shown};
 
 #[derive(Deserialize)]
 struct Naming {
@@ -19,13 +20,14 @@ struct Naming {
     name: String,
 }
 
-#[derive(Deserialize)]
-pub struct Rename {
-    addr: Option<String>,
-    var: Option<String>,
-    name: Option<String>,
-    #[serde(default)]
-    names: Vec<Naming>,
+options! {
+    pub struct Rename {
+        addr: Option<String> = schema::addr("A function entry or a data address; with `var`, the function, by address or name. Or a struct, `Struct.field` for one of its fields"),
+        var: Option<String> = json!({ "type": "string", "description": "A parameter or local variable of the function, as `decompile` spells it now: `param_1`, `local_18`, `uVar3`." }),
+        name: Option<String> = json!({ "type": "string", "description": "The new name; empty to remove." }),
+        #[serde(default)]
+        names: Vec<Naming> = json!({ "type": "array", "items": { "type": "object", "properties": { "addr": { "type": "string" }, "var": { "type": "string" }, "name": { "type": "string" } }, "required": ["addr", "name"] }, "description": "Several renames at once." }),
+    }
 }
 
 /// What one renaming names.
@@ -199,10 +201,11 @@ pub fn rename(binary: &mut Binary, args: Rename) -> Result<String> {
     Ok(out)
 }
 
-#[derive(Deserialize)]
-pub struct Comment {
-    addr: String,
-    text: String,
+options! {
+    pub struct Comment {
+        addr: String = schema::addr("Any address in the image"),
+        text: String = json!({ "type": "string", "description": "The note; empty to remove." }),
+    }
 }
 
 pub fn comment(binary: &mut Binary, args: Comment) -> Result<String> {
@@ -219,16 +222,16 @@ pub fn comment(binary: &mut Binary, args: Comment) -> Result<String> {
     Ok(if text.is_empty() { format!("comment at {addr:#x} removed\n") } else { format!("comment at {addr:#x} saved; `function`, `disassemble` and `decompile` show it\n") })
 }
 
-#[derive(Deserialize)]
-pub struct Declare {
-    code: Option<String>,
-    addr: Option<String>,
-    #[serde(rename = "type")]
-    kind: Option<String>,
+options! {
+    pub struct Declare {
+        code: Option<String> = json!({ "type": "string", "description": "One or more C declarations." }),
+        addr: Option<String> = schema::addr("A data address"),
+        r#type: Option<String> = json!({ "type": "string", "description": "A type name the decompiler knows; empty to remove." }),
+    }
 }
 
 pub fn declare(binary: &mut Binary, args: Declare) -> Result<String> {
-    match (args.code, args.addr, args.kind) {
+    match (args.code, args.addr, args.r#type) {
         (Some(code), None, None) => {
             let code = code.trim().to_string();
             ensure!(!code.is_empty(), "`code` is empty");
@@ -256,9 +259,10 @@ pub fn declare(binary: &mut Binary, args: Declare) -> Result<String> {
     }
 }
 
-#[derive(Deserialize)]
-pub struct Type {
-    name: Option<String>,
+options! {
+    pub struct Type {
+        name: Option<String> = json!({ "type": "string", "description": "A type name: declared, built in, a struct the decompiler recovered such as `S_401a20_RDI`, or one kept with `rename`." }),
+    }
 }
 
 pub fn type_(binary: &mut Binary, args: Type) -> Result<String> {
@@ -302,10 +306,11 @@ fn holders<'a>(edits: &'a Edits, name: &'a str) -> impl Iterator<Item = (u64, &'
     edits.holders.iter().flat_map(move |(&function, slots)| slots.iter().filter(move |(_, held)| *held == name).map(move |(slot, _)| (function, slot)))
 }
 
-#[derive(Deserialize)]
-pub struct Symbols {
-    pattern: Option<String>,
-    limit: Option<usize>,
+options! {
+    pub struct Symbols {
+        pattern: Option<String> = schema::pattern("name"),
+        limit: Option<usize> = schema::limit(),
+    }
 }
 
 /// Every address that has a name, whoever gave it: the file, the analysis, or an edit.

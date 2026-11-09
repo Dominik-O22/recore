@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -17,7 +18,7 @@ use recore_decomp::ObjectReport;
 use recore_decomp::isolate::Status;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::binary::{Binary, Cache};
 use crate::{code, edit, emulate};
@@ -30,254 +31,267 @@ const USERS_SHOWN: usize = 12;
 const TEXT_SHOWN: usize = 200;
 const MAX_BYTES: usize = 4096;
 
-/// One tool as `tools/list` describes it. Every tool takes `path`.
-fn tool(name: &str, description: &str, mut properties: Value, required: &[&str]) -> Value {
-    properties["path"] = json!({ "type": "string", "description": "Path of the binary to analyze (ELF or Windows PE)." });
-    let required: Vec<&str> = ["path"].into_iter().chain(required.iter().copied()).collect();
-    json!({ "name": name, "description": description, "inputSchema": { "type": "object", "properties": properties, "required": required } })
+/// Declares the options a tool takes besides `path`: the struct they are read into, and the
+/// schema `tools/list` gives each, from one list in which every field is followed by its schema.
+/// Whether the tool needs an option follows from its type: see `Required`.
+macro_rules! options {
+    ($(#[$meta:meta])* $vis:vis struct $name:ident { $($(#[$field_meta:meta])* $field:ident: $type:ty = $schema:expr),* $(,)? }) => {
+        $(#[$meta])*
+        #[derive(serde::Deserialize)]
+        $vis struct $name { $($(#[$field_meta])* $field: $type),* }
+
+        impl $crate::tools::Options for $name {
+            const FIELDS: &[&str] = &[$(stringify!($field)),*];
+
+            fn properties() -> Vec<(&'static str, serde_json::Value, bool)> {
+                vec![$((stringify!($field).trim_start_matches("r#"), $schema, <$type as $crate::tools::Required>::REQUIRED)),*]
+            }
+        }
+    };
+}
+pub(crate) use options;
+
+/// What a tool takes besides `path`, as `options!` declares it.
+pub(crate) trait Options: DeserializeOwned + 'static {
+    /// The options as the struct spells its fields, `r#type` for `type`. Unlike `properties`
+    /// this costs nothing, so each call checks its arguments against it.
+    const FIELDS: &[&str];
+    /// Each option's name, its schema, and whether the tool needs it.
+    fn properties() -> Vec<(&'static str, Value, bool)>;
 }
 
-pub fn list() -> Value {
-    let pattern = |of: &str| json!({ "type": "string", "description": format!("Regular expression matched anywhere in the {of}, ignoring case. Plain text works as a substring.") });
-    let function = json!({ "type": "string", "description": "The function: its name, or a hex address anywhere inside it." });
-    let timeout = json!({ "type": "number", "description": "Seconds each decompilation may take (default 30)." });
-    let limit = json!({ "type": "integer", "minimum": 1, "description": format!("Most rows to return (default {DEFAULT_LIMIT}).") });
-    let addr = |what: &str| json!({ "type": "string", "description": format!("{what}, in hex with or without 0x.") });
-    json!([
-        tool("summary", "What the binary is: format, machine, sections, and how many functions, imports, strings and jump tables were recovered. Analysis is cached, so call this first.", json!({}), &[]),
-        tool(
+/// Whether an option of this type must be given. Serde leaves out an `Option`, and a list, a
+/// flag or a `Sort` that has `#[serde(default)]`.
+pub(crate) trait Required {
+    const REQUIRED: bool;
+}
+impl Required for String {
+    const REQUIRED: bool = true;
+}
+impl Required for PathBuf {
+    const REQUIRED: bool = true;
+}
+impl<T> Required for Option<T> {
+    const REQUIRED: bool = false;
+}
+impl<T> Required for Vec<T> {
+    const REQUIRED: bool = false;
+}
+impl Required for bool {
+    const REQUIRED: bool = false;
+}
+impl Required for Sort {
+    const REQUIRED: bool = false;
+}
+
+/// Schemas several tools' options share.
+pub(crate) mod schema {
+    use serde_json::{Value, json};
+
+    pub fn pattern(of: &str) -> Value {
+        json!({ "type": "string", "description": format!("Regular expression matched anywhere in the {of}, ignoring case. Plain text works as a substring.") })
+    }
+    pub fn function() -> Value {
+        json!({ "type": "string", "description": "The function: its name, or a hex address anywhere inside it." })
+    }
+    pub fn timeout() -> Value {
+        json!({ "type": "number", "description": "Seconds each decompilation may take (default 30)." })
+    }
+    pub fn limit() -> Value {
+        json!({ "type": "integer", "minimum": 1, "description": format!("Most rows to return (default {}).", super::DEFAULT_LIMIT) })
+    }
+    pub fn addr(what: &str) -> Value {
+        json!({ "type": "string", "description": format!("{what}, in hex with or without 0x.") })
+    }
+}
+
+/// One tool: what `tools/list` says of it, and how it runs on the arguments of a call. The
+/// schema is built only when asked for: a call needs none of it.
+struct Tool {
+    name: &'static str,
+    description: &'static str,
+    properties: fn() -> Vec<(&'static str, Value, bool)>,
+    run: Box<Run>,
+}
+
+type Run = dyn Fn(&mut Cache, Value) -> Result<String> + Send + Sync;
+
+impl Tool {
+    fn schema(&self) -> Value {
+        let mut properties = Map::from_iter([("path".to_string(), json!({ "type": "string", "description": "Path of the binary to analyze (ELF or Windows PE)." }))]);
+        let mut required = vec!["path"];
+        for (option, schema, needed) in (self.properties)() {
+            properties.insert(option.to_string(), schema);
+            if needed {
+                required.push(option);
+            }
+        }
+        json!({ "name": self.name, "description": self.description, "inputSchema": { "type": "object", "properties": properties, "required": required } })
+    }
+}
+
+/// A tool given `path` and the options `T`. Any other argument is refused, naming the ones it takes.
+fn tool<T: Options>(name: &'static str, description: &'static str, run: impl Fn(&mut Cache, PathBuf, T) -> Result<String> + Send + Sync + 'static) -> Tool {
+    let run = move |cache: &mut Cache, arguments: Value| {
+        let Value::Object(mut arguments) = arguments else { bail!("the arguments of `{name}` must be an object") };
+        let known = || ["path"].into_iter().chain(T::FIELDS.iter().map(|field| field.trim_start_matches("r#")));
+        let unknown: Vec<&str> = arguments.keys().map(String::as_str).filter(|given| !known().any(|option| option == *given)).collect();
+        if !unknown.is_empty() {
+            return Err(unknown_options(name, &unknown, known(), ""));
+        }
+        let path: PathBuf = arguments.remove("path").as_ref().and_then(Value::as_str).with_context(|| format!("`{name}` needs `path`, the binary to analyze"))?.into();
+        let options = serde_json::from_value(Value::Object(arguments)).map_err(|error| anyhow!("invalid arguments for `{name}`: {error}"))?;
+        run(cache, path, options)
+    };
+    Tool { name, description, properties: T::properties, run: Box::new(run) }
+}
+
+/// A tool that answers about the one binary at `path`.
+fn on_binary<T: Options>(name: &'static str, description: &'static str, run: fn(&mut Binary, T) -> Result<String>) -> Tool {
+    tool(name, description, move |cache, path, options| run(cache.get(&path)?, options))
+}
+
+/// The error for options `tool` does not take, each with the nearest one it does, and all of
+/// those, spelled with `prefix` as the caller writes them: `--` from a shell.
+pub(crate) fn unknown_options<'a>(tool: &str, given: &[&str], known: impl Iterator<Item = &'a str>, prefix: &str) -> anyhow::Error {
+    let mut known: Vec<&str> = known.collect();
+    known.sort_unstable();
+    let unknown: Vec<String> = given
+        .iter()
+        .map(|given| {
+            let nearest = known.iter().map(|name| (edits(given, name), name)).min().filter(|&(edits, _)| edits <= 2 && edits < given.len());
+            nearest.map_or_else(|| format!("`{prefix}{given}`"), |(_, name)| format!("`{prefix}{given}` (did you mean `{prefix}{name}`?)"))
+        })
+        .collect();
+    let takes: Vec<String> = known.iter().map(|name| format!("`{prefix}{name}`")).collect();
+    let takes = if takes.is_empty() { "none".to_string() } else { takes.join(", ") };
+    anyhow!("`{tool}` has no option {}. Its options: {takes}.", unknown.join(", "))
+}
+
+/// Characters inserted, removed or replaced to turn `a` into `b`.
+fn edits(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, from) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, &to) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1).min(row[j] + 1).min(diagonal + usize::from(from != to));
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
+/// Every tool, in the order `tools/list` gives them. Built once: a session makes many calls.
+static TOOLS: LazyLock<[Tool; 22]> = LazyLock::new(|| {
+    [
+        on_binary("summary", "What the binary is: format, machine, sections, and how many functions, imports, strings and jump tables were recovered. Analysis is cached, so call this first.", summary),
+        on_binary(
             "strings",
             "Strings the code or relocated pointers refer to, each with its address and the functions that use it. `used by: none` means only a pointer in data refers to it; `xrefs` finds that pointer. C++ class names appear here mangled; `classes` lists them with their vtables.",
-            json!({ "pattern": pattern("text"), "limit": limit, "full": { "type": "boolean", "description": "Print long strings whole. They are cut to 200 characters otherwise." } }),
-            &[],
+            strings,
         ),
-        tool("imports", "Imported functions the code calls, each with the functions that call it.", json!({ "pattern": pattern("import name") }), &[]),
-        tool(
-            "functions",
-            "Lists functions: address, size in bytes, number of calling functions, and name if the binary carries one.",
-            json!({
-                "pattern": pattern("function name"),
-                "limit": limit,
-                "sort": { "type": "string", "enum": ["address", "size"], "description": "Ascending address (default) or largest first." },
-            }),
-            &[],
-        ),
-        tool(
-            "function",
-            "One function: its extent, callers, the calls it makes (imports by name), and the strings and globals it refers to. Give `addr` or `name`.",
-            json!({
-                "addr": addr("Any address inside the function"),
-                "name": { "type": "string", "description": "The function's name, or a part of it that only one function has." },
-            }),
-            &[],
-        ),
-        tool(
+        on_binary("imports", "Imported functions the code calls, each with the functions that call it.", imports),
+        on_binary("functions", "Lists functions: address, size in bytes, number of calling functions, and name if the binary carries one.", functions),
+        on_binary("function", "One function: its extent, callers, the calls it makes (imports by name), and the strings and globals it refers to. Give `addr` or `name`.", function),
+        on_binary(
             "xrefs",
             "What refers to an address, or with `offset` what uses a field of a structure. For an address: call sites if it is a function or an import slot, and the instructions that read or write it or take its address, with the function each is in. If the address holds pointers, such as a vtable or a table of strings, lists what each entry points to.",
-            json!({
-                "addr": addr("The function entry or data address"),
-                "offset": addr("Instead of `addr`: the offset of a field in a structure. Lists the functions that read or write memory at that offset from a register, which is how to find who sets or uses a field"),
-                "function": { "type": "string", "description": "With `offset`, look in this function only." },
-                "limit": limit,
-            }),
-            &[],
+            xrefs,
         ),
-        tool(
-            "decompile",
-            "Decompiles functions to C with Ghidra's decompiler. A function that crashes the decompiler or runs out of time is reported and the others still come back.",
-            json!({
-                "functions": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Hex addresses (anywhere inside a function) or function names. From a shell, several separated by spaces or commas." },
-                "addresses": { "type": "boolean", "description": "Print before each line of C the address of the instruction it came from, to match a line with what `xrefs`, `disassemble` and `comment` say about an address." },
-                "around": addr("Show only the lines of C that came from the instructions near this address, with their addresses. The function it is in need not be given"),
-                "timeout": { "type": "number", "description": "Seconds each function may take (default 30)." },
-            }),
-            &[],
-        ),
-        tool(
+        on_binary("decompile", "Decompiles functions to C with Ghidra's decompiler. A function that crashes the decompiler or runs out of time is reported and the others still come back.", decompile),
+        on_binary(
             "unnamed",
             "The data addresses the code reads or writes that have no name, the most accessed first, with how many instructions read and write each and the functions they are in. In firmware these are the chip's registers and the program's variables: name the first few with `rename`, or in the names file of the layout, and the code that uses them reads by name.",
-            json!({ "space": { "type": "string", "description": "Only the addresses in this memory of an 8051: `sfr`, `xdata` or `idata`." }, "limit": limit }),
-            &[],
+            unnamed,
         ),
-        tool(
-            "bytes",
-            "Hex dump of bytes as mapped in the image, for reading tables, keys and other data out of its sections.",
-            json!({
-                "addr": addr("Address of the first byte"),
-                "len": { "type": "integer", "minimum": 1, "maximum": MAX_BYTES, "description": "Number of bytes (default 256)." },
-            }),
-            &["addr"],
-        ),
-        tool(
+        on_binary("bytes", "Hex dump of bytes as mapped in the image, for reading tables, keys and other data out of its sections.", bytes),
+        on_binary(
             "classes",
             "C++ classes recovered from the type information that MSVC, GCC and Clang emit: each with its base classes, its vtable address and its virtual functions in vtable order. A virtual call through slot N of an object goes to entry N here. A class with several vtables is listed once per vtable. Also the Objective-C classes and categories of a Mach-O binary with their methods, and its Swift classes, structs and enums with their fields, the protocols they conform to, and a class's methods in vtable order followed by its overrides.",
-            json!({ "pattern": pattern("class name") }),
-            &[],
+            classes,
         ),
-        tool(
+        on_binary(
             "addr",
             "What is at an address: a string, a function, a name, or data told by what it holds, with each pointer in it followed to what it reaches. Also converts between the address and its offset in the file. Give `addr` or `offset`.",
-            json!({ "addr": addr("Address in the image"), "offset": addr("Offset in the file") }),
-            &[],
+            addr,
         ),
-        tool(
+        on_binary(
             "disassemble",
             "Instructions as Ghidra's listing prints them, grouped into basic blocks with where each block goes next. Each line carries the instruction's bytes and what the analysis knows about it: the function it calls, the string or data it refers to, a switch's targets, a comment. Give `function` for a whole function, or `addr` to start anywhere in code.",
-            json!({
-                "function": function,
-                "addr": addr("Where to start; inside a function this snaps to the instruction it is in"),
-                "count": { "type": "integer", "minimum": 1, "description": "Instructions to show (default 500 for a function, 32 from an address)." },
-                "pcode": { "type": "boolean", "description": "Also show each instruction's raw p-code: what it does to registers and memory, one operation per line." },
-            }),
-            &[],
+            code::disassemble,
         ),
-        tool(
+        on_binary(
             "pcode",
             "A function's data flow after the decompiler has simplified it: basic blocks, and operations over values that are each assigned once (SSA). Shows exactly what feeds every call, store, branch and return, where the C leaves it implicit.",
-            json!({ "function": function, "limit": limit, "timeout": timeout }),
-            &["function"],
+            code::pcode,
         ),
-        tool(
+        on_binary(
             "trace",
             "Follows one value through the code, across calls. `param` follows a parameter forward to everything computed from it, into the functions it is passed to. `returns`, or `call` with `arg`, follows a returned value or a call's argument back to the constants, parameters, memory and call results it comes from, out into callers. Values that pass through memory are not followed.",
-            json!({
-                "function": function,
-                "param": { "type": "integer", "minimum": 1, "description": "Parameter to follow forward, from 1: param_1 is 1." },
-                "returns": { "type": "boolean", "description": "Follow the returned value backward." },
-                "call": addr("A call instruction in the function, to follow one of its arguments backward"),
-                "arg": { "type": "integer", "minimum": 1, "description": "Which argument of `call`, from 1." },
-                "depth": { "type": "integer", "minimum": 0, "description": "Calls to follow into callees and out to callers (default 2)." },
-                "timeout": timeout,
-            }),
-            &["function"],
+            code::trace,
         ),
-        tool(
+        on_binary(
             "structs",
             "The structs a function's pointers got: each parameter that points to one, and each struct field that points to another, with the struct's name and how much the code reads and writes through it. With `refused`, also each pointer the code reads fields through that got no struct, and why: so `*(int8 *)(param_1 + 0x28)` can be told from a struct that was never tried. Costs one decompilation.",
-            json!({
-                "function": function,
-                "refused": { "type": "boolean", "description": "Also list the pointers that got no struct, with the reason." },
-                "timeout": timeout,
-            }),
-            &["function"],
+            structs,
         ),
-        tool(
+        on_binary(
             "run",
             "Runs a function of the binary as its processor would and answers what it did: the value it returned, the buffers it was given as it left them, and the memory it wrote. This is what the original does on inputs you choose, to check a rewrite against or to show a finding. It runs the function and everything it calls, not the program: imports such as memcpy and malloc run as stand-ins, as do the Windows functions the MSVC C runtime calls (the last error, TLS slots, the heap, critical sections, the version resource, and with `ticks` the clock), a call to any other import stops the run, and memory that nothing wrote and the file does not hold reads as zero, which the answer counts because on a chip that memory is the peripherals. With `snapshot`, memory starts as a live process had it.",
-            json!({
-                "function": function,
-                "args": { "type": "array", "items": { "type": ["integer", "string"] }, "description": "The arguments in order, as the platform's calling convention passes them. A number, decimal or hex as 0x1f; `f32:1.5` or `f64:1.5` for a float, passed where the platform passes floats (the stack on x86-32, XMM registers on x86-64, d0 to d7 on AArch64); `hex:4142` for bytes put in memory and passed by their address; `str:text` for a string with its end; `buf:16` for 16 zero bytes. Buffers are shown as the function left them." },
-                "set": { "type": "array", "items": { "type": "string" }, "description": "Registers and memory to set after the arguments are placed: `RDX=5`, `XMM0=f64:2.5` or `ST0=f64:2.5` for a float, which an x87 register holds as an extended float, `0x20000000=hex:0011` for bytes at an address, or `EXTMEM:0x100=hex:09` for bytes in a memory of the processor other than the one the code is in (an 8051 has CODE, INTMEM, EXTMEM, SFR and BITS)." },
-                "read": { "type": "array", "items": { "type": "string" }, "description": "Registers to show after the run, besides the one that holds the result. An x87 register, ST0 to ST7, shows as the extended float it holds; `XMM0:f64` or `ST0:f32` shows a float of that size. A float function returns in ST0 on x86-32, in XMM0 on x86-64 and in d0 on AArch64." },
-                "dump": { "type": "array", "items": { "type": "string" }, "description": "Memory to show after the run, as ADDRESS:LENGTH or SPACE:ADDRESS:LENGTH, for what a returned pointer reaches." },
-                "bits": { "type": "integer", "minimum": 1, "description": "Width of the result in bits, for a function that returns fewer than its register holds (32 for an int)." },
-                "steps": { "type": "integer", "minimum": 1, "description": "Most instructions to run (default 10,000,000)." },
-                "snapshot": { "type": "string", "description": "A directory holding the memory of a live process, which the run starts from where it holds any: a `snapshot.tsv` of `region START END PERMISSIONS NAME` rows, each region's bytes in `START.bin` with START spelled as the row spells it, and `teb ADDRESS` rows for the threads of a Windows process, the first of which the run is on unless `set` gives FS_OFFSET. `set` and `args` apply on top, and the run keeps its own stack." },
-                "before": { "type": "array", "items": { "type": "string" }, "description": "Functions to run first, in order and with no arguments, as setup: their writes are not listed and their instructions not counted. For a C runtime whose startup has not run, such as MSVC's `_mtinit`, which sets up the locks and the thread data its string functions need." },
-                "writes": { "type": "string", "description": "A file to write every range of memory the run wrote to, one per line as ADDRESS HEX, where the answer shows the first 16 cut at 64 bytes. For comparing two whole runs." },
-                "entered": { "type": "string", "description": "A file to write the entry of every function the run entered to, one per line, in order of address." },
-                "timeout": { "type": "number", "description": "Seconds the run may take before it stops, whatever `steps` allows (default 30)." },
-                "skip": { "type": "array", "items": { "type": "string" }, "description": "Functions that return as soon as they are entered, as FUNCTION:BYTES with the bytes of arguments each takes off the stack, 0 unless it is stdcall: `0x401230:8`. The result register keeps what it held. For a function the run cannot or need not go through, such as one that draws." },
-                "ticks": { "type": "integer", "minimum": 0, "description": "What `GetTickCount` returns, every time it is called, so that a run that reads the clock can be compared with another. Without it a call to GetTickCount stops the run." },
-                "coverage": { "type": "boolean", "description": "Run nothing, and list what a run would stop on: the instructions it cannot run and the calls to imports with no stand-in, in `function` and every function it calls, or in the whole binary without `function`. A path that never reaches them still runs; calls through pointers are not followed, and `skip`, `ticks` and `args` are not read. x86 and x86-64 only." },
-            }),
-            &[],
+            emulate::run,
         ),
-        tool(
-            "symbols",
-            "Every address that has a name: functions, import slots, vtables, exported data, and the names given with `rename`.",
-            json!({ "pattern": pattern("name"), "limit": limit }),
-            &[],
-        ),
+        on_binary("symbols", "Every address that has a name: functions, import slots, vtables, exported data, and the names given with `rename`.", edit::symbols),
+        // Two binaries at once, so it takes the cache rather than one binary.
         tool(
             "diff",
             "Compares two builds of one program, such as before and after a patch: which functions changed, which are new and which are gone. Functions are paired by name, by code and by their place among callers and callees, so it works on stripped binaries. With `function`, compares the decompiled C of that one function in the two builds, line by line. `path` is the earlier build.",
-            json!({
-                "to": { "type": "string", "description": "Path of the later build." },
-                "function": { "type": "string", "description": "A function, by its name or address in either build. Shows the lines of its C that the later build dropped and added." },
-                "limit": limit,
-                "timeout": timeout,
-            }),
-            &["to"],
+            diff,
         ),
-        tool(
+        on_binary(
             "rename",
             "Names a function (at its entry address), a data address, with `var` a variable inside a function, or a struct or one of its fields. The name is saved for this binary and used everywhere from then on, the decompiler's C included. An empty name removes it. Give `addr` and `name`, or several in `names`. A struct the decompiler recovered, such as `S_401a20_RDI`, is kept under the name given, with the structs it points to, and callers that pass the pointer on show it too. Giving a second struct a name already taken says the two are one type: their fields merge, or the rename is refused with the offsets that clash. `S_401a20_RDI.field_0x10` names a field.",
-            json!({
-                "addr": addr("A function entry or a data address; with `var`, the function, by address or name. Or a struct, `Struct.field` for one of its fields"),
-                "var": { "type": "string", "description": "A parameter or local variable of the function, as `decompile` spells it now: `param_1`, `local_18`, `uVar3`." },
-                "name": { "type": "string", "description": "The new name; empty to remove." },
-                "names": { "type": "array", "items": { "type": "object", "properties": { "addr": { "type": "string" }, "var": { "type": "string" }, "name": { "type": "string" } }, "required": ["addr", "name"] }, "description": "Several renames at once." },
-            }),
-            &[],
+            edit::rename,
         ),
-        tool(
-            "comment",
-            "Attaches a note to an address, saved for this binary and shown by `function`, `disassemble` and `decompile`. Empty text removes it.",
-            json!({ "addr": addr("Any address in the image"), "text": { "type": "string", "description": "The note; empty to remove." } }),
-            &["addr", "text"],
-        ),
-        tool(
+        on_binary("comment", "Attaches a note to an address, saved for this binary and shown by `function`, `disassemble` and `decompile`. Empty text removes it.", edit::comment),
+        on_binary(
             "declare",
             "Tells the decompiler about data types, saved for this binary. `code` takes C: `struct`, `union`, `enum` and `typedef` declarations, and `extern` prototypes that set the parameters and return type of a named function, such as `extern int parse(Request *req, char *text);`. A calling convention goes before the return type: `extern __stdcall int f(void);`. `addr` with `type` says what the data at an address is, such as `Config` or `char *`. Sizes are spelled int1, int2, int4, int8, uint1 to uint8, float4, float8; char and void also work.",
-            json!({
-                "code": { "type": "string", "description": "One or more C declarations." },
-                "addr": addr("A data address"),
-                "type": { "type": "string", "description": "A type name the decompiler knows; empty to remove." },
-            }),
-            &[],
+            edit::declare,
         ),
-        tool(
+        on_binary(
             "type",
             "The layout of a data type: size, alignment, and each field of a struct or union with its offset, or the values of an enum. A struct kept with `rename` also lists the functions passed a pointer to it. Without `name`, lists what `declare` and `rename` have recorded.",
-            json!({ "name": { "type": "string", "description": "A type name: declared, built in, a struct the decompiler recovered such as `S_401a20_RDI`, or one kept with `rename`." } }),
-            &[],
+            edit::type_,
         ),
-    ])
+    ]
+});
+
+pub fn list() -> Value {
+    TOOLS.iter().map(Tool::schema).collect()
+}
+
+/// The schema of the tool `name`, as `list` gives it.
+pub fn described(name: &str) -> Option<Value> {
+    TOOLS.iter().find(|tool| tool.name == name).map(Tool::schema)
 }
 
 /// Runs the tool `name`, or says `None` if there is no such tool. An `Err` is a message for the
 /// caller of the tool.
 pub fn call(cache: &mut Cache, name: &str, arguments: Value) -> Option<Result<String>> {
-    fn run<T: DeserializeOwned>(cache: &mut Cache, name: &str, arguments: Value, tool: fn(&mut Binary, T) -> Result<String>) -> Result<String> {
-        let path: PathBuf = arguments.get("path").and_then(Value::as_str).with_context(|| format!("`{name}` needs `path`, the binary to analyze"))?.into();
-        let arguments = serde_json::from_value(arguments).map_err(|error| anyhow!("invalid arguments for `{name}`: {error}"))?;
-        tool(cache.get(&path)?, arguments)
-    }
-    Some(match name {
-        "summary" => run(cache, name, arguments, summary),
-        "strings" => run(cache, name, arguments, strings),
-        "imports" => run(cache, name, arguments, imports),
-        "functions" => run(cache, name, arguments, functions),
-        "function" => run(cache, name, arguments, function),
-        "xrefs" => run(cache, name, arguments, xrefs),
-        "decompile" => run(cache, name, arguments, decompile),
-        "bytes" => run(cache, name, arguments, bytes),
-        "unnamed" => run(cache, name, arguments, unnamed),
-        "classes" => run(cache, name, arguments, classes),
-        "addr" => run(cache, name, arguments, addr),
-        "disassemble" => run(cache, name, arguments, code::disassemble),
-        "pcode" => run(cache, name, arguments, code::pcode),
-        "trace" => run(cache, name, arguments, code::trace),
-        "run" => run(cache, name, arguments, emulate::run),
-        "symbols" => run(cache, name, arguments, edit::symbols),
-        "diff" => diff(cache, arguments),
-        "rename" => run(cache, name, arguments, edit::rename),
-        "comment" => run(cache, name, arguments, edit::comment),
-        "declare" => run(cache, name, arguments, edit::declare),
-        "type" => run(cache, name, arguments, edit::type_),
-        "structs" => run(cache, name, arguments, structs),
-        _ => return None,
-    })
+    let tool = TOOLS.iter().find(|tool| tool.name == name)?;
+    Some((tool.run)(cache, arguments))
 }
 
-#[derive(Deserialize)]
-struct Diff {
-    path: PathBuf,
-    to: PathBuf,
-    function: Option<String>,
-    limit: Option<usize>,
-    timeout: Option<f64>,
+options! {
+    struct Diff {
+        to: PathBuf = json!({ "type": "string", "description": "Path of the later build." }),
+        function: Option<String> = json!({ "type": "string", "description": "A function, by its name or address in either build. Shows the lines of its C that the later build dropped and added." }),
+        limit: Option<usize> = schema::limit(),
+        timeout: Option<f64> = schema::timeout(),
+    }
 }
 
 /// The lines of a function's C with what differs between two builds for no reason of the
@@ -413,9 +427,8 @@ fn diff_function(old: &mut Binary, new: &mut Binary, function: &str, timeout: Du
 }
 
 /// What changed between the build at `path` and the one at `to`.
-fn diff(cache: &mut Cache, arguments: Value) -> Result<String> {
-    let args: Diff = serde_json::from_value(arguments).map_err(|error| anyhow!("invalid arguments for `diff`: {error}"))?;
-    let (old, new) = cache.pair(&args.path, &args.to)?;
+fn diff(cache: &mut Cache, path: PathBuf, args: Diff) -> Result<String> {
+    let (old, new) = cache.pair(&path, &args.to)?;
     ensure!(old.program.image.machine == new.program.image.machine, "the two are built for different processors, which leaves no code in common");
     if let Some(function) = &args.function {
         let timeout = Duration::try_from_secs_f64(args.timeout.unwrap_or(30.0)).map_err(|_| anyhow!("`timeout` must be a positive number of seconds"))?;
@@ -750,10 +763,11 @@ fn pointer_table(binary: &Binary, addr: u64, longest: usize, numbers: usize) -> 
     slots
 }
 
-#[derive(Deserialize)]
-struct Unnamed {
-    space: Option<String>,
-    limit: Option<usize>,
+options! {
+    struct Unnamed {
+        space: Option<String> = json!({ "type": "string", "description": "Only the addresses in this memory of an 8051: `sfr`, `xdata` or `idata`." }),
+        limit: Option<usize> = schema::limit(),
+    }
 }
 
 fn unnamed(binary: &mut Binary, args: Unnamed) -> Result<String> {
@@ -782,8 +796,9 @@ fn unnamed(binary: &mut Binary, args: Unnamed) -> Result<String> {
     Ok(out)
 }
 
-#[derive(Deserialize)]
-struct Summary {}
+options! {
+    struct Summary {}
+}
 
 fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
     let Program { image, analysis, .. } = &binary.program;
@@ -843,12 +858,13 @@ fn summary(binary: &mut Binary, _: Summary) -> Result<String> {
     Ok(out)
 }
 
-#[derive(Deserialize)]
-struct Strings {
-    pattern: Option<String>,
-    limit: Option<usize>,
-    #[serde(default)]
-    full: bool,
+options! {
+    struct Strings {
+        pattern: Option<String> = schema::pattern("text"),
+        limit: Option<usize> = schema::limit(),
+        #[serde(default)]
+        full: bool = json!({ "type": "boolean", "description": "Print long strings whole. They are cut to 200 characters otherwise." }),
+    }
 }
 
 fn strings(binary: &mut Binary, args: Strings) -> Result<String> {
@@ -866,9 +882,10 @@ fn strings(binary: &mut Binary, args: Strings) -> Result<String> {
     Ok(out)
 }
 
-#[derive(Deserialize)]
-struct Imports {
-    pattern: Option<String>,
+options! {
+    struct Imports {
+        pattern: Option<String> = schema::pattern("import name"),
+    }
 }
 
 fn imports(binary: &mut Binary, args: Imports) -> Result<String> {
@@ -891,12 +908,13 @@ enum Sort {
     Size,
 }
 
-#[derive(Deserialize)]
-struct Functions {
-    pattern: Option<String>,
-    limit: Option<usize>,
-    #[serde(default)]
-    sort: Sort,
+options! {
+    struct Functions {
+        pattern: Option<String> = schema::pattern("function name"),
+        limit: Option<usize> = schema::limit(),
+        #[serde(default)]
+        sort: Sort = json!({ "type": "string", "enum": ["address", "size"], "description": "Ascending address (default) or largest first." }),
+    }
 }
 
 fn functions(binary: &mut Binary, args: Functions) -> Result<String> {
@@ -919,10 +937,11 @@ fn functions(binary: &mut Binary, args: Functions) -> Result<String> {
     Ok(out)
 }
 
-#[derive(Deserialize)]
-struct Function {
-    addr: Option<String>,
-    name: Option<String>,
+options! {
+    struct Function {
+        addr: Option<String> = schema::addr("Any address inside the function"),
+        name: Option<String> = json!({ "type": "string", "description": "The function's name, or a part of it that only one function has." }),
+    }
 }
 
 fn function(binary: &mut Binary, args: Function) -> Result<String> {
@@ -1008,12 +1027,13 @@ fn function(binary: &mut Binary, args: Function) -> Result<String> {
     Ok(out)
 }
 
-#[derive(Deserialize)]
-struct Xrefs {
-    addr: Option<String>,
-    offset: Option<String>,
-    function: Option<String>,
-    limit: Option<usize>,
+options! {
+    struct Xrefs {
+        addr: Option<String> = schema::addr("The function entry or data address"),
+        offset: Option<String> = schema::addr("Instead of `addr`: the offset of a field in a structure. Lists the functions that read or write memory at that offset from a register, which is how to find who sets or uses a field"),
+        function: Option<String> = json!({ "type": "string", "description": "With `offset`, look in this function only." }),
+        limit: Option<usize> = schema::limit(),
+    }
 }
 
 /// The instructions that reach memory at `offset` from a register, by function: where code
@@ -1096,14 +1116,15 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
     Ok(out)
 }
 
-#[derive(Deserialize)]
-struct Decompile {
-    #[serde(default)]
-    functions: Vec<String>,
-    #[serde(default)]
-    addresses: bool,
-    around: Option<String>,
-    timeout: Option<f64>,
+options! {
+    struct Decompile {
+        #[serde(default)]
+        functions: Vec<String> = json!({ "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Hex addresses (anywhere inside a function) or function names. From a shell, several separated by spaces or commas." }),
+        #[serde(default)]
+        addresses: bool = json!({ "type": "boolean", "description": "Print before each line of C the address of the instruction it came from, to match a line with what `xrefs`, `disassemble` and `comment` say about an address." }),
+        around: Option<String> = schema::addr("Show only the lines of C that came from the instructions near this address, with their addresses. The function it is in need not be given"),
+        timeout: Option<f64> = json!({ "type": "number", "description": "Seconds each function may take (default 30)." }),
+    }
 }
 
 /// The lines of C printed with addresses that are nearest the instruction at `addr`: the line
@@ -1126,12 +1147,13 @@ fn around(c_text: &str, addr: u64) -> String {
     out + &format!("\n  ...{}", cut(end - start, lines.len(), "lines ", "`decompile` without `around` shows all"))
 }
 
-#[derive(Deserialize)]
-struct Structs {
-    function: String,
-    #[serde(default)]
-    refused: bool,
-    timeout: Option<f64>,
+options! {
+    struct Structs {
+        function: String = schema::function(),
+        #[serde(default)]
+        refused: bool = json!({ "type": "boolean", "description": "Also list the pointers that got no struct, with the reason." }),
+        timeout: Option<f64> = schema::timeout(),
+    }
 }
 
 fn structs(binary: &mut Binary, args: Structs) -> Result<String> {
@@ -1239,10 +1261,11 @@ fn decompile(binary: &mut Binary, args: Decompile) -> Result<String> {
     Ok(out)
 }
 
-#[derive(Deserialize)]
-struct Bytes {
-    addr: String,
-    len: Option<usize>,
+options! {
+    struct Bytes {
+        addr: String = schema::addr("Address of the first byte"),
+        len: Option<usize> = json!({ "type": "integer", "minimum": 1, "maximum": MAX_BYTES, "description": "Number of bytes (default 256)." }),
+    }
 }
 
 fn bytes(binary: &mut Binary, args: Bytes) -> Result<String> {
@@ -1270,10 +1293,11 @@ fn bytes(binary: &mut Binary, args: Bytes) -> Result<String> {
     Ok(out)
 }
 
-#[derive(Deserialize)]
-struct Addr {
-    addr: Option<String>,
-    offset: Option<String>,
+options! {
+    struct Addr {
+        addr: Option<String> = schema::addr("Address in the image"),
+        offset: Option<String> = schema::addr("Offset in the file"),
+    }
 }
 
 fn addr(binary: &mut Binary, args: Addr) -> Result<String> {
@@ -1308,9 +1332,10 @@ fn addr(binary: &mut Binary, args: Addr) -> Result<String> {
     Ok(format!("address {addr:#x}, {stored}, in {}: {}\n", section.name, describe(binary, addr)))
 }
 
-#[derive(Deserialize)]
-struct Classes {
-    pattern: Option<String>,
+options! {
+    struct Classes {
+        pattern: Option<String> = schema::pattern("class name"),
+    }
 }
 
 fn classes(binary: &mut Binary, args: Classes) -> Result<String> {
@@ -1349,6 +1374,49 @@ fn classes(binary: &mut Binary, args: Classes) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A value of the type `schema` gives.
+    fn sample(schema: &Value) -> Value {
+        if let Some(first) = schema["enum"].get(0) {
+            return first.clone();
+        }
+        // `run`'s `args` are integers or strings.
+        match schema["type"].as_str().or_else(|| schema["type"][0].as_str()) {
+            Some("boolean") => json!(true),
+            Some("integer" | "number") => json!(1),
+            Some("array") => json!([sample(&schema["items"])]),
+            Some("object") => schema["properties"].as_object().unwrap().iter().map(|(name, property)| (name.clone(), sample(property))).collect(),
+            _ => json!("1"),
+        }
+    }
+
+    /// Each tool takes every option it lists, and needs no more than it lists as required: the
+    /// call gets as far as reading the binary, which is not there.
+    #[test]
+    fn every_tool_takes_the_options_it_lists() {
+        let mut cache = Cache::new(false);
+        for described in list().as_array().unwrap() {
+            let name = described["name"].as_str().unwrap();
+            let schema = &described["inputSchema"];
+            let required = schema["required"].as_array().unwrap();
+            let all: Map<String, Value> = schema["properties"].as_object().unwrap().iter().map(|(option, property)| (option.clone(), sample(property))).collect();
+            let needed: Map<String, Value> = all.clone().into_iter().filter(|(option, _)| required.contains(&json!(option))).collect();
+            for mut arguments in [all, needed] {
+                arguments.insert("path".into(), json!("/nonexistent/binary"));
+                let error = call(&mut cache, name, Value::Object(arguments)).unwrap().unwrap_err();
+                assert!(error.to_string().starts_with("cannot read /nonexistent/binary"), "{name}: {error:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_option_a_tool_does_not_take_is_refused() {
+        let mut cache = Cache::new(false);
+        let error = call(&mut cache, "functions", json!({ "path": "/nonexistent/binary", "limt": 2, "patern": "zzz" })).unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "`functions` has no option `limt` (did you mean `limit`?), `patern` (did you mean `pattern`?). Its options: `limit`, `path`, `pattern`, `sort`.");
+        let error = call(&mut cache, "diff", json!({ "path": "/nonexistent/binary", "to": "/nonexistent/other", "context": 3 })).unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "`diff` has no option `context`. Its options: `function`, `limit`, `path`, `timeout`, `to`.");
+    }
 
     /// A recovered struct is named after the function it was recovered in. In a later build
     /// where that function moved, the line that names it is the same line.

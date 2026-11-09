@@ -7,13 +7,6 @@ use serde_json::{Map, Value, json};
 use crate::binary::Cache;
 use crate::tools;
 
-/// Options whose value is a number. Everything else, addresses included, stays text.
-const NUMERIC: [&str; 10] = ["limit", "len", "timeout", "count", "param", "arg", "depth", "bits", "steps", "ticks"];
-/// Options that may be given again and again, and reach the tool as a list.
-const REPEATED: [&str; 6] = ["args", "set", "read", "dump", "before", "skip"];
-/// Options that are on or off.
-const FLAGS: [&str; 6] = ["pcode", "returns", "full", "addresses", "refused", "coverage"];
-
 pub fn usage() -> String {
     let mut text = String::from(
         "recore-mcp                               serve the Model Context Protocol on stdin and stdout\n\
@@ -32,8 +25,10 @@ pub fn usage() -> String {
 }
 
 /// Turns shell arguments into the tool's arguments: `--key value` pairs as they are, and plain
-/// arguments under the name the tool's main argument has.
-fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
+/// arguments under the name the tool's main argument has. The schema of each option says how
+/// its value is read: a boolean is a flag that takes none, a number is parsed, and an array may be
+/// given again and again. Everything else, addresses included, stays text.
+fn arguments(tool: &str, properties: &Map<String, Value>, binary: &str, rest: &[String]) -> Result<Value> {
     let mut named = Map::from_iter([("path".to_string(), json!(binary))]);
     let mut plain = Vec::new();
     let mut rest = rest.iter();
@@ -42,7 +37,11 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
             plain.push(argument.as_str());
             continue;
         };
-        if FLAGS.contains(&key) {
+        // `path` is the binary, which comes first and plain.
+        let Some(kind) = properties.get(key).filter(|_| key != "path").map(|property| &property["type"]) else {
+            return Err(tools::unknown_options(tool, &[key], properties.keys().map(String::as_str).filter(|name| *name != "path"), "--"));
+        };
+        if kind == "boolean" {
             named.insert(key.to_string(), json!(true));
             continue;
         }
@@ -54,8 +53,8 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
         // A count in decimal or in hex with `0x`, or seconds with a fraction.
         let hex = || value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).and_then(|digits| u64::from_str_radix(digits, 16).ok()).map(Value::from);
         let number = || hex().map(Ok).unwrap_or_else(|| value.parse::<u64>().map(Value::from).or_else(|_| value.parse::<f64>().map(Value::from)));
-        let value = if NUMERIC.contains(&key) { number().with_context(|| format!("--{key} takes a number, in decimal or with 0x in hex, not `{value}`"))? } else { json!(value) };
-        if REPEATED.contains(&key) {
+        let value = if kind == "integer" || kind == "number" { number().with_context(|| format!("--{key} takes a number, in decimal or with 0x in hex, not `{value}`"))? } else { json!(value) };
+        if kind == "array" {
             named.entry(key).or_insert_with(|| json!([])).as_array_mut().expect("a list").push(value);
         } else {
             named.insert(key.to_string(), value);
@@ -112,24 +111,42 @@ fn arguments(tool: &str, binary: &str, rest: &[String]) -> Result<Value> {
 }
 
 /// What one tool takes, for `recore-mcp <tool> --help`.
-fn tool_usage(tool: &str) -> Option<String> {
-    let tools = tools::list();
-    let described = tools.as_array()?.iter().find(|described| described["name"] == tool)?;
-    let mut text = format!("recore-mcp {tool} <binary> [arguments]\n\n{}\n\n<binary>\n    The file to analyze, called `path` above.\n", described["description"].as_str()?);
-    for (name, property) in described["inputSchema"]["properties"].as_object()?.iter().filter(|(name, _)| *name != "path") {
+fn tool_usage(tool: &str, described: &Value, properties: &Map<String, Value>) -> String {
+    let mut text = format!("recore-mcp {tool} <binary> [arguments]\n\n{}\n\n<binary>\n    The file to analyze, called `path` above.\n", described["description"].as_str().unwrap_or_default());
+    for (name, property) in properties.iter().filter(|(name, _)| *name != "path") {
         text += &format!("--{name}\n    {}\n", property["description"].as_str().unwrap_or_default());
     }
-    Some(text)
+    text
 }
 
 /// Runs one tool and returns what it answers.
 pub fn run(tool: &str, binary: &str, rest: &[String]) -> Result<String> {
+    let Some(described) = tools::described(tool) else { bail!("there is no tool `{tool}`\n\n{}", usage()) };
+    let properties = described["inputSchema"]["properties"].as_object().context("the tool's schema has no properties")?;
     if binary == "--help" || rest.iter().any(|argument| argument == "--help") {
-        return tool_usage(tool).ok_or_else(|| anyhow::anyhow!("there is no tool `{tool}`\n\n{}", usage()));
+        return Ok(tool_usage(tool, &described, properties));
     }
-    let arguments = arguments(tool, binary, rest)?;
-    match tools::call(&mut Cache::new(tool == "decompile"), tool, arguments) {
-        Some(answer) => answer,
-        None => bail!("there is no tool `{tool}`\n\n{}", usage()),
+    let arguments = arguments(tool, properties, binary, rest)?;
+    tools::call(&mut Cache::new(tool == "decompile"), tool, arguments).with_context(|| format!("there is no tool `{tool}`"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_option_is_refused_from_a_shell() {
+        let error = run("functions", "/nonexistent/binary", &["--limt".into(), "2".into()]).unwrap_err();
+        assert_eq!(error.to_string(), "`functions` has no option `--limt` (did you mean `--limit`?). Its options: `--limit`, `--pattern`, `--sort`.");
+    }
+
+    /// The schema says how each option's value is read: a flag, a number, or a list.
+    #[test]
+    fn options_are_read_as_their_schema_says() {
+        let tools = tools::list();
+        let run = tools.as_array().unwrap().iter().find(|tool| tool["name"] == "run").unwrap();
+        let given = ["f", "1", "--steps", "0x10", "--set", "A=1", "--set", "B=2", "--coverage", "--snapshot", "12"].map(String::from);
+        let read = arguments("run", run["inputSchema"]["properties"].as_object().unwrap(), "bin", &given).unwrap();
+        assert_eq!(read, json!({ "path": "bin", "function": "f", "args": ["1"], "steps": 16, "set": ["A=1", "B=2"], "coverage": true, "snapshot": "12" }));
     }
 }
