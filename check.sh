@@ -8,7 +8,8 @@
 # the binaries it moved in. It fails when a total got worse.
 #
 # Where a corpus has DWARF, the decompiler's signatures are scored too: a fixed sample of each
-# binary's functions, each one's parameter count and whether it returns a value, held against the
+# binary's functions, each one's parameter count, whether it returns a value, and what its
+# parameters and its return are (a number, a float or a pointer, and its size), held against the
 # base's decompiler on the same functions with `recore-decompile params --against`.
 #
 # Last, `recore-bench ratchet` counts the instructions of what an agent waits for on the
@@ -66,7 +67,7 @@ signatures() {
   # A report left from an earlier run would pass for this one's.
   rm -rf "$out/signatures"
   ./target/release/recore-decompile corpus "$in/bin" "$out/signatures" "${sample[@]}" >"$out/signatures.log" 2>&1
-  ./target/release/recore-decompile params "$out/signatures" "$in/debug" | sed -n '1p;3p'
+  ./target/release/recore-decompile params "$out/signatures" "$in/debug" | sed -n '1p;3,5p'
   if [ -n "$against" ] && [[ "$("$base-decompile" corpus --help)" != *--sample* ]]; then
     echo "$out/signatures: the base's decompiler takes no --sample, so nothing to compare with"
   elif [ -n "$against" ]; then
@@ -114,7 +115,8 @@ for in in "$corpora"/*/; do
     done
   fi
   # The decompiler's signatures against the debug files: the parameter count of every so many
-  # functions of each binary, and whether it returns a value. corpus-large holds the largest
+  # functions of each binary, whether it returns a value, and what each parameter and the
+  # return are. corpus-large holds the largest
   # programs for timing, whose setup alone takes longer than every other corpus's sample.
   if compgen -G "$in/debug/*.debug" >/dev/null && [ "$corpus" != corpus-large ]; then
     signatures "$in"

@@ -271,6 +271,42 @@ pub enum Style {
     ParamId,
 }
 
+/// What a value is, whatever its type is called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// The decompiler gave it no type but its size, as `undefined8`.
+    Unknown,
+    /// An integer of either sign, a boolean, a character or an enum.
+    Int,
+    Float,
+    Pointer,
+    /// A struct, a union or an array by value.
+    Aggregate,
+}
+
+impl Kind {
+    /// The kind the shim numbers `raw`: its `RD_KIND_*`.
+    fn from_raw(raw: u32) -> Kind {
+        match raw {
+            1 => Kind::Int,
+            2 => Kind::Float,
+            3 => Kind::Pointer,
+            4 => Kind::Aggregate,
+            _ => Kind::Unknown,
+        }
+    }
+}
+
+/// A parameter or a returned value as the machine code holds it: what it is, and its size in
+/// bytes. Two types of one shape read the same to someone following the code, `long` and
+/// `ssize_t`, and two of different shapes do not, `long` and `char *`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Shape {
+    pub kind: Kind,
+    pub size: u32,
+}
+
 /// One parameter of a recovered prototype.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
@@ -279,7 +315,9 @@ pub struct Param {
     /// Register name (`RDI`, `XMM0_Qa`) or `stack:0x8`.
     pub storage: String,
     pub size: u32,
+    pub kind: Kind,
 }
+
 
 /// An indirect jump and the table of addresses the decompiler used for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,6 +344,8 @@ pub struct Decompiled {
     pub c_text: String,
     pub params: Vec<Param>,
     pub return_type: String,
+    /// What it returns, which says nothing where `returns_value` is false.
+    pub return_shape: Shape,
     pub returns_value: bool,
     /// Control flow ran into bytes that do not decode, usually a missed non-returning call.
     pub bad_data: bool,
@@ -989,7 +1029,7 @@ impl Session {
             let text = |ptr| CStr::from_ptr(ptr).to_string_lossy().into_owned();
             let params = slice(out.params, out.param_count)
                 .iter()
-                .map(|p| Param { type_name: text(p.type_name), storage: text(p.storage), size: p.size })
+                .map(|p| Param { type_name: text(p.type_name), storage: text(p.storage), size: p.size, kind: Kind::from_raw(p.kind) })
                 .collect();
             let mut targets = slice(out.jump_targets, slice(out.jump_counts, out.jump_table_count).iter().sum());
             let jump_tables = slice(out.jump_addrs, out.jump_table_count)
@@ -1009,6 +1049,7 @@ impl Session {
                 c_text: text(out.c_text),
                 params,
                 return_type: text(out.return_type),
+                return_shape: Shape { kind: Kind::from_raw(out.return_kind), size: out.return_size },
                 returns_value: out.flags & ffi::RD_RETURNS_VALUE != 0,
                 bad_data: out.flags & ffi::RD_BAD_DATA != 0,
                 unimplemented: out.flags & ffi::RD_UNIMPLEMENTED != 0,
