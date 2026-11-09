@@ -25,6 +25,14 @@ pub struct RdParam {
     pub kind: u32,
 }
 
+#[repr(C)]
+pub struct RdGlobal {
+    pub addr: u64,
+    pub size: u32,
+    /// One of the shim's `RD_KIND_*`.
+    pub kind: u32,
+}
+
 pub const RD_BAD_DATA: u32 = 4;
 pub const RD_UNIMPLEMENTED: u32 = 8;
 pub const RD_RETURNS_VALUE: u32 = 16;
@@ -44,6 +52,8 @@ pub struct RdDecompiled {
     pub locals: *const c_char,
     pub return_kind: u32,
     pub return_size: u32,
+    pub globals: *const RdGlobal,
+    pub global_count: usize,
 }
 
 /// One object of [`RdEvidence`]: the lowest and highest offset a member points to, and flags

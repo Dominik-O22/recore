@@ -50,6 +50,14 @@ struct RdParam {
   uint32_t kind;
 };
 
+// Memory outside the stack that a function reads or writes as a variable: where it is, and
+// what the function takes it for.
+struct RdGlobal {
+  uint64_t addr;
+  uint32_t size;
+  uint32_t kind;
+};
+
 // Bits of RdDecompiled::flags.
 const uint32_t RD_BAD_DATA = 4;        // flow ran into bytes that do not decode
 const uint32_t RD_UNIMPLEMENTED = 8;  // flow hit an instruction without p-code semantics
@@ -75,6 +83,8 @@ struct RdDecompiled {
   // What the function returns, and its size in bytes.
   uint32_t return_kind;
   uint32_t return_size;
+  const RdGlobal *globals;
+  size_t global_count;
 };
 
 // What struct recovery hands to recore and gets back: see `recover_structs`, and
@@ -610,6 +620,7 @@ struct RdSession {
   string c_text, return_type, flow, locals, text;
   vector<string> strings;
   vector<RdParam> params;
+  vector<RdGlobal> globals;
   vector<uint64_t> jump_addrs, jump_targets;
   vector<size_t> jump_counts;
 
@@ -1233,6 +1244,30 @@ static uint32_t kind_of(const Datatype *type) {
     default:
       return RD_KIND_UNKNOWN;
   }
+}
+
+// The globals `fd` reads or writes, by address, each as its widest use types it. One whose
+// address the function only takes is not among them: nothing there says what it holds.
+static vector<RdGlobal> globals_of(const RdSession *session, const Funcdata *fd) {
+  map<uint64_t, RdGlobal> found;
+  AddrSpace *data = session->arch->getDefaultDataSpace();
+  for (VarnodeLocSet::const_iterator it = fd->beginLoc(); it != fd->endLoc(); ++it) {
+    const Varnode *vn = *it;
+    if (!vn->isPersist() || vn->isAnnotation() || vn->getSpace() != data) continue;
+    const Datatype *type;
+    try {
+      type = vn->getHigh()->getType();
+    } catch (const LowlevelError &) {
+      continue;
+    }
+    uint64_t addr = session->offset(vn->getAddr());
+    auto at = found.find(addr);
+    if (at == found.end() || at->second.size < (uint32_t)vn->getSize())
+      found[addr] = {addr, (uint32_t)vn->getSize(), kind_of(type)};
+  }
+  vector<RdGlobal> out;
+  for (const pair<const uint64_t, RdGlobal> &global : found) out.push_back(global.second);
+  return out;
 }
 
 // The decompiler's name for an operation. The four that only exist after analysis share their
@@ -2843,6 +2878,9 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
         session->jump_targets.push_back(table->getAddressByIndex(j).getOffset());
     }
 
+    session->globals = globals_of(session, fd);
+    out->globals = session->globals.data();
+    out->global_count = session->globals.size();
     out->c_text = session->c_text.c_str();
     out->return_type = session->return_type.c_str();
     out->return_kind = kind_of(proto.getOutputType());

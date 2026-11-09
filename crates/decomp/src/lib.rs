@@ -346,6 +346,9 @@ pub struct Decompiled {
     pub return_type: String,
     /// What it returns, which says nothing where `returns_value` is false.
     pub return_shape: Shape,
+    /// The globals it reads or writes, by address, and what it takes each for. One whose
+    /// address it only takes is not among them.
+    pub globals: Vec<(u64, Shape)>,
     pub returns_value: bool,
     /// Control flow ran into bytes that do not decode, usually a missed non-returning call.
     pub bad_data: bool,
@@ -1050,6 +1053,7 @@ impl Session {
                 params,
                 return_type: text(out.return_type),
                 return_shape: Shape { kind: Kind::from_raw(out.return_kind), size: out.return_size },
+                globals: slice(out.globals, out.global_count).iter().map(|g| (g.addr, Shape { kind: Kind::from_raw(g.kind), size: g.size })).collect(),
                 returns_value: out.flags & ffi::RD_RETURNS_VALUE != 0,
                 bad_data: out.flags & ffi::RD_BAD_DATA != 0,
                 unimplemented: out.flags & ffi::RD_UNIMPLEMENTED != 0,
