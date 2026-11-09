@@ -20,7 +20,8 @@ pub struct Config {
     pub shard: usize,
     pub worker: Options,
     /// Decompile only this many functions of each binary, the same each run: every so many of
-    /// those the debug file `<dir>/<name>.debug` lists. Binaries without one are left out.
+    /// those the debug file `<dir>/<name>.debug` lists. Binaries without one, or whose debug
+    /// file lists none, are left out.
     pub sample: Option<(usize, PathBuf)>,
 }
 
@@ -126,10 +127,14 @@ fn plan(path: &Path) -> Result<Binary> {
 /// `count` of them. They come from the debug file and not from the analysis, so that a change
 /// to the analysis does not change which functions are decompiled.
 fn sampled(path: &Path, count: usize, debug_dir: &Path) -> Result<Binary> {
-    let name = path.file_name().context("no file name")?.to_string_lossy().into_owned();
+    // A raw image goes by the name of its layout, as its debug file does.
+    let name = if recore::layout::is_layout(path) { path.file_stem() } else { path.file_name() };
+    let name = name.context("no file name")?.to_string_lossy().into_owned();
     let debug = debug_dir.join(format!("{name}.debug"));
     anyhow::ensure!(debug.exists(), "no debug file");
     let listed: Vec<u64> = recore_decomp::dwarf::DebugInfo::load(&debug)?.functions.into_keys().collect();
+    // An unstripped Mach-O original has symbols and no DWARF: nothing to sample or to score.
+    anyhow::ensure!(!listed.is_empty(), "its debug file lists no function");
     let taken = count.min(listed.len());
     let functions = (0..taken).map(|index| listed[index * listed.len() / taken]).collect();
     Ok(Binary { name, path: path.to_path_buf(), functions, fragments: 0, pending: 0, records: Vec::new(), c_text: Vec::new() })

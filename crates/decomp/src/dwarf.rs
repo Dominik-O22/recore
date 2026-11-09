@@ -537,6 +537,9 @@ impl<'a> Reader<'a> {
                     Some(gimli::AttributeValue::Encoding(gimli::DW_ATE_boolean)) => Base::Bool,
                     Some(gimli::AttributeValue::Encoding(gimli::DW_ATE_signed_char | gimli::DW_ATE_UTF | gimli::DW_ATE_ASCII)) => Base::Char,
                     Some(gimli::AttributeValue::Encoding(gimli::DW_ATE_signed)) => Base::Int,
+                    // Two floats side by side, which neither a float nor an integer of the
+                    // size is.
+                    Some(gimli::AttributeValue::Encoding(gimli::DW_ATE_complex_float)) => Base::Unknown,
                     _ => Base::Uint,
                 };
                 // A number of no size, as Rust's `()` is, holds nothing.

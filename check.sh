@@ -67,6 +67,13 @@ signatures() {
   # A report left from an earlier run would pass for this one's.
   rm -rf "$out/signatures"
   ./target/release/recore-decompile corpus "$in/bin" "$out/signatures" "${sample[@]}" >"$out/signatures.log" 2>&1
+  # A debug file without DWARF, as the unstripped original of a Mach-O binary is, lists no
+  # function to decompile. Only summary.json is written then, and 0 of 0 would read as a score.
+  local reports=("$out"/signatures/*.json)
+  if [ "${#reports[@]}" -le 1 ]; then
+    echo "$out/signatures: no debug file lists a function, so no signature is scored"
+    return
+  fi
   ./target/release/recore-decompile params "$out/signatures" "$in/debug" | sed -n '1p;3,6p'
   if [ -n "$against" ] && [[ "$("$base-decompile" corpus --help)" != *--sample* ]]; then
     echo "$out/signatures: the base's decompiler takes no --sample, so nothing to compare with"

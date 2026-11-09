@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use recore_decomp::Session;
-use recore_decomp::types::{self, Importer, Type};
+use recore_decomp::types::{self, Base, Importer, Type};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name)
@@ -131,4 +131,15 @@ fn dwarf_locates_each_parameter_where_the_function_is_entered() {
     let params: Vec<(&str, Option<recore_decomp::dwarf::Entry>)> = located.functions[&total].params.iter().map(|param| (param.name.as_str(), param.entry)).collect();
     use recore_decomp::dwarf::Entry::Register;
     assert_eq!(params, [("list", Some(Register(5))), ("scale", Some(Register(4)))]);
+}
+
+/// DWARF encodes `float _Complex` as a base type of its own. It is two floats in eight bytes,
+/// which no integer or float of that size describes.
+#[test]
+fn a_complex_number_is_bytes_and_no_integer() {
+    let path = fixture("complex.elf");
+    let debug = types::load(&path, &recore::Image::load(&path).unwrap()).expect("the fixture has debug information");
+    let twice = debug.functions.iter().find(|found| found.name == "twice").expect("the function is described");
+    let Type::Function(prototype) = debug.get(twice.prototype) else { panic!("twice has no prototype") };
+    assert_eq!(debug.get(prototype.params[0].1), &Type::Base { base: Base::Unknown, size: 8 });
 }
