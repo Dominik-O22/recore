@@ -44,16 +44,19 @@ fn cause(name: &str, difference: i64) -> &'static str {
 /// What the debug information says a value of type `id` is, as the machine code holds it. `None`
 /// for nothing at all, for bytes it gives no type, and for a struct or union by value: that
 /// arrives split among registers or on the stack as the ABI says, which the parameter count
-/// already scores.
-fn shape(types: &Types, mut id: TypeId) -> Option<Shape> {
+/// already scores. Also for a float wider than a double, which the engine sizes by the 10
+/// bytes x87 holds and DWARF by the 16 it is stored in, and for an array that is `returned`:
+/// C returns none, and the reader spells a pointer to a member function as one, two words wide.
+fn shape(types: &Types, mut id: TypeId, returned: bool) -> Option<Shape> {
     loop {
         let (kind, size) = match types.get(id) {
             Type::Typedef { target, .. } | Type::Alias(target) => {
                 id = *target;
                 continue;
             }
-            Type::Base { base: Base::Float, size } => (Kind::Float, *size),
-            Type::Base { base: Base::Unknown, .. } | Type::Void | Type::Composite { .. } => return None,
+            Type::Base { base: Base::Float, size } if *size <= 8 => (Kind::Float, *size),
+            Type::Base { base: Base::Float | Base::Unknown, .. } | Type::Void | Type::Composite { .. } => return None,
+            Type::Array { .. } if returned => return None,
             Type::Base { size, .. } | Type::Enum { size, .. } => (Kind::Int, *size),
             // An array parameter is a pointer to its first element, and a function one a
             // pointer to the function.
@@ -68,6 +71,33 @@ fn shape(types: &Types, mut id: TypeId) -> Option<Shape> {
 /// size. Calling a number a pointer, or a pointer a number, is what the score is after.
 fn comparable(found: Shape) -> Shape {
     Shape { kind: if found.kind == Kind::Unknown { Kind::Int } else { found.kind }, ..found }
+}
+
+/// What [`Typed::score`] counts.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+struct Shapes {
+    params: usize,
+    params_matched: usize,
+    returns: usize,
+    returns_matched: usize,
+    /// Of `params`, the pointers, and of `params_matched`. Typing every untyped value a pointer
+    /// would raise these two and `params_matched` with them, so `pointers_claimed` counts the
+    /// parameters the decompiler calls a pointer, right or wrong.
+    pointers: usize,
+    pointers_matched: usize,
+    pointers_claimed: usize,
+}
+
+impl std::ops::AddAssign for Shapes {
+    fn add_assign(&mut self, other: Shapes) {
+        self.params += other.params;
+        self.params_matched += other.params_matched;
+        self.returns += other.returns;
+        self.returns_matched += other.returns_matched;
+        self.pointers += other.pointers;
+        self.pointers_matched += other.pointers_matched;
+        self.pointers_claimed += other.pointers_claimed;
+    }
 }
 
 fn spelled(shape: Shape) -> String {
@@ -104,34 +134,40 @@ impl Typed {
             .functions
             .iter()
             .filter_map(|function| match types.get(function.prototype) {
-                Type::Function(prototype) if !prototype.variadic => Some((function.addr, (prototype.params.iter().map(|&(_, kind)| shape(&types, kind)).collect(), shape(&types, prototype.returns)))),
+                Type::Function(prototype) if !prototype.variadic => Some((function.addr, (prototype.params.iter().map(|&(_, kind)| shape(&types, kind, false)).collect(), shape(&types, prototype.returns, true)))),
                 _ => None,
             })
             .collect();
         Ok(Typed { functions })
     }
 
-    /// For the function `record` is of: how many of its parameters the debug information gives a
-    /// shape, how many of those the decompiler has a parameter of the same shape for, and the
-    /// same two for its return. Parameters pair off by shape and not by position, since the
-    /// decompiler lists the ones in integer registers before the ones in float registers
-    /// whatever order the source has them in. Nothing is counted for a function whose parameter
-    /// count is wrong, which that score already says, or that returns a value by only one account.
-    /// `misses` counts what was taken for what, as `a pointer of 8 as a number of 8`: a return,
-    /// and a parameter where the function has one miss, so that it is plain which was which.
-    fn score(&self, record: &FunctionRecord, misses: &mut BTreeMap<String, usize>) -> [usize; 4] {
-        let Some((params, returns)) = self.functions.get(&record.addr) else { return [0; 4] };
+    /// For the function `record` is of, its parameters the decompiler has a parameter of the
+    /// same shape for, and whether its return is of the right one. Parameters pair off by shape
+    /// and not by position, since the decompiler lists the ones in integer registers before the
+    /// ones in float registers whatever order the source has them in, so two it swapped still
+    /// count. Nothing is counted for parameters where the count is wrong, which that score
+    /// already says, or where the debug information gives one of them no shape: what the
+    /// decompiler made of that one could pair with another. Nor for a return that only one of
+    /// the two accounts has. `misses` counts what was taken for what, as `a pointer of 8 as a
+    /// number of 8`: a return, and a parameter where the function has one miss, so that it is
+    /// plain which was which.
+    fn score(&self, record: &FunctionRecord, misses: &mut BTreeMap<String, usize>) -> Shapes {
+        let mut counts = Shapes::default();
+        let Some((params, returns)) = self.functions.get(&record.addr) else { return counts };
         let mut miss = |what: &str, expected: Shape, found: Shape| *misses.entry(format!("{what}: {} as {}", spelled(expected), spelled(found))).or_default() += 1;
-        let mut counts = [0; 4];
-        if params.len() == record.shapes.len() {
+        if let Some(params) = params.iter().copied().collect::<Option<Vec<Shape>>>().filter(|params| params.len() == record.shapes.len()) {
             let mut found: Vec<Shape> = record.shapes.iter().copied().map(comparable).collect();
+            counts.pointers_claimed = found.iter().filter(|found| found.kind == Kind::Pointer).count();
             let mut missed = Vec::new();
-            for &expected in params.iter().flatten() {
-                counts[0] += 1;
+            for expected in params {
+                let pointer = usize::from(expected.kind == Kind::Pointer);
+                counts.params += 1;
+                counts.pointers += pointer;
                 match found.iter().position(|&found| found == expected) {
                     Some(at) => {
                         found.swap_remove(at);
-                        counts[1] += 1;
+                        counts.params_matched += 1;
+                        counts.pointers_matched += pointer;
                     }
                     None => missed.push(expected),
                 }
@@ -141,9 +177,9 @@ impl Typed {
             }
         }
         if let (Some(expected), Some(found)) = (*returns, record.return_shape.map(comparable)) {
-            counts[2] += 1;
+            counts.returns += 1;
             if found == expected {
-                counts[3] += 1;
+                counts.returns_matched += 1;
             } else {
                 miss("return", expected, found);
             }
@@ -165,9 +201,7 @@ struct Tally {
     /// decompiler agrees with. Variadic functions count here.
     returns_compared: usize,
     returns_matched: usize,
-    /// As [`Typed::score`] counts them: parameters compared and matched, returns compared and
-    /// matched.
-    types: [usize; 4],
+    types: Shapes,
     /// What was taken for what, as [`Typed::score`] words it.
     type_misses: BTreeMap<String, usize>,
     /// Variadic functions, which are left out of the comparison.
@@ -188,9 +222,7 @@ impl Tally {
         self.matched_c += other.matched_c;
         self.returns_compared += other.returns_compared;
         self.returns_matched += other.returns_matched;
-        for (count, other) in self.types.iter_mut().zip(other.types) {
-            *count += other;
-        }
+        self.types += other.types;
         for (miss, count) in &other.type_misses {
             *self.type_misses.entry(miss.clone()).or_default() += count;
         }
@@ -220,9 +252,7 @@ impl Tally {
 fn tally(report: &BinaryReport, debug: &DebugInfo, typed: &Typed) -> Tally {
     let mut tally = Tally::default();
     for record in report.functions.iter().filter(|record| record.status == Status::Ok) {
-        for (count, scored) in tally.types.iter_mut().zip(typed.score(record, &mut tally.type_misses)) {
-            *count += scored;
-        }
+        tally.types += typed.score(record, &mut tally.type_misses);
     }
     let results: BTreeMap<u64, (usize, bool)> = report.functions.iter().filter(|r| r.status == Status::Ok).map(|r| (r.addr, (r.params, r.returns_value))).collect();
     for (addr, expected) in &debug.functions {
@@ -321,9 +351,10 @@ pub fn compare(out_dir: &Path, debug_dir: &Path, jobs: usize, list: usize) -> Re
     total.print(&format!("{} binaries with debug info", tallies.len()));
     println!("of them in C units: {} of {} match ({:.1}%)", total.matched_c, total.compared_c, 100.0 * total.matched_c as f64 / total.compared_c.max(1) as f64);
     println!("returns a value or not: {} of {} match ({:.1}%)", total.returns_matched, total.returns_compared, 100.0 * total.returns_matched as f64 / total.returns_compared.max(1) as f64);
-    let [params, params_matched, returns, returns_matched] = total.types;
+    let Shapes { params, params_matched, returns, returns_matched, pointers, pointers_matched, pointers_claimed } = total.types;
     println!("parameter types, a number, a float or a pointer of the size: {params_matched} of {params} match ({:.1}%)", 100.0 * params_matched as f64 / params.max(1) as f64);
     println!("return types: {returns_matched} of {returns} match ({:.1}%)", 100.0 * returns_matched as f64 / returns.max(1) as f64);
+    println!("of the parameters, pointers: {pointers_matched} of {pointers} match ({:.1}%), and the decompiler calls {pointers_claimed} one", 100.0 * pointers_matched as f64 / pointers.max(1) as f64);
     for (group, tally) in &groups {
         tally.print(group);
     }
@@ -352,11 +383,18 @@ pub fn compare(out_dir: &Path, debug_dir: &Path, jobs: usize, list: usize) -> Re
 }
 
 /// The counts [`against`] holds a run to, each with whether more of it is better.
-const MEASURES: [(&str, bool); 5] =
-    [("parameter counts right", true), ("returns a value or not right", true), ("failed or crashed", false), ("parameter types right", true), ("return types right", true)];
+const MEASURES: [(&str, bool); 6] = [
+    ("parameter counts right", true),
+    ("returns a value or not right", true),
+    ("failed or crashed", false),
+    ("parameter types right", true),
+    ("return types right", true),
+    // What keeps typing every untyped value a pointer from passing for better types.
+    ("parameters wrongly called a pointer", false),
+];
 
 /// One binary's [`MEASURES`] in a run, over the functions that both runs decompiled.
-type Counts = [usize; 5];
+type Counts = [usize; 6];
 
 /// The [`MEASURES`] of `base` and of `head`, two runs of the same functions of one binary.
 fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &Typed) -> (Counts, Counts) {
@@ -365,13 +403,14 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
     // Over every function: a decompiler that starts to fail drops functions from the ones both
     // runs finished. A timeout depends on the load and is left out.
     let failed = |report: &BinaryReport| report.functions.iter().filter(|r| matches!(r.status, Status::Error | Status::Crash)).count();
-    let (mut base_counts, mut head_counts) = ([0, 0, failed(base), 0, 0], [0, 0, failed(head), 0, 0]);
+    let (mut base_counts, mut head_counts) = ([0, 0, failed(base), 0, 0, 0], [0, 0, failed(head), 0, 0, 0]);
     // The types of the functions both runs finished, as the counts below are.
     for (counts, report, other) in [(&mut base_counts, base, &head_ok), (&mut head_counts, head, &base_ok)] {
         for record in report.functions.iter().filter(|record| record.status == Status::Ok && other.contains_key(&record.addr)) {
-            let [_, params, _, returns] = typed.score(record, &mut BTreeMap::new());
-            counts[3] += params;
-            counts[4] += returns;
+            let scored = typed.score(record, &mut BTreeMap::new());
+            counts[3] += scored.params_matched;
+            counts[4] += scored.returns_matched;
+            counts[5] += scored.pointers_claimed - scored.pointers_matched;
         }
     }
     for (addr, expected) in &debug.functions {
@@ -459,10 +498,10 @@ mod tests {
         // 0x10 now reads as returning a value, and 0x20 timed out.
         let head = run(&[(0x10, Status::Ok, 1, true), (0x20, Status::Timeout, 0, false), (0x30, Status::Ok, 0, false)]);
         let typed = Typed { functions: BTreeMap::new() };
-        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0], [2, 0, 0, 0, 0]));
+        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0]));
         // A function that fails drops out of the comparison, and counts as failed.
         let head = run(&[(0x10, Status::Error, 0, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, false)]);
-        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0], [2, 1, 1, 0, 0]));
+        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0], [2, 1, 1, 0, 0, 0]));
     }
 
     #[test]
@@ -475,10 +514,21 @@ mod tests {
         // The integer registers first, the pointer taken for a number, and the int untyped.
         let found = record(&[shape(Kind::Unknown, 8), shape(Kind::Unknown, 4), shape(Kind::Float, 8)], Some(shape(Kind::Pointer, 8)));
         let mut misses = BTreeMap::new();
-        assert_eq!(typed.score(&found, &mut misses), [3, 2, 1, 1]);
+        let scored = Shapes { params: 3, params_matched: 2, returns: 1, returns_matched: 1, pointers: 1, pointers_matched: 0, pointers_claimed: 0 };
+        assert_eq!(typed.score(&found, &mut misses), scored);
         assert_eq!(misses, BTreeMap::from([("parameter: a pointer of 8 as a number of 8".to_string(), 1)]));
         // With a parameter missing the count is what is wrong, and a return the decompiler
         // does not see is scored as whether it returns.
-        assert_eq!(typed.score(&record(&[shape(Kind::Float, 8)], None), &mut misses), [0; 4]);
+        assert_eq!(typed.score(&record(&[shape(Kind::Float, 8)], None), &mut misses), Shapes::default());
+    }
+
+    #[test]
+    fn a_parameter_without_a_shape_leaves_the_others_unscored() {
+        let shape = |kind, size| Shape { kind, size };
+        // f(struct by value, char *): the struct arrives as a pointer the debug information
+        // does not describe, which would pair with the `char *` the decompiler took for a number.
+        let typed = Typed { functions: BTreeMap::from([(0x10, (vec![None, Some(shape(Kind::Pointer, 8))], None))]) };
+        let found = FunctionRecord { shapes: vec![shape(Kind::Pointer, 8), shape(Kind::Int, 8)], ..FunctionRecord::failed(0x10, Status::Ok, String::new(), 0.0) };
+        assert_eq!(typed.score(&found, &mut BTreeMap::new()), Shapes::default());
     }
 }

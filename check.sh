@@ -67,7 +67,7 @@ signatures() {
   # A report left from an earlier run would pass for this one's.
   rm -rf "$out/signatures"
   ./target/release/recore-decompile corpus "$in/bin" "$out/signatures" "${sample[@]}" >"$out/signatures.log" 2>&1
-  ./target/release/recore-decompile params "$out/signatures" "$in/debug" | sed -n '1p;3,5p'
+  ./target/release/recore-decompile params "$out/signatures" "$in/debug" | sed -n '1p;3,6p'
   if [ -n "$against" ] && [[ "$("$base-decompile" corpus --help)" != *--sample* ]]; then
     echo "$out/signatures: the base's decompiler takes no --sample, so nothing to compare with"
   elif [ -n "$against" ]; then
