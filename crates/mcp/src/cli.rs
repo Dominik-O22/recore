@@ -45,8 +45,9 @@ fn arguments(tool: &str, properties: &Map<String, Value>, binary: &str, rest: &[
             named.insert(key.to_string(), json!(true));
             continue;
         }
-        // The functions of `decompile` are its plain arguments, with or without the option.
-        if key == "functions" {
+        // The functions of `decompile` are its plain arguments, with or without the option, and
+        // so are the renames of `rename`: an address and a name, again and again.
+        if key == "functions" || key == "names" {
             continue;
         }
         let Some(value) = rest.next() else { bail!("--{key} needs a value") };
@@ -133,6 +134,18 @@ pub fn run(tool: &str, binary: &str, rest: &[String]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn several_renames_are_plain_pairs_with_or_without_the_option() {
+        let tools = tools::list();
+        let rename = tools.as_array().unwrap().iter().find(|tool| tool["name"] == "rename").unwrap();
+        let properties = rename["inputSchema"]["properties"].as_object().unwrap();
+        let pairs = json!({ "path": "bin", "names": [{ "addr": "0x10", "name": "first" }, { "addr": "0x20", "name": "second" }] });
+        for given in [&["--names", "0x10", "first", "0x20", "second"][..], &["0x10", "first", "0x20", "second"]] {
+            let given: Vec<String> = given.iter().map(|word| word.to_string()).collect();
+            assert_eq!(arguments("rename", properties, "bin", &given).unwrap(), pairs);
+        }
+    }
 
     #[test]
     fn an_unknown_option_is_refused_from_a_shell() {
