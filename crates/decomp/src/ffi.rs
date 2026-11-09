@@ -21,6 +21,8 @@ pub struct RdParam {
     pub type_name: *const c_char,
     pub storage: *const c_char,
     pub size: u32,
+    /// One of the shim's `RD_KIND_*`: see [`crate::Kind`].
+    pub kind: u32,
 }
 
 pub const RD_BAD_DATA: u32 = 4;
@@ -40,6 +42,8 @@ pub struct RdDecompiled {
     pub flags: u32,
     pub flow: *const c_char,
     pub locals: *const c_char,
+    pub return_kind: u32,
+    pub return_size: u32,
 }
 
 /// One object of [`RdEvidence`]: the lowest and highest offset a member points to, and flags

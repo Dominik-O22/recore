@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use recore::edits::Edits;
 use recore::structs::{Recovered, auto_function};
 
-use crate::{Converged, Facts, Flow, Instruction, Local, Session, StructReport, Style};
+use crate::{Converged, Facts, Flow, Instruction, Local, Session, Shape, StructReport, Style};
 
 /// Where switch targets come from.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -87,14 +87,20 @@ pub struct FunctionRecord {
     /// Where each parameter lives: a register name or `stack:<offset>`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub storage: Vec<String>,
+    /// What each parameter is, in the order of `storage`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shapes: Vec<Shape>,
     pub returns_value: bool,
+    /// What it returns, where it returns a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_shape: Option<Shape>,
     pub c_len: usize,
 }
 
 impl FunctionRecord {
     /// A record for a function that produced no result.
     pub fn failed(addr: u64, status: Status, message: String, ms: f64) -> FunctionRecord {
-        FunctionRecord { addr, status, message: Some(message), ms, params: 0, storage: Vec::new(), returns_value: false, c_len: 0 }
+        FunctionRecord { addr, status, message: Some(message), ms, params: 0, storage: Vec::new(), shapes: Vec::new(), returns_value: false, return_shape: None, c_len: 0 }
     }
 }
 
@@ -589,7 +595,9 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                     ms,
                     params: function.param_count(),
                     storage: function.params.iter().map(|p| p.storage.clone()).collect(),
+                    shapes: function.params.iter().map(|p| Shape { kind: p.kind, size: p.size }).collect(),
                     returns_value: function.returns_value,
+                    return_shape: function.returns_value.then_some(function.return_shape),
                     c_len: function.c_text.len(),
                 },
                 c_text: (options.emit_c && (keep || matches!(request, Request::Decompile(_)))).then_some(function.c_text),

@@ -35,10 +35,19 @@ struct RdSection {
   uint32_t code;
 };
 
+// What a value is, whatever its type is called: RdParam::kind and RdDecompiled::return_kind.
+// Unknown is a value the decompiler gave no type but its size, such as `undefined8`.
+const uint32_t RD_KIND_UNKNOWN = 0;
+const uint32_t RD_KIND_INT = 1;  // integers of either sign, booleans, characters and enums
+const uint32_t RD_KIND_FLOAT = 2;
+const uint32_t RD_KIND_POINTER = 3;
+const uint32_t RD_KIND_AGGREGATE = 4;  // a struct, union or array by value
+
 struct RdParam {
   const char *type_name;
   const char *storage;  // register name, or "<space>:<offset>"
   uint32_t size;
+  uint32_t kind;
 };
 
 // Bits of RdDecompiled::flags.
@@ -63,6 +72,9 @@ struct RdDecompiled {
   const char *flow;
   // The function's variables, a line each: the name, a tab, and the place rd_name_local takes.
   const char *locals;
+  // What the function returns, and its size in bytes.
+  uint32_t return_kind;
+  uint32_t return_size;
 };
 
 // What struct recovery hands to recore and gets back: see `recover_structs`, and
@@ -1195,6 +1207,32 @@ static string type_name(const Datatype *type) {
   ostringstream s;
   type->printRaw(s);
   return s.str();
+}
+
+// Which RD_KIND_* a value of a data type is. A typedef has the metatype of what it names.
+static uint32_t kind_of(const Datatype *type) {
+  switch (type->getMetatype()) {
+    case TYPE_INT:
+    case TYPE_UINT:
+    case TYPE_BOOL:
+    case TYPE_ENUM_INT:
+    case TYPE_ENUM_UINT:
+    case TYPE_PARTIALENUM:
+      return RD_KIND_INT;
+    case TYPE_FLOAT:
+      return RD_KIND_FLOAT;
+    case TYPE_PTR:
+    case TYPE_PTRREL:
+      return RD_KIND_POINTER;
+    case TYPE_ARRAY:
+    case TYPE_STRUCT:
+    case TYPE_UNION:
+    case TYPE_PARTIALSTRUCT:
+    case TYPE_PARTIALUNION:
+      return RD_KIND_AGGREGATE;
+    default:
+      return RD_KIND_UNKNOWN;
+  }
 }
 
 // The decompiler's name for an operation. The four that only exist after analysis share their
@@ -2791,7 +2829,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
       session->strings.push_back(type_name(param->getType()));
       session->strings.push_back(where);
       session->params.push_back({session->strings[2 * i].c_str(), session->strings[2 * i + 1].c_str(),
-                                 (uint32_t)param->getSize()});
+                                 (uint32_t)param->getSize(), kind_of(param->getType())});
     }
 
     session->jump_addrs.clear();
@@ -2807,6 +2845,8 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
 
     out->c_text = session->c_text.c_str();
     out->return_type = session->return_type.c_str();
+    out->return_kind = kind_of(proto.getOutputType());
+    out->return_size = proto.getOutputType()->getSize();
     out->params = session->params.data();
     out->param_count = session->params.size();
     out->jump_addrs = session->jump_addrs.data();
