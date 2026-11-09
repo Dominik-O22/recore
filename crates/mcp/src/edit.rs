@@ -26,7 +26,7 @@ options! {
         var: Option<String> = json!({ "type": "string", "description": "A parameter or local variable of the function, as `decompile` spells it now: `param_1`, `local_18`, `uVar3`." }),
         name: Option<String> = json!({ "type": "string", "description": "The new name; empty to remove." }),
         #[serde(default)]
-        names: Vec<Naming> = json!({ "type": "array", "items": { "type": "object", "properties": { "addr": { "type": "string" }, "var": { "type": "string" }, "name": { "type": "string" } }, "required": ["addr", "name"] }, "description": "Several renames at once." }),
+        names: Vec<Naming> = json!({ "type": "array", "items": { "type": "object", "properties": { "addr": { "type": "string" }, "var": { "type": "string" }, "name": { "type": "string" } }, "required": ["addr", "name"] }, "description": "Several renames at once. From a shell, an address and a name, again and again." }),
     }
 }
 
