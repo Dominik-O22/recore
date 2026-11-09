@@ -16,17 +16,17 @@ Derivation. `pdb.py struct creature` gives `0x0fa weaknessAmount` and sizeof 0x2
 
 ## Task B: potion colors for seed 2026
 
-- **B1.** The potion of detect magic is brown.
-- **B2.** The potion of descent is gray.
+- **B1.** The potion of detect magic is brown: its color slot, 0x5f33f2, reads `brown` once the game has started.
+- **B2.** The potion of descent is gray: its color slot, 0x5f351e, reads `gray` once the game has started.
 - **B3.** How the colors are dealt: the game start, 0x473050, seeds the generator (0x455cd0) and draws each of 41 levels' seed and stairs before the shuffle function 0x449de0 shuffles the 21 color names into 30-byte slots at 0x5f335c. Each potion's record in the table at 0x506010, with records 0x61c bytes apart, points at the slot that names its color: detect magic's record at 0x507880 points at slot 5, 0x5f33f2, and descent's record at 0x50b598 points at slot 15, 0x5f351e. Naming the shuffle or the game start and the slot each potion points at passes. A color guessed without running or reproducing the draws fails B1 and B2, whatever it is.
 
 Derivation. Two routes agree. `flavors.py 2026` reproduces the generator of src/brogue/Math.c and the draws of `initializeRogue` (src/brogue/RogueMain.c), parsing the color list from src/brogue/Globals.c and the table from src/variants/GlobalsBrogue.c, and prints `detect magic itemColors[5] brown` and `descent itemColors[15] gray`. recore's emulator runs the binary itself:
 
 ```
-recore-mcp run game.exe --function 0x473050 --args 2026 --args 0 --before 0x473030 --skip 0x44bd00:0 --dump 0x5f33f2:30 --dump 0x5f351e:30
+recore-mcp run game.exe --function 0x473050 --args 2026 --args 0 --before 0x473030 --dump 0x5f33f2:30 --dump 0x5f351e:30
 ```
 
-It stops in 0x42e110 after the shuffle, at a `pshuflw` the emulator does not run, and the dumps read `brown` and `gray`. Two things are needed for that run, and they are what make the task hard. The `memset` at 0x44bd00 starts with SSE2 the emulator stops on, so it must be skipped; it clears memory that reads as zero in the emulator anyway. And 0x473030 must run first: it sets the variant's tables, among them the pointer at 0x5ab3a0 that gives the number of levels. Without it the run reads zeros there, finishes without complaint and deals other colors: detect magic comes out crimson.
+It returns, and the dumps read `brown` and `gray`. One thing is needed for that run, and it is what makes the task hard: 0x473030 must run first. It sets the variant's tables, among them the pointer at 0x5ab3a0 that gives the number of levels. Without it the run reads zeros there, deals other colors, and stops later on a call through a null pointer: detect magic comes out crimson and descent blue.
 
 ## Task C: the record the pack is made of
 
@@ -58,13 +58,13 @@ Derivation. `pdb.py functions` names 0x447b60 `readScroll` and 0x459150 `telepor
 
 - **F1.** Once a turn, the player's status update in 0x47e780 and the monsters' in 0x45b230 take one from the creature's poison duration, the 16-bit field at +0x1a2 (the player's at 0x5a9a26), and inflict damage equal to its poison amount, the 16-bit field at +0xfc (the player's at 0x5a9980), through 0x416a70 with protective shields ignored. When the duration reaches zero they set the amount to 0. Both functions are needed.
 - **F2.** Each poisoning adds its concentration to the amount, which is at least 1, and its duration to the duration: 0x418330, inlined into the attack function 0x416f40 at 0x417d9a. A hit from a creature with ability bit 0x80 at +0xe8 deals 1 damage directly, and its rolled damage becomes the poison's duration with concentration 1, at 0x417658 to 0x417670.
-- **F3.** Two hits rolling 7 and 4 cost 24 hit points over 11 turns: 1 each directly, then 2 a turn for 11 turns, 22 from poison. The amount is 2 because each hit added 1. A report of 11 from poison, one a turn, fails. This holds outside the game's easy mode, which cuts damage to the player to a fifth.
+- **F3.** Two hits rolling 7 and 4 cost 24 hit points over 11 turns: 1 each directly, then 2 a turn for 11 turns, 22 from poison. The amount is 2 because each hit added 1, in the store at 0x417daa. A report of 11 from poison, one a turn, fails. This holds outside the game's easy mode, which cuts damage to the player to a fifth.
 
 Derivation. `pdb.py functions` names 0x47e780 `playerTurnEnded`, 0x45b230 `decrementMonsterStatus`, 0x416a70 `inflictDamage`, 0x418330 `addPoison` and 0x416f40 `attack`. `pdb.py struct creature` gives `poisonAmount 0x0fc` and `status 0x18c`, and `STATUS_POISONED` is 11 in `enum statusEffects` (src/brogue/Rogue.h), so the duration is at 0x18c + 2 × 11 = 0x1a2. The source is src/brogue/Time.c:2329-2337 for the player, src/brogue/Monsters.c:1907-1922 for monsters, src/brogue/Combat.c:1615 for `addPoison`, and `attack` in Combat.c for `poisonDamage = damage; damage = 1;` and `specialHit`'s `addPoison(defender, damage, 1)`. `stores.py 0xfc 2 0x5a9884` lists the amount's writers: 0x417daa in `attack`, 0x418381 in `addPoison`, the clears in `heal`, `decrementMonsterStatus` and `playerTurnEnded`, and the item stores again.
 
 ## What to expect
 
-- **Hard: B.** It needs a run of the game start, and the run fails twice before it works: the emulator stops on the first `memset`, and without the variant's setup the run finishes and deals the wrong colors. Reproducing the draws by hand means reading 41 iterations of a loop with a retry inside it.
+- **Hard: B.** It needs a run of the game start, and without the variant's setup first the run deals the wrong colors, and stops only later, on a call through a null pointer. Reproducing the draws by hand means reading 41 iterations of a loop with a retry inside it.
 - **Hard: D.** Nothing the tool lists writes the slot. The agent has to see that a copy of a whole table in `main` covers it.
 - **Hard: A.** The field query mixes in five item functions, the player's two writers address the player's record directly and show up only among 33 "reads or writes it" rows for 0x5a997e, and one of them sits inside an 8 KB function.
 - **Medium: E.** The jump table is plain, but recore's `switch to` list is sorted by address, so its third entry is not case 2.
