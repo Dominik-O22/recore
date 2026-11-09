@@ -94,7 +94,8 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         shard: usize,
         /// Decompile only this many functions of each binary, chosen from its debug file in
-        /// `--debug-dir`, the same each run. Binaries without one are left out.
+        /// `--debug-dir`, the same each run. Binaries without one, or whose debug file lists no
+        /// function, are left out.
         #[arg(long, requires = "debug_dir")]
         sample: Option<usize>,
         /// Where `<name>.debug` of each binary is, for `--sample`.
