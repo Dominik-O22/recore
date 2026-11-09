@@ -1,7 +1,7 @@
 # The player
 
-`recore-mcp lift` turns a 32-bit Windows game into a Cargo workspace of Rust functions that run
-on `recore-machine`. Every call the game makes to Windows or a DLL lands in the machine's `Host`.
+`recore-mcp lift`, with the lifter in recore's `crates/lift`, turns a 32-bit Windows game into a
+Cargo workspace of Rust functions that run on `recore-machine`. Every call the game makes to Windows or a DLL lands in the machine's `Host`.
 The player is that host, shared by every game: Windows, DirectDraw, DirectInput, DirectSound, CD
 audio and Miles, plus a window, offscreen frames and sound output.
 

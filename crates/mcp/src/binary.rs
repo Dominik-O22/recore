@@ -193,3 +193,21 @@ impl Cache {
         Ok((&mut first[0], &mut second[0]))
     }
 }
+
+impl recore_lift::Source for Binary {
+    fn program(&self) -> &Program {
+        &self.program
+    }
+
+    fn edits(&self) -> &Edits {
+        &self.edits
+    }
+
+    fn lift(&mut self, start: u64, end: u64) -> Result<Vec<Instruction>> {
+        Binary::lift(self, start, end)
+    }
+
+    fn register(&mut self, name: &str) -> Result<(String, u64, u32)> {
+        Binary::register(self, name)
+    }
+}

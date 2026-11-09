@@ -873,6 +873,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "recore-lift"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "recore",
+ "recore-decomp",
+ "recore-machine",
+ "regex",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "recore-machine"
 version = "0.2.0"
 dependencies = [
@@ -887,11 +900,11 @@ dependencies = [
  "anyhow",
  "recore",
  "recore-decomp",
+ "recore-lift",
  "recore-machine",
  "regex",
  "serde",
  "serde_json",
- "toml",
 ]
 
 [[package]]

@@ -272,6 +272,7 @@ The speed table compares Ghidra's `Total Time` per binary with the wall time of 
 | `crates/core` | Loading and analysis |
 | `crates/decomp` | Ghidra's decompiler engine as a library |
 | `crates/mcp` | The MCP server and command line |
+| `crates/lift` | The lifter behind `recore-mcp lift`: a 32-bit x86 program as Rust on `crates/machine`, for `player/` |
 | `crates/corpus`, `crates/bench` | Scorers, timings and a profiler |
 | `third_party/ghidra-decompiler` | The vendored engine, with its own licence notes |
 

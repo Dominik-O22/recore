@@ -17,11 +17,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use recore::program::Program;
 use recore::{FxHashMap, Image};
 use serde::Deserialize;
 
-use super::lift::{Function, X87Abi, lift};
-use crate::binary::Cache;
+use crate::Source;
+use crate::lift::{Function, X87Abi, lift};
 
 /// A project's lift.toml. Paths are relative to the file.
 #[derive(Deserialize)]
@@ -103,16 +104,17 @@ fn resolve(base: &Path, path: &Path) -> PathBuf {
 
 /// Lifts the program `config` describes into its workspace, or into `out` when given, and answers
 /// a summary. The full report of what could not be lifted is in the workspace's report.txt.
-pub fn run(config: &Path, out: Option<&Path>) -> Result<String> {
+/// `load` gives the analyzed executable.
+pub fn run<'a>(config: &Path, out: Option<&Path>, load: impl FnOnce(&Path) -> Result<&'a mut dyn Source>) -> Result<String> {
     let text = std::fs::read_to_string(config).with_context(|| format!("reading {}", config.display()))?;
     let config_file: Config = toml::from_str(&text).with_context(|| format!("reading {}", config.display()))?;
     let base = std::path::absolute(config.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
     let exe = resolve(&base, &config_file.exe);
     let out = out.map_or_else(|| resolve(&base, &config_file.out), |o| resolve(&std::env::current_dir().unwrap_or_default(), o));
-    let mut cache = Cache::new(false);
-    let roots = roots(&mut cache, &exe)?;
+    let binary = load(&exe)?;
+    let roots = roots(binary.program());
     let abi = config_file.x87.as_ref().map_or_else(X87Abi::default, |x| X87Abi { runtime: x.runtime, helpers: x.helpers.iter().map(|h| (h.at, (h.takes, h.net))).collect() });
-    let program = lift(cache.get(&exe)?, &roots, &abi)?;
+    let program = lift(binary, &roots, &abi)?;
     std::fs::create_dir_all(&out)?;
     std::fs::write(out.join("report.txt"), &program.report)?;
     let count = write(&config_file, &base, &out, program.functions)?;
@@ -127,8 +129,7 @@ pub fn run(config: &Path, out: Option<&Path>) -> Result<String> {
 /// one function pushes and the analysis lists inside another. Either is dropped when it lands
 /// inside an instruction of a function the analysis found. The lifter takes roots from the end,
 /// so the order fixes the order of the output.
-fn roots(cache: &mut Cache, exe: &Path) -> Result<Vec<u64>> {
-    let program = &cache.get(exe)?.program;
+fn roots(program: &Program) -> Vec<u64> {
     let image = &program.image;
     let functions: BTreeSet<u64> = program.functions().map(|f| f.addr).collect();
     let taken = program.analysis.data_refs.iter().filter(|r| !r.access).map(|r| r.to);
@@ -145,7 +146,7 @@ fn roots(cache: &mut Cache, exe: &Path) -> Result<Vec<u64>> {
                 instructions.binary_search(&v).is_ok()
             })
     });
-    Ok(functions.into_iter().chain(extra).collect())
+    functions.into_iter().chain(extra).collect()
 }
 
 /// The words outside code that may be addresses. An image that keeps its relocations names them:
