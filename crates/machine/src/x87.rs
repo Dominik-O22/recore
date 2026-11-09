@@ -16,6 +16,8 @@ use std::cmp::Ordering;
 use crate::ops::{Code, fits, mask, signed, signed_min};
 
 mod instructions;
+#[cfg(kani)]
+mod proofs;
 mod wide;
 
 pub use instructions::{Instruction, Stack, execute};

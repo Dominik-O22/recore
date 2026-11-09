@@ -1,0 +1,12 @@
+# The tools that check proofs, on top of mise.toml's. Loaded only when MISE_ENV=verify, so a plain
+# `mise install` does not fetch them:
+#   MISE_ENV=verify mise install && MISE_ENV=verify mise exec -- cargo kani setup
+#   MISE_ENV=verify mise run x87-proofs
+# .claude/skills/verify-x87-fast-path/SKILL.md says what the proofs cover and how to read them.
+
+[tools]
+"cargo:kani-verifier" = "0.68.0"
+
+[tasks.x87-proofs]
+description = "Prove the x87 fast path gives the exact path's bits (crates/machine/src/x87/proofs.rs)"
+run = "crates/machine/proofs.sh"
