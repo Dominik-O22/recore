@@ -10,10 +10,10 @@ use recore::program::parse_addr;
 use recore::report::CallTarget;
 use recore_decomp::Flow;
 use recore_decomp::flow::{Kind, Op};
-use serde::Deserialize;
+use serde_json::json;
 
 use crate::binary::Binary;
-use crate::tools::{addr_arg, cut, describe, resolve_function};
+use crate::tools::{addr_arg, cut, describe, options, resolve_function, schema};
 
 /// Instructions shown for a whole function unless the caller sets `count`.
 const FUNCTION_COUNT: usize = 500;
@@ -24,13 +24,14 @@ const LONGEST_INSTRUCTION: u64 = 16;
 /// P-code operations shown unless the caller sets `limit`.
 const OPERATIONS: usize = 400;
 
-#[derive(Deserialize)]
-pub struct Disassemble {
-    function: Option<String>,
-    addr: Option<String>,
-    count: Option<usize>,
-    #[serde(default)]
-    pcode: bool,
+options! {
+    pub struct Disassemble {
+        function: Option<String> = schema::function(),
+        addr: Option<String> = schema::addr("Where to start; inside a function this snaps to the instruction it is in"),
+        count: Option<usize> = json!({ "type": "integer", "minimum": 1, "description": "Instructions to show (default 500 for a function, 32 from an address)." }),
+        #[serde(default)]
+        pcode: bool = json!({ "type": "boolean", "description": "Also show each instruction's raw p-code: what it does to registers and memory, one operation per line." }),
+    }
 }
 
 /// What the analysis and the edits know about one instruction, for the end of its line.
@@ -167,11 +168,12 @@ fn operation(binary: &Binary, flow: &Flow, op: &Op) -> String {
     format!("{:#x}  {output}{}{callee}{}{}", op.addr, op.code, if inputs.is_empty() { "" } else { " " }, inputs.join(", "))
 }
 
-#[derive(Deserialize)]
-pub struct Pcode {
-    function: String,
-    limit: Option<usize>,
-    timeout: Option<f64>,
+options! {
+    pub struct Pcode {
+        function: String = schema::function(),
+        limit: Option<usize> = schema::limit(),
+        timeout: Option<f64> = schema::timeout(),
+    }
 }
 
 fn timeout_arg(seconds: Option<f64>) -> Result<Duration> {
@@ -218,19 +220,17 @@ pub fn pcode(binary: &mut Binary, args: Pcode) -> Result<String> {
     Ok(out)
 }
 
-#[derive(Deserialize)]
-pub struct Trace {
-    function: String,
-    /// Follow this parameter forward, counted from 1 as the decompiler names them.
-    param: Option<usize>,
-    /// Follow what the function returns back to where it comes from.
-    #[serde(default)]
-    returns: bool,
-    /// With `arg`: follow an argument of the call at this address back to where it comes from.
-    call: Option<String>,
-    arg: Option<usize>,
-    depth: Option<usize>,
-    timeout: Option<f64>,
+options! {
+    pub struct Trace {
+        function: String = schema::function(),
+        param: Option<usize> = json!({ "type": "integer", "minimum": 1, "description": "Parameter to follow forward, from 1: param_1 is 1." }),
+        #[serde(default)]
+        returns: bool = json!({ "type": "boolean", "description": "Follow the returned value backward." }),
+        call: Option<String> = schema::addr("A call instruction in the function, to follow one of its arguments backward"),
+        arg: Option<usize> = json!({ "type": "integer", "minimum": 1, "description": "Which argument of `call`, from 1." }),
+        depth: Option<usize> = json!({ "type": "integer", "minimum": 0, "description": "Calls to follow into callees and out to callers (default 2)." }),
+        timeout: Option<f64> = schema::timeout(),
+    }
 }
 
 /// Functions decompiled for one trace, the function asked about included.

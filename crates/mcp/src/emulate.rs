@@ -25,8 +25,10 @@ use recore::thumb;
 use recore_machine::ops::{Code, compute, mask, signed};
 use recore_machine::x87;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::binary::Binary;
+use crate::tools::{options, schema};
 
 mod lift;
 mod snapshot;
@@ -1300,34 +1302,32 @@ pub fn emulate(binary: &mut Binary, call: &Call) -> Result<Outcome> {
     emulator.outcome(call, stop, buffers).map_err(anyhow::Error::msg)
 }
 
-/// The arguments of the `run` tool.
-#[derive(Deserialize)]
-pub struct Run {
-    function: Option<String>,
-    /// List what a run would stop on instead of running.
-    #[serde(default)]
-    coverage: bool,
-    #[serde(default)]
-    args: Vec<Given>,
-    #[serde(default)]
-    set: Vec<String>,
-    #[serde(default)]
-    read: Vec<String>,
-    #[serde(default)]
-    dump: Vec<String>,
-    steps: Option<u64>,
-    bits: Option<u32>,
-    snapshot: Option<String>,
-    #[serde(default)]
-    before: Vec<String>,
-    /// A file for every range the run wrote.
-    writes: Option<String>,
-    /// A file for the entry of every function the run entered.
-    entered: Option<String>,
-    timeout: Option<f64>,
-    #[serde(default)]
-    skip: Vec<String>,
-    ticks: Option<u64>,
+options! {
+    /// The arguments of the `run` tool.
+    pub struct Run {
+        function: Option<String> = schema::function(),
+        #[serde(default)]
+        coverage: bool = json!({ "type": "boolean", "description": "Run nothing, and list what a run would stop on: the instructions it cannot run and the calls to imports with no stand-in, in `function` and every function it calls, or in the whole binary without `function`. A path that never reaches them still runs; calls through pointers are not followed, and `skip`, `ticks` and `args` are not read. x86 and x86-64 only." }),
+        #[serde(default)]
+        args: Vec<Given> = json!({ "type": "array", "items": { "type": ["integer", "string"] }, "description": "The arguments in order, as the platform's calling convention passes them. A number, decimal or hex as 0x1f; `f32:1.5` or `f64:1.5` for a float, passed where the platform passes floats (the stack on x86-32, XMM registers on x86-64, d0 to d7 on AArch64); `hex:4142` for bytes put in memory and passed by their address; `str:text` for a string with its end; `buf:16` for 16 zero bytes. Buffers are shown as the function left them." }),
+        #[serde(default)]
+        set: Vec<String> = json!({ "type": "array", "items": { "type": "string" }, "description": "Registers and memory to set after the arguments are placed: `RDX=5`, `XMM0=f64:2.5` or `ST0=f64:2.5` for a float, which an x87 register holds as an extended float, `0x20000000=hex:0011` for bytes at an address, or `EXTMEM:0x100=hex:09` for bytes in a memory of the processor other than the one the code is in (an 8051 has CODE, INTMEM, EXTMEM, SFR and BITS)." }),
+        #[serde(default)]
+        read: Vec<String> = json!({ "type": "array", "items": { "type": "string" }, "description": "Registers to show after the run, besides the one that holds the result. An x87 register, ST0 to ST7, shows as the extended float it holds; `XMM0:f64` or `ST0:f32` shows a float of that size. A float function returns in ST0 on x86-32, in XMM0 on x86-64 and in d0 on AArch64." }),
+        #[serde(default)]
+        dump: Vec<String> = json!({ "type": "array", "items": { "type": "string" }, "description": "Memory to show after the run, as ADDRESS:LENGTH or SPACE:ADDRESS:LENGTH, for what a returned pointer reaches." }),
+        steps: Option<u64> = json!({ "type": "integer", "minimum": 1, "description": "Most instructions to run (default 10,000,000)." }),
+        bits: Option<u32> = json!({ "type": "integer", "minimum": 1, "description": "Width of the result in bits, for a function that returns fewer than its register holds (32 for an int)." }),
+        snapshot: Option<String> = json!({ "type": "string", "description": "A directory holding the memory of a live process, which the run starts from where it holds any: a `snapshot.tsv` of `region START END PERMISSIONS NAME` rows, each region's bytes in `START.bin` with START spelled as the row spells it, and `teb ADDRESS` rows for the threads of a Windows process, the first of which the run is on unless `set` gives FS_OFFSET. `set` and `args` apply on top, and the run keeps its own stack." }),
+        #[serde(default)]
+        before: Vec<String> = json!({ "type": "array", "items": { "type": "string" }, "description": "Functions to run first, in order and with no arguments, as setup: their writes are not listed and their instructions not counted. For a C runtime whose startup has not run, such as MSVC's `_mtinit`, which sets up the locks and the thread data its string functions need." }),
+        writes: Option<String> = json!({ "type": "string", "description": "A file to write every range of memory the run wrote to, one per line as ADDRESS HEX, where the answer shows the first 16 cut at 64 bytes. For comparing two whole runs." }),
+        entered: Option<String> = json!({ "type": "string", "description": "A file to write the entry of every function the run entered to, one per line, in order of address." }),
+        timeout: Option<f64> = json!({ "type": "number", "description": "Seconds the run may take before it stops, whatever `steps` allows (default 30)." }),
+        #[serde(default)]
+        skip: Vec<String> = json!({ "type": "array", "items": { "type": "string" }, "description": "Functions that return as soon as they are entered, as FUNCTION:BYTES with the bytes of arguments each takes off the stack, 0 unless it is stdcall: `0x401230:8`. The result register keeps what it held. For a function the run cannot or need not go through, such as one that draws." }),
+        ticks: Option<u64> = json!({ "type": "integer", "minimum": 0, "description": "What `GetTickCount` returns, every time it is called, so that a run that reads the clock can be compared with another. Without it a call to GetTickCount stops the run." }),
+    }
 }
 
 /// A number or a text, as JSON has it.
