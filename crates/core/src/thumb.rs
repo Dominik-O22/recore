@@ -839,7 +839,8 @@ pub(crate) fn decode_at(bytes: &[u8], base: u64, offset: usize, it: &mut u8, a32
     };
     let conditional = *it != 0;
     *it = it.saturating_sub(1);
-    if !a32 && wide && hw1 >> 11 == 0b11110 && hw2 & 0xD000 == 0xC000 {
+    // BLX to a label, which an odd second halfword makes undefined.
+    if wide && hw1 >> 11 == 0b11110 && hw2 & 0xD000 == 0xC000 && (!a32 || hw2 & 1 != 0) {
         return Some(Decoded { addr, len: 4, insn: None });
     }
     // IT with a mask: the instructions it makes conditional follow.
