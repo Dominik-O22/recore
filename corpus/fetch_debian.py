@@ -3,6 +3,7 @@
 
 Usage: fetch_debian.py <arch> <corpus>      e.g. amd64 corpus, arm64 corpus-arm64, armhf corpus-armhf
                                             or armel corpus-armel
+A corpus whose name ends in -holdout, such as corpus-armhf-holdout, gets HOLDOUT instead of PACKAGES.
 Writes <corpus>/bin/deb__<pkg>__<name> and <corpus>/debug/deb__<pkg>__<name>.debug in the corpora's
 directory, which corpus/store.py names.
 Debian builds differ from Arch's: calls go through a PLT, and flags and compiler versions differ.
@@ -19,6 +20,10 @@ MAX_PER_PACKAGE = 8
 PACKAGES = """coreutils bash grep sed gawk findutils tar gzip xz-utils zstd curl openssh-client git sqlite3
 make diffutils less nano tmux htop jq lua5.4 zsh binutils-common openssl rsync wget file ninja-build cmake re2c
 gperf fish ripgrep fd-find bat eza hyperfine""".split()
+# Packages a router or an IoT device carries, none of them in PACKAGES. The held-out corpora score a
+# change once it is done, so nothing is tuned on them.
+HOLDOUT = """avahi-daemon busybox dnsmasq-base dropbear-bin hostapd iptables lighttpd mosquitto ntpsec openvpn
+ppp socat tcpdump wpasupplicant""".split()
 
 
 def index(url):
@@ -88,12 +93,13 @@ def process(pkg, arch, corpus, binaries, debugs):
 
 def main():
     arch, corpus = sys.argv[1], CORPORA / sys.argv[2]
+    packages = HOLDOUT if corpus.name.endswith("-holdout") else PACKAGES
     for d in ("bin", "debug"):
         (corpus / d).mkdir(parents=True, exist_ok=True)
     binaries = index(f"{MIRROR}/debian/dists/{SUITE}/main/binary-{arch}/Packages.xz")
     debugs = index(f"{MIRROR}/debian-debug/dists/{SUITE}-debug/main/binary-{arch}/Packages.xz")
     with ThreadPoolExecutor(6) as pool:
-        for pkg, status, n in pool.map(lambda p: process(p, arch, corpus, binaries, debugs), PACKAGES):
+        for pkg, status, n in pool.map(lambda p: process(p, arch, corpus, binaries, debugs), packages):
             print(f"{pkg:18} {status:24} {n} binaries")
     made = [f for f in (corpus / "bin").iterdir() if f.name.startswith("deb__")]
     print(f"total: {len(made)} Debian binaries, {sum(f.stat().st_size for f in made) / 1e6:.0f} MB")

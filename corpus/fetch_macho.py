@@ -2,6 +2,7 @@
 """Builds a Mach-O corpus from Homebrew bottles: stripped executables plus the originals.
 
 Usage: fetch_macho.py <arch> <corpus>      e.g. arm64 corpus-macho, or x86_64 corpus-macho-x86
+A corpus whose name ends in -holdout, such as corpus-macho-holdout, gets HOLDOUT instead of FORMULAE.
 Writes, in the corpora's directory that corpus/store.py names, <corpus>/bin/brew__<formula>__<name>, stripped the way applications ship, and
 <corpus>/debug/brew__<formula>__<name>.debug, the file as Homebrew built it. Homebrew does not
 strip, so the original's symbol table names every function; that is the truth to score against.
@@ -28,6 +29,11 @@ FORMULAE = """jq lua sqlite zstd xz tmux htop curl git tree pcre2 nano less make
 rsync ninja cmake re2c openssl@3 ripgrep fd bat eza hyperfine
 blueutil pngpaste switchaudio-osx terminal-notifier cliclick duti trash macvim reattach-to-user-namespace
 sleepwatcher mas swiftformat""".split()
+# Formulae none of FORMULAE is, in C, C++, Rust, Go, Swift, Zig and Haskell. The held-out corpora
+# score a change once it is done, so nothing is tuned on them. Fewer have x86_64 bottles.
+HOLDOUT = """dnsmasq lighttpd mosquitto openvpn socat tcpdump nmap mtr iperf3 aria2 redis unbound wireguard-tools
+flac lame sox smartmontools fzf starship zoxide tokei just dust xcbeautify displayplacer p7zip tig ncdu pigz nnn
+the_silver_searcher fswatch bison nasm shellcheck""".split()
 
 MH_MAGIC_64, FAT_MAGIC, MH_EXECUTE = 0xFEEDFACF, 0xCAFEBABE, 2
 LC_FUNCTION_STARTS = 0x26
@@ -118,10 +124,11 @@ def process(formula, arch, corpus):
 
 def main():
     arch, corpus = sys.argv[1], CORPORA / sys.argv[2]
+    formulae = HOLDOUT if corpus.name.endswith("-holdout") else FORMULAE
     for d in ("bin", "debug", "nostarts", "pkgs"):
         (corpus / d).mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(6) as pool:
-        for formula, status, n in pool.map(lambda f: process(f, arch, corpus), FORMULAE):
+        for formula, status, n in pool.map(lambda f: process(f, arch, corpus), formulae):
             print(f"{formula:28} {status:24} {n} binaries")
     made = [f for f in (corpus / "bin").iterdir() if f.name.startswith("brew__")]
     print(f"total: {len(made)} Homebrew binaries, {sum(f.stat().st_size for f in made) / 1e6:.0f} MB")
