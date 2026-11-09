@@ -33,6 +33,23 @@ bench/agent/judge.py ~/agent-runs/il2cpp-head ~/agent-runs/il2cpp-base
 - **`judge.py`** scores each report against the key. A model judges every item three times and the majority verdict counts, because borderline items come out either way from one judgement to the next. `<dir>/score.md` has each verdict with its reason.
 - **`stats.py`** prints the cost table again for any directories `run.sh` wrote.
 
+## Game tasks
+
+The tasks above are saturated: Haiku scores 16.8 of 17 with recore. [`game/`](game) holds six harder tasks on a binary shaped like the games recore is used on: 32-bit Windows, MSVC's ABI, no symbols, structs, tables of records and calls through pointers. It is Brogue CE's game logic, built so that its PDB can be the key.
+
+```
+MISE_ENV=corpus mise install
+bench/agent/game/build.sh
+bench/agent/game/run.sh claude-sonnet-5-5 ~/agent-runs/sonnet-game
+KEY=bench/agent/game/key.md bench/agent/judge.py ~/agent-runs/sonnet-game
+```
+
+- **`build.sh`** fetches the source by pinned URL and sha256, compiles it with clang-cl as MSVC would compile a release build, and links it with zig's lld-link, with a small C runtime over kernel32 in place of Microsoft's. It writes `target/agent/game/game.exe` and `game.pdb`, and fails when the exe is not the build [`game/key.md`](game/key.md) was written for. Never run the exe.
+- **`run.sh`** puts only the exe in the session's folder. recore reads a PDB it finds beside an exe, and the PDB is the key.
+- **`pdb.py`**, **`stores.py`** and **`flavors.py`** derive the key's answers from the PDB, the disassembly and the source, as the key's derivations say.
+
+Haiku 5.5 scored 18 of 22 in each of two sessions, two weeks and 155 commits of recore apart, and failed the same four items both times: A4, B1, B2 and F1. Sonnet 5.5 scored 22 of 22 in one session, with 247 `disassemble` calls and 5.8 M tokens read. So Haiku's score has four points to gain, and Sonnet's sessions are scored by their calls and tokens.
+
 ## What to keep in mind
 
 - One session is an illustration and not a benchmark. Run several before trusting a difference.
