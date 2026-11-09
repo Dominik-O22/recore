@@ -20,8 +20,9 @@ jobs:
         include:
           - name: clippy
             run: cargo clippy --profile ci --workspace --all-targets -- -D warnings
+          # With the ignored tests: the decoders' agreement with yaxpeax-arm on every word.
           - name: core tests
-            run: cargo test --profile ci -p recore
+            run: cargo test --profile ci -p recore -- --include-ignored
           - name: other tests
             run: cargo test --profile ci --workspace --exclude recore
           # The player is a workspace of its own; cpal plays through ALSA on Linux.
