@@ -404,13 +404,21 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
     // runs finished. A timeout depends on the load and is left out.
     let failed = |report: &BinaryReport| report.functions.iter().filter(|r| matches!(r.status, Status::Error | Status::Crash)).count();
     let (mut base_counts, mut head_counts) = ([0, 0, failed(base), 0, 0, 0], [0, 0, failed(head), 0, 0, 0]);
-    // The types of the functions both runs finished, as the counts below are.
-    for (counts, report, other) in [(&mut base_counts, base, &head_ok), (&mut head_counts, head, &base_ok)] {
-        for record in report.functions.iter().filter(|record| record.status == Status::Ok && other.contains_key(&record.addr)) {
-            let scored = typed.score(record, &mut BTreeMap::new());
-            counts[3] += scored.params_matched;
-            counts[4] += scored.returns_matched;
-            counts[5] += scored.pointers_claimed - scored.pointers_matched;
+    // Types count where both runs have them scored: a function whose parameter count one run
+    // got wrong has no parameters scored in that run, and a build from before shapes were
+    // recorded has none scored at all. Its wrong pointers would otherwise read as new ones.
+    let scored = |report: &BinaryReport| -> BTreeMap<u64, Shapes> { report.functions.iter().filter(|r| r.status == Status::Ok).map(|r| (r.addr, typed.score(r, &mut BTreeMap::new()))).collect() };
+    let (base_scored, head_scored) = (scored(base), scored(head));
+    for (addr, base_shapes) in &base_scored {
+        let Some(head_shapes) = head_scored.get(addr) else { continue };
+        for (counts, shapes) in [(&mut base_counts, base_shapes), (&mut head_counts, head_shapes)] {
+            if base_shapes.params > 0 && head_shapes.params > 0 {
+                counts[3] += shapes.params_matched;
+                counts[5] += shapes.pointers_claimed - shapes.pointers_matched;
+            }
+            if base_shapes.returns > 0 && head_shapes.returns > 0 {
+                counts[4] += shapes.returns_matched;
+            }
         }
     }
     for (addr, expected) in &debug.functions {
@@ -520,6 +528,26 @@ mod tests {
         // With a parameter missing the count is what is wrong, and a return the decompiler
         // does not see is scored as whether it returns.
         assert_eq!(typed.score(&record(&[shape(Kind::Float, 8)], None), &mut misses), Shapes::default());
+    }
+
+    #[test]
+    fn types_count_only_where_both_runs_have_them_scored() {
+        let shape = |kind, size| Shape { kind, size };
+        let function = |params| Function { params, variadic: false, returns_value: Some(false), c: true };
+        let debug = DebugInfo { functions: BTreeMap::from([(0x10, function(1)), (0x20, function(1))]), symbols: BTreeMap::new() };
+        // Both take a number of 8.
+        let typed = Typed { functions: BTreeMap::from([(0x10, (vec![Some(shape(Kind::Int, 8))], None)), (0x20, (vec![Some(shape(Kind::Int, 8))], None))]) };
+        let run = |shapes: [&[Shape]; 2]| {
+            let functions = [0x10, 0x20].into_iter().zip(shapes).map(|(addr, shapes)| FunctionRecord { params: shapes.len(), shapes: shapes.to_vec(), ..FunctionRecord::failed(addr, Status::Ok, String::new(), 0.0) }).collect();
+            BinaryReport { name: "b".into(), fragments_skipped: 0, functions }
+        };
+        let (number, pointer) = (shape(Kind::Int, 8), shape(Kind::Pointer, 8));
+        // A build that records no shapes has no type scored, so the head's wrong pointer is no
+        // loss. Its records here have no parameters either, which is what the first count says.
+        let head = run([&[pointer], &[number]]);
+        assert_eq!(counted(&run([&[], &[]]), &head, &debug, &typed), ([0, 2, 0, 0, 0, 0], [2, 2, 0, 0, 0, 0]));
+        // Against a run that had both right, it is one: a type lost and a pointer wrongly called.
+        assert_eq!(counted(&run([&[number], &[number]]), &head, &debug, &typed), ([2, 2, 0, 2, 0, 0], [2, 2, 0, 1, 0, 1]));
     }
 
     #[test]
