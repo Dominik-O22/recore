@@ -396,8 +396,9 @@ const MEASURES: [(&str, bool); 6] = [
 /// One binary's [`MEASURES`] in a run, over the functions that both runs decompiled.
 type Counts = [usize; 6];
 
-/// The [`MEASURES`] of `base` and of `head`, two runs of the same functions of one binary.
-fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &Typed) -> (Counts, Counts) {
+/// The [`MEASURES`] of `base` and of `head`, two runs of the same functions of one binary, and
+/// how many functions have their parameters' types scored in both.
+fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &Typed) -> (Counts, Counts, usize) {
     let ok = |report: &BinaryReport| -> BTreeMap<u64, (usize, bool)> { report.functions.iter().filter(|r| r.status == Status::Ok).map(|r| (r.addr, (r.params, r.returns_value))).collect() };
     let (base_ok, head_ok) = (ok(base), ok(head));
     // Over every function: a decompiler that starts to fail drops functions from the ones both
@@ -409,8 +410,10 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
     // recorded has none scored at all. Its wrong pointers would otherwise read as new ones.
     let scored = |report: &BinaryReport| -> BTreeMap<u64, Shapes> { report.functions.iter().filter(|r| r.status == Status::Ok).map(|r| (r.addr, typed.score(r, &mut BTreeMap::new()))).collect() };
     let (base_scored, head_scored) = (scored(base), scored(head));
+    let mut typed_in_both = 0;
     for (addr, base_shapes) in &base_scored {
         let Some(head_shapes) = head_scored.get(addr) else { continue };
+        typed_in_both += usize::from(base_shapes.params > 0 && head_shapes.params > 0);
         for (counts, shapes) in [(&mut base_counts, base_shapes), (&mut head_counts, head_shapes)] {
             if base_shapes.params > 0 && head_shapes.params > 0 {
                 counts[3] += shapes.params_matched;
@@ -429,7 +432,7 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
             counts[1] += usize::from(expected.returns_value == Some(returns_value));
         }
     }
-    (base_counts, head_counts)
+    (base_counts, head_counts, typed_in_both)
 }
 
 /// Prints each of [`MEASURES`] that moved from the corpus run in `base_dir` to the one in
@@ -438,15 +441,15 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
 pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) -> Result<()> {
     let reports = reports(head_dir)?;
     let read = |path: &Path| -> Result<BinaryReport> { serde_json::from_slice(&std::fs::read(path)?).with_context(|| format!("parsing {path:?}")) };
-    let mut binaries: Vec<(String, Counts, Counts)> = in_parallel(&reports, jobs, |path| -> Result<Option<(String, Counts, Counts)>> {
+    let mut binaries: Vec<(String, Counts, Counts, usize)> = in_parallel(&reports, jobs, |path| -> Result<Option<(String, Counts, Counts, usize)>> {
         let head = read(path)?;
         let base_path = base_dir.join(path.file_name().context("no file name")?);
         let debug_path = debug_dir.join(format!("{}.debug", head.name));
         if !base_path.exists() || !debug_path.exists() {
             return Ok(None);
         }
-        let (base, head_counts) = counted(&read(&base_path)?, &head, &DebugInfo::load(&debug_path)?, &Typed::load(&debug_path)?);
-        Ok(Some((head.name, base, head_counts)))
+        let (base, head_counts, typed_in_both) = counted(&read(&base_path)?, &head, &DebugInfo::load(&debug_path)?, &Typed::load(&debug_path)?);
+        Ok(Some((head.name, base, head_counts, typed_in_both)))
     })
     .into_iter()
     .collect::<Result<Vec<_>>>()?
@@ -454,6 +457,8 @@ pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) 
     .flatten()
     .collect();
     binaries.sort_by(|a, b| a.0.cmp(&b.0));
+    // A base from before shapes were recorded has none, and then no type count can move.
+    println!("  parameter types compared in {} functions", binaries.iter().map(|binary| binary.3).sum::<usize>());
 
     let mut worse = Vec::new();
     for (index, (measure, more_is_better)) in MEASURES.into_iter().enumerate() {
@@ -467,7 +472,7 @@ pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) 
         }
         println!("  {:<7} {measure:<30} {base} -> {head} ({:+})", if better { "better" } else { "worse" }, head as i64 - base as i64);
         for gained in [true, false] {
-            let moved: Vec<(&str, usize)> = binaries.iter().filter_map(|(name, b, h)| {
+            let moved: Vec<(&str, usize)> = binaries.iter().filter_map(|(name, b, h, _)| {
                 let (b, h) = (b[index], h[index]);
                 ((h > b) == gained && h != b).then(|| (name.as_str(), h.abs_diff(b)))
             }).collect();
@@ -506,10 +511,10 @@ mod tests {
         // 0x10 now reads as returning a value, and 0x20 timed out.
         let head = run(&[(0x10, Status::Ok, 1, true), (0x20, Status::Timeout, 0, false), (0x30, Status::Ok, 0, false)]);
         let typed = Typed { functions: BTreeMap::new() };
-        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0]));
+        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0], 0));
         // A function that fails drops out of the comparison, and counts as failed.
         let head = run(&[(0x10, Status::Error, 0, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, false)]);
-        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0], [2, 1, 1, 0, 0, 0]));
+        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0], [2, 1, 1, 0, 0, 0], 0));
     }
 
     #[test]
@@ -545,9 +550,9 @@ mod tests {
         // A build that records no shapes has no type scored, so the head's wrong pointer is no
         // loss. Its records here have no parameters either, which is what the first count says.
         let head = run([&[pointer], &[number]]);
-        assert_eq!(counted(&run([&[], &[]]), &head, &debug, &typed), ([0, 2, 0, 0, 0, 0], [2, 2, 0, 0, 0, 0]));
+        assert_eq!(counted(&run([&[], &[]]), &head, &debug, &typed), ([0, 2, 0, 0, 0, 0], [2, 2, 0, 0, 0, 0], 0));
         // Against a run that had both right, it is one: a type lost and a pointer wrongly called.
-        assert_eq!(counted(&run([&[number], &[number]]), &head, &debug, &typed), ([2, 2, 0, 2, 0, 0], [2, 2, 0, 1, 0, 1]));
+        assert_eq!(counted(&run([&[number], &[number]]), &head, &debug, &typed), ([2, 2, 0, 2, 0, 0], [2, 2, 0, 1, 0, 1], 2));
     }
 
     #[test]
