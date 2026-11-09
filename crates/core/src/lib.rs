@@ -9,6 +9,8 @@ pub mod arm;
 pub mod arm64;
 pub mod cache;
 pub mod cfg;
+#[cfg(test)]
+mod decoders_agree;
 pub mod diff;
 pub mod discover;
 pub mod edits;

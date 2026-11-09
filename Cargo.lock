@@ -813,6 +813,8 @@ dependencies = [
  "serde_json",
  "swift-demangler",
  "toml",
+ "yaxpeax-arch",
+ "yaxpeax-arm",
 ]
 
 [[package]]

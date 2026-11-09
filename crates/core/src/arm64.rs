@@ -23,8 +23,8 @@ const PACIBSP: u32 = 0xD503_237F;
 /// One instruction word and where it sits, which PC-relative forms need.
 #[derive(Clone, Copy)]
 pub struct Insn {
-    word: u32,
-    addr: u64,
+    pub(crate) word: u32,
+    pub(crate) addr: u64,
 }
 
 fn sign_extend(value: u32, bits: u32) -> i64 {
@@ -51,12 +51,12 @@ impl Insn {
     }
 
     /// `b` and `bl`: `(is_call, target)`.
-    fn direct(self) -> Option<(bool, u64)> {
+    pub(crate) fn direct(self) -> Option<(bool, u64)> {
         (self.word & 0x7C00_0000 == 0x1400_0000).then(|| (self.word >> 31 == 1, self.branch_target(0, 26)))
     }
 
     /// `b.cond`, `cbz`/`cbnz`, `tbz`/`tbnz`.
-    fn conditional(self) -> Option<u64> {
+    pub(crate) fn conditional(self) -> Option<u64> {
         if self.word & 0xFF00_0000 == 0x5400_0000 || self.word & 0x7E00_0000 == 0x3400_0000 {
             Some(self.branch_target(5, 19))
         } else if self.word & 0x7E00_0000 == 0x3600_0000 {
@@ -72,7 +72,7 @@ impl Insn {
     }
 
     /// `adr` and `adrp`: the address formed.
-    fn pc_relative(self) -> Option<(bool, u64)> {
+    pub(crate) fn pc_relative(self) -> Option<(bool, u64)> {
         if self.word & 0x1F00_0000 != 0x1000_0000 {
             return None;
         }
@@ -135,7 +135,7 @@ impl Insn {
 
     /// 64-bit `ldr xt, label`: the address loaded from. Apple's linker rewrites `adrp` and `ldr`
     /// to this when the slot is near enough.
-    fn load_literal(self) -> Option<u64> {
+    pub(crate) fn load_literal(self) -> Option<u64> {
         (self.word & 0xFF00_0000 == 0x5800_0000).then(|| self.branch_target(5, 19))
     }
 

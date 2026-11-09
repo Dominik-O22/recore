@@ -13,6 +13,10 @@ run = "cargo build --release"
 description = "Run the tests, which need no corpus"
 run = "cargo test --profile ci --workspace"
 
+[tasks.decoders-agree]
+description = "Decode every ARM, Thumb and AArch64 word with recore and with yaxpeax-arm, and compare (crates/core/src/decoders_agree.rs)"
+run = "cargo test --profile ci -p recore --lib decoders_agree -- --ignored"
+
 [tasks.check]
 description = "Analyze and score the corpora, once corpus/fetch*.py have downloaded them"
 run = "./check.sh"
