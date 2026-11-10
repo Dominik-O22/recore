@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Fetches the Windows corpora: released PE binaries whose projects publish matching PDBs.
 
-Usage: fetch_pe.py [corpus-pe | corpus-pe32]...      default: both
+Usage: fetch_pe.py [corpus-pe | corpus-pe32 | corpus-pe-holdout | corpus-pe32-holdout]...
+                                                            default: all four
 
 corpus-pe holds PE32+ (x86-64) images and corpus-pe32 holds PE32 (i386) images, each as
 <corpus>/bin/<source>__<file> with its PDB at <corpus>/debug/<source>__<file>.pdb. Every archive
@@ -9,8 +10,12 @@ is pinned by URL and sha256 and cached in <corpus>/pkgs. A binary is paired with
 GUID both carry (the image's CodeView record and the PDB's info stream), never by file name, so
 a pair that made it into the corpus is known to belong together.
 
-MSI packages (python.org ships its PDBs that way) are unpacked with 7-Zip, run through mise.
-Nothing downloaded is executed. corpus/build_pe.py adds programs compiled here with llvm-mingw.
+The two -holdout corpora hold projects none of the others has, and score a change once it is
+done, so nothing is tuned on them. Some of their PDBs come from a symbol server, by the name and
+GUID their image names, and Mozilla's serves them as .pd_ cabinets.
+
+MSI packages (python.org ships its PDBs that way), installers (cached as .7z) and .pd_ cabinets
+are unpacked with 7-Zip, run through mise. Nothing downloaded is executed. corpus/build_pe.py adds programs compiled here with llvm-mingw.
 """
 import hashlib, shutil, struct, subprocess, sys, urllib.request, zipfile
 from dataclasses import dataclass, field
@@ -27,6 +32,11 @@ OBS = f"{GITHUB}/obsproject/obs-studio/releases/download/32.2.2"
 OPENSSH = f"{GITHUB}/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview"
 X64DBG = f"{GITHUB}/x64dbg/x64dbg/releases/download/2026.05.27"
 GIT = f"{GITHUB}/git-for-windows/git/releases/download"
+FIREFOX = "https://archive.mozilla.org/pub/firefox/releases/140.5.0esr"
+DOTNET = "https://api.nuget.org/v3-flatcontainer"
+WIRESHARK = "https://www.wireshark.org/download"
+MOZILLA_SYMBOLS = "https://symbols.mozilla.org"
+MICROSOFT_SYMBOLS = "https://msdl.microsoft.com/download/symbols"
 
 
 @dataclass
@@ -36,6 +46,20 @@ class Source:
     archives: list[tuple]
     # The binaries to keep, by file name or by a longer path suffix where the name alone is ambiguous.
     keep: list[str] = field(default_factory=list)
+
+
+def symbols(server, pdbs, packed=False):
+    """Archives for PDBs on a symbol server, each given as (PDB name, GUID and age, sha256)."""
+    return [(f"{server}/{name}/{key}/{name[:-1] + '_' if packed else name}", sha256) for name, key, sha256 in pdbs]
+
+
+FIREFOX_KEEP = ["firefox.exe", "mozglue.dll", "nss3.dll", "freebl3.dll", "softokn3.dll", "lgpllibs.dll", "mozavutil.dll",
+                "mozavcodec.dll", "gkcodecs.dll", "libGLESv2.dll", "plugin-container.exe", "updater.exe",
+                "crashhelper.exe", "maintenanceservice.exe"]
+DOTNET_KEEP = ["coreclr.dll", "clrjit.dll", "clrgc.dll", "hostfxr.dll", "hostpolicy.dll", "mscordbi.dll",
+               "mscordaccore.dll", "msquic.dll", "System.IO.Compression.Native.dll"]
+WIRESHARK_KEEP = ["tshark.exe", "dumpcap.exe", "sharkd.exe", "libwiretap.dll", "libwsutil.dll", "editcap.exe",
+                  "capinfos.exe", "rawshark.exe", "glib-2.0-0.dll", "libxml2.dll"]
 
 
 SOURCES = {
@@ -144,6 +168,98 @@ SOURCES = {
               "47f26cc01e9f6f04ca4c9ba49809a8f4aa645e292d099feb2f193f15adbcd4a8")],
             ["mingw32/bin/git.exe", "git-remote-https.exe", "git-http-fetch.exe"]),
     },
+    # clang-cl, C++ and C with Rust linked in. The installer is a 7-Zip archive.
+    "corpus-pe-holdout": {
+        "firefox": Source(
+            [(f"{FIREFOX}/win64/en-US/Firefox%20Setup%20140.5.0esr.exe",
+              "e24385749a6b2fccb2157722d94a9235cc141da7e43d947c01844eb530a9e01d", "firefox-140.5.0esr-win64.7z"),
+             *symbols(MOZILLA_SYMBOLS, [
+                 ("firefox.pdb", "0D5729EA62924F954C4C44205044422E1", "0dda7b4e6d58f394cd12c4462e2be8a5faba8baa57858067ab39147a172ab827"),
+                 ("mozglue.pdb", "F51B0E089F14D8A74C4C44205044422E1", "3f644650e145c3aa0060c709be67ab8cb3d47602230cb6971b3b065d34b9aec1"),
+                 ("nss3.pdb", "65B82AA7BBC04F7D4C4C44205044422E1", "a2a11ad755a06e4961c6a149b4a237857963c98fa7bca99649898360766ba689"),
+                 ("freebl3.pdb", "467C07D78DB6DE834C4C44205044422E1", "ed472422535ead66331578615ebec08daeed9320f0c2f01948a2ad11dba89b26"),
+                 ("softokn3.pdb", "F0F4E6AEC5D95FC44C4C44205044422E1", "bab9527fc1a532490a1316e5a0cb9889f3572da8a7c5cabcfac651a836d8ca5c"),
+                 ("lgpllibs.pdb", "3A138185FAFBB1E74C4C44205044422E1", "dedbe67faa9e91fd040dfe7d389d0c194196278620d80d6187445bae31640402"),
+                 ("mozavutil.pdb", "EAAFF1E4B75E83704C4C44205044422E1", "0815e0d5cd36b92e34b28c8923ceeb0dcc201c1816cfcb3ec6efe791ab1c18dd"),
+                 ("mozavcodec.pdb", "4FF2D448F1598B724C4C44205044422E1", "262780ffd80bb031b75fe3d9f9e58f8d467644de688d7c2a5b2fe72ed5c4fa68"),
+                 ("gkcodecs.pdb", "BEA87BB7872E82014C4C44205044422E1", "985b4da054eaf07442672b196fd1ff9d6df15b9b386c55f384761e969a78e251"),
+                 ("libGLESv2.pdb", "92459B8198E2C4E94C4C44205044422E1", "092995d82931fc307fe9aa6c907889eee289d2af03f4b8a1d27dc085096d7276"),
+                 ("plugin-container.pdb", "C69B44A271C24B9C4C4C44205044422E1", "f900b7616f5f0b058630d1289755250067dc6045e9b39a85a1a51ec01dc1eaef"),
+                 ("updater.pdb", "67FEF2A760DAF7144C4C44205044422E1", "723e24836c9c3509def5bc3ccafd9788aa2aa74bc170d20217559ce0291ed82c"),
+                 ("crashhelper.pdb", "E31D4D657F395BA24C4C44205044422E1", "026c9aacec698576211e036380df411655147adab09d0e02d65bf42d64a4839b"),
+                 ("maintenanceservice.pdb", "544EC4A7A3A12A184C4C44205044422E1", "50cd8085d14995a90388127710e3d08ba876756a17c0b8971b5d7310300398c4"),
+             ], packed=True)],
+            FIREFOX_KEEP),
+        # MSVC, C++: the .NET runtime's native part, from its NuGet runtime pack.
+        "dotnet": Source(
+            [(f"{DOTNET}/microsoft.netcore.app.runtime.win-x64/9.0.11/microsoft.netcore.app.runtime.win-x64.9.0.11.nupkg",
+              "32862c1b409bc570f94d62a4e87b65ed2bff28c889d07f47c2c8f2197719126e", "microsoft.netcore.app.runtime.win-x64.9.0.11.zip"),
+             *symbols(MICROSOFT_SYMBOLS, [
+                 ("coreclr.pdb", "9A11BC2D917E4FDD9A0F60908232B7141", "8db470292ee8ef7f1e6af517b033a27dd761535958075a73b6885986c2d221f1"),
+                 ("clrjit.pdb", "13040EFF9B4A4C9D83CAE3707EA582A71", "badc4b0d831c500c91b04e9f14e7d0a19f20502b11fef16de47f7ea1ba40a39e"),
+                 ("clrgc.pdb", "07D567E33DC246ABAED9E8F63DB3B7D21", "dde1177d6b362a5e7e91821a3020e55f5720294bbfddae981b78a40032376c49"),
+                 ("hostfxr.pdb", "D9714B9BF0CF4E57881CC90B7D52B7201", "969c823f1cfe1adc7967c041407eac449f7acb9d7b7f8f7f9e83f11c8ec11c1f"),
+                 ("hostpolicy.pdb", "179CC3A4A57B4DB18FE83373D60301F51", "42c22ad3deadc45905e7d2040678a01c18e592f8039469f59566ead8095810bc"),
+                 ("mscordbi.pdb", "AFA178C72A454C8AB1CDF99905105E881", "4f5988eb36740d636f7db37033b59678d6dcfb3c1680330be7ffbf35de168342"),
+                 ("mscordaccore.pdb", "39C389895F764F6C9578103DF9A8513A1", "6668b609d90db4cacc627e46ec30c066a6f9915298058bc90fe239dc2d2aa64f"),
+                 ("msquic.pdb", "01E07A25093646F493F93B2140E3018E1", "bfb7f102fe4348759aab859d1d972b412fda8c0a95eb9e6748a2137594048ba7"),
+                 ("System.IO.Compression.Native.pdb", "D5FB8C1E93F04DA389A7A31C6DD502621",
+                  "2fe95a2299014e71351dc0dac40c8d25deb27bae9906cf5821f9182f42479565"),
+             ])],
+            DOTNET_KEEP),
+        # MSVC, C, with Qt and libraries vcpkg builds. The installer is NSIS, which 7-Zip unpacks.
+        "wireshark": Source(
+            [(f"{WIRESHARK}/win64/all-versions/Wireshark-4.6.9-x64.exe",
+              "bf9b5ce8a89f244c376a9b1a946276eaa06463dde3e33069a34d7f102f5878cf", "Wireshark-4.6.9-x64.7z"),
+             (f"{WIRESHARK}/win64/all-versions/Wireshark-pdb-4.6.9-x64.zip",
+              "91d6e7df23115364a004c8fbe64d122d296468f65db4eab667cdb61cb4a5c1f4")],
+            WIRESHARK_KEEP),
+    },
+    "corpus-pe32-holdout": {
+        "firefox": Source(
+            [(f"{FIREFOX}/win32/en-US/Firefox%20Setup%20140.5.0esr.exe",
+              "25c13854ca75bddb349745c3ecf15aaa7cb75ebaae575491ecf1c6b932178ab3", "firefox-140.5.0esr-win32.7z"),
+             *symbols(MOZILLA_SYMBOLS, [
+                 ("firefox.pdb", "1B1DA80E1A1A439E4C4C44205044422E1", "26ed6c7afcafd24d8f620cb6a40571973044fdc5b1fa72d8e5f8ac55e6acb2f5"),
+                 ("mozglue.pdb", "1590F520C4C9A6504C4C44205044422E1", "b1355ba02619649c28682e6843d9ca374eff6cbc60cff3cb09f48ae538fcec15"),
+                 ("nss3.pdb", "3C058BAE37DB3A424C4C44205044422E1", "dfc9c21b5540e944d027a8085ef12918c6916c6b9da315d4b38482dd025378cc"),
+                 ("freebl3.pdb", "FE01031852BC520A4C4C44205044422E1", "2d9aac6e53e80077cc6cba0a7ffb516b8058788c71962be3bd538d7f88845469"),
+                 ("softokn3.pdb", "1BFA620101018C124C4C44205044422E1", "fb11777b922168b3452500c8fc5c6c08d6b5521a9e364b72a7296b8025b547d6"),
+                 ("lgpllibs.pdb", "0DF6E0CEAAFBC2804C4C44205044422E1", "095941b9d9ccd73d6f896587c2280da0d3da3d3ff6262cc30ef77ae3c7f345f1"),
+                 ("mozavutil.pdb", "DF4F20C447D761D24C4C44205044422E1", "ba7bf20f667bc9ead7896fc27df3b2da6153ffe66cd59c91d50f2107e69d97ea"),
+                 ("mozavcodec.pdb", "BA9310D30C970B5B4C4C44205044422E1", "585fd3c20bf02a9df6ff6d14e7b5b8fcfafa96a7c71832b231081bc2f9f14768"),
+                 ("gkcodecs.pdb", "DAEB7A65495AE8904C4C44205044422E1", "18d94b77f79c8b04b576bfd85da4ed476de021e20e209c5af6e70ffe84cb8e59"),
+                 ("libGLESv2.pdb", "B1725CC2BE14F7694C4C44205044422E1", "89aef7c95dd341175449724b0158b904233fda2b606ba5e6feb9cbb2533d1e64"),
+                 ("plugin-container.pdb", "F23FFC234A72B1EF4C4C44205044422E1", "8f0364b20b1e955a65ae32f607404bd4724d85bdbede542cb59d182a09684b99"),
+                 ("updater.pdb", "414141DDCFDEAB0A4C4C44205044422E1", "565fb0219ad73b51ea2b924ccc7e75a4a0278e51408b740593b86b6645d53c3b"),
+                 ("crashhelper.pdb", "0D110E83CCF9E57B4C4C44205044422E1", "259f05bcf583c2d9a3a218579e9c989582eea808e2a8e0137db963efa32fb7d5"),
+                 ("maintenanceservice.pdb", "C811A9F9E824AA8A4C4C44205044422E1", "0efcce227b7272613783c638746cb6116b97f08bd43c645252bca708d25b7dfc"),
+             ], packed=True)],
+            FIREFOX_KEEP),
+        "dotnet": Source(
+            [(f"{DOTNET}/microsoft.netcore.app.runtime.win-x86/9.0.11/microsoft.netcore.app.runtime.win-x86.9.0.11.nupkg",
+              "362975bbcb7f85f14d14cc936ca9eedcd1e785f6228799a78db16854e2c9031a", "microsoft.netcore.app.runtime.win-x86.9.0.11.zip"),
+             *symbols(MICROSOFT_SYMBOLS, [
+                 ("coreclr.pdb", "388C00448FD04196BE397E3FD703C1C61", "8cfad970919cd3123d69e433a87b93c2201eb365ab591f6aee87eceea93a73e0"),
+                 ("clrjit.pdb", "4F9F5F252B134F769D3642352BD01F681", "9d7f27dad70d36f476b54652216054304151493448c0f47228941880b2059478"),
+                 ("clrgc.pdb", "F4708884610C45D0B6181282DC01F7F91", "2fcbd5405169d709398244dcac7e22b589e1fb32aa00e68c4801164fcf65ecc4"),
+                 ("hostfxr.pdb", "FDB257BFD46740178630254B2D800BE11", "07cf1dacddd9d5a8f96e9cd57b6ea2827ff418433458d780f95c82b910a6bcc0"),
+                 ("hostpolicy.pdb", "0CBB0B021935439998CE725FAB1BEB731", "28a3c020d19e8d6169d8f220a83bea7dd726a7a866abb97cc17f875055b766d1"),
+                 ("mscordbi.pdb", "24AB7D71F9584E828DF2DFBF7B877AEC1", "b7ca4702565406fe398242c9eac735553079b12559a6a40cde0b72f9ddb5f56c"),
+                 ("mscordaccore.pdb", "06710B1380FD407B8F130BAE4D7070131", "7fb5733c551a14083441c5ab6894f79e8c81037bbf836590656deee4411631a6"),
+                 ("msquic.pdb", "485B3F8711984DE1A4FBBBAE48EE49A21", "ed1f1f3fc579dd4e2ddc99f38a9ecc063f436efee75cb60e0e4f967e19533a35"),
+                 ("System.IO.Compression.Native.pdb", "932BFE09DCA3463FB430B81651BFFD601",
+                  "f9778f085b555d1718190d2699c4fa0dc3e42044a54fe67cb6050c7a5b88c792"),
+             ])],
+            DOTNET_KEEP),
+        # Wireshark 3.6 is the last release with a 32-bit build.
+        "wireshark": Source(
+            [(f"{WIRESHARK}/win32/all-versions/Wireshark-win32-3.6.24.exe",
+              "38a62949d38f96457633982c8b1ec465587e01a9370807ab2e67c8504cff679a", "Wireshark-win32-3.6.24.7z"),
+             (f"{WIRESHARK}/win32/all-versions/Wireshark-pdb-win32-3.6.24.zip",
+              "a5c32fea12dd35d50006a9a5126c2a2ad21bfde5749c133554a05162187eea53")],
+            WIRESHARK_KEEP),
+    },
 }
 
 
@@ -162,7 +278,7 @@ def download(pkgs, url, sha256, name=None):
 
 def unpack(archive):
     """Returns the files of an archive, extracting it next to the cache. A bare file is itself."""
-    if archive.suffix not in (".zip", ".msi"):
+    if archive.suffix not in (".zip", ".msi", ".7z", ".pd_"):
         return [archive]
     dest = archive.parent / "x" / archive.name
     if not dest.exists():
@@ -248,7 +364,7 @@ def fetch(corpus_name):
             if not wanted or wanted in kept:
                 continue
             identity = image_identity(f)
-            if not identity or identity[0] != MACHINE[corpus_name]:
+            if not identity or identity[0] != MACHINE[corpus_name.removesuffix("-holdout")]:
                 continue
             if identity[1] not in pdbs:
                 print(f"{prefix:8} {f.name}: no PDB with its GUID, skipped")

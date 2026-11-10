@@ -127,6 +127,23 @@ A 32-bit Windows program linked with `/FIXED`, as many older games and tools are
 
 The Linux AArch64 and Mach-O corpora have no jump table truth. A stripped Mach-O binary keeps the linker's list of function starts and both tools read it, so the rows with it hidden show what each finds on its own.
 
+The rules were worked out on the binaries above. Each corpus but Linux AArch64 also has a held-out sibling of programs none of them is, scored once with the same build as the tuned corpus beside it. That build is newer than the one behind the table above, so a few tuned numbers differ by a tenth or two. Linux x86-64 holds the Debian builds of the 14 packages of the 32-bit ARM holdout. Windows holds Firefox 140 ESR (clang-cl, with Rust), the .NET 9 runtime and Wireshark (MSVC), with PDBs from Mozilla's and Microsoft's symbol servers and Wireshark's own. Mach-O holds 35 Homebrew formulae on AArch64 and the 19 of them with an x86-64 bottle, including Zig, Swift and Haskell programs.
+
+| Corpus | Tuned: found | Precision | Held out: found | Precision | Held-out binaries |
+|---|---|---|---|---|---|
+| Linux x86-64 | 100.0% | 100.0% | 99.7% | 100.0% | 28 |
+| Linux x86-64, unwind info hidden | 99.8% | 99.6% | 99.4% | 100.0% | |
+| Windows x86-64 | 99.8% | 98.3% | 99.9% | 99.6% | 29 |
+| Windows x86-64, unwind info hidden | 98.5% | 97.1% | 96.7% | 98.8% | |
+| Windows x86 | 99.4% | 99.0% | 98.3% | 97.4% | 31 |
+| Windows x86, relocations stripped | 99.2% | 99.0% | 98.8% | 98.1% | |
+| AArch64 Mach-O | 100.0% | 100.0% | 100.0% | 100.0% | 56 |
+| AArch64 Mach-O, function starts hidden | 99.8% | 99.9% | 99.6% | 45.8% | |
+| x86-64 Mach-O | 100.0% | 100.0% | 97.7% | 100.0% | 26 |
+| x86-64 Mach-O, function starts hidden | 99.3% | 99.7% | 77.3% | 85.6% | |
+
+Jump tables hold up: 765 of 765 exact on Windows x86-64 and 1,248 of 1,252 on x86. The Linux x86-64 loss is all BusyBox where unwind info is read. With it hidden, BusyBox is half and tcpdump most of the rest. On Windows x86, Wireshark 3.6's command line tools lose about 39 functions each, the 32-bit .NET runtime finds 94.9% of `coreclr.dll`, and Firefox's Rust `crashhelper.exe` comes in at 76.8% precision. Without function starts, ShellCheck, a Haskell program, is most of the Mach-O loss: without it, recore finds 98.6% at 99.8% on AArch64 and 96.5% at 99.8% on x86-64. On AArch64 recore decodes the tables GHC puts before each function as code. On x86-64 the truth is at fault too: ShellCheck's symbol table names 23,803 of those tables (`*_info_dsp`), the truth counts each as a function, and they are every one of the misses in the 97.7% row. The x86-64 Mach-O rows therefore understate what recore finds and say nothing sure about its precision on that program.
+
 Three of Ghidra's exports give a jump table target as a negative number, which the scorer rejects along with the whole binary. They were scored with those targets written as unsigned.
 
 Decompiled function signatures against PDB records, 8 binaries per corpus:
