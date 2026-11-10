@@ -2,8 +2,9 @@
 //! (crates/machine), written out as a cargo workspace. `recore-mcp lift --config <lift.toml>`
 //! runs it ([`workspace::run`]). It serves the lifted games and `player/`, not agents.
 //!
-//! [`pcode`] reads the decompiler's raw p-code into operations; recore-mcp's emulator takes the
-//! same operations, so it lives here, below both.
+//! [`pcode`] is the exception: it reads the decompiler's raw p-code into operations, and
+//! recore-mcp's emulator, which agents reach through `run`, takes the same operations. It lives
+//! here, below both.
 
 use anyhow::Result;
 use recore::edits::Edits;

@@ -75,7 +75,7 @@ struct Lifted {
     semantics: Semantics,
 }
 
-/// Why a run stops at an operation that is neither harmless nor in [`recore_lift::pcode::sse`].
+/// Why a run stops at an operation that is neither harmless nor in [`recore_machine::sse`].
 fn userop_stop(name: &str) -> String {
     if name.is_empty() { "an unnamed processor operation is not run".into() } else { format!("the processor operation {name} is not run") }
 }

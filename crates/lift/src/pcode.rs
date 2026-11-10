@@ -3,9 +3,7 @@
 
 use anyhow::{Context, Result, bail};
 use recore_machine::ops::Code;
-use recore_machine::x87;
-
-pub mod sse;
+use recore_machine::{sse, x87};
 
 /// A place in one of the processor's spaces: the registers, the memory, the temporaries an
 /// instruction's operations pass between them, or the constants operations take.
@@ -83,7 +81,7 @@ impl Userop {
 /// Processor operations that change nothing a function can observe, as the specifications name
 /// them, compared without regard to case. `setISAMode` tells a decompiler which instruction set
 /// a branch goes to, and a Cortex-M has one.
-pub const HARMLESS: &[&str] = &[
+const HARMLESS: &[&str] = &[
     "setISAMode", "lock", "unlock", "nop", "sev", "SendEvent", "Yield", "Hint_Prefetch", "DataMemoryBarrier", "DataSynchronizationBarrier", "InstructionSynchronizationBarrier",
 ];
 
