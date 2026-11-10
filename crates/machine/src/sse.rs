@@ -8,7 +8,7 @@
 //! Not here: the string compares (`pcmpestri` and its kin), `maskmovdqu`, which writes memory,
 //! and the VEX forms, which the specification names apart (`vpshufb_avx` and so on).
 
-use super::{mask, signed as sext};
+use crate::ops::{mask, signed as sext};
 
 /// One of the operations, resolved from its name when the instruction is lifted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

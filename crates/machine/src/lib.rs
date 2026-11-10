@@ -1,12 +1,14 @@
 //! The machine that code `recore-mcp lift` writes runs on: the x86 registers as bytes, a flat
 //! 32-bit memory, and the p-code semantics recore's emulator runs ([`ops`], [`x87`]) for the
-//! operations the lifter does not write out as Rust. Every call to an address at or above
+//! operations the lifter does not write out as Rust. [`sse`] is the emulator's alone so far:
+//! lifted code stops at those operations. Every call to an address at or above
 //! [`HOST`] goes to the [`Host`], which the program running the lifted code provides: it stands
 //! in for Windows and the other DLLs the executable imports.
 
 mod coverage;
 pub mod image;
 pub mod ops;
+pub mod sse;
 pub mod x87;
 
 use std::{collections::HashMap, fs::File, io::Read, path::Path, sync::OnceLock};

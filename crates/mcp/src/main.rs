@@ -46,7 +46,8 @@ fn main() -> Result<()> {
                 [flag, dir] if flag == "--out" => Some(Path::new(dir)),
                 _ => anyhow::bail!("usage: recore-mcp lift --config <lift.toml> [--out <dir>]"),
             };
-            print!("{}", emulate::workspace::run(Path::new(config), out)?);
+            let mut cache = Cache::new(false);
+            print!("{}", recore_lift::workspace::run(Path::new(config), out, |exe| Ok(cache.get(exe)?))?);
             return Ok(());
         }
         [worker, binary, options] if worker == WORKER_ARG => return recore_decomp::isolate::serve(Path::new(binary), options),

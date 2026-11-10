@@ -1,0 +1,14 @@
+[package]
+name = "recore-lift"
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.104"
+regex = "1.13.1"
+recore = { version = "0.2.0", path = "../core" }
+recore-decomp = { version = "0.2.0", path = "../decomp" }
+recore-machine = { version = "0.2.0", path = "../machine" }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1"

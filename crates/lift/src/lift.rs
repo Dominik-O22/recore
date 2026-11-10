@@ -1,14 +1,25 @@
 //! Writes Rust source that does what the functions reachable from some roots do, one Rust
 //! function per function, each instruction's raw p-code as statements. The source runs on
 //! `recore-machine` (crates/machine): `Cpu`, `dispatch`, and the p-code and x87 semantics the
-//! emulator runs too. [`super::workspace`] writes it out as a cargo workspace.
+//! emulator runs too. [`crate::workspace`] writes it out as a cargo workspace.
 
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
+    fmt::Write,
 };
 
-use super::*;
+use anyhow::{Context, Result, bail, ensure};
+use recore::FxHashMap;
+use recore::report::CallTarget;
+use recore_machine::ops::{Code, signed};
+use recore_machine::x87;
+
+use crate::Source;
+use crate::pcode::*;
+
+/// Bytes lifted at a time.
+const WINDOW: u64 = 512;
 
 struct Insn {
     addr: u64,
@@ -45,7 +56,7 @@ fn x87_step(text: &str) -> Step {
     })
 }
 
-fn lift_range(binary: &mut Binary, spaces: &mut Spaces, start: u64, end: u64, out: &mut Vec<Insn>) -> Result<()> {
+fn lift_range(binary: &mut dyn Source, spaces: &mut Spaces, start: u64, end: u64, out: &mut Vec<Insn>) -> Result<()> {
     let mut pc = start;
     while pc < end {
         let mut window = WINDOW.min(end - pc).max(16);
@@ -687,7 +698,7 @@ fn braced(text: &str) -> Option<(&str, Jump)> {
 
 /// The instructions reachable from `entry` by falling through and branching, for a call target
 /// the analysis did not make a function.
-fn discover(binary: &mut Binary, spaces: &mut Spaces, entry: u64) -> Result<Vec<Insn>> {
+fn discover(binary: &mut dyn Source, spaces: &mut Spaces, entry: u64) -> Result<Vec<Insn>> {
     let mut seen: BTreeMap<u64, Insn> = BTreeMap::new();
     let mut work = vec![entry];
     while let Some(pc) = work.pop() {
@@ -1698,24 +1709,24 @@ pub struct Function {
 }
 
 /// Lifts every function `roots` reach by direct calls, and every root.
-pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program> {
+pub fn lift(binary: &mut dyn Source, roots: &[u64], abi: &X87Abi) -> Result<Program> {
     let mut spaces = Spaces::new();
     spaces.intern("ram");
-    let jump_tables: FxHashMap<u64, Vec<u64>> = binary.program.analysis.jump_tables.iter().map(|t| (t.jump, t.targets.clone())).collect();
+    let jump_tables: FxHashMap<u64, Vec<u64>> = binary.program().analysis.jump_tables.iter().map(|t| (t.jump, t.targets.clone())).collect();
     let imports: FxHashMap<u64, (String, bool)> = binary
-        .program
+        .program()
         .analysis
         .calls
         .iter()
         .filter_map(|call| match call.target {
-            CallTarget::Import(slot) => Some((call.at, (binary.program.import_name(slot)?.to_string(), call.tail))),
+            CallTarget::Import(slot) => Some((call.at, (binary.program().import_name(slot)?.to_string(), call.tail))),
             CallTarget::Function(_) => None,
         })
         .collect();
     // The names and comments the binary's edits give functions (recore's `rename` and `comment`),
     // as each lifted function's doc: identifiers stay `f_<address>`, which never collide.
-    let names = binary.edits.names.clone();
-    let notes = binary.edits.comments.clone();
+    let names = binary.edits().names.clone();
+    let notes = binary.edits().comments.clone();
     let doc = |entry: u64| match (names.get(&entry), notes.get(&entry)) {
         (Some(name), Some(note)) => format!("#[doc = {:?}] ", format!("{name} ({entry:#x}): {note}")),
         (Some(name), None) => format!("#[doc = {:?}] ", format!("{name} ({entry:#x})")),
@@ -1737,7 +1748,7 @@ pub fn lift(binary: &mut Binary, roots: &[u64], abi: &X87Abi) -> Result<Program>
         let mut error = None;
         // A function's body, or for an entry inside one, as a method or a switch case reached
         // from a table, that function's whole body, entered here.
-        let program = &binary.program;
+        let program = binary.program();
         let owner = if program.function(entry).is_some() { Some(entry) } else { program.owners(entry).first().copied() };
         match owner.map(|owner| program.body(owner)) {
             Some(body) => {
