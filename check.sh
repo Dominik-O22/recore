@@ -9,7 +9,8 @@
 #
 # Where a corpus has DWARF, the decompiler's signatures are scored too: a fixed sample of each
 # binary's functions, each one's parameter count, whether it returns a value, and what its
-# parameters and its return are (a number, a float or a pointer, and its size), held against the
+# parameters, its return and the globals it uses are (a number, a float or a pointer, and its
+# size), held against the
 # base's decompiler on the same functions with `recore-decompile params --against`.
 #
 # Last, `recore-bench ratchet` counts the instructions of what an agent waits for on the
@@ -74,7 +75,7 @@ signatures() {
     echo "$out/signatures: no debug file lists a function, so no signature is scored"
     return
   fi
-  ./target/release/recore-decompile params "$out/signatures" "$in/debug" | sed -n '1p;3,6p'
+  ./target/release/recore-decompile params "$out/signatures" "$in/debug" | sed -n '1p;3,7p'
   if [ -n "$against" ] && [[ "$("$base-decompile" corpus --help)" != *--sample* ]]; then
     echo "$out/signatures: the base's decompiler takes no --sample, so nothing to compare with"
   elif [ -n "$against" ]; then

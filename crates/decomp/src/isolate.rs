@@ -94,13 +94,16 @@ pub struct FunctionRecord {
     /// What it returns, where it returns a value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_shape: Option<Shape>,
+    /// The globals it reads or writes, by address, and what it takes each for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub globals: Vec<(u64, Shape)>,
     pub c_len: usize,
 }
 
 impl FunctionRecord {
     /// A record for a function that produced no result.
     pub fn failed(addr: u64, status: Status, message: String, ms: f64) -> FunctionRecord {
-        FunctionRecord { addr, status, message: Some(message), ms, params: 0, storage: Vec::new(), shapes: Vec::new(), returns_value: false, return_shape: None, c_len: 0 }
+        FunctionRecord { addr, status, message: Some(message), ms, params: 0, storage: Vec::new(), shapes: Vec::new(), returns_value: false, return_shape: None, globals: Vec::new(), c_len: 0 }
     }
 }
 
@@ -598,6 +601,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                     shapes: function.params.iter().map(|p| Shape { kind: p.kind, size: p.size }).collect(),
                     returns_value: function.returns_value,
                     return_shape: function.returns_value.then_some(function.return_shape),
+                    globals: function.globals,
                     c_len: function.c_text.len(),
                 },
                 c_text: (options.emit_c && (keep || matches!(request, Request::Decompile(_)))).then_some(function.c_text),

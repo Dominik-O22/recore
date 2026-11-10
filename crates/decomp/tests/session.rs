@@ -1,7 +1,7 @@
 //! Sessions over hand-assembled code, so the tests need no corpus binary.
 
 use recore_decomp::facts::SwitchCall;
-use recore_decomp::{Facts, Section, Session, Target, vendored_spec_dir};
+use recore_decomp::{Facts, Kind, Section, Session, Target, vendored_spec_dir};
 
 fn session(code: &[u8]) -> Session {
     Session::new(&vendored_spec_dir().unwrap(), Target::X86_64Gcc, &[Section { addr: 0x1000, data: code, readonly: true, code: true }]).unwrap()
@@ -14,6 +14,18 @@ fn recovers_register_parameters() {
     assert_eq!(function.param_count(), 2);
     assert!(function.returns_value);
     assert!(function.c_text.contains("param_1 + param_2"), "{}", function.c_text);
+}
+
+#[test]
+fn lists_the_globals_a_function_uses_and_not_one_whose_address_it_takes() {
+    // mov rax, [0x2000]; mov eax, [rax]; lea rdx, [0x2020]; mov [0x2010], rdx; ret
+    let code = [0x48, 0x8b, 0x05, 0xf9, 0x0f, 0x00, 0x00, 0x8b, 0x00, 0x48, 0x8d, 0x15, 0x10, 0x10, 0x00, 0x00, 0x48, 0x89, 0x15, 0xf9, 0x0f, 0x00, 0x00, 0xc3];
+    let sections = [Section { addr: 0x1000, data: &code, readonly: true, code: true }, Section { addr: 0x2000, data: &[0; 0x40], readonly: false, code: false }];
+    let function = Session::new(&vendored_spec_dir().unwrap(), Target::X86_64Gcc, &sections).unwrap().decompile(0x1000).unwrap();
+    let globals: Vec<(u64, Kind, u32)> = function.globals.iter().map(|&(addr, shape)| (addr, shape.kind, shape.size)).collect();
+    // The one it reads through is a pointer, and the one it stores an address in is 8 bytes.
+    assert_eq!(globals.iter().map(|&(addr, _, size)| (addr, size)).collect::<Vec<_>>(), [(0x2000, 8), (0x2010, 8)], "{}", function.c_text);
+    assert_eq!(globals[0].1, Kind::Pointer, "{}", function.c_text);
 }
 
 #[test]

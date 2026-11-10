@@ -1,5 +1,6 @@
 //! Compares the parameter counts of a corpus run, whether each function returns a value, and
-//! what its parameters and its return are, with the debug info of each binary.
+//! what its parameters, its return and the globals it uses are, with the debug info of each
+//! binary.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -45,9 +46,10 @@ fn cause(name: &str, difference: i64) -> &'static str {
 /// for nothing at all, for bytes it gives no type, and for a struct or union by value: that
 /// arrives split among registers or on the stack as the ABI says, which the parameter count
 /// already scores. Also for a float wider than a double, which the engine sizes by the 10
-/// bytes x87 holds and DWARF by the 16 it is stored in, and for an array that is `returned`:
-/// C returns none, and the reader spells a pointer to a member function as one, two words wide.
-fn shape(types: &Types, mut id: TypeId, returned: bool) -> Option<Shape> {
+/// bytes x87 holds and DWARF by the 16 it is stored in, and for an array that is no `parameter`:
+/// a global one is its elements, C returns none, and the reader spells a pointer to a member
+/// function as one, two words wide.
+fn shape(types: &Types, mut id: TypeId, parameter: bool) -> Option<Shape> {
     loop {
         let (kind, size) = match types.get(id) {
             Type::Typedef { target, .. } | Type::Alias(target) => {
@@ -56,7 +58,7 @@ fn shape(types: &Types, mut id: TypeId, returned: bool) -> Option<Shape> {
             }
             Type::Base { base: Base::Float, size } if *size <= 8 => (Kind::Float, *size),
             Type::Base { base: Base::Float | Base::Unknown, .. } | Type::Void | Type::Composite { .. } => return None,
-            Type::Array { .. } if returned => return None,
+            Type::Array { .. } if !parameter => return None,
             Type::Base { size, .. } | Type::Enum { size, .. } => (Kind::Int, *size),
             // An array parameter is a pointer to its first element, and a function one a
             // pointer to the function.
@@ -86,6 +88,9 @@ struct Shapes {
     pointers: usize,
     pointers_matched: usize,
     pointers_claimed: usize,
+    /// Globals a function uses that the debug information gives a shape, a use each.
+    globals: usize,
+    globals_matched: usize,
 }
 
 impl std::ops::AddAssign for Shapes {
@@ -97,6 +102,8 @@ impl std::ops::AddAssign for Shapes {
         self.pointers += other.pointers;
         self.pointers_matched += other.pointers_matched;
         self.pointers_claimed += other.pointers_claimed;
+        self.globals += other.globals;
+        self.globals_matched += other.globals_matched;
     }
 }
 
@@ -110,10 +117,13 @@ fn spelled(shape: Shape) -> String {
     format!("{kind} of {}", shape.size)
 }
 
-/// What the debug information says each function's parameters and return are.
+/// What the debug information says each function's parameters and return are, and each global.
+#[derive(Default)]
 struct Typed {
     /// By address: each parameter's shape, and the return's.
     functions: BTreeMap<u64, (Vec<Option<Shape>>, Option<Shape>)>,
+    /// By address, the globals that have a shape: a struct or an array has none.
+    globals: BTreeMap<u64, Shape>,
 }
 
 impl Typed {
@@ -134,11 +144,19 @@ impl Typed {
             .functions
             .iter()
             .filter_map(|function| match types.get(function.prototype) {
-                Type::Function(prototype) if !prototype.variadic => Some((function.addr, (prototype.params.iter().map(|&(_, kind)| shape(&types, kind, false)).collect(), shape(&types, prototype.returns, true)))),
+                Type::Function(prototype) if !prototype.variadic => Some((function.addr, (prototype.params.iter().map(|&(_, kind)| shape(&types, kind, true)).collect(), shape(&types, prototype.returns, false)))),
                 _ => None,
             })
             .collect();
-        Ok(Typed { functions })
+        let globals = types.globals.iter().filter_map(|global| Some((global.addr, shape(&types, global.kind, false)?))).collect();
+        Ok(Typed { functions, globals })
+    }
+
+    /// Whether `found`, what a function takes the global at `addr` for, is what the debug
+    /// information declares it. `None` where it declares none there, or one without a shape.
+    fn global(&self, addr: u64, found: Shape) -> Option<(Shape, bool)> {
+        let expected = *self.globals.get(&addr)?;
+        Some((expected, comparable(found) == expected))
     }
 
     /// For the function `record` is of, its parameters the decompiler has a parameter of the
@@ -148,13 +166,22 @@ impl Typed {
     /// count. Nothing is counted for parameters where the count is wrong, which that score
     /// already says, or where the debug information gives one of them no shape: what the
     /// decompiler made of that one could pair with another. Nor for a return that only one of
-    /// the two accounts has. `misses` counts what was taken for what, as `a pointer of 8 as a
-    /// number of 8`: a return, and a parameter where the function has one miss, so that it is
-    /// plain which was which.
+    /// the two accounts has. A global counts once for each function that reads or writes it,
+    /// by the widest use that function makes of it. `misses` counts what was taken for what, as `a pointer of 8 as a
+    /// number of 8`: a global, a return, and a parameter where the function has one miss, so
+    /// that it is plain which was which.
     fn score(&self, record: &FunctionRecord, misses: &mut BTreeMap<String, usize>) -> Shapes {
         let mut counts = Shapes::default();
-        let Some((params, returns)) = self.functions.get(&record.addr) else { return counts };
         let mut miss = |what: &str, expected: Shape, found: Shape| *misses.entry(format!("{what}: {} as {}", spelled(expected), spelled(found))).or_default() += 1;
+        for &(addr, found) in &record.globals {
+            let Some((expected, matched)) = self.global(addr, found) else { continue };
+            counts.globals += 1;
+            counts.globals_matched += usize::from(matched);
+            if !matched {
+                miss("global", expected, comparable(found));
+            }
+        }
+        let Some((params, returns)) = self.functions.get(&record.addr) else { return counts };
         if let Some(params) = params.iter().copied().collect::<Option<Vec<Shape>>>().filter(|params| params.len() == record.shapes.len()) {
             let mut found: Vec<Shape> = record.shapes.iter().copied().map(comparable).collect();
             counts.pointers_claimed = found.iter().filter(|found| found.kind == Kind::Pointer).count();
@@ -351,10 +378,11 @@ pub fn compare(out_dir: &Path, debug_dir: &Path, jobs: usize, list: usize) -> Re
     total.print(&format!("{} binaries with debug info", tallies.len()));
     println!("of them in C units: {} of {} match ({:.1}%)", total.matched_c, total.compared_c, 100.0 * total.matched_c as f64 / total.compared_c.max(1) as f64);
     println!("returns a value or not: {} of {} match ({:.1}%)", total.returns_matched, total.returns_compared, 100.0 * total.returns_matched as f64 / total.returns_compared.max(1) as f64);
-    let Shapes { params, params_matched, returns, returns_matched, pointers, pointers_matched, pointers_claimed } = total.types;
+    let Shapes { params, params_matched, returns, returns_matched, pointers, pointers_matched, pointers_claimed, globals, globals_matched } = total.types;
     println!("parameter types, a number, a float or a pointer of the size: {params_matched} of {params} match ({:.1}%)", 100.0 * params_matched as f64 / params.max(1) as f64);
     println!("return types: {returns_matched} of {returns} match ({:.1}%)", 100.0 * returns_matched as f64 / returns.max(1) as f64);
     println!("of the parameters, pointers: {pointers_matched} of {pointers} match ({:.1}%), and the decompiler calls {pointers_claimed} one", 100.0 * pointers_matched as f64 / pointers.max(1) as f64);
+    println!("global types, a use in each function: {globals_matched} of {globals} match ({:.1}%)", 100.0 * globals_matched as f64 / globals.max(1) as f64);
     for (group, tally) in &groups {
         tally.print(group);
     }
@@ -383,7 +411,7 @@ pub fn compare(out_dir: &Path, debug_dir: &Path, jobs: usize, list: usize) -> Re
 }
 
 /// The counts [`against`] holds a run to, each with whether more of it is better.
-const MEASURES: [(&str, bool); 6] = [
+const MEASURES: [(&str, bool); 8] = [
     ("parameter counts right", true),
     ("returns a value or not right", true),
     ("failed or crashed", false),
@@ -391,20 +419,26 @@ const MEASURES: [(&str, bool); 6] = [
     ("return types right", true),
     // What keeps typing every untyped value a pointer from passing for better types.
     ("parameters wrongly called a pointer", false),
+    ("global types right", true),
+    ("globals wrongly called a pointer", false),
 ];
 
 /// One binary's [`MEASURES`] in a run, over the functions that both runs decompiled.
-type Counts = [usize; 6];
+type Counts = [usize; 8];
+
+/// A binary's name, its [`MEASURES`] in the base and in the head, and what [`counted`] compared.
+type Compared = (String, Counts, Counts, [usize; 2]);
 
 /// The [`MEASURES`] of `base` and of `head`, two runs of the same functions of one binary, and
-/// how many functions have their parameters' types scored in both.
-fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &Typed) -> (Counts, Counts, usize) {
+/// how many functions have their parameters' types scored in both, and how many uses of a
+/// global.
+fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &Typed) -> (Counts, Counts, [usize; 2]) {
     let ok = |report: &BinaryReport| -> BTreeMap<u64, (usize, bool)> { report.functions.iter().filter(|r| r.status == Status::Ok).map(|r| (r.addr, (r.params, r.returns_value))).collect() };
     let (base_ok, head_ok) = (ok(base), ok(head));
     // Over every function: a decompiler that starts to fail drops functions from the ones both
     // runs finished. A timeout depends on the load and is left out.
     let failed = |report: &BinaryReport| report.functions.iter().filter(|r| matches!(r.status, Status::Error | Status::Crash)).count();
-    let (mut base_counts, mut head_counts) = ([0, 0, failed(base), 0, 0, 0], [0, 0, failed(head), 0, 0, 0]);
+    let (mut base_counts, mut head_counts) = ([0, 0, failed(base), 0, 0, 0, 0, 0], [0, 0, failed(head), 0, 0, 0, 0, 0]);
     // Types count where both runs have them scored: a function whose parameter count one run
     // got wrong has no parameters scored in that run, and a build from before shapes were
     // recorded has none scored at all. Its wrong pointers would otherwise read as new ones.
@@ -424,6 +458,20 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
             }
         }
     }
+    // A global counts where both runs have the function use it: one a run no longer reads, or
+    // that a build from before they were recorded does not list, is no type gone wrong.
+    let uses = |report: &'_ BinaryReport| -> BTreeMap<(u64, u64), Shape> { report.functions.iter().filter(|r| r.status == Status::Ok).flat_map(|r| r.globals.iter().map(|&(addr, shape)| ((r.addr, addr), shape))).collect() };
+    let (base_uses, head_uses) = (uses(base), uses(head));
+    let mut globals_in_both = 0;
+    for (&(function, addr), &base_shape) in &base_uses {
+        let (Some(&head_shape), Some(_)) = (head_uses.get(&(function, addr)), typed.global(addr, base_shape)) else { continue };
+        globals_in_both += 1;
+        for (counts, found) in [(&mut base_counts, base_shape), (&mut head_counts, head_shape)] {
+            let matched = typed.global(addr, found).is_some_and(|(_, matched)| matched);
+            counts[6] += usize::from(matched);
+            counts[7] += usize::from(found.kind == Kind::Pointer && !matched);
+        }
+    }
     for (addr, expected) in &debug.functions {
         // A function that timed out in one run says nothing about the other.
         let (Some(&base_found), Some(&head_found)) = (base_ok.get(addr), head_ok.get(addr)) else { continue };
@@ -432,7 +480,7 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
             counts[1] += usize::from(expected.returns_value == Some(returns_value));
         }
     }
-    (base_counts, head_counts, typed_in_both)
+    (base_counts, head_counts, [typed_in_both, globals_in_both])
 }
 
 /// Prints each of [`MEASURES`] that moved from the corpus run in `base_dir` to the one in
@@ -441,7 +489,7 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
 pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) -> Result<()> {
     let reports = reports(head_dir)?;
     let read = |path: &Path| -> Result<BinaryReport> { serde_json::from_slice(&std::fs::read(path)?).with_context(|| format!("parsing {path:?}")) };
-    let mut binaries: Vec<(String, Counts, Counts, usize)> = in_parallel(&reports, jobs, |path| -> Result<Option<(String, Counts, Counts, usize)>> {
+    let mut binaries: Vec<Compared> = in_parallel(&reports, jobs, |path| -> Result<Option<Compared>> {
         let head = read(path)?;
         let base_path = base_dir.join(path.file_name().context("no file name")?);
         let debug_path = debug_dir.join(format!("{}.debug", head.name));
@@ -458,7 +506,8 @@ pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) 
     .collect();
     binaries.sort_by(|a, b| a.0.cmp(&b.0));
     // A base from before shapes were recorded has none, and then no type count can move.
-    println!("  parameter types compared in {} functions", binaries.iter().map(|binary| binary.3).sum::<usize>());
+    let both = |index: usize| binaries.iter().map(|binary| binary.3[index]).sum::<usize>();
+    println!("  parameter types compared in {} functions, global types in {} uses", both(0), both(1));
 
     let mut worse = Vec::new();
     for (index, (measure, more_is_better)) in MEASURES.into_iter().enumerate() {
@@ -510,11 +559,11 @@ mod tests {
         let base = run(&[(0x10, Status::Ok, 1, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, true)]);
         // 0x10 now reads as returning a value, and 0x20 timed out.
         let head = run(&[(0x10, Status::Ok, 1, true), (0x20, Status::Timeout, 0, false), (0x30, Status::Ok, 0, false)]);
-        let typed = Typed { functions: BTreeMap::new() };
-        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0], 0));
+        let typed = Typed::default();
+        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0, 0], [0, 0]));
         // A function that fails drops out of the comparison, and counts as failed.
         let head = run(&[(0x10, Status::Error, 0, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, false)]);
-        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0], [2, 1, 1, 0, 0, 0], 0));
+        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 1, 1, 0, 0, 0, 0, 0], [0, 0]));
     }
 
     #[test]
@@ -522,12 +571,12 @@ mod tests {
         let shape = |kind, size| Shape { kind, size };
         // f(double, char *, int) returning a pointer.
         let expected = (vec![Some(shape(Kind::Float, 8)), Some(shape(Kind::Pointer, 8)), Some(shape(Kind::Int, 4))], Some(shape(Kind::Pointer, 8)));
-        let typed = Typed { functions: BTreeMap::from([(0x10, expected)]) };
+        let typed = Typed { functions: BTreeMap::from([(0x10, expected)]), ..Typed::default() };
         let record = |shapes: &[Shape], return_shape| FunctionRecord { shapes: shapes.to_vec(), return_shape, ..FunctionRecord::failed(0x10, Status::Ok, String::new(), 0.0) };
         // The integer registers first, the pointer taken for a number, and the int untyped.
         let found = record(&[shape(Kind::Unknown, 8), shape(Kind::Unknown, 4), shape(Kind::Float, 8)], Some(shape(Kind::Pointer, 8)));
         let mut misses = BTreeMap::new();
-        let scored = Shapes { params: 3, params_matched: 2, returns: 1, returns_matched: 1, pointers: 1, pointers_matched: 0, pointers_claimed: 0 };
+        let scored = Shapes { params: 3, params_matched: 2, returns: 1, returns_matched: 1, pointers: 1, pointers_matched: 0, pointers_claimed: 0, ..Shapes::default() };
         assert_eq!(typed.score(&found, &mut misses), scored);
         assert_eq!(misses, BTreeMap::from([("parameter: a pointer of 8 as a number of 8".to_string(), 1)]));
         // With a parameter missing the count is what is wrong, and a return the decompiler
@@ -541,7 +590,7 @@ mod tests {
         let function = |params| Function { params, variadic: false, returns_value: Some(false), c: true };
         let debug = DebugInfo { functions: BTreeMap::from([(0x10, function(1)), (0x20, function(1))]), symbols: BTreeMap::new() };
         // Both take a number of 8.
-        let typed = Typed { functions: BTreeMap::from([(0x10, (vec![Some(shape(Kind::Int, 8))], None)), (0x20, (vec![Some(shape(Kind::Int, 8))], None))]) };
+        let typed = Typed { functions: BTreeMap::from([(0x10, (vec![Some(shape(Kind::Int, 8))], None)), (0x20, (vec![Some(shape(Kind::Int, 8))], None))]), ..Typed::default() };
         let run = |shapes: [&[Shape]; 2]| {
             let functions = [0x10, 0x20].into_iter().zip(shapes).map(|(addr, shapes)| FunctionRecord { params: shapes.len(), shapes: shapes.to_vec(), ..FunctionRecord::failed(addr, Status::Ok, String::new(), 0.0) }).collect();
             BinaryReport { name: "b".into(), fragments_skipped: 0, functions }
@@ -550,9 +599,29 @@ mod tests {
         // A build that records no shapes has no type scored, so the head's wrong pointer is no
         // loss. Its records here have no parameters either, which is what the first count says.
         let head = run([&[pointer], &[number]]);
-        assert_eq!(counted(&run([&[], &[]]), &head, &debug, &typed), ([0, 2, 0, 0, 0, 0], [2, 2, 0, 0, 0, 0], 0));
+        assert_eq!(counted(&run([&[], &[]]), &head, &debug, &typed), ([0, 2, 0, 0, 0, 0, 0, 0], [2, 2, 0, 0, 0, 0, 0, 0], [0, 0]));
         // Against a run that had both right, it is one: a type lost and a pointer wrongly called.
-        assert_eq!(counted(&run([&[number], &[number]]), &head, &debug, &typed), ([2, 2, 0, 2, 0, 0], [2, 2, 0, 1, 0, 1], 2));
+        assert_eq!(counted(&run([&[number], &[number]]), &head, &debug, &typed), ([2, 2, 0, 2, 0, 0, 0, 0], [2, 2, 0, 1, 0, 1, 0, 0], [2, 0]));
+    }
+
+    #[test]
+    fn a_global_counts_where_it_is_declared_and_both_runs_use_it() {
+        let shape = |kind, size| Shape { kind, size };
+        // A pointer at 0x100 and a 4-byte number at 0x200. Nothing is declared at 0x300.
+        let typed = Typed { globals: BTreeMap::from([(0x100, shape(Kind::Pointer, 8)), (0x200, shape(Kind::Int, 4))]), ..Typed::default() };
+        let run = |globals: &[(u64, Shape)]| BinaryReport { name: "b".into(), fragments_skipped: 0, functions: vec![FunctionRecord { globals: globals.to_vec(), ..FunctionRecord::failed(0x10, Status::Ok, String::new(), 0.0) }] };
+        let head = run(&[(0x100, shape(Kind::Unknown, 8)), (0x200, shape(Kind::Unknown, 4)), (0x300, shape(Kind::Float, 8))]);
+        let mut misses = BTreeMap::new();
+        assert_eq!(typed.score(&head.functions[0], &mut misses), Shapes { globals: 2, globals_matched: 1, ..Shapes::default() });
+        assert_eq!(misses, BTreeMap::from([("global: a pointer of 8 as a number of 8".to_string(), 1)]));
+        let debug = DebugInfo { functions: BTreeMap::new(), symbols: BTreeMap::new() };
+        // A build that lists no globals has none to compare, so the head's miss is no loss.
+        assert_eq!(counted(&run(&[]), &head, &debug, &typed), ([0; 8], [0; 8], [0, 0]));
+        // Against a run that had the pointer right and did not use the number, it is one.
+        assert_eq!(counted(&run(&[(0x100, shape(Kind::Pointer, 8))]), &head, &debug, &typed), ([0, 0, 0, 0, 0, 0, 1, 0], [0; 8], [0, 1]));
+        // Calling the number a pointer is no better type, and counts against the run.
+        let pointers = run(&[(0x100, shape(Kind::Pointer, 8)), (0x200, shape(Kind::Pointer, 4))]);
+        assert_eq!(counted(&head, &pointers, &debug, &typed), ([0, 0, 0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 0, 1, 1], [0, 2]));
     }
 
     #[test]
@@ -560,7 +629,7 @@ mod tests {
         let shape = |kind, size| Shape { kind, size };
         // f(struct by value, char *): the struct arrives as a pointer the debug information
         // does not describe, which would pair with the `char *` the decompiler took for a number.
-        let typed = Typed { functions: BTreeMap::from([(0x10, (vec![None, Some(shape(Kind::Pointer, 8))], None))]) };
+        let typed = Typed { functions: BTreeMap::from([(0x10, (vec![None, Some(shape(Kind::Pointer, 8))], None))]), ..Typed::default() };
         let found = FunctionRecord { shapes: vec![shape(Kind::Pointer, 8), shape(Kind::Int, 8)], ..FunctionRecord::failed(0x10, Status::Ok, String::new(), 0.0) };
         assert_eq!(typed.score(&found, &mut BTreeMap::new()), Shapes::default());
     }

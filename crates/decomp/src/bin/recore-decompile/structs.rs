@@ -59,7 +59,9 @@ pub fn score(config: &Config) -> Result<()> {
         let mut paths: Vec<PathBuf> = std::fs::read_dir(corpus.join("bin"))?.map(|entry| Ok(entry?.path())).collect::<Result<_>>()?;
         paths.sort();
         for path in paths {
-            let debug = corpus.join("debug").join(format!("{}.debug", path.file_name().unwrap().to_string_lossy()));
+            // A raw image goes by the name of its layout, as its debug file does.
+            let name = if recore::layout::is_layout(&path) { path.file_stem() } else { path.file_name() };
+            let debug = corpus.join("debug").join(format!("{}.debug", name.unwrap().to_string_lossy()));
             if debug.is_file() {
                 binaries.push((path, debug));
             }
