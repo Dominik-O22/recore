@@ -62,7 +62,7 @@ pub struct Op {
 pub enum Userop {
     /// One of the MMX and SSE operations of [`sse`].
     Sse(sse::Op),
-    /// Nothing a function can observe: see [`HARMLESS`].
+    /// Nothing a function can observe: see `HARMLESS`.
     Harmless,
     /// Any other operation, by name: a run stops at it, and the lifter runs a few.
     Other(String),
