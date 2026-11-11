@@ -162,7 +162,7 @@ impl Insn {
         let (offset, size) = (u64::from(hw2 & 0xFF) * 4, 8);
         let Value::Const(base) = state.registers[usize::from(hw1 & 0xF)] else { return None };
         let at = if hw1 & 0x0080 != 0 { u64::from(base) + offset } else { u64::from(base).wrapping_sub(offset) };
-        (at > self.addr && at - self.addr <= REACH && at % 4 == 0).then_some((at, at + size))
+        (at > self.addr && at - self.addr <= REACH && at % 4 == 0).then(|| (at, at + size))
     }
 
     /// The base register of a load or a store, other than SP or PC: of one register at an
