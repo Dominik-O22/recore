@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
-use recore::edits::Edits;
+use recore::edits::{Edits, EditsFile};
 use recore::program::Program;
 use recore::report::CallTarget;
 use recore_decomp::isolate::{Options, Status, Worker};
@@ -386,9 +386,10 @@ pub fn session(binaries: &[PathBuf], runs: usize, count: usize) -> Result<Vec<Se
         };
         let callers: Vec<(u64, u64)> = program.functions().filter_map(|f| Some((f.addr, callee_of(f.addr)?))).collect();
         let starts: Vec<(u64, u64)> = callers.iter().copied().step_by(callers.len().div_ceil(count.max(1)).max(1)).collect();
+        let edits_file = EditsFile::of(binary)?;
         let mut walks = Vec::new();
         for _ in 0..runs {
-            let _ = std::fs::remove_file(Edits::file(binary)?);
+            let _ = std::fs::remove_file(edits_file.path());
             let tool = tool.clone();
             let command = move || {
                 let mut command = Command::new(&tool);
@@ -406,13 +407,13 @@ pub fn session(binaries: &[PathBuf], runs: usize, count: usize) -> Result<Vec<Se
                         continue;
                     };
                     edits.names.insert(addr, format!("{name}_{index}"));
-                    edits.save(binary)?;
+                    edits.save(&edits_file)?;
                     worker.update(&edits, SLOW);
                 }
             }
             walks.push(ms(start));
         }
-        let _ = std::fs::remove_file(Edits::file(binary)?);
+        let _ = std::fs::remove_file(edits_file.path());
         rows.push(SessionRow { binary: name(binary), starts: starts.len(), walk: Stat::of(walks) });
     }
     Ok(rows)

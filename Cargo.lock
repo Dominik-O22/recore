@@ -813,6 +813,7 @@ dependencies = [
  "serde_json",
  "swift-demangler",
  "toml",
+ "twox-hash",
  "yaxpeax-arch",
  "yaxpeax-arm",
 ]
