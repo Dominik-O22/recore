@@ -20,7 +20,7 @@ use ops::{compute, signed};
 #[cold]
 #[inline(never)]
 fn outside_flat(addr: u32, len: usize) -> ! {
-    panic!("memory {addr:#x}+{len:#x} is outside flat memory, which ends at {FLAT_SIZE:#x}");
+    panic!("memory {addr:#x}+{len:#x} is outside flat memory, which ends at {FLAT_END:#x}");
 }
 
 /// Register offsets in the x86 p-code register space, as `(offset, size)`.
@@ -51,6 +51,12 @@ const PAGE: usize = 4096;
 /// program uses, and an access above them panics.
 const RESERVES_ALL: bool = cfg!(all(unix, target_pointer_width = "64"));
 const FLAT_SIZE: u64 = if RESERVES_ALL { 1 << 32 } else { 1 << 29 };
+/// Where an access must end. Both blocks hold a page past [`FLAT_SIZE`], so a `u128` load of a
+/// narrower value near the end stays inside them; the whole address space's block also lets an
+/// access that starts below 4 GiB run into that page rather than wrap.
+const FLAT_END: u64 = if RESERVES_ALL { FLAT_SIZE + PAGE as u64 } else { FLAT_SIZE };
+/// The size of the block [`Mem::flat_block`] makes.
+const FLAT_BLOCK: usize = FLAT_SIZE as usize + PAGE;
 
 struct Page {
     bytes: [u8; PAGE],
@@ -82,22 +88,27 @@ impl Mem {
         if !flat {
             return Ok(Mem { flat: std::ptr::null_mut(), pages: (0..(1usize << 20)).map(|_| None).collect(), backing });
         }
-        let base = Self::flat_block(&backing)?;
-        Ok(Mem { flat: base, pages: Vec::new(), backing })
+        // `Mem` owns the block before filling it, so its `Drop` frees it when filling fails.
+        let mem = Mem { flat: Self::flat_block()?, pages: Vec::new(), backing };
+        mem.fill()?;
+        Ok(mem)
     }
 
-    /// The whole address space: a private anonymous mapping reserved without backing store,
-    /// snapshot regions mapped over it at their addresses.
+    /// The whole address space: a private anonymous mapping reserved without backing store.
     #[cfg(all(unix, target_pointer_width = "64"))]
-    fn flat_block(backing: &Backing) -> std::io::Result<*mut u8> {
-        // SAFETY: a fresh private anonymous mapping, reserved without backing store; regions are
-        // mapped over it at fixed addresses inside it.
-        let base = unsafe { libc::mmap(std::ptr::null_mut(), (1usize << 32) + PAGE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0) };
+    fn flat_block() -> std::io::Result<*mut u8> {
+        // SAFETY: a fresh private anonymous mapping, reserved without backing store.
+        let base = unsafe { libc::mmap(std::ptr::null_mut(), FLAT_BLOCK, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0) };
         if base == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
-        let base = base.cast::<u8>();
-        match backing {
+        Ok(base.cast())
+    }
+
+    /// Maps snapshot regions over the reservation at their addresses, or copies the image in.
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn fill(&self) -> std::io::Result<()> {
+        match &self.backing {
             Backing::Snapshot { regions } => {
                 use std::os::fd::AsRawFd;
                 for (start, end, file) in regions {
@@ -106,39 +117,49 @@ impl Mem {
                         continue;
                     }
                     // SAFETY: inside the reservation; a private mapping of a file we opened.
-                    let at = unsafe { libc::mmap(base.add(*start as usize).cast(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_FIXED, file.as_raw_fd(), 0) };
+                    let at = unsafe { libc::mmap(self.flat.add(*start as usize).cast(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_FIXED, file.as_raw_fd(), 0) };
                     if at == libc::MAP_FAILED {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
             }
-            Backing::Image(sections) => Self::copy_sections(base, sections),
+            Backing::Image(sections) => Self::copy_sections(self.flat, sections),
         }
-        Ok(base)
+        Ok(())
     }
 
     /// The low [`FLAT_SIZE`] bytes, zeroed, and a page more for the widest access at their end.
     #[cfg(not(all(unix, target_pointer_width = "64")))]
-    fn flat_block(backing: &Backing) -> std::io::Result<*mut u8> {
-        let layout = std::alloc::Layout::from_size_align(FLAT_SIZE as usize + PAGE, PAGE).expect("flat memory's layout");
+    fn flat_block() -> std::io::Result<*mut u8> {
         // SAFETY: the layout's size is not zero.
-        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        let base = unsafe { std::alloc::alloc_zeroed(Self::flat_layout()) };
         if base.is_null() {
             return Err(std::io::ErrorKind::OutOfMemory.into());
         }
-        match backing {
+        Ok(base)
+    }
+
+    /// Copies snapshot regions or the image into the block.
+    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    fn fill(&self) -> std::io::Result<()> {
+        match &self.backing {
             Backing::Snapshot { regions } => {
                 for (start, end, file) in regions {
                     let mut bytes = Vec::new();
                     file.take(u64::from(end - start)).read_to_end(&mut bytes)?;
                     assert!(u64::from(*start) + bytes.len() as u64 <= FLAT_SIZE, "snapshot region {start:#x} is outside flat memory");
                     // SAFETY: inside the block, as just checked.
-                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(*start as usize), bytes.len()) };
+                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.flat.add(*start as usize), bytes.len()) };
                 }
             }
-            Backing::Image(sections) => Self::copy_sections(base, sections),
+            Backing::Image(sections) => Self::copy_sections(self.flat, sections),
         }
-        Ok(base)
+        Ok(())
+    }
+
+    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    fn flat_layout() -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(FLAT_BLOCK, PAGE).expect("flat memory's layout")
     }
 
     fn copy_sections(base: *mut u8, sections: &[image::Section]) {
@@ -149,13 +170,15 @@ impl Mem {
         }
     }
 
-    /// Where `len` bytes from `addr` live in flat memory; panics when they are outside it.
+    /// Where `len` bytes from `addr` live in flat memory; panics when they are outside it. For
+    /// the fixed sizes `read` and `write` pass, the whole address space's check folds away: no
+    /// `u32` address plus 16 passes [`FLAT_END`]. The add saturates so no `len` wraps past it.
     #[inline(always)]
     fn flat_at(&self, addr: u32, len: usize) -> *mut u8 {
-        if !RESERVES_ALL && u64::from(addr) + len as u64 > FLAT_SIZE {
+        if u64::from(addr).saturating_add(len as u64) > FLAT_END {
             outside_flat(addr, len);
         }
-        // SAFETY: inside the block: the whole address space, or checked above.
+        // SAFETY: inside the block, as just checked.
         unsafe { self.flat.add(addr as usize) }
     }
 
@@ -298,6 +321,24 @@ impl Mem {
             }
         }
         out
+    }
+}
+
+impl Drop for Mem {
+    fn drop(&mut self) {
+        if self.flat.is_null() {
+            return;
+        }
+        // SAFETY: `flat_block` made this block, and nothing reaches it once `Mem` is gone.
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        unsafe {
+            libc::munmap(self.flat.cast(), FLAT_BLOCK);
+        }
+        // SAFETY: as above, and `flat_block` allocated it with this layout.
+        #[cfg(not(all(unix, target_pointer_width = "64")))]
+        unsafe {
+            std::alloc::dealloc(self.flat, Self::flat_layout());
+        }
     }
 }
 
@@ -1014,5 +1055,52 @@ fn write_le(r: &mut [u8], at: usize, size: usize, v: u128) {
         4 => r[at..at + 4].copy_from_slice(&(v as u32).to_le_bytes()),
         8 => r[at..at + 8].copy_from_slice(&(v as u64).to_le_bytes()),
         _ => (0..size).for_each(|i| r[at + i] = (v >> (8 * i)) as u8),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flat() -> Mem {
+        Mem::new(Backing::Image(Vec::new()), true).expect("flat memory")
+    }
+
+    /// The last page of flat memory, whose end a long access runs past.
+    const LAST: u32 = (FLAT_SIZE - PAGE as u64) as u32;
+
+    #[test]
+    fn flat_memory_holds_its_last_page() {
+        let mut mem = flat();
+        mem.poke(LAST, &[7; PAGE]);
+        assert_eq!(mem.bytes(LAST, PAGE), [7; PAGE]);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside flat memory")]
+    fn poke_across_the_top_panics() {
+        flat().poke(LAST, &[7; 3 * PAGE]);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside flat memory")]
+    fn bytes_across_the_top_panics() {
+        flat().bytes(LAST, 3 * PAGE);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside flat memory")]
+    fn a_length_that_wraps_panics() {
+        flat().bytes(1, usize::MAX);
+    }
+
+    /// A 48-bit address space holds fewer than 65,536 reservations of 4 GiB, so this fails
+    /// when dropped memory keeps its reservation.
+    #[test]
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn dropped_memory_gives_back_its_reservation() {
+        for _ in 0..70_000 {
+            flat();
+        }
     }
 }
