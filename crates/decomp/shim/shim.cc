@@ -2,8 +2,9 @@
 //
 // One RdSession is one ghidra::Architecture: a program image, its symbol database and a
 // SLEIGH translator. Sessions are independent of each other and may run on different
-// threads, but a single session must only be used by one thread at a time. The two places
-// where the engine touches process-wide state, session creation and C printing, take a lock.
+// threads, but a single session must only be used by one thread at a time. Three kinds of the
+// engine's process-wide state are locked across sessions: `xml_lock` for session creation and
+// every XML document parsed, `parse_lock` for the C parser, and a lock around C printing.
 
 #include <algorithm>
 #include <cstdint>
@@ -1375,6 +1376,10 @@ void operator delete[](void *block, size_t) noexcept { mi_free(block); }
 // since that parses the language files, and so is every other document parsed.
 static mutex xml_lock;
 
+// The engine's C parser keeps its state in globals too: `parse` in grammar.cc and bison's own.
+// Every call into it, parse_C or parse_type, takes this one lock, whatever the session.
+static mutex parse_lock;
+
 extern "C" {
 
 static void recover_structs(RdSession *session, Funcdata &fd);
@@ -1650,8 +1655,7 @@ int rd_override_call(RdSession *session, uint64_t function, uint64_t call, uint6
 // Parses one C declaration with the engine's own parser. `extern` declarations set the prototype
 // of the function of that name, which must exist; `typedef` and struct declarations add types.
 int rd_declare(RdSession *session, const char *declaration, char *err, size_t errlen) {
-  static mutex parser_lock;  // the bison parser keeps its state in globals
-  lock_guard<mutex> guard(parser_lock);
+  lock_guard<mutex> guard(parse_lock);
   return guarded(err, errlen, [&] {
     istringstream text(declaration);
     parse_C(session->arch, text);
@@ -2135,8 +2139,7 @@ int rd_add_global(RdSession *session, uint64_t addr, const char *name, const cha
     Address where = session->address(addr);
     Datatype *datatype = arch->types->getBase(1, TYPE_UNKNOWN);
     if (type[0] != 0) {
-      static mutex parser_lock;
-      lock_guard<mutex> guard(parser_lock);
+      lock_guard<mutex> guard(parse_lock);
       istringstream text(type);
       string unused;
       datatype = parse_type(text, unused, arch);
@@ -2257,8 +2260,7 @@ int rd_type_layout(RdSession *session, const char *name, const char **out, char 
     Architecture *arch = session->arch;
     Datatype *type = arch->types->findByName(name);
     if (type == nullptr) {
-      static mutex parser_lock;
-      lock_guard<mutex> guard(parser_lock);
+      lock_guard<mutex> guard(parse_lock);
       istringstream text(name);
       string unused;
       type = parse_type(text, unused, arch);
