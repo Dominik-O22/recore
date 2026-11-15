@@ -18,7 +18,7 @@
 //! pointer in writable data. Until the runtime first fills it, the slot holds which item it
 //! is for: `kind << 29 | index << 1 | 1`.
 
-mod metadata;
+pub mod metadata;
 mod tables;
 
 use std::path::{Path, PathBuf};

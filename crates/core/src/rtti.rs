@@ -31,12 +31,12 @@ impl Reader<'_> {
     /// A link between type-information records: an address, or an offset from the image base.
     fn link(&self, addr: u64) -> Option<u64> {
         let value = self.u32(addr)?;
-        Some(if self.pointer == 4 { value } else { self.image.base + value })
+        if self.pointer == 4 { Some(value) } else { self.image.base.checked_add(value) }
     }
 
     /// The class a type descriptor names, such as `.?AVKey@crypto@@`.
     fn type_name(&self, descriptor: u64) -> Option<String> {
-        let bytes = self.image.bytes_from(descriptor + 2 * self.pointer)?;
+        let bytes = self.image.bytes_from(descriptor.checked_add(2 * self.pointer)?)?;
         let mangled = std::str::from_utf8(&bytes[..bytes.iter().position(|&byte| byte == 0)?]).ok()?;
         mangled.starts_with(".?A").then(|| class_name(mangled))
     }

@@ -60,7 +60,6 @@ struct PageScan {
     /// `(offset, after_data)` on entering the page and on leaving it.
     entry: (usize, usize),
     exit: (usize, usize),
-    found: bool,
 }
 
 impl Region<'_> {
@@ -99,9 +98,9 @@ impl Region<'_> {
         if stop == len || self.covered[stop / 64] >> (stop % 64) & 1 == 0 {
             return stop;
         }
-        // A shared byte: the run's last instruction is the one that holds the byte before it.
-        let last = (offset..stop).rev().find(|&start| self.insn_len[start] != 0).expect("the instruction at `offset` at least");
-        last + usize::from(self.insn_len[last])
+        // A shared byte: the run's last instruction is the one that holds the byte before it. No
+        // instruction at all, at an address taken that was never decoded, is no run.
+        (offset..stop).rev().find(|&start| self.insn_len[start] != 0).map_or(offset, |last| last + usize::from(self.insn_len[last]))
     }
 
     /// Where the decoded instruction that ends at `end` begins.
@@ -168,6 +167,10 @@ struct AddrSet {
     bits: Vec<u64>,
     /// Per word of `bits`, the number of members in the words before it.
     before: Vec<u32>,
+    /// The members, sorted, when they lie too far apart for a bit set, and `bits` is empty:
+    /// only a broken file's addresses do. Kept apart from `bits` so that a set that has them
+    /// answers as fast as before.
+    sparse: Vec<u64>,
 }
 
 impl AddrSet {
@@ -175,8 +178,13 @@ impl AddrSet {
     fn new(addrs: impl Iterator<Item = u64>) -> AddrSet {
         let sorted: Vec<u64> = addrs.collect();
         let base = sorted.first().copied().unwrap_or(0);
-        let span = sorted.last().map_or(0, |last| last - base + 1);
-        let mut bits = vec![0u64; span.div_ceil(64) as usize];
+        let words = sorted.last().map_or(0, |last| (last - base) / 64 + 1);
+        // At most 64 words a member, past a floor of 2^20 words: 8 MiB of bits, which cover
+        // 64 MiB of addresses, more than any real binary's code spans.
+        if words > 64 * sorted.len() as u64 + (1 << 20) {
+            return AddrSet { base, bits: Vec::new(), before: Vec::new(), sparse: sorted };
+        }
+        let mut bits = vec![0u64; words as usize];
         let mut before = vec![0u32; bits.len()];
         for addr in &sorted {
             let word = ((addr - base) / 64) as usize;
@@ -190,16 +198,19 @@ impl AddrSet {
             count += *word;
             *word = count;
         }
-        AddrSet { base, bits, before }
+        AddrSet { base, bits, before, sparse: Vec::new() }
     }
 
     fn contains(&self, addr: u64) -> bool {
         addr >= self.base && self.bits.get(((addr - self.base) / 64) as usize).is_some_and(|word| word >> ((addr - self.base) % 64) & 1 != 0)
+            || !self.sparse.is_empty() && self.sparse.binary_search(&addr).is_ok()
     }
 
     /// Whether a member lies in `low..=high`.
     fn any_in(&self, low: u64, high: u64) -> bool {
-        let Some(last) = (self.bits.len() as u64 * 64).checked_sub(1) else { return false };
+        let Some(last) = (self.bits.len() as u64 * 64).checked_sub(1) else {
+            return self.sparse.get(self.sparse.partition_point(|&addr| addr < low)).is_some_and(|&addr| addr <= high);
+        };
         let low = low.max(self.base);
         if low > high || low - self.base > last {
             return false;
@@ -1460,14 +1471,15 @@ impl<'a, A: Arch> Explorer<'a, A> {
                 // A page that looks as it did the last time is not scanned again. After the
                 // first scan that is nearly every page, and every scan but the last finds
                 // something somewhere.
+                // What it found was found in an earlier round, which went on for it, so it does
+                // not count again: where what it found changed no page in its reach, counting it
+                // went on forever.
                 if let Some(scan) = self.regions[index].rescan((offset, after_data), self.tables.len()) {
                     (offset, after_data) = scan.exit;
-                    found |= scan.found;
                     continue;
                 }
                 self.clock += 1;
                 let (time, entry) = (self.clock, (offset, after_data));
-                let found_before = std::mem::replace(&mut found, false);
                 let page_end = ((offset / PAGE + 1) * PAGE).min(section.data.len());
                 while offset < page_end {
                     let addr = section.addr + offset as u64;
@@ -1592,8 +1604,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     found = true;
                     self.drain(decoders);
                 }
-                self.regions[index].scans[entry.0 / PAGE] = Some(PageScan { time, tables: self.tables.len(), entry, exit: (offset, after_data), found });
-                found |= found_before;
+                self.regions[index].scans[entry.0 / PAGE] = Some(PageScan { time, tables: self.tables.len(), entry, exit: (offset, after_data) });
             }
         }
         found
@@ -1832,4 +1843,25 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
     }
 
     explorer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AddrSet;
+
+    #[test]
+    fn a_sorted_set_answers_as_a_bit_set_does() {
+        let members = [0x1000, 0x1040, 0x1041, 0x2000];
+        let bits = AddrSet::new(members.into_iter());
+        assert!(bits.sparse.is_empty());
+        // The same members, with one so far off that a bit set would take 2^57 bytes.
+        let sorted = AddrSet::new(members.into_iter().chain([u64::MAX]));
+        assert!(sorted.bits.is_empty());
+        for (low, high) in [(0, 0xFFF), (0, 0x1000), (0x1001, 0x103F), (0x1001, 0x1040), (0x1042, 0x1FFF), (0x1042, 0x2000), (0x2001, 0x2001)] {
+            assert_eq!(bits.any_in(low, high), sorted.any_in(low, high), "{low:#x}..={high:#x}");
+        }
+        for addr in [0xFFF, 0x1000, 0x1041, 0x1042, 0x2000] {
+            assert_eq!(bits.contains(addr), sorted.contains(addr), "{addr:#x}");
+        }
+    }
 }

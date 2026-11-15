@@ -107,26 +107,30 @@ impl<'a> Elf<'a> {
         };
         let segments = (0..u64::from(phnum))
             .map(|index| {
-                let at = phoff + index * u64::from(phentsize);
-                Some(if wide {
+                let header = data.get(usize::try_from(phoff.checked_add(index * u64::from(phentsize))?).ok()?..)?;
+                let segment = if wide {
                     Segment {
-                        kind: u32_at(data, at)?,
-                        flags: u32_at(data, at + 4)?,
-                        offset: u64_at(data, at + 8)?,
-                        addr: u64_at(data, at + 16)?,
-                        filesz: u64_at(data, at + 32)?,
-                        memsz: u64_at(data, at + 40)?,
+                        kind: u32_at(header, 0)?,
+                        flags: u32_at(header, 4)?,
+                        offset: u64_at(header, 8)?,
+                        addr: u64_at(header, 16)?,
+                        filesz: u64_at(header, 32)?,
+                        memsz: u64_at(header, 40)?,
                     }
                 } else {
                     Segment {
-                        kind: u32_at(data, at)?,
-                        offset: u32_at(data, at + 4)?.into(),
-                        addr: u32_at(data, at + 8)?.into(),
-                        filesz: u32_at(data, at + 16)?.into(),
-                        memsz: u32_at(data, at + 20)?.into(),
-                        flags: u32_at(data, at + 24)?,
+                        kind: u32_at(header, 0)?,
+                        offset: u32_at(header, 4)?.into(),
+                        addr: u32_at(header, 8)?.into(),
+                        filesz: u32_at(header, 16)?.into(),
+                        memsz: u32_at(header, 20)?.into(),
+                        flags: u32_at(header, 24)?,
                     }
-                })
+                };
+                // A segment's bytes lie in the file and its memory ends below 2^64, so that an
+                // offset or an address in one plus a size within it stays in range.
+                let in_file = segment.offset.checked_add(segment.filesz).is_some_and(|end| end <= data.len() as u64);
+                (in_file && segment.addr.checked_add(segment.memsz.max(segment.filesz)).is_some()).then_some(segment)
             })
             .collect::<Option<Vec<_>>>()?;
         Some(Elf { shnum, segments, ..elf })
@@ -143,7 +147,7 @@ impl<'a> Elf<'a> {
 
     /// The file offset of address `addr`, in a loaded segment's bytes from the file.
     fn offset(&self, addr: u64) -> Option<u64> {
-        self.loads().find(|s| addr >= s.addr && addr < s.addr + s.filesz).map(|s| s.offset + addr - s.addr)
+        self.loads().find(|s| addr >= s.addr && addr < s.addr + s.filesz).map(|s| s.offset + (addr - s.addr))
     }
 
     fn u32_at_addr(&self, addr: u64) -> Option<u32> {
@@ -165,20 +169,22 @@ impl<'a> Elf<'a> {
     /// GNU table with no chains, in a program that exports nothing, says nothing, and then the
     /// symbols run up to the next table the dynamic section points to.
     fn symbol_count(&self, tag: impl Fn(u64) -> Option<u64>, symbol_size: u64) -> Option<u64> {
+        // The tables' addresses are the file's numbers, so every sum past them is checked.
         if let Some(hash) = tag(4) {
-            return self.u32_at_addr(hash + 4).map(u64::from);
+            return self.u32_at_addr(hash.checked_add(4)?).map(u64::from);
         }
         let symbols = tag(6)?;
         let chained = tag(0x6fff_fef5).and_then(|hash| {
-            let (buckets, first, bloom) = (self.u32_at_addr(hash)?, self.u32_at_addr(hash + 4)?, self.u32_at_addr(hash + 8)?);
-            let bucket_table = hash + 16 + u64::from(bloom) * if self.wide { 8 } else { 4 };
-            let chains = bucket_table + 4 * u64::from(buckets);
-            let last = (0..u64::from(buckets)).filter_map(|index| self.u32_at_addr(bucket_table + 4 * index)).max()?;
+            let (buckets, first, bloom) = (self.u32_at_addr(hash)?, self.u32_at_addr(hash.checked_add(4)?)?, self.u32_at_addr(hash.checked_add(8)?)?);
+            let bucket_table = hash.checked_add(16 + u64::from(bloom) * if self.wide { 8 } else { 4 })?;
+            let chains = bucket_table.checked_add(4 * u64::from(buckets))?;
+            // The buckets run on together, so the first outside the file ends them.
+            let last = (0..u64::from(buckets)).map_while(|index| self.u32_at_addr(bucket_table.checked_add(4 * index)?)).max()?;
             if last < first {
                 return None;
             }
             let mut index = u64::from(last);
-            while self.u32_at_addr(chains + 4 * (index - u64::from(first)))? & 1 == 0 {
+            while self.u32_at_addr(chains.checked_add(4 * (index - u64::from(first)))?)? & 1 == 0 {
                 index += 1;
             }
             Some(index + 1)
@@ -195,7 +201,7 @@ impl<'a> Elf<'a> {
         let value = i64::from(u32_at(self.data, at + 4)? as i32);
         match encoding {
             // Signed 4 bytes, relative to the field itself or to the start of the header.
-            0x1b => Some((hdr + 4).wrapping_add_signed(value)),
+            0x1b => Some(hdr.wrapping_add(4).wrapping_add_signed(value)),
             0x3b => Some(hdr.wrapping_add_signed(value)),
             0x03 => Some(u64::from(u32_at(self.data, at + 4)?)),
             _ => None,
@@ -220,7 +226,7 @@ impl<'a> Elf<'a> {
                 .map(|end| 4 * end + 4),
             _ => None,
         }?;
-        Some((addr & !1) + found as u64)
+        (addr & !1).checked_add(found as u64)
     }
 
     /// The end of each function the dynamic symbol table at `symbols` defines, from its address
@@ -228,15 +234,17 @@ impl<'a> Elf<'a> {
     fn function_ends(&self, symbols: Option<u64>, count: Option<u64>, size: u64) -> impl Iterator<Item = u64> + '_ {
         const STT_FUNC: u8 = 2;
         let at = symbols.and_then(|symbols| self.offset(symbols));
-        (0..count.unwrap_or(0)).filter_map(move |index| {
-            let entry = at? + index * size;
-            let (info, section, value, length) = if self.wide {
-                (*self.data.get(entry as usize + 4)?, u16_at(self.data, entry + 6)?, u64_at(self.data, entry + 8)?, u64_at(self.data, entry + 16)?)
-            } else {
-                (*self.data.get(entry as usize + 12)?, u16_at(self.data, entry + 14)?, u32_at(self.data, entry + 4)?.into(), u32_at(self.data, entry + 8)?.into())
-            };
-            (info & 0xF == STT_FUNC && section != 0 && value != 0).then_some((value & !1) + length)
-        })
+        (0..count.unwrap_or(0))
+            // The symbols run on together, so the first that starts past the file ends them.
+            .map_while(move |index| self.data.get(usize::try_from(at?.checked_add(index * size)?).ok()?..))
+            .filter_map(move |entry| {
+                let (info, section, value, length) = if self.wide {
+                    (*entry.get(4)?, u16_at(entry, 6)?, u64_at(entry, 8)?, u64_at(entry, 16)?)
+                } else {
+                    (*entry.get(12)?, u16_at(entry, 14)?, u32_at(entry, 4)?.into(), u32_at(entry, 8)?.into())
+                };
+                (info & 0xF == STT_FUNC && section != 0 && value != 0).then(|| (value & !1).checked_add(length)).flatten()
+            })
     }
 
     /// Where the PLT is, with `count` stubs: GNU ld places it right after `.init`, and its first
@@ -250,24 +258,24 @@ impl<'a> Elf<'a> {
             // `push {lr}; ldr lr, [pc, #4]`, 20 bytes in all; the stubs are walked below.
             EM_ARM => (found(4, &|o| word(o) == Some(0xE52D_E004) && word(o + 4) == Some(0xE59F_E004))?, 0),
             // `stp x16, x30, [sp, #-16]!`, then 32 bytes in all, and 16 for each stub.
-            EM_AARCH64 => (found(4, &|o| word(o) == Some(0xA9BF_7BF0))?, 32 + 16 * count),
+            EM_AARCH64 => (found(4, &|o| word(o) == Some(0xA9BF_7BF0))?, count.saturating_mul(16).saturating_add(32)),
             // `push [rip+a]; jmp [rip+b]`, or `push [ebx+4]; jmp [ebx+8]` in 32-bit PIC: 16 bytes each.
             EM_X86_64 | EM_386 => {
                 // The jump may carry a `bnd` prefix, 0xF2.
                 let jumps = |b: &[u8], pattern: [u8; 2]| b[6..8] == pattern || b[6..9] == [0xF2, pattern[0], pattern[1]];
                 let starts = |o: usize| window.get(o..o + 9).is_some_and(|b| b[..2] == [0xFF, 0x35] && jumps(b, [0xFF, 0x25]));
                 let pic = |o: usize| window.get(o..o + 9).is_some_and(|b| b[..2] == [0xFF, 0xB3] && jumps(b, [0xFF, 0xA3]));
-                (found(16, &|o| starts(o) || pic(o))?, 16 + 16 * count)
+                (found(16, &|o| starts(o) || pic(o))?, count.saturating_mul(16).saturating_add(16))
             }
             _ => return None,
         };
         if self.machine != EM_ARM {
             // With indirect branch tracking, each stub of the PLT pushes and jumps to the first
             // entry, and the stubs callers call, `endbr64; jmp [slot]`, follow in `.plt.sec`.
-            let next = window.get(start + size as usize..).unwrap_or_default();
+            let next = window.get(start.saturating_add(size as usize)..).unwrap_or_default();
             let secondary = next.starts_with(&[0xF3, 0x0F, 0x1E, 0xFA, 0xFF, 0x25]) || next.starts_with(&[0xF3, 0x0F, 0x1E, 0xFA, 0xF2, 0xFF, 0x25]);
-            let size = if secondary && matches!(self.machine, EM_X86_64 | EM_386) { size + 16 * count } else { size };
-            return Some((init + start as u64, size));
+            let size = if secondary && matches!(self.machine, EM_X86_64 | EM_386) { size.saturating_add(count.saturating_mul(16)) } else { size };
+            return Some((init.checked_add(start as u64)?, size));
         }
         // ARM stubs are `add ip, pc, #a; add ip, ip, #b; ldr pc, [ip, #c]!`, and one a Thumb
         // caller reaches has a four-byte `bx pc` and `nop` or `b .` before it, so walk them to
@@ -281,7 +289,7 @@ impl<'a> Elf<'a> {
             }
             end = stub + 12;
         }
-        Some((init + start as u64, (end - start) as u64))
+        Some((init.checked_add(start as u64)?, (end - start) as u64))
     }
 
     fn sections(&self) -> Option<Vec<Shdr>> {
@@ -292,6 +300,7 @@ impl<'a> Elf<'a> {
         let mut table = |name, kind, addr: Option<u64>, size: Option<u64>, link, entsize| {
             if let (Some(addr), Some(size)) = (addr, size)
                 && size > 0
+                && addr.checked_add(size).is_some()
             {
                 tables.push(Shdr { name, kind, flags: SHF_ALLOC, addr, size, link, entsize });
             }
@@ -323,7 +332,9 @@ impl<'a> Elf<'a> {
             }
         }
         let relocation_size = if tag(20) == Some(7) { rela } else { 2 * word };
-        if let Some((addr, size)) = tag(12).zip(tag(2)).and_then(|(init, size)| self.plt(init & !1, size / relocation_size)) {
+        if let Some((addr, size)) = tag(12).zip(tag(2)).and_then(|(init, size)| self.plt(init & !1, size / relocation_size))
+            && addr.checked_add(size).is_some()
+        {
             tables.push(Shdr { name: ".plt", kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_EXECINSTR, addr, size, link: None, entsize: 0 });
         }
         // Tables that overlap, such as `.dynamic` inside the writable segment, each keep their
@@ -449,13 +460,13 @@ impl<'a> Elf<'a> {
 }
 
 fn u16_at(data: &[u8], at: u64) -> Option<u16> {
-    Some(u16::from_le_bytes(data.get(at as usize..at as usize + 2)?.try_into().ok()?))
+    Some(u16::from_le_bytes(*data.get(usize::try_from(at).ok()?..)?.first_chunk()?))
 }
 
 fn u32_at(data: &[u8], at: u64) -> Option<u32> {
-    Some(u32::from_le_bytes(data.get(at as usize..at as usize + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(*data.get(usize::try_from(at).ok()?..)?.first_chunk()?))
 }
 
 fn u64_at(data: &[u8], at: u64) -> Option<u64> {
-    Some(u64::from_le_bytes(data.get(at as usize..at as usize + 8)?.try_into().ok()?))
+    Some(u64::from_le_bytes(*data.get(usize::try_from(at).ok()?..)?.first_chunk()?))
 }

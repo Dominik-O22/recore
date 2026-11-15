@@ -5,7 +5,7 @@
 //! target afterwards, pointer authentication bits stripped, so everything downstream reads
 //! plain pointers.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use object::macho;
 use object::read::macho::{
     DyldChainedImport, FatArch, Fixup, LoadCommandVariant, MachOFatFile32, MachOFatFile64, MachOFile64, Nlist, Section as _, Segment as _,
@@ -80,7 +80,10 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
     while let Some(command) = commands.next()? {
         match command.variant()? {
             LoadCommandVariant::Segment64(segment, section_data) => {
-                segments.push((segment.vmaddr(endian), segment.data(endian, data).ok().context("a segment lies outside the file")?));
+                let bytes = segment.data(endian, data).ok().context("a segment lies outside the file")?;
+                // An address in a segment plus an offset into it stays in range.
+                ensure!(segment.vmaddr(endian).checked_add(bytes.len() as u64).is_some(), "a segment ends past 2^64");
+                segments.push((segment.vmaddr(endian), bytes));
                 if segment.name() == macho::SEG_TEXT.as_bytes() {
                     base = segment.vmaddr(endian);
                 }
@@ -89,6 +92,10 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
                     && segment.flags(endian).0 & macho::SG_READ_ONLY.0 == 0
                     && !segment.name().ends_with(b"_CONST");
                 for section in segment.sections(endian, section_data)? {
+                    // None ends past 2^64, so that sums of an address and a size stay in range.
+                    if section.addr(endian).checked_add(section.size(endian)).is_none() {
+                        continue;
+                    }
                     let kind = section.section_type(endian);
                     if matches!(kind, macho::S_NON_LAZY_SYMBOL_POINTERS | macho::S_LAZY_SYMBOL_POINTERS) {
                         pointer_sections.push((section.addr(endian), section.size(endian), section.reserved1(endian)));
@@ -104,7 +111,11 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
                     sections.push(Section {
                         name: format!("{},{}", String::from_utf8_lossy(section.segment_name()), String::from_utf8_lossy(section.name())),
                         addr: section.addr(endian),
-                        data: data.get(offset as usize..(offset + size) as usize).context("a section lies outside the file")?.to_vec(),
+                        data: offset
+                            .checked_add(size)
+                            .and_then(|end| data.get(usize::try_from(offset).ok()?..usize::try_from(end).ok()?))
+                            .context("a section lies outside the file")?
+                            .to_vec(),
                         file_offset: Some(offset),
                         executable: section.flags(endian).0 & instructions != 0,
                         writable,
@@ -124,6 +135,8 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
         }
     }
     sections.sort_by_key(|section| section.addr);
+    // The image's tables give addresses as 32-bit offsets from its base.
+    ensure!(base.checked_add(u32::MAX.into()).is_some(), "the image base leaves no room for the image above it");
 
     let mut import_slots: FxHashMap<u64, String> = FxHashMap::default();
     let mut relative_targets = Vec::new();
@@ -141,7 +154,10 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
                 let (offset, fixup) = fixup?;
                 let slot = address + offset;
                 let target = match fixup {
-                    Fixup::Rebase(rebase) => base + rebase.target_offset,
+                    Fixup::Rebase(rebase) => match base.checked_add(rebase.target_offset) {
+                        Some(target) => target,
+                        None => continue,
+                    },
                     Fixup::Bind(bind) => {
                         let import = imports.get(bind.ordinal as usize).context("a fixup binds an import the image does not list")?;
                         import_slots.insert(slot, plain_name(import.name));
@@ -259,7 +275,7 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
         machine,
         base: 0,
         branch_targets_marked: false,
-        entry: entry_offset.map_or(0, |offset| base + offset),
+        entry: entry_offset.and_then(|offset| base.checked_add(offset)).unwrap_or(0),
         sections,
         zero_filled,
         import_slots,
@@ -311,7 +327,7 @@ pub fn unwind_starts(section: &[u8], base: u64) -> Vec<u64> {
             // Function offset and encoding, a word each.
             REGULAR => u32_at(page + entries + 8 * i),
             // The low 24 bits are the function's offset from the page's first function.
-            COMPRESSED => Some(first + (u32_at(page + entries + 4 * i)? & 0x00FF_FFFF)),
+            COMPRESSED => first.checked_add(u32_at(page + entries + 4 * i)? & 0x00FF_FFFF),
             _ => None,
         }));
     }

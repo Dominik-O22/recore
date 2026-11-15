@@ -1,0 +1,30 @@
+# Fuzz targets for cargo-fuzz, a workspace of their own so that recore's build never compiles
+# libFuzzer. fuzz/run.sh seeds and runs them.
+[package]
+name = "recore-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+recore = { path = "../crates/core" }
+
+[[bin]]
+name = "load"
+path = "fuzz_targets/load.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+
+[[bin]]
+name = "metadata"
+path = "fuzz_targets/metadata.rs"
+test = false
+doc = false
+bench = false
