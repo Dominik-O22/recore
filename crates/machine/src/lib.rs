@@ -20,7 +20,7 @@ use ops::{compute, signed};
 #[cold]
 #[inline(never)]
 fn outside_flat(addr: u32, len: usize) -> ! {
-    panic!("memory {addr:#x}+{len:#x} is outside flat memory, which ends at {FLAT_SIZE:#x}");
+    panic!("memory {addr:#x}+{len:#x} is outside flat memory, which ends at {FLAT_END:#x}");
 }
 
 /// Register offsets in the x86 p-code register space, as `(offset, size)`.
@@ -172,10 +172,10 @@ impl Mem {
 
     /// Where `len` bytes from `addr` live in flat memory; panics when they are outside it. For
     /// the fixed sizes `read` and `write` pass, the whole address space's check folds away: no
-    /// `u32` address plus 16 passes [`FLAT_END`].
+    /// `u32` address plus 16 passes [`FLAT_END`]. The add saturates so no `len` wraps past it.
     #[inline(always)]
     fn flat_at(&self, addr: u32, len: usize) -> *mut u8 {
-        if u64::from(addr) + len as u64 > FLAT_END {
+        if u64::from(addr).saturating_add(len as u64) > FLAT_END {
             outside_flat(addr, len);
         }
         // SAFETY: inside the block, as just checked.
@@ -1088,12 +1088,18 @@ mod tests {
         flat().bytes(LAST, 3 * PAGE);
     }
 
-    /// A 47-bit address space holds fewer than 32,768 reservations of 4 GiB, so this fails
+    #[test]
+    #[should_panic(expected = "outside flat memory")]
+    fn a_length_that_wraps_panics() {
+        flat().bytes(1, usize::MAX);
+    }
+
+    /// A 48-bit address space holds fewer than 65,536 reservations of 4 GiB, so this fails
     /// when dropped memory keeps its reservation.
     #[test]
     #[cfg(all(unix, target_pointer_width = "64"))]
     fn dropped_memory_gives_back_its_reservation() {
-        for _ in 0..40_000 {
+        for _ in 0..70_000 {
             flat();
         }
     }
