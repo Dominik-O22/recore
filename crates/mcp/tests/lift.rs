@@ -55,10 +55,13 @@ fn build(dir: &Path) -> std::path::PathBuf {
     assert!(lifted.status.success() && summary.contains("; 0 failed"), "{summary}{}", String::from_utf8_lossy(&lifted.stderr));
     // The versions recore builds with, so the build needs no registry.
     std::fs::copy(Path::new(MANIFEST).join("../../Cargo.lock"), dir.join("workspace/Cargo.lock")).unwrap();
+    // With overflow checks on, as a game crate may build the lifted code: x86 arithmetic wraps,
+    // so lifted code must say so rather than rely on the profile.
     let built = Command::new(env!("CARGO"))
         .args(["build", "--release", "--quiet", "--manifest-path"])
         .arg(dir.join("workspace/Cargo.toml"))
         .env("CARGO_TARGET_DIR", dir.join("target"))
+        .env("CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS", "true")
         .output()
         .unwrap();
     assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));

@@ -1116,10 +1116,10 @@ impl Values<'_> {
                     Code::ZExt => cast(r(0), s0, w),
                     Code::SExt if whole(s0) && whole(w) => format!("({} as {} as {} as {})", t0(), sty(s0), sty(w), ty(w)),
                     Code::SExt => cast(format!("({} as u128)", signed_of(&r(0), s0)), 16, w),
-                    // The lifted crates build without overflow checks, so the operators wrap.
-                    Code::Add => fit(format!("({} + {})", t0(), r(1)), w),
-                    Code::Sub => fit(format!("({} - {})", t0(), r(1)), w),
-                    Code::Mult => fit(format!("({} * {})", t0(), r(1)), w),
+                    // x86 arithmetic wraps, whatever profile builds the lifted code.
+                    Code::Add => fit(format!("{}.wrapping_add({})", t0(), r(1)), w),
+                    Code::Sub => fit(format!("{}.wrapping_sub({})", t0(), r(1)), w),
+                    Code::Mult => fit(format!("{}.wrapping_mul({})", t0(), r(1)), w),
                     Code::TwoComp => fit(format!("{}.wrapping_neg()", t0()), w),
                     Code::Negate => fit(format!("(!{})", t0()), w),
                     Code::And => format!("({} & {})", t0(), r(1)),
