@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use recore::Image;
-use recore::edits::Edits;
+use recore::edits::{Edits, EditsFile};
 use recore::program::Program;
 use recore_decomp::isolate::{FunctionRecord, Options, Worker};
 use recore::structs::Recovered;
@@ -26,6 +26,8 @@ pub struct Binary {
     pub program: Program,
     /// The names, comments and types given to this binary, as saved.
     pub edits: Edits,
+    /// Where `edits` are saved.
+    edits_file: EditsFile,
     /// The name the analysis gave each of `program.analysis.functions`, before edits.
     found_names: Vec<Option<String>>,
     /// Time spent loading and analyzing.
@@ -63,13 +65,14 @@ impl Binary {
         let worker = early.unwrap_or_else(|| worker(path, start_worker));
         let analysis_ms = start.elapsed().as_secs_f64() * 1e3;
 
-        let edits = Edits::load(path)?;
+        let edits_file = EditsFile::of(path)?;
+        let edits = edits_file.load()?;
         let found_names = analysis.functions.iter().map(|function| function.name.clone()).collect();
         edits.apply(&mut analysis);
         let program = Program::new(image, analysis);
         // What loading freed would otherwise be held while queries are answered.
         recore_decomp::give_back_freed_memory();
-        Ok(Binary { path: path.to_path_buf(), stamp, program, edits, found_names, analysis_ms, worker })
+        Ok(Binary { path: path.to_path_buf(), stamp, program, edits, edits_file, found_names, analysis_ms, worker })
     }
 
     /// Changes the binary's edits and saves them. The decompiler process takes names, comments
@@ -79,7 +82,7 @@ impl Binary {
     pub fn edit(&mut self, change: impl FnOnce(&mut Edits)) -> Result<()> {
         let mut edits = self.edits.clone();
         change(&mut edits);
-        edits.save(&self.path)?;
+        edits.save(&self.edits_file)?;
         self.edits = edits;
         for (function, found) in self.program.analysis.functions.iter_mut().zip(&self.found_names) {
             function.name.clone_from(found);
@@ -90,8 +93,8 @@ impl Binary {
     }
 
     /// Where this binary's edits are saved.
-    pub fn edits_file(&self) -> Result<PathBuf> {
-        Edits::file(&self.path)
+    pub fn edits_file(&self) -> &Path {
+        self.edits_file.path()
     }
 
     /// Disassembles `[start, end)`: see [`Worker::listing`].
