@@ -2,10 +2,9 @@
 //
 // One RdSession is one ghidra::Architecture: a program image, its symbol database and a
 // SLEIGH translator. Sessions are independent of each other and may run on different
-// threads, but a single session must only be used by one thread at a time. Where the engine
-// touches process-wide state, a lock serializes it across sessions: `xml_lock` for session
-// creation and every XML document parsed, `parse_lock` for the C parser, and a lock around
-// C printing.
+// threads, but a single session must only be used by one thread at a time. Three kinds of the
+// engine's process-wide state are locked across sessions: `xml_lock` for session creation and
+// every XML document parsed, `parse_lock` for the C parser, and a lock around C printing.
 
 #include <algorithm>
 #include <cstdint>
