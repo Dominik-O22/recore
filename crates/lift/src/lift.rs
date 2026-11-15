@@ -1131,9 +1131,10 @@ impl Values<'_> {
                     Code::LessEqual => format!("(({} <= {}) as u8)", t0(), r(1)),
                     Code::SLess => format!("(({} < {}) as u8)", signed_of(&r(0), s0), signed_of(&r(1), s0)),
                     Code::SLessEqual => format!("(({} <= {}) as u8)", signed_of(&r(0), s0), signed_of(&r(1), s0)),
-                    // Division by zero panics, as the runtime's compute does for x86.
-                    Code::Div if whole(s0) => format!("({} / {})", t0(), r(1)),
-                    Code::Rem if whole(s0) => format!("({} % {})", t0(), r(1)),
+                    // Division by zero panics, as the runtime's compute does for x86. A method,
+                    // so a constant zero (AAM 0) is not refused at compile time.
+                    Code::Div if whole(s0) => format!("{}.wrapping_div({})", t0(), r(1)),
+                    Code::Rem if whole(s0) => format!("{}.wrapping_rem({})", t0(), r(1)),
                     Code::SDiv if whole(s0) => format!("({}.wrapping_div({}) as {})", signed_of(&r(0), s0), signed_of(&r(1), s0), ty(s0)),
                     Code::SRem if whole(s0) => format!("({}.wrapping_rem({}) as {})", signed_of(&r(0), s0), signed_of(&r(1), s0), ty(s0)),
                     Code::Carry if whole(s0) => format!("({}.overflowing_add({}).1 as u8)", t0(), r(1)),
