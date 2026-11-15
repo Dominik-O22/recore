@@ -596,3 +596,32 @@ fn a_byte_masked_into_a_locked_word_stays_a_byte() {
     let caller = session.decompile(0x1000).unwrap();
     assert!(caller.params.is_empty() && caller.c_text.contains("func_0x00001020(0x7f);"), "{}", caller.c_text);
 }
+
+#[test]
+fn sessions_on_several_threads_parse_c_at_once() {
+    // The engine's C parser keeps its state in globals. Declaring, adding a typed global and
+    // describing a type on different sessions at once must each still parse their own text.
+    let ready = std::sync::Barrier::new(6);
+    std::thread::scope(|scope| {
+        for thread in 0..6 {
+            let ready = &ready;
+            scope.spawn(move || {
+                let sections = [Section { addr: 0x1000, data: &[0xc3], readonly: true, code: true }, Section { addr: 0x2000, data: &[0; 0x100], readonly: false, code: false }];
+                let mut session = Session::new(&vendored_spec_dir().unwrap(), Target::X86_64Gcc, &sections).unwrap();
+                session.declare(&format!("struct s_{thread} {{ int4 a; int8 b_{thread}; }};")).unwrap();
+                ready.wait();
+                for round in 0..20000u64 {
+                    // Each thread keeps to one entry point, so the three run against each other.
+                    match thread % 3 {
+                        0 => session.declare(&format!("struct t_{round} {{ int4 a; int8 b_{thread}; }};")).unwrap(),
+                        1 => session.add_global(0x2000 + round % 0x20 * 8, &format!("g_{round}"), Some(&format!("s_{thread} *"))).unwrap(),
+                        _ => {
+                            let layout = session.type_layout(&format!("s_{thread} *")).unwrap();
+                            assert!(layout.contains(&format!("s_{thread}")), "{layout}");
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
