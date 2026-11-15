@@ -345,7 +345,7 @@ pub(crate) fn decode_a32(bytes: &[u8], base: u64, offset: usize) -> Option<Decod
     // Off the word, or cut short by the end of the bytes: no instruction, and on to the next
     // halfword, which may be one in the other set.
     if !addr.is_multiple_of(4) || rest.len() < 4 {
-        return Some(Decoded { addr, len: 2.min(rest.len() as u8), insn: None });
+        return Some(Decoded { addr, len: rest.len().min(2) as u8, insn: None });
     }
     let word = u32::from_le_bytes(rest[..4].try_into().unwrap());
     let mut insn = A32 { addr, word, literal: None };
@@ -1346,5 +1346,13 @@ mod tests {
         let image = image(&[0xFA00_0001, 0xE12F_FF1E], &[0x4770, 0x2000, 0x4770, 0x4770], 0x1000);
         let sets = instruction_sets(&image, &[(0x1000, InstructionSet::A32)]);
         assert_eq!(sets, [(0x1000, InstructionSet::A32), (0x100C, InstructionSet::Thumb)]);
+    }
+
+    #[test]
+    fn a32_off_a_word_steps_on_with_256_bytes_left() {
+        // The length once came from `rest.len() as u8`, which is 0 for 256 bytes, and decoding
+        // never moved on.
+        let decoded = decode_a32(&[0; 256], 2, 0).unwrap();
+        assert_eq!((decoded.addr, decoded.len), (2, 2));
     }
 }

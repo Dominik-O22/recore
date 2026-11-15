@@ -3,7 +3,7 @@
 
 use rustc_hash::FxHashMap;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use object::read::pe::{ImageNtHeaders, Import, PeFile, ResourceDirectoryTable};
 use object::{LittleEndian as LE, Object};
 
@@ -29,6 +29,8 @@ pub struct Metadata {
 pub fn load<Pe: ImageNtHeaders>(data: &[u8], sections: &[Section]) -> Result<Metadata> {
     let pe = PeFile::<Pe>::parse(data)?;
     let base = pe.relative_address_base();
+    // Every address the tables give is a 32-bit offset from the base.
+    ensure!(base.checked_add(u32::MAX.into()).is_some(), "the image base leaves no room for the image above it");
     let pointer_size = std::mem::size_of::<Pe::ImageThunkData>() as u64;
 
     let mut import_slots = FxHashMap::default();

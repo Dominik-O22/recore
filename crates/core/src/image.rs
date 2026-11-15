@@ -229,16 +229,28 @@ impl Image {
             return crate::layout::load(path);
         }
         let data = std::fs::read(path).with_context(|| format!("reading {path:?}"))?;
+        let mut image = Image::parse(path.file_name().unwrap().to_string_lossy().into_owned(), data)?;
+        // IL2CPP metadata sits in a file beside an ELF or PE build.
+        if image.format != Format::MachO {
+            crate::il2cpp::attach(&mut image, path);
+        }
+        Ok(image)
+    }
+
+    /// Parses the ELF, PE or Mach-O executable in `data`, which needs no file around it: `load`
+    /// reads one with this, and the fuzzer (fuzz/) feeds it bytes.
+    pub fn parse(name: String, data: Vec<u8>) -> Result<Image> {
         if crate::macho::is_macho(&data) {
-            return crate::macho::load(path.file_name().unwrap().to_string_lossy().into_owned(), &data);
+            return crate::macho::load(name, &data);
         }
         // OpenWrt and other firmware strip the section headers; read them back from the segments.
         let data = if crate::sectionless::is_sectionless(&data) { crate::sectionless::restore(&data).unwrap_or(data) } else { data };
         let file = object::File::parse(&*data)?;
 
-        let mut sections: Vec<Section> = file
-            .sections()
-            .filter(|s| s.address() != 0 && s.size() > 0)
+        // The sections at an address, but for one whose end the file puts past 2^64.
+        let mapped = || file.sections().filter(|s| s.address() != 0 && s.address().checked_add(s.size()).is_some());
+        let mut sections: Vec<Section> = mapped()
+            .filter(|s| s.size() > 0)
             .filter(|s| !matches!(s.kind(), SectionKind::UninitializedData | SectionKind::UninitializedTls))
             .filter_map(|s| {
                 Some(Section {
@@ -253,9 +265,8 @@ impl Image {
             .collect();
         sections.sort_by_key(|s| s.addr);
         // A section with no bytes in the file, or the tail of one that is larger in memory.
-        let mut zero_filled: Vec<(u64, u64)> = file
-            .sections()
-            .filter(|s| s.address() != 0 && s.kind() != SectionKind::UninitializedTls)
+        let mut zero_filled: Vec<(u64, u64)> = mapped()
+            .filter(|s| s.kind() != SectionKind::UninitializedTls)
             .filter_map(|s| {
                 let stored = if s.kind() == SectionKind::UninitializedData { 0 } else { s.file_range().map_or(0, |(_, size)| size) };
                 (s.size() > stored).then(|| (s.address() + stored, s.address() + s.size()))
@@ -309,7 +320,7 @@ impl Image {
             symbol_names,
             machine,
             branch_targets_marked,
-            name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            name,
             entry: file.entry(),
             sections,
             import_slots,
@@ -329,7 +340,6 @@ impl Image {
         if machine == Machine::Arm {
             crate::arm::load(&file, &mut image);
         }
-        crate::il2cpp::attach(&mut image, path);
         Ok(image)
     }
 
@@ -449,8 +459,11 @@ pub(crate) fn parse_frames(data: &[u8], addr: u64) -> Vec<(u64, u64)> {
                     cies.insert(offset, cie.clone());
                     Ok(cie)
                 });
-                if let Ok(fde) = fde && fde.len() > 0 {
-                    frames.push((fde.initial_address(), fde.initial_address() + fde.len()));
+                if let Ok(fde) = fde
+                    && fde.len() > 0
+                    && let Some(end) = fde.initial_address().checked_add(fde.len())
+                {
+                    frames.push((fde.initial_address(), end));
                 }
             }
         }
@@ -468,12 +481,13 @@ fn relr_slots(data: &[u8], word: usize) -> Vec<u64> {
     let mut slots = Vec::new();
     let mut next = 0u64;
     for entry in data.chunks_exact(word).map(|c| c.iter().rev().fold(0u64, |entry, &byte| entry << 8 | u64::from(byte))) {
+        // Slots past 2^64 are none a section holds, so the sums saturate.
         if entry & 1 == 0 {
             slots.push(entry);
-            next = entry + step;
+            next = entry.saturating_add(step);
         } else {
-            slots.extend((0..bits).filter(|bit| entry >> (bit + 1) & 1 == 1).map(|bit| next + step * bit));
-            next += step * bits;
+            slots.extend((0..bits).filter(|bit| entry >> (bit + 1) & 1 == 1).map(|bit| next.saturating_add(step * bit)));
+            next = next.saturating_add(step * bits);
         }
     }
     slots

@@ -1,0 +1,11 @@
+# The fuzzer, on top of mise.toml's tools. Loaded only when MISE_ENV=fuzz, so a plain
+# `mise install` does not fetch it:
+#   MISE_ENV=fuzz mise install
+#   MISE_ENV=fuzz mise run fuzz
+
+[tools]
+"cargo:cargo-fuzz" = "0.13.1"
+
+[tasks.fuzz]
+description = "Fuzz the loaders and analysis, and the IL2CPP metadata parser, seeded from the corpora (fuzz/run.sh); takes the seconds for each, 600 by default"
+run = "fuzz/run.sh"

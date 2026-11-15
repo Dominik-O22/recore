@@ -141,8 +141,9 @@ impl Insn {
             0xED1F | 0xED5F if hw2 & 0x0E00 == 0x0A00 => (u64::from(hw2 & 0xFF) * 4, if hw2 & 0x0100 != 0 { 8 } else { 4 }),
             _ => return None,
         };
-        let at = if up { pc + offset } else { pc.wrapping_sub(offset) };
-        Some((at, at + size))
+        // Addresses wrap as the processor's do, as in the A32 `literal_range`.
+        let at = if up { pc.wrapping_add(offset) } else { pc.wrapping_sub(offset) };
+        Some((at, at.wrapping_add(size)))
     }
 
     /// `[start, end)` of the doubleword an `LDRD` or `VLDR` reads at an offset from a register
@@ -826,7 +827,9 @@ pub struct Thumb;
 
 /// Decodes the instruction at `offset` into `bytes`, which are loaded at `base`. `it` counts the
 /// instructions of an `IT` block still to come. `BLX` to A32 code is an instruction only where
-/// the processor runs A32 as well.
+/// the processor runs A32 as well. Inlined into the decoders that call it whatever else does:
+/// out of line, analyzing 32-bit ARM code executes 5% more instructions.
+#[inline(always)]
 pub(crate) fn decode_at(bytes: &[u8], base: u64, offset: usize, it: &mut u8, a32: bool) -> Option<Decoded<Insn>> {
     let hw1 = u16::from_le_bytes(bytes.get(offset..offset + 2)?.try_into().unwrap());
     let addr = base + offset as u64;

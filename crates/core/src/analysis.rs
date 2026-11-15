@@ -789,12 +789,15 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                     .flatten()
             })
             .collect();
-        if splits.is_empty() {
-            let Program { controls, extents, .. } = program;
-            break (starts, functions, chunks, noreturn, controls, extents);
-        }
+        let before = discovery.starts.len();
         for addr in splits {
             discovery.starts.entry(addr).or_insert(Origin::Unreachable);
+        }
+        // A split that is an entry point already, one whose bytes did not decode, changes
+        // nothing, and another round would find it again.
+        if discovery.starts.len() == before {
+            let Program { controls, extents, .. } = program;
+            break (starts, functions, chunks, noreturn, controls, extents);
         }
         decoded = spans.into_iter().zip(functions).collect();
     };

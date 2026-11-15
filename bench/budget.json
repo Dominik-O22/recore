@@ -108,58 +108,58 @@
     "diff": 318828212
   },
   "corpus-armhf/bin/deb__cmake__ctest": {
-    "analysis": 10080971909,
-    "again": 919550256,
-    "setup": 2875383089,
+    "analysis": 9508307611,
+    "again": 856473190,
+    "setup": 2731337123,
     "decompile": 5066217008,
     "lookups": 408473107,
     "dataflow": 2621689100,
-    "diff": 5566261206
+    "diff": 5288846811
   },
   "corpus-armhf/bin/deb__coreutils__expr": {
-    "analysis": 22972834,
-    "again": 6283376,
+    "analysis": 21731489,
+    "again": 6154937,
     "setup": 213654457,
     "decompile": 308875333,
     "lookups": 37646937,
     "dataflow": 4172569033,
-    "diff": 13515377
+    "diff": 12681195
   },
   "corpus-armhf/bin/deb__git__git-imap-send": {
-    "analysis": 1670406824,
-    "again": 107921288,
-    "setup": 539990421,
+    "analysis": 1573783455,
+    "again": 101748709,
+    "setup": 521676273,
     "decompile": 5444260585,
     "lookups": 84318904,
     "dataflow": 27127866284,
-    "diff": 899730061
+    "diff": 848672549
   },
   "corpus-armhf/bin/deb__gzip__gzip": {
-    "analysis": 44875491,
-    "again": 11236397,
+    "analysis": 42081847,
+    "again": 10702470,
     "setup": 225743260,
     "decompile": 2343958482,
     "lookups": 72601734,
     "dataflow": 2026323226,
-    "diff": 31546959
+    "diff": 29656821
   },
   "corpus-armhf/bin/deb__openssh-client__ssh-agent": {
-    "analysis": 136594074,
-    "again": 17534027,
+    "analysis": 127628386,
+    "again": 16747975,
     "setup": 264202073,
     "decompile": 749377227,
     "lookups": 64954180,
     "dataflow": 903861338,
-    "diff": 94856153
+    "diff": 89129679
   },
   "corpus-armhf/bin/deb__re2c__re2rust": {
-    "analysis": 351034750,
-    "again": 54407224,
-    "setup": 337812109,
+    "analysis": 331983144,
+    "again": 51030822,
+    "setup": 328522411,
     "decompile": 1034084891,
     "lookups": 72959527,
     "dataflow": 3459085534,
-    "diff": 325307840
+    "diff": 304420432
   },
   "corpus-large/bin/godot__godot": {
     "analysis": 60305778292,

@@ -254,7 +254,7 @@ impl State {
                     if is_page { Value::Page(address) } else { Value::Addr(address) }
                 } else if let Some(immediate) = insn.add_immediate() {
                     match self.registers[insn.rn()] {
-                        Value::Page(base) | Value::Addr(base) => Value::Addr(base + immediate),
+                        Value::Page(base) | Value::Addr(base) => Value::Addr(base.wrapping_add(immediate)),
                         _ => Value::Unknown,
                     }
                 } else {
