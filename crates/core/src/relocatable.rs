@@ -119,8 +119,9 @@ fn try_link(data: &[u8]) -> Option<Vec<u8>> {
     let externs: Vec<&[u8]> = referenced.difference(&called).copied().collect();
 
     let plt = next.checked_next_multiple_of(STUB)?;
-    let got = plt + STUB * imports.len() as u64;
-    let extern_start = got + 8 * imports.len() as u64;
+    let got = plt.checked_add(STUB * imports.len() as u64)?;
+    let extern_start = got.checked_add(8 * imports.len() as u64)?;
+    extern_start.checked_add(8 * externs.len() as u64)?;
     let undefined: HashMap<&[u8], u64> = imports
         .iter()
         .enumerate()
@@ -274,26 +275,27 @@ pub fn is_padding(name: &[u8]) -> bool {
 
 /// The bytes the kernel writes over the call or jump to `name` whose 32-bit displacement is at
 /// `at` in `code`, as the offset they start at and the bytes, or `None` when `name` is not one
-/// of its thunks. A `cs` prefix before the opcode is overwritten with it.
+/// of its thunks.
 fn thunk(name: &[u8], code: &[u8], at: usize) -> Option<(u64, Vec<u8>)> {
     const NOP: u8 = 0x90;
     const INT3: u8 = 0xcc;
     let opcode = *code.get(at.checked_sub(1)?)?;
     code.get(at..at.checked_add(4)?)?;
-    let start = if at >= 2 && code[at - 2] == 0x2e { at - 2 } else { at - 1 };
-    let length = at + 4 - start;
-    let (mut bytes, fill) = match (name, opcode) {
-        (b"__fentry__", 0xe8) => return Some((start as u64, [&[0x66][..length - 5], &[0x0f, 0x1f, 0x44, 0x00, 0x00][..]].concat())),
-        (b"__x86_return_thunk", 0xe9) => (vec![0xc3], INT3),
+    let (start, mut bytes, fill) = match (name, opcode) {
+        (b"__fentry__", 0xe8) => return Some(((at - 1) as u64, vec![0x0f, 0x1f, 0x44, 0x00, 0x00])),
+        (b"__x86_return_thunk", 0xe9) => (at - 1, vec![0xc3], INT3),
         (_, 0xe8 | 0xe9) => {
             let register = indirect_thunk_register(name)?;
+            // `-mindirect-branch-cs-prefix` puts a `cs` before each call and jump through r8 to
+            // r15, to leave room for the extra byte of the instruction the kernel writes.
+            let start = if register >= 8 && at >= 2 && code[at - 2] == 0x2e { at - 2 } else { at - 1 };
             let modrm = if opcode == 0xe8 { 0xd0 } else { 0xe0 } | (register & 7);
             let bytes = if register >= 8 { vec![0x41, 0xff, modrm] } else { vec![0xff, modrm] };
-            (bytes, if opcode == 0xe8 { NOP } else { INT3 })
+            (start, bytes, if opcode == 0xe8 { NOP } else { INT3 })
         }
         _ => return None,
     };
-    bytes.resize(length, fill);
+    bytes.resize(at + 4 - start, fill);
     Some((start as u64, bytes))
 }
 
@@ -453,4 +455,17 @@ fn u32_at(data: &[u8], at: u64) -> Option<u32> {
 
 fn u64_at(data: &[u8], at: u64) -> Option<u64> {
     Some(u64::from_le_bytes(data.get(usize::try_from(at).ok()?..)?.get(..8)?.try_into().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thunk;
+
+    #[test]
+    fn a_cs_prefix_is_overwritten_only_where_the_compiler_puts_one() {
+        // `jne` with a displacement of 0x2e, then `jmp __x86_return_thunk`.
+        assert_eq!(thunk(b"__x86_return_thunk", &[0x75, 0x2e, 0xe9, 0, 0, 0, 0], 3), Some((2, vec![0xc3, 0xcc, 0xcc, 0xcc, 0xcc])));
+        // `cs call __x86_indirect_thunk_r11` is `call r11`.
+        assert_eq!(thunk(b"__x86_indirect_thunk_r11", &[0x2e, 0xe8, 0, 0, 0, 0], 2), Some((0, vec![0x41, 0xff, 0xd3, 0x90, 0x90, 0x90])));
+    }
 }

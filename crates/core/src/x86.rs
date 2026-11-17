@@ -90,8 +90,13 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
         }
     }
 
-    fn address_taken(insn: &Instruction, _: &State, _: &Image) -> Option<u64> {
-        if BITS == 64 { lea_target(insn).or_else(|| kernel_address(insn)) } else { immediate_address(insn) }
+    fn address_taken(insn: &Instruction, _: &State, image: &Image) -> Option<u64> {
+        if BITS == 64 {
+            let mapped = |&addr: &u64| image.section_at(addr).is_some() || image.is_zero_filled(addr);
+            lea_target(insn).or_else(|| kernel_address(insn).filter(mapped))
+        } else {
+            immediate_address(insn)
+        }
     }
 
     fn based_data_address(insn: &Instruction, state: &State) -> Option<(u64, u64)> {
@@ -322,7 +327,8 @@ fn immediate_address(instr: &Instruction) -> Option<u64> {
 
 /// The immediate of `push imm32` or `mov dest, imm32` in 64-bit code when it sign-extends into
 /// the top 2 GB, where no code but the kernel's runs. Code built with `-mcmodel=kernel`, as Linux
-/// and its modules are, takes addresses this way, and no constant of a program lies there.
+/// and its modules are, takes addresses this way. Every negative constant lies there too, so it
+/// is an address only where the image has memory.
 fn kernel_address(instr: &Instruction) -> Option<u64> {
     let operand = match instr.mnemonic() {
         Mnemonic::Push => 0,
