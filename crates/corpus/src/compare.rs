@@ -35,6 +35,7 @@ const COUNTS: [Count; 12] = [
 #[derive(Debug, PartialEq, Eq)]
 pub struct Change {
     pub count: &'static str,
+    /// The totals over the binaries the base read something of.
     pub base: u64,
     pub head: u64,
     /// Whether `lost` outweighs `gained`.
@@ -77,7 +78,8 @@ pub fn compare(base: &[(String, Score)], head: &[(String, Score)]) -> (Vec<Chang
             for list in [&mut lost, &mut gained, &mut new_lost, &mut new_gained] {
                 list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             }
-            let (base, head) = pairs.iter().fold((0, 0), |(b, h), &(_, sb, sh)| (b + get(sb), h + get(sh)));
+            let read = pairs.iter().filter(|(_, sb, _)| !read_nothing(sb));
+            let (base, head) = read.fold((0, 0), |(b, h), &(_, sb, sh)| (b + get(sb), h + get(sh)));
             Some(Change { count, base, head, worse: total(&lost) > total(&gained), lost, gained, new_lost, new_gained })
         })
         .collect();
