@@ -56,10 +56,11 @@ pub fn compare(base: &[(String, Score)], head: &[(String, Score)]) -> (Vec<Chang
         .filter_map(|&(count, get, better)| {
             let (mut lost, mut gained) = (Vec::new(), Vec::new());
             for &(name, b, h) in &pairs {
+                let new = read_nothing(b);
                 let (b, h) = (get(b), get(h));
                 let (up, down) = (h.saturating_sub(b), b.saturating_sub(h));
                 let (wrong, right) = if better == Better::Higher { (down, up) } else { (up, down) };
-                if wrong > 0 {
+                if wrong > 0 && !new {
                     lost.push((name.to_string(), wrong));
                 }
                 if right > 0 {
@@ -72,11 +73,19 @@ pub fn compare(base: &[(String, Score)], head: &[(String, Score)]) -> (Vec<Chang
             lost.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             gained.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             let (base, head) = pairs.iter().fold((0, 0), |(b, h), &(_, sb, sh)| (b + get(sb), h + get(sh)));
-            let worse = if better == Better::Higher { head < base } else { head > base };
+            let total = |list: &[(String, u64)]| list.iter().map(|(_, n)| n).sum::<u64>();
+            let worse = total(&lost) > total(&gained);
             Some(Change { count, base, head, worse, lost, gained })
         })
         .collect();
     (changes, missing)
+}
+
+/// Whether the base found no function in a binary and covered none of its bytes, as when it
+/// could not read its format. Nothing the head reports there is a loss, for there is nothing to
+/// have lost.
+fn read_nothing(score: &Score) -> bool {
+    score.found + score.mid_function + score.in_fragment + score.outside == 0 && score.covered_bytes == 0
 }
 
 /// Prints the changes, worst first, with the binaries behind each.
@@ -148,6 +157,14 @@ mod tests {
         let head = [("a".to_string(), Score { mid_function: 5, ..Score::default() })];
         let (changes, _) = compare(&base, &head);
         assert_eq!(changes.iter().map(|c| (c.count, c.worse)).collect::<Vec<_>>(), [("mid-func", true)]);
+    }
+
+    #[test]
+    fn a_binary_the_base_read_nothing_of_only_gains() {
+        let base = [found("a", 0)];
+        let head = [("a".to_string(), Score { found: 10, mid_function: 2, covered_bytes: 400, ..Score::default() })];
+        let (changes, _) = compare(&base, &head);
+        assert_eq!(changes.iter().map(|c| (c.count, c.worse)).collect::<Vec<_>>(), [("starts found", false), ("bytes covered", false)]);
     }
 
     #[test]
