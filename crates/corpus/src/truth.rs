@@ -300,7 +300,7 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     if recore::layout::is_layout(binary_path) {
         return if is_elf_of_raw(debug_path) { thumb::extract(binary_path, debug_path) } else { sdcc::extract(binary_path, debug_path) };
     }
-    let binary_data = std::fs::read(binary_path).with_context(|| format!("reading {binary_path:?}"))?;
+    let binary_data = recore::relocatable::link(std::fs::read(binary_path).with_context(|| format!("reading {binary_path:?}"))?);
     let binary = object::File::parse(&*binary_data)?;
     if binary.format() == object::BinaryFormat::Pe {
         return pe::extract(binary_path, &binary_data, debug_path);
@@ -308,7 +308,7 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     if binary.format() == object::BinaryFormat::MachO {
         return macho::extract(binary_path, debug_path);
     }
-    let debug_data = std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?;
+    let debug_data = recore::relocatable::link(std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?);
     let debug = object::File::parse(&*debug_data)?;
     elf(binary_path, &binary, &debug)
 }
@@ -339,7 +339,7 @@ fn elf(binary_path: &Path, binary: &object::File, debug: &object::File) -> Resul
             continue;
         }
         let name = symbol.name().unwrap_or("").to_string();
-        if is_mapping_symbol(&name) {
+        if is_mapping_symbol(&name) || recore::relocatable::is_padding(name.as_bytes()) {
             continue;
         }
         let function = Function {

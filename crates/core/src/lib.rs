@@ -29,6 +29,7 @@ pub mod objc;
 pub mod pe;
 pub mod phase;
 pub mod program;
+pub mod relocatable;
 pub mod report;
 pub mod rtti;
 pub mod score;

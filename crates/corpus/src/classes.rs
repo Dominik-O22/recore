@@ -263,7 +263,7 @@ fn all_bases(name: &str, described: &HashMap<String, Option<Described>>) -> Opti
 fn score_one(binary: &Path, debug_path: &Path, detail: bool) -> Result<Tally> {
     let image = Image::load(binary)?;
     let analysis = recore::analyze(&image);
-    let data = std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?;
+    let data = recore::relocatable::link(std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?);
     let debug = object::File::parse(&*data)?;
     let truth = true_classes(&image, &debug);
     let reported: BTreeMap<u64, &Class> = analysis.classes.iter().filter(|class| !class.objc).map(|class| (class.vtable, class)).collect();

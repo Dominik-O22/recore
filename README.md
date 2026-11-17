@@ -91,7 +91,7 @@ Opus 5.5 is left out: in three sessions its safeguards stopped the response afte
 
 The analysis is written from scratch in Rust: loading, function discovery, calls that never return, jump tables, strings, references, library function names by fingerprint, and C++, Objective-C and Swift classes with their methods. The C comes from Ghidra's decompiler engine, compiled into recore and fed recore's analysis instead of Ghidra's. `run` interprets the p-code of the same engine's processor specifications, and computes the x87's 80-bit floats in software. Its arithmetic rounds as the processor's does, and its transcendental instructions come within a unit in the last place of the processor's. It can start from a snapshot of a live process's memory instead of the file's, so a function runs on the state a program had. [`snapshot.rs`](crates/mcp/src/emulate/snapshot.rs) gives the format.
 
-It reads ELF, Windows PE and Mach-O for x86, x86-64 and AArch64, ELF for 32-bit ARM, A32 and Thumb-2 side by side, and raw firmware that a layout file describes: 8051 and ARM Cortex-M.
+It reads ELF, Windows PE and Mach-O for x86, x86-64 and AArch64, ELF for 32-bit ARM, A32 and Thumb-2 side by side, Linux kernel modules for x86-64, and raw firmware that a layout file describes: 8051 and ARM Cortex-M.
 
 ## Fast is not sloppy
 
@@ -141,6 +141,9 @@ The rules were worked out on the binaries above. Each corpus but Linux AArch64 a
 | AArch64 Mach-O, function starts hidden | 99.8% | 99.9% | 99.6% | 45.8% | |
 | x86-64 Mach-O | 100.0% | 100.0% | 97.7% | 100.0% | 26 |
 | x86-64 Mach-O, function starts hidden | 99.3% | 99.7% | 77.3% | 85.6% | |
+| Linux kernel modules, x86-64 | 100.0% | 98.9% | 100.0% | 99.6% | 24 |
+
+A kernel module is a relocatable file whose sections have no addresses until the kernel loads it. recore places it where Linux puts modules and applies its relocations, so its calls into the kernel read as imports and DWARF names the same addresses. The corpus is 40 drivers, file systems and network modules from Debian's kernel, and 25 more held out, 24 of them scored, each with every symbol the module does not need stripped, so that recore finds its static functions itself. The kernel's own list of the functions it can trace, `__mcount_loc`, gives most of them. The precision lost is code that only a jump label reaches, which the kernel patches in at run time.
 
 Jump tables hold up: 765 of 765 exact on Windows x86-64 and 1,248 of 1,252 on x86. The Linux x86-64 loss is all BusyBox where unwind info is read. With it hidden, BusyBox is half and tcpdump most of the rest. On Windows x86, Wireshark 3.6's command line tools lose about 39 functions each, the 32-bit .NET runtime finds 94.9% of `coreclr.dll`, and Firefox's Rust `crashhelper.exe` comes in at 76.8% precision. Without function starts, ShellCheck, a Haskell program, is most of the Mach-O loss: without it, recore finds 98.6% at 99.8% on AArch64 and 96.5% at 99.8% on x86-64. On AArch64 recore decodes the tables GHC puts before each function as code. On x86-64 the truth is at fault too: ShellCheck's symbol table names 23,803 of those tables (`*_info_dsp`), the truth counts each as a function, and they are every one of the misses in the 97.7% row. The x86-64 Mach-O rows therefore understate what recore finds and say nothing sure about its precision on that program.
 

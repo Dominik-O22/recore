@@ -35,14 +35,19 @@ const COUNTS: [Count; 12] = [
 #[derive(Debug, PartialEq, Eq)]
 pub struct Change {
     pub count: &'static str,
+    /// The totals over the binaries the base read something of.
     pub base: u64,
     pub head: u64,
-    /// Whether the total moved the wrong way.
+    /// Whether `lost` outweighs `gained`.
     pub worse: bool,
     /// Binaries where the count moved the wrong way, by how far, farthest first.
     pub lost: Vec<(String, u64)>,
     /// Binaries where it moved the right way, by how far, farthest first.
     pub gained: Vec<(String, u64)>,
+    /// As `lost` and `gained`, for the binaries the base read nothing of, which have no say in
+    /// `worse`.
+    pub new_lost: Vec<(String, u64)>,
+    pub new_gained: Vec<(String, u64)>,
 }
 
 /// The counts that moved from `base` to `head`, each a list of `(binary, score)` sorted by
@@ -54,35 +59,47 @@ pub fn compare(base: &[(String, Score)], head: &[(String, Score)]) -> (Vec<Chang
     let changes = COUNTS
         .iter()
         .filter_map(|&(count, get, better)| {
-            let (mut lost, mut gained) = (Vec::new(), Vec::new());
+            let (mut lost, mut gained, mut new_lost, mut new_gained) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for &(name, b, h) in &pairs {
+                let read = !read_nothing(b);
                 let (b, h) = (get(b), get(h));
                 let (up, down) = (h.saturating_sub(b), b.saturating_sub(h));
                 let (wrong, right) = if better == Better::Higher { (down, up) } else { (up, down) };
                 if wrong > 0 {
-                    lost.push((name.to_string(), wrong));
+                    if read { &mut lost } else { &mut new_lost }.push((name.to_string(), wrong));
                 }
                 if right > 0 {
-                    gained.push((name.to_string(), right));
+                    if read { &mut gained } else { &mut new_gained }.push((name.to_string(), right));
                 }
             }
-            if lost.is_empty() && gained.is_empty() {
+            if [&lost, &gained, &new_lost, &new_gained].iter().all(|list| list.is_empty()) {
                 return None;
             }
-            lost.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            gained.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            let (base, head) = pairs.iter().fold((0, 0), |(b, h), &(_, sb, sh)| (b + get(sb), h + get(sh)));
-            let worse = if better == Better::Higher { head < base } else { head > base };
-            Some(Change { count, base, head, worse, lost, gained })
+            for list in [&mut lost, &mut gained, &mut new_lost, &mut new_gained] {
+                list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            }
+            let read = pairs.iter().filter(|(_, sb, _)| !read_nothing(sb));
+            let (base, head) = read.fold((0, 0), |(b, h), &(_, sb, sh)| (b + get(sb), h + get(sh)));
+            Some(Change { count, base, head, worse: total(&lost) > total(&gained), lost, gained, new_lost, new_gained })
         })
         .collect();
     (changes, missing)
 }
 
+fn total(list: &[(String, u64)]) -> u64 {
+    list.iter().map(|(_, n)| n).sum()
+}
+
+/// Whether the base found no function in a binary and covered none of its bytes, as when it
+/// could not read its format. What the head reports there has nothing to be compared with.
+fn read_nothing(score: &Score) -> bool {
+    score.found + score.mid_function + score.in_fragment + score.outside == 0 && score.covered_bytes == 0
+}
+
 /// Prints the changes, worst first, with the binaries behind each.
 pub fn print(changes: &[Change], missing: &[String]) {
     let binaries = |list: &[(String, u64)]| {
-        let total: u64 = list.iter().map(|(_, n)| n).sum();
+        let total = total(list);
         let named: Vec<String> = list.iter().take(4).map(|(name, n)| format!("{name} {n}")).collect();
         let more = if list.len() > 4 { format!(", {} more", list.len() - 4) } else { String::new() };
         format!("{total} in {} binaries ({}{more})", list.len(), named.join(", "))
@@ -96,7 +113,15 @@ pub fn print(changes: &[Change], missing: &[String]) {
     let mut sorted: Vec<&Change> = changes.iter().collect();
     sorted.sort_by_key(|c| !c.worse);
     for c in sorted {
-        let verdict = if c.worse { "worse" } else if c.base == c.head { "traded" } else { "better" };
+        let verdict = if c.worse {
+            "worse"
+        } else if c.lost.is_empty() && c.gained.is_empty() {
+            "new"
+        } else if total(&c.lost) == total(&c.gained) {
+            "traded"
+        } else {
+            "better"
+        };
         let delta = c.head as i64 - c.base as i64;
         println!("  {verdict:7} {:31} {} -> {} ({delta:+})", c.count, c.base, c.head);
         if !c.lost.is_empty() {
@@ -104,6 +129,12 @@ pub fn print(changes: &[Change], missing: &[String]) {
         }
         if !c.gained.is_empty() {
             println!("            gained {}", binaries(&c.gained));
+        }
+        if !c.new_lost.is_empty() {
+            println!("            lost where the base read nothing   {}", binaries(&c.new_lost));
+        }
+        if !c.new_gained.is_empty() {
+            println!("            gained where the base read nothing {}", binaries(&c.new_gained));
         }
     }
 }
@@ -131,6 +162,8 @@ mod tests {
                 worse: true,
                 lost: vec![("a".to_string(), 48)],
                 gained: vec![("b".to_string(), 9)],
+                new_lost: vec![],
+                new_gained: vec![],
             }]
         );
     }
@@ -148,6 +181,26 @@ mod tests {
         let head = [("a".to_string(), Score { mid_function: 5, ..Score::default() })];
         let (changes, _) = compare(&base, &head);
         assert_eq!(changes.iter().map(|c| (c.count, c.worse)).collect::<Vec<_>>(), [("mid-func", true)]);
+    }
+
+    #[test]
+    fn what_a_binary_the_base_read_nothing_of_misplaces_is_not_worse() {
+        let base = [found("a", 0)];
+        let head = [("a".to_string(), Score { found: 10, mid_function: 2, ..Score::default() })];
+        let (changes, _) = compare(&base, &head);
+        let moved = |c: &Change| (c.count, c.worse, c.new_lost.clone(), c.new_gained.clone());
+        assert_eq!(
+            changes.iter().map(moved).collect::<Vec<_>>(),
+            [("starts found", false, vec![], vec![("a".to_string(), 10)]), ("mid-func", false, vec![("a".to_string(), 2)], vec![])]
+        );
+    }
+
+    #[test]
+    fn a_binary_the_base_read_nothing_of_cannot_cancel_a_loss_in_another() {
+        let base = [found("a", 0), found("b", 5)];
+        let head = [found("a", 10), found("b", 4)];
+        let (changes, _) = compare(&base, &head);
+        assert_eq!(changes.iter().map(|c| (c.count, c.worse)).collect::<Vec<_>>(), [("starts found", true)]);
     }
 
     #[test]
