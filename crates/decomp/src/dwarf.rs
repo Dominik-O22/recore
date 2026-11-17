@@ -37,7 +37,7 @@ pub struct DebugInfo {
 impl DebugInfo {
     pub fn load(path: &Path) -> Result<DebugInfo> {
         use gimli::{EndianArcSlice, LittleEndian};
-        let data = std::fs::read(path).with_context(|| format!("reading {path:?}"))?;
+        let data = recore::relocatable::link(std::fs::read(path).with_context(|| format!("reading {path:?}"))?);
         let debug = object::File::parse(&*data)?;
         let symbols = debug
             .symbols()
@@ -265,7 +265,7 @@ fn unpack_sections<'d>(file: &object::File<'d>, needed: &[gimli::SectionId]) -> 
 
 fn read(path: &Path, machine: Machine, locations: bool, roots: &[PathBuf]) -> Result<Located> {
     let pointer = machine.pointer_size();
-    let data = std::fs::read(path).with_context(|| format!("reading {path:?}"))?;
+    let data = recore::relocatable::link(std::fs::read(path).with_context(|| format!("reading {path:?}"))?);
     let file = object::File::parse(&*data)?;
     // Debian compresses these sections, and unpacking them is then most of the work: only the
     // ones that describe types are unpacked, not variable locations or macros, and each on a

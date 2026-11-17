@@ -91,7 +91,7 @@ impl<const BITS: u32, const WINDOWS: bool> Arch for X86<BITS, WINDOWS> {
     }
 
     fn address_taken(insn: &Instruction, _: &State, _: &Image) -> Option<u64> {
-        if BITS == 64 { lea_target(insn) } else { immediate_address(insn) }
+        if BITS == 64 { lea_target(insn).or_else(|| kernel_address(insn)) } else { immediate_address(insn) }
     }
 
     fn based_data_address(insn: &Instruction, state: &State) -> Option<(u64, u64)> {
@@ -320,10 +320,24 @@ fn immediate_address(instr: &Instruction) -> Option<u64> {
     (instr.op_kind(operand) == OpKind::Immediate32).then(|| u64::from(instr.immediate32()))
 }
 
+/// The immediate of `push imm32` or `mov dest, imm32` in 64-bit code when it sign-extends into
+/// the top 2 GB, where no code but the kernel's runs. Code built with `-mcmodel=kernel`, as Linux
+/// and its modules are, takes addresses this way, and no constant of a program lies there.
+fn kernel_address(instr: &Instruction) -> Option<u64> {
+    let operand = match instr.mnemonic() {
+        Mnemonic::Push => 0,
+        Mnemonic::Mov => 1,
+        _ => return None,
+    };
+    (instr.op_kind(operand) == OpKind::Immediate32to64).then(|| instr.immediate(operand)).filter(|&value| value >= 0xffff_ffff_8000_0000)
+}
+
 /// The address a `lea reg, [rip+disp]` computes, which is how position-independent code takes
-/// the address of a function or of data.
+/// the address of a function or of data. `lea reg, [rip]` takes the code's own position, as the
+/// Linux kernel's `_THIS_IP_` does, and never a function: none starts where code runs on into it.
 fn lea_target(instr: &Instruction) -> Option<u64> {
-    (instr.mnemonic() == Mnemonic::Lea && instr.is_ip_rel_memory_operand()).then(|| instr.ip_rel_memory_address())
+    (instr.mnemonic() == Mnemonic::Lea && instr.is_ip_rel_memory_operand() && instr.ip_rel_memory_address() != instr.next_ip())
+        .then(|| instr.ip_rel_memory_address())
 }
 
 /// Bytes the compiler or linker inserts between functions: `int3`, and every form of `nop`.

@@ -245,6 +245,8 @@ impl Image {
         }
         // OpenWrt and other firmware strip the section headers; read them back from the segments.
         let data = if crate::sectionless::is_sectionless(&data) { crate::sectionless::restore(&data).unwrap_or(data) } else { data };
+        // A kernel module has no addresses until it is linked.
+        let data = crate::relocatable::link(data);
         let file = object::File::parse(&*data)?;
 
         // The sections at an address, but for one whose end the file puts past 2^64.

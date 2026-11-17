@@ -331,13 +331,13 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Option<Extracted
         }
         return crate::truth::sdcc::jump_tables(binary_path, &debug_path.with_extension("rst"));
     }
-    let binary_data = std::fs::read(binary_path).with_context(|| format!("reading {binary_path:?}"))?;
+    let binary_data = recore::relocatable::link(std::fs::read(binary_path).with_context(|| format!("reading {binary_path:?}"))?);
     let binary = object::File::parse(&*binary_data)?;
     let name = binary_path.file_name().unwrap().to_string_lossy().into_owned();
     if binary.format() == BinaryFormat::Pe {
         return extract_pe(name, &binary_data, debug_path);
     }
-    let debug_data = std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?;
+    let debug_data = recore::relocatable::link(std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?);
     let debug = object::File::parse(&*debug_data)?;
     if binary.architecture() == object::Architecture::Arm {
         return crate::truth::arm::jump_tables(name, &binary, &debug);
