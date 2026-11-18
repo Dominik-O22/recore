@@ -20,9 +20,10 @@
 # time or 10% more memory with this build than with the base's. RECORE_COST_ACCEPTED=1 lets a
 # change past that which its description says is worth it.
 #
-# `--quick` is for while a change is made: it builds without whole-program optimization, which
-# rebuilds in seconds rather than minutes and scores the same, and skips the ratchet, the cost
-# and the status, which measure the build that ships. The run that leaves the status is a full one.
+# `--quick` is for while a change is made: it builds the ci profile, without whole-program
+# optimization, which rebuilds in seconds rather than minutes and scores the same unless a number
+# overflows, which panics there. It skips the ratchet, the cost and the status, which measure the
+# build that ships. The run that leaves the status is a full one.
 set -euo pipefail
 cd "$(dirname "$0")"
 # What the run below is of, for the status it leaves on that commit.
