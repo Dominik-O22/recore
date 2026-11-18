@@ -1071,7 +1071,7 @@ impl Worker {
     fn process(&mut self) -> Result<&mut Process, Failure> {
         if self.process.as_mut().is_none_or(|process| !matches!(process.child.try_wait(), Ok(None))) {
             // A child that died while idle takes the kept parameters with it too.
-            self.lost |= self.process.is_some();
+            self.lost |= self.process.as_ref().is_some_and(|process| process.ready);
             let started = Process::start((self.command)());
             self.process = Some(started.map_err(|error| Failure { status: Status::Error, message: format!("{error:#}") })?);
         }
@@ -1080,10 +1080,13 @@ impl Worker {
 
     /// Asks the child, starting one if the last one is gone.
     fn ask(&mut self, request: Request, timeout: Duration) -> Result<Event, Failure> {
-        let result = self.process()?.ask(request, timeout);
+        let process = self.process()?;
+        let result = process.ask(request, timeout);
+        // Only a child that had set up held any parameters to lose.
+        let held = process.ready;
         if result.is_err() {
             self.process = None;
-            self.lost = true;
+            self.lost |= held;
         }
         result
     }

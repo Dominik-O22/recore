@@ -440,7 +440,7 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
     let (base_ok, head_ok) = (ok(base), ok(head));
     // Over every function: a decompiler that starts to fail drops functions from the ones both
     // runs finished. A timeout depends on the load and is left out.
-    let failed = |report: &BinaryReport| report.functions.iter().filter(|r| matches!(r.status, Status::Error | Status::Crash) && !r.after_failure).count();
+    let failed = |report: &BinaryReport| report.functions.iter().filter(|r| matches!(r.status, Status::Error | Status::Crash)).count();
     let (mut base_counts, mut head_counts) = ([0, 0, failed(base), 0, 0, 0, 0, 0], [0, 0, failed(head), 0, 0, 0, 0, 0]);
     // Types count where both runs have them scored: a function whose parameter count one run
     // got wrong has no parameters scored in that run, and a build from before shapes were
@@ -515,7 +515,7 @@ pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) 
     // A head that makes a callee fail every time leaves the rest of its shard out of the
     // comparison, so many more left out here than in the base can hide what changed.
     if both(2) + both(3) > 0 {
-        println!("  left out for coming after a worker lost to a timeout: {} in the base, {} here", both(2), both(3));
+        println!("  left out for coming after a worker lost a child to a timeout or a crash: {} in the base, {} here", both(2), both(3));
     }
 
     let mut worse = Vec::new();
@@ -577,6 +577,11 @@ mod tests {
         let mut head = run(&[(0x10, Status::Ok, 0, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, true)]);
         head.functions[0].after_failure = true;
         assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 1, 0, 0, 0, 0, 0, 0], [0, 0, 0, 1]));
+        // A function that fails after a lost child still fails: a head that crashes everywhere
+        // marks every function after its first crash.
+        let mut head = run(&[(0x10, Status::Crash, 0, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, false)]);
+        head.functions[0].after_failure = true;
+        assert_eq!(counted(&base, &head, &debug, &typed).1[2], 1);
     }
 
     #[test]
