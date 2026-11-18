@@ -58,6 +58,7 @@ once() {
   (
     flock 9
     if [ "$(cat "$dir.done" 2>/dev/null)" != "$stamp" ]; then
+      rm -f "$dir.done"
       rm -rf "$dir"
       "$@"
       echo "$stamp" >"$dir.done"
@@ -65,11 +66,15 @@ once() {
   ) 9>"$dir.lock"
 }
 # The base is a build of <ref> with this run's profile, which every worktree of this repository
-# shares: its binaries and its outputs, kept under the main checkout's target/against. Its
+# shares: its binaries and its outputs, kept under the main checkout's target/bases. Its
 # decompiler stops at a time limit, so a base made with the other profile is a different base.
 if [ -n "$against" ]; then
-  shared="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/target/against"
+  shared="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/target/bases"
   base="$shared/$against-$profile"
+  # Held to the end of the run, so that no other run prunes the base while this one reads it.
+  mkdir -p "$base"
+  exec 7>"$base.lock"
+  flock -s 7
   build_base() {
     (
       flock 8
@@ -82,9 +87,11 @@ if [ -n "$against" ]; then
     ) 8>"$shared/build.lock"
   }
   once "$base/bin" built build_base
-  # The newest bases stay; a base in use is new, since every run touches its own.
+  # The four newest bases stay, and one that a run still holds.
   touch "$base"
-  { ls -dt "$shared"/*-release/ "$shared"/*-ci/ 2>/dev/null || true; } | tail -n +5 | xargs -r rm -rf
+  { ls -dt "$shared"/*-release/ "$shared"/*-ci/ 2>/dev/null || true; } | tail -n +5 | while read -r old; do
+    flock -n "${old%/}.lock" rm -rf "$old" || true
+  done
 fi
 # analyze <variant> <binaries> [flags]: this checkout's recore, and the base's when there is one.
 analyze() {
