@@ -95,7 +95,8 @@ signatures() {
 SIGNATURE_SAMPLE=100
 # One decompiler per core. Two on the threads of one core take twice as long each and finish no
 # sooner, and twice as many reach the time limit.
-CORES="$(lscpu -p=core | awk '!/^#/' | sort -u | wc -l)"
+CORES="$(lscpu -p=core 2>/dev/null | awk '!/^#/' | sort -u | wc -l)"
+[ "$CORES" -gt 1 ] || CORES="$(nproc)"
 worse=()
 # Every corpus in the store that has truth, so a new corpus is scored without a change here.
 for in in "$corpora"/*/; do

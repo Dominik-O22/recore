@@ -427,12 +427,12 @@ const MEASURES: [(&str, bool); 8] = [
 type Counts = [usize; 8];
 
 /// A binary's name, its [`MEASURES`] in the base and in the head, and what [`counted`] compared.
-type Compared = (String, Counts, Counts, [usize; 2]);
+type Compared = (String, Counts, Counts, [usize; 4]);
 
 /// The [`MEASURES`] of `base` and of `head`, two runs of the same functions of one binary, and
-/// how many functions have their parameters' types scored in both, and how many uses of a
-/// global.
-fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &Typed) -> (Counts, Counts, [usize; 2]) {
+/// how many functions have their parameters' types scored in both, how many uses of a global,
+/// and how many functions each run left out for coming after a lost worker.
+fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &Typed) -> (Counts, Counts, [usize; 4]) {
     // Neither a function that timed out nor one decompiled after a timeout lost its worker the
     // parameters it had kept: either depends on the load, not on the change.
     let compared = |r: &FunctionRecord| r.status == Status::Ok && !r.after_failure;
@@ -440,7 +440,7 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
     let (base_ok, head_ok) = (ok(base), ok(head));
     // Over every function: a decompiler that starts to fail drops functions from the ones both
     // runs finished. A timeout depends on the load and is left out.
-    let failed = |report: &BinaryReport| report.functions.iter().filter(|r| matches!(r.status, Status::Error | Status::Crash)).count();
+    let failed = |report: &BinaryReport| report.functions.iter().filter(|r| matches!(r.status, Status::Error | Status::Crash) && !r.after_failure).count();
     let (mut base_counts, mut head_counts) = ([0, 0, failed(base), 0, 0, 0, 0, 0], [0, 0, failed(head), 0, 0, 0, 0, 0]);
     // Types count where both runs have them scored: a function whose parameter count one run
     // got wrong has no parameters scored in that run, and a build from before shapes were
@@ -483,7 +483,8 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
             counts[1] += usize::from(expected.returns_value == Some(returns_value));
         }
     }
-    (base_counts, head_counts, [typed_in_both, globals_in_both])
+    let left_out = |report: &BinaryReport| report.functions.iter().filter(|r| r.after_failure).count();
+    (base_counts, head_counts, [typed_in_both, globals_in_both, left_out(base), left_out(head)])
 }
 
 /// Prints each of [`MEASURES`] that moved from the corpus run in `base_dir` to the one in
@@ -511,6 +512,11 @@ pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) 
     // A base from before shapes were recorded has none, and then no type count can move.
     let both = |index: usize| binaries.iter().map(|binary| binary.3[index]).sum::<usize>();
     println!("  parameter types compared in {} functions, global types in {} uses", both(0), both(1));
+    // A head that makes a callee fail every time leaves the rest of its shard out of the
+    // comparison, so many more left out here than in the base can hide what changed.
+    if both(2) + both(3) > 0 {
+        println!("  left out for coming after a worker lost to a timeout: {} in the base, {} here", both(2), both(3));
+    }
 
     let mut worse = Vec::new();
     for (index, (measure, more_is_better)) in MEASURES.into_iter().enumerate() {
@@ -563,14 +569,14 @@ mod tests {
         // 0x10 now reads as returning a value, and 0x20 timed out.
         let head = run(&[(0x10, Status::Ok, 1, true), (0x20, Status::Timeout, 0, false), (0x30, Status::Ok, 0, false)]);
         let typed = Typed::default();
-        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0, 0], [0, 0]));
+        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0]));
         // A function that fails drops out of the comparison, and counts as failed.
         let head = run(&[(0x10, Status::Error, 0, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, false)]);
-        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 1, 1, 0, 0, 0, 0, 0], [0, 0]));
+        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 1, 1, 0, 0, 0, 0, 0], [0, 0, 0, 0]));
         // 0x10 lost a parameter after its worker lost a child, which is the load's doing.
         let mut head = run(&[(0x10, Status::Ok, 0, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, true)]);
         head.functions[0].after_failure = true;
-        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 1, 0, 0, 0, 0, 0, 0], [0, 0]));
+        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 1, 0, 0, 0, 0, 0, 0], [0, 0, 0, 1]));
     }
 
     #[test]
@@ -606,9 +612,9 @@ mod tests {
         // A build that records no shapes has no type scored, so the head's wrong pointer is no
         // loss. Its records here have no parameters either, which is what the first count says.
         let head = run([&[pointer], &[number]]);
-        assert_eq!(counted(&run([&[], &[]]), &head, &debug, &typed), ([0, 2, 0, 0, 0, 0, 0, 0], [2, 2, 0, 0, 0, 0, 0, 0], [0, 0]));
+        assert_eq!(counted(&run([&[], &[]]), &head, &debug, &typed), ([0, 2, 0, 0, 0, 0, 0, 0], [2, 2, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0]));
         // Against a run that had both right, it is one: a type lost and a pointer wrongly called.
-        assert_eq!(counted(&run([&[number], &[number]]), &head, &debug, &typed), ([2, 2, 0, 2, 0, 0, 0, 0], [2, 2, 0, 1, 0, 1, 0, 0], [2, 0]));
+        assert_eq!(counted(&run([&[number], &[number]]), &head, &debug, &typed), ([2, 2, 0, 2, 0, 0, 0, 0], [2, 2, 0, 1, 0, 1, 0, 0], [2, 0, 0, 0]));
     }
 
     #[test]
@@ -623,12 +629,12 @@ mod tests {
         assert_eq!(misses, BTreeMap::from([("global: a pointer of 8 as a number of 8".to_string(), 1)]));
         let debug = DebugInfo { functions: BTreeMap::new(), symbols: BTreeMap::new() };
         // A build that lists no globals has none to compare, so the head's miss is no loss.
-        assert_eq!(counted(&run(&[]), &head, &debug, &typed), ([0; 8], [0; 8], [0, 0]));
+        assert_eq!(counted(&run(&[]), &head, &debug, &typed), ([0; 8], [0; 8], [0, 0, 0, 0]));
         // Against a run that had the pointer right and did not use the number, it is one.
-        assert_eq!(counted(&run(&[(0x100, shape(Kind::Pointer, 8))]), &head, &debug, &typed), ([0, 0, 0, 0, 0, 0, 1, 0], [0; 8], [0, 1]));
+        assert_eq!(counted(&run(&[(0x100, shape(Kind::Pointer, 8))]), &head, &debug, &typed), ([0, 0, 0, 0, 0, 0, 1, 0], [0; 8], [0, 1, 0, 0]));
         // Calling the number a pointer is no better type, and counts against the run.
         let pointers = run(&[(0x100, shape(Kind::Pointer, 8)), (0x200, shape(Kind::Pointer, 4))]);
-        assert_eq!(counted(&head, &pointers, &debug, &typed), ([0, 0, 0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 0, 1, 1], [0, 2]));
+        assert_eq!(counted(&head, &pointers, &debug, &typed), ([0, 0, 0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 0, 1, 1], [0, 2, 0, 0]));
     }
 
     #[test]
