@@ -19,45 +19,89 @@
 # With a base, `recore-bench cost` then fails when the largest binaries took more than 10% more
 # time or 10% more memory with this build than with the base's. RECORE_COST_ACCEPTED=1 lets a
 # change past that which its description says is worth it.
+#
+# `--quick` is for while a change is made: it builds the ci profile, without whole-program
+# optimization, which rebuilds in seconds rather than minutes and scores the same unless a number
+# overflows, which panics there. It skips the ratchet, the cost and the status, which measure the
+# build that ships. The run that leaves the status is a full one.
 set -euo pipefail
 cd "$(dirname "$0")"
 # What the run below is of, for the status it leaves on that commit.
 head="$(git rev-parse HEAD)" uncommitted="$(git status --porcelain)"
-against=
-if [ "${1:-}" = --against ]; then
-  against="$(git rev-parse --verify "${2:?--against takes a git ref}^{commit}")"
-  shift 2
-fi
+quick= against=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quick) quick=1; shift ;;
+    --against) against="$(git rev-parse --verify "${2:?--against takes a git ref}^{commit}")"; shift 2 ;;
+    *) break ;;
+  esac
+done
+profile=release
+[ -n "$quick" ] && profile=ci
+build="target/$profile"
 # Only the crates the loop needs; other crates may be mid-change.
-cargo build --release -q -p recore -p recore-corpus -p recore-bench -p recore-mcp -p recore-decomp
+if [ -n "$quick" ]; then
+  cargo build --profile ci -q -p recore -p recore-corpus -p recore-decomp
+else
+  cargo build --release -q -p recore -p recore-corpus -p recore-bench -p recore-mcp -p recore-decomp
+fi
 # Only crates/*/tests may name the program a test needs. CI runs this scan with the other
-# tests; the loop runs it first, so a leaked name fails before the corpora are scored.
-cargo test --release -q -p recore --test general_naming
+# tests; the loop runs it first, so a leaked name fails before the corpora are scored. It reads
+# only the sources, so it takes the profile the tests already build rather than linking a release.
+cargo test --profile ci -q -p recore --test general_naming
 corpora="${RECORE_CORPORA:-$HOME/recore-corpora}"
-# The base is built once per commit, from a worktree that goes away after, and its analysis is
-# kept by commit, so the next comparison against the same commit only analyzes this checkout.
+# once <dir> <stamp> <command>...: runs the command, which writes <dir>, unless a run from any
+# checkout already did with the same stamp. The lock keeps two checkouts from writing it at once.
+once() {
+  local dir="$1" stamp="$2"
+  shift 2
+  mkdir -p "$(dirname "$dir")"
+  (
+    flock 9
+    if [ "$(cat "$dir.done" 2>/dev/null)" != "$stamp" ]; then
+      rm -f "$dir.done"
+      rm -rf "$dir"
+      "$@"
+      echo "$stamp" >"$dir.done"
+    fi
+  ) 9>"$dir.lock"
+}
+# The base is a build of <ref> with this run's profile, which every worktree of this repository
+# shares: its binaries and its outputs, kept under the main checkout's target/bases. Its
+# decompiler stops at a time limit, so a base made with the other profile is a different base.
 if [ -n "$against" ]; then
-  base="target/against/recore-$against"
-  if [ ! -x "$base-mcp" ] || [ ! -x "$base-decompile" ]; then
-    src=target/against/src
-    git worktree remove --force "$src" 2>/dev/null || true
-    git worktree add -q --detach "$src" "$against"
-    CARGO_TARGET_DIR="$PWD/target/against/build" cargo build --release -q -p recore -p recore-mcp -p recore-decomp --manifest-path "$src/Cargo.toml"
-    cp target/against/build/release/recore "$base"
-    cp target/against/build/release/recore-mcp "$base-mcp"
-    cp target/against/build/release/recore-decompile "$base-decompile"
-    git worktree remove --force "$src"
-  fi
+  shared="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/target/bases"
+  base="$shared/$against-$profile"
+  # Held to the end of the run, so that no other run prunes the base while this one reads it.
+  mkdir -p "$base"
+  exec 7>"$base.lock"
+  flock -s 7
+  build_base() {
+    (
+      flock 8
+      git worktree remove --force "$shared/src" 2>/dev/null || true
+      git worktree add -q --detach "$shared/src" "$against"
+      CARGO_TARGET_DIR="$shared/build" cargo build --profile "$profile" -q -p recore -p recore-mcp -p recore-decomp --manifest-path "$shared/src/Cargo.toml"
+      mkdir -p "$base/bin"
+      cp "$shared/build/$profile"/{recore,recore-mcp,recore-decompile} "$base/bin"
+      git worktree remove --force "$shared/src"
+    ) 8>"$shared/build.lock"
+  }
+  once "$base/bin" built build_base
+  # The four newest bases stay, and one that a run still holds.
+  touch "$base"
+  { ls -dt "$shared"/*-release/ "$shared"/*-ci/ 2>/dev/null || true; } | tail -n +5 | while read -r old; do
+    flock -n "${old%/}.lock" rm -rf "$old" || true
+  done
 fi
 # analyze <variant> <binaries> [flags]: this checkout's recore, and the base's when there is one.
 analyze() {
   local variant="$1" bin="$2"
   shift 2
-  ./target/release/recore corpus "$bin" "$out/$variant" "$@" 2>/dev/null
+  "$build/recore" corpus "$bin" "$out/$variant" "$@" 2>/dev/null
   dirs+=("$out/$variant")
-  if [ -n "$against" ] && [ ! -e "$out/against-$against/$variant/done" ]; then
-    "$base" corpus "$bin" "$out/against-$against/$variant" "$@" 2>/dev/null
-    touch "$out/against-$against/$variant/done"
+  if [ -n "$against" ]; then
+    once "$base_out/$variant" done "$base/bin/recore" corpus "$bin" "$base_out/$variant" "$@" 2>/dev/null
   fi
 }
 # signatures <corpus>: decompiles the sample of each binary with this checkout's decompiler and
@@ -67,7 +111,7 @@ signatures() {
   local in="$1" sample=(--sample "$SIGNATURE_SAMPLE" --debug-dir "$1/debug" --timeout 5 --shard 25 --jobs "$CORES")
   # A report left from an earlier run would pass for this one's.
   rm -rf "$out/signatures"
-  ./target/release/recore-decompile corpus "$in/bin" "$out/signatures" "${sample[@]}" >"$out/signatures.log" 2>&1
+  "$build/recore-decompile" corpus "$in/bin" "$out/signatures" "${sample[@]}" >"$out/signatures.log" 2>&1
   # A debug file without DWARF, as the unstripped original of a Mach-O binary is, lists no
   # function to decompile. Only summary.json is written then, and 0 of 0 would read as a score.
   local reports=("$out"/signatures/*.json)
@@ -75,20 +119,20 @@ signatures() {
     echo "$out/signatures: no debug file lists a function, so no signature is scored"
     return
   fi
-  ./target/release/recore-decompile params "$out/signatures" "$in/debug" | sed -n '1p;3,7p'
-  if [ -n "$against" ] && [[ "$("$base-decompile" corpus --help)" != *--sample* ]]; then
+  "$build/recore-decompile" params "$out/signatures" "$in/debug" | sed -n '1p;3,7p'
+  if [ -n "$against" ] && [[ "$("$base/bin/recore-decompile" corpus --help)" != *--sample* ]]; then
     echo "$out/signatures: the base's decompiler takes no --sample, so nothing to compare with"
   elif [ -n "$against" ]; then
-    # Kept by commit, and made again if this checkout samples differently.
-    local base_out="$out/against-$against/signatures"
-    if [ "$(cat "$base_out/done" 2>/dev/null)" != "${sample[*]}" ]; then
-      rm -rf "$base_out"
-      "$base-decompile" corpus "$in/bin" "$base_out" "${sample[@]}" >"$out/against-$against/signatures.log" 2>&1
-      echo "${sample[*]}" > "$base_out/done"
-    fi
-    echo "$out/signatures against $base_out"
-    ./target/release/recore-decompile params "$out/signatures" "$in/debug" --against "$base_out" || worse+=("$out/signatures")
+    # Made again if this checkout samples differently.
+    once "$base_out/signatures" "${sample[*]}" base_signatures "$in" "${sample[@]}"
+    echo "$out/signatures against $base_out/signatures"
+    "$build/recore-decompile" params "$out/signatures" "$in/debug" --against "$base_out/signatures" || worse+=("$out/signatures")
   fi
+}
+base_signatures() {
+  local in="$1"
+  shift
+  "$base/bin/recore-decompile" corpus "$in/bin" "$base_out/signatures" "$@" >"$base_out/signatures.log" 2>&1
 }
 # Functions of each binary whose signatures are scored: enough to see a change that reaches many
 # functions, few enough to keep the run short.
@@ -105,6 +149,7 @@ for in in "$corpora"/*/; do
   # The held-out corpora score a change once it is done, and are never part of the loop.
   [[ "$corpus" == *-holdout ]] && continue
   out="target/corpus/$corpus"
+  base_out="${base:-}/corpus/$corpus"
   dirs=()
   analyze recore "$in/bin"
   # A raw image, which a layout file describes, has no unwind info to leave out.
@@ -120,10 +165,10 @@ for in in "$corpora"/*/; do
   if [ -d "$in/norelocs" ]; then
     analyze recore-norelocs "$in/norelocs"
   fi
-  ./target/release/recore-corpus --corpus "$in" score "${dirs[@]}" "$@"
+  "$build/recore-corpus" --corpus "$in" score "${dirs[@]}" "$@"
   if [ -n "$against" ]; then
     for dir in "${dirs[@]}"; do
-      ./target/release/recore-corpus --corpus "$in" compare "$out/against-$against/${dir##*/}" "$dir" || worse+=("$dir")
+      "$build/recore-corpus" --corpus "$in" compare "$base_out/${dir##*/}" "$dir" || worse+=("$dir")
     done
   fi
   # The decompiler's signatures against the debug files: the parameter count of every so many
@@ -134,10 +179,11 @@ for in in "$corpora"/*/; do
     signatures "$in"
   fi
 done
-if ! ./target/release/recore-bench ratchet; then
+# The ratchet and the cost measure the build that ships, which a --quick run does not build.
+if [ -z "$quick" ] && ! "$build/recore-bench" ratchet; then
   worse+=("bench/budget.json")
 fi
-if [ -n "$against" ] && ! ./target/release/recore-bench cost --base "$base-mcp" ${RECORE_COST_ACCEPTED:+--accept}; then
+if [ -z "$quick" ] && [ -n "$against" ] && ! "$build/recore-bench" cost --base "$base/bin/recore-mcp" ${RECORE_COST_ACCEPTED:+--accept}; then
   worse+=("time or memory")
 fi
 if [ ${#worse[@]} -gt 0 ]; then
@@ -146,7 +192,9 @@ if [ ${#worse[@]} -gt 0 ]; then
 fi
 # `main` takes a commit only with this status, so it says that this run passed on that commit. A
 # budget this run lowered is left to commit, and the commit then needs a run of its own.
-if [ -z "$against" ] || [ -n "$uncommitted$(git status --porcelain)" ] || [ "$head" != "$(git rev-parse HEAD)" ]; then
+if [ -n "$quick" ]; then
+  echo "no check status: a --quick run leaves out the ratchet and the cost, so run without it last" >&2
+elif [ -z "$against" ] || [ -n "$uncommitted$(git status --porcelain)" ] || [ "$head" != "$(git rev-parse HEAD)" ]; then
   echo "no check status: that takes --against, on a commit with nothing left to commit" >&2
 elif ! gh api --silent "repos/{owner}/{repo}/statuses/$head" -f state=success -f context=check -f description="passed against ${against:0:12}"; then
   echo "no check status: GitHub has to know $head, so push before the run" >&2
