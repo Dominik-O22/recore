@@ -433,7 +433,10 @@ type Compared = (String, Counts, Counts, [usize; 2]);
 /// how many functions have their parameters' types scored in both, and how many uses of a
 /// global.
 fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &Typed) -> (Counts, Counts, [usize; 2]) {
-    let ok = |report: &BinaryReport| -> BTreeMap<u64, (usize, bool)> { report.functions.iter().filter(|r| r.status == Status::Ok).map(|r| (r.addr, (r.params, r.returns_value))).collect() };
+    // Neither a function that timed out nor one decompiled after a timeout lost its worker the
+    // parameters it had kept: either depends on the load, not on the change.
+    let compared = |r: &FunctionRecord| r.status == Status::Ok && !r.after_failure;
+    let ok = |report: &BinaryReport| -> BTreeMap<u64, (usize, bool)> { report.functions.iter().filter(|r| compared(r)).map(|r| (r.addr, (r.params, r.returns_value))).collect() };
     let (base_ok, head_ok) = (ok(base), ok(head));
     // Over every function: a decompiler that starts to fail drops functions from the ones both
     // runs finished. A timeout depends on the load and is left out.
@@ -442,7 +445,7 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
     // Types count where both runs have them scored: a function whose parameter count one run
     // got wrong has no parameters scored in that run, and a build from before shapes were
     // recorded has none scored at all. Its wrong pointers would otherwise read as new ones.
-    let scored = |report: &BinaryReport| -> BTreeMap<u64, Shapes> { report.functions.iter().filter(|r| r.status == Status::Ok).map(|r| (r.addr, typed.score(r, &mut BTreeMap::new()))).collect() };
+    let scored = |report: &BinaryReport| -> BTreeMap<u64, Shapes> { report.functions.iter().filter(|r| compared(r)).map(|r| (r.addr, typed.score(r, &mut BTreeMap::new()))).collect() };
     let (base_scored, head_scored) = (scored(base), scored(head));
     let mut typed_in_both = 0;
     for (addr, base_shapes) in &base_scored {
@@ -460,7 +463,7 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
     }
     // A global counts where both runs have the function use it: one a run no longer reads, or
     // that a build from before they were recorded does not list, is no type gone wrong.
-    let uses = |report: &'_ BinaryReport| -> BTreeMap<(u64, u64), Shape> { report.functions.iter().filter(|r| r.status == Status::Ok).flat_map(|r| r.globals.iter().map(|&(addr, shape)| ((r.addr, addr), shape))).collect() };
+    let uses = |report: &'_ BinaryReport| -> BTreeMap<(u64, u64), Shape> { report.functions.iter().filter(|r| compared(r)).flat_map(|r| r.globals.iter().map(|&(addr, shape)| ((r.addr, addr), shape))).collect() };
     let (base_uses, head_uses) = (uses(base), uses(head));
     let mut globals_in_both = 0;
     for (&(function, addr), &base_shape) in &base_uses {
@@ -564,6 +567,10 @@ mod tests {
         // A function that fails drops out of the comparison, and counts as failed.
         let head = run(&[(0x10, Status::Error, 0, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, false)]);
         assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 1, 1, 0, 0, 0, 0, 0], [0, 0]));
+        // 0x10 lost a parameter after its worker lost a child, which is the load's doing.
+        let mut head = run(&[(0x10, Status::Ok, 0, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, true)]);
+        head.functions[0].after_failure = true;
+        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 1, 0, 0, 0, 0, 0, 0], [0, 0]));
     }
 
     #[test]

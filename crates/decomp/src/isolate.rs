@@ -98,12 +98,17 @@ pub struct FunctionRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub globals: Vec<(u64, Shape)>,
     pub c_len: usize,
+    /// Decompiled after its worker lost a child to a timeout or a crash, which took the
+    /// parameters kept so far with it. A run where nothing timed out knew more here, so a
+    /// comparison of two runs leaves the function out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_failure: bool,
 }
 
 impl FunctionRecord {
     /// A record for a function that produced no result.
     pub fn failed(addr: u64, status: Status, message: String, ms: f64) -> FunctionRecord {
-        FunctionRecord { addr, status, message: Some(message), ms, params: 0, storage: Vec::new(), shapes: Vec::new(), returns_value: false, return_shape: None, globals: Vec::new(), c_len: 0 }
+        FunctionRecord { addr, status, message: Some(message), ms, params: 0, storage: Vec::new(), shapes: Vec::new(), returns_value: false, return_shape: None, globals: Vec::new(), c_len: 0, after_failure: false }
     }
 }
 
@@ -603,6 +608,8 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                     return_shape: function.returns_value.then_some(function.return_shape),
                     globals: function.globals,
                     c_len: function.c_text.len(),
+                    // The parent knows whether a child was lost before this one.
+                    after_failure: false,
                 },
                 c_text: (options.emit_c && (keep || matches!(request, Request::Decompile(_)))).then_some(function.c_text),
             },
@@ -865,6 +872,8 @@ pub struct Worker {
     process: Option<Process>,
     /// Callees that took a child down. They are no longer decompiled ahead of their callers.
     avoid: HashSet<u64>,
+    /// Whether a child has been lost to a timeout or a crash.
+    lost: bool,
 }
 
 impl Worker {
@@ -886,7 +895,7 @@ impl Worker {
             command.arg(&binary).arg(&json);
             command
         };
-        Worker { command: Box::new(command), options: options.clone(), process: None, avoid: HashSet::new() }
+        Worker { command: Box::new(command), options: options.clone(), process: None, avoid: HashSet::new(), lost: false }
     }
 
     /// Decompiles one function. If the child dies or exceeds `timeout`, the record says so.
@@ -902,7 +911,7 @@ impl Worker {
             result = self.ask(Request::Decompile(addr), timeout);
         }
         match result {
-            Ok(Event::Done { record, c_text }) => (record, c_text),
+            Ok(Event::Done { record, c_text }) => (FunctionRecord { after_failure: self.lost, ..record }, c_text),
             Ok(_) => (FunctionRecord::failed(addr, Status::Crash, "worker answered something else".into(), 0.0), None),
             Err(failure) => (FunctionRecord::failed(addr, failure.status, failure.message, start.elapsed().as_secs_f64() * 1e3), None),
         }
@@ -1068,6 +1077,7 @@ impl Worker {
         let result = self.process()?.ask(request, timeout);
         if result.is_err() {
             self.process = None;
+            self.lost = true;
         }
         result
     }

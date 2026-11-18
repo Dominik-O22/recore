@@ -64,7 +64,7 @@ analyze() {
 # the base's, scores it, and compares the two over the functions both decompiled in time. Shards
 # of 25 split the largest binaries over several processes.
 signatures() {
-  local in="$1" sample=(--sample "$SIGNATURE_SAMPLE" --debug-dir "$1/debug" --timeout 5 --shard 25)
+  local in="$1" sample=(--sample "$SIGNATURE_SAMPLE" --debug-dir "$1/debug" --timeout 5 --shard 25 --jobs "$CORES")
   # A report left from an earlier run would pass for this one's.
   rm -rf "$out/signatures"
   ./target/release/recore-decompile corpus "$in/bin" "$out/signatures" "${sample[@]}" >"$out/signatures.log" 2>&1
@@ -93,6 +93,9 @@ signatures() {
 # Functions of each binary whose signatures are scored: enough to see a change that reaches many
 # functions, few enough to keep the run short.
 SIGNATURE_SAMPLE=100
+# One decompiler per core. Two on the threads of one core take twice as long each and finish no
+# sooner, and twice as many reach the time limit.
+CORES="$(lscpu -p=core | awk '!/^#/' | sort -u | wc -l)"
 worse=()
 # Every corpus in the store that has truth, so a new corpus is scored without a change here.
 for in in "$corpora"/*/; do
