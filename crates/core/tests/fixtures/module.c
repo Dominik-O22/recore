@@ -1,4 +1,5 @@
-// A stand-in for a Linux kernel module, compiled as the kernel compiles one: see build-module.sh.
+// A stand-in for a Linux kernel module, compiled as the kernel compiles one for x86-64 and for
+// AArch64: see build-module.sh.
 struct ops {
     int (*probe)(int);
     void (*remove)(void);
@@ -22,7 +23,8 @@ static void remove(void) {
     printk("remove\n");
 }
 
-static struct ops driver = {probe, remove};
+// `used`, or clang sees that nothing reads `remove` and drops it.
+static struct ops driver __attribute__((used)) = {probe, remove};
 
 __attribute__((noipa)) int call_probe(struct ops *ops, int id) {
     return ops->probe(id);

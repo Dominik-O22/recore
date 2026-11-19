@@ -1,4 +1,5 @@
-//! Linux kernel modules, and other relocatable x86-64 ELF files, read as if they were linked.
+//! Linux kernel modules, and other relocatable x86-64 and AArch64 ELF files, read as if they were
+//! linked.
 //!
 //! In a relocatable file every section sits at address 0 until a loader places it and applies
 //! its relocations, as the kernel does when it loads a `.ko`. [`link`] does the same and writes
@@ -10,11 +11,12 @@
 //!   `.rela.dyn` relocation binds to it, which makes it an import; every other undefined symbol,
 //!   such as `jiffies`, gets 8 bytes of `.extern`, a section without bytes in the file;
 //! - each 64-bit pointer to the module itself gets a relative relocation in `.rela.dyn`, and so
-//!   does the start of each function `__mcount_loc` lists, the kernel's own list of them;
+//!   does the start of each function the kernel can trace: on x86-64 from `__mcount_loc`, on
+//!   AArch64 from `__patchable_function_entries`;
 //! - `.dynsym` names the functions and objects of `.symtab`, but for the padding the kernel puts
 //!   before each function (`__pfx_`, `__cfi_`), and the symbols in `.extern`;
 //! - the entry is `init_module`, the function the kernel calls first;
-//! - calls and jumps to the kernel's thunks are rewritten to what the kernel patches them to
+//! - on x86-64, calls and jumps to the kernel's thunks are rewritten to what the kernel patches them to
 //!   when it loads a module: `jmp __x86_return_thunk` to `ret`, `call __x86_indirect_thunk_rax`
 //!   to `call rax`, and `call __fentry__` to a no-op.
 
@@ -23,6 +25,7 @@ use std::collections::{BTreeSet, HashMap};
 const ET_REL: u16 = 1;
 const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
 
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
@@ -51,28 +54,161 @@ const R_X86_64_32: u32 = 10;
 const R_X86_64_32S: u32 = 11;
 const R_X86_64_PC64: u32 = 24;
 
+const R_AARCH64_ABS64: u32 = 257;
+const R_AARCH64_ABS32: u32 = 258;
+const R_AARCH64_PREL64: u32 = 260;
+const R_AARCH64_PREL32: u32 = 261;
+const R_AARCH64_MOVW_UABS_G0: u32 = 263;
+const R_AARCH64_MOVW_UABS_G3: u32 = 269;
+const R_AARCH64_LD_PREL_LO19: u32 = 273;
+const R_AARCH64_ADR_PREL_LO21: u32 = 274;
+const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275;
+const R_AARCH64_ADR_PREL_PG_HI21_NC: u32 = 276;
+const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
+const R_AARCH64_LDST8_ABS_LO12_NC: u32 = 278;
+const R_AARCH64_TSTBR14: u32 = 279;
+const R_AARCH64_CONDBR19: u32 = 280;
+const R_AARCH64_JUMP26: u32 = 282;
+const R_AARCH64_CALL26: u32 = 283;
+const R_AARCH64_LDST16_ABS_LO12_NC: u32 = 284;
+const R_AARCH64_LDST32_ABS_LO12_NC: u32 = 285;
+const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
+const R_AARCH64_LDST128_ABS_LO12_NC: u32 = 299;
+const R_AARCH64_JUMP_SLOT: u32 = 1026;
+const R_AARCH64_RELATIVE: u32 = 1027;
+
 /// The kernel's list of the `call __fentry__` that starts each function it can trace, after the
 /// function's `endbr64` when it has one.
 const MCOUNT_LOC: &[u8] = b"__mcount_loc";
 /// The kernel's list of the padding before each function, which it patches in at run time.
 const PATCHABLE_FUNCTION_ENTRIES: &[u8] = b"__patchable_function_entries";
 const ENDBR64: [u8; 4] = [0xf3, 0x0f, 0x1e, 0xfa];
+const AARCH64_NOP: u32 = 0xd503_201f;
+const BTI_C: u32 = 0xd503_245f;
 
-/// Where the first section goes: where Linux loads its modules on x86-64. Code built for the
-/// kernel takes addresses there as sign-extended 32-bit immediates, which no other code uses.
-const BASE: u64 = 0xffff_ffff_c000_0000;
-/// The size of a `.plt` stub: `jmp [rip+slot]`, padded to 16 bytes as ELF linkers pad theirs.
+/// The size of a `.plt` stub: x86-64's `jmp [rip+slot]` padded to 16 bytes as ELF linkers pad
+/// theirs, or AArch64's four instructions.
 const STUB: u64 = 16;
 
-/// `data` as a linked image when it is a relocatable x86-64 ELF file, and unchanged otherwise.
+/// The machines [`link`] places code for.
+#[derive(Clone, Copy, PartialEq)]
+enum Machine {
+    X86_64,
+    Aarch64,
+}
+
+impl Machine {
+    /// Where the first section goes: where Linux loads its modules. On x86-64, code built for the
+    /// kernel takes addresses there as sign-extended 32-bit immediates, which no other code uses.
+    fn base(self) -> u64 {
+        match self {
+            Machine::X86_64 => 0xffff_ffff_c000_0000,
+            Machine::Aarch64 => 0xffff_8000_0000_0000,
+        }
+    }
+
+    /// Whether a relocation of `kind` is a call or a jump, which makes an undefined symbol an import.
+    fn calls(self, kind: u32) -> bool {
+        match self {
+            Machine::X86_64 => kind == R_X86_64_PLT32,
+            Machine::Aarch64 => matches!(kind, R_AARCH64_CALL26 | R_AARCH64_JUMP26),
+        }
+    }
+
+    /// Whether a relocation of `kind` stores a 64-bit pointer, which a loader would relocate again.
+    fn stores_pointer(self, kind: u32) -> bool {
+        kind == self.relocation(R_X86_64_64, R_AARCH64_ABS64)
+    }
+
+    fn relocation(self, x86_64: u32, aarch64: u32) -> u32 {
+        match self {
+            Machine::X86_64 => x86_64,
+            Machine::Aarch64 => aarch64,
+        }
+    }
+
+    /// The bytes a relocation of `kind` writes at `place` to refer to `value`, given the `old`
+    /// bytes there, or `None` for a kind it does not apply.
+    fn apply(self, kind: u32, place: u64, value: u64, old: &[u8]) -> Option<Vec<u8>> {
+        let relative = value.wrapping_sub(place);
+        let little = |word: u64, width: usize| word.to_le_bytes()[..width].to_vec();
+        if self == Machine::X86_64 {
+            return match kind {
+                R_X86_64_64 => Some(little(value, 8)),
+                R_X86_64_PC64 => Some(little(relative, 8)),
+                R_X86_64_PC32 | R_X86_64_PLT32 => Some(little(relative, 4)),
+                R_X86_64_32 | R_X86_64_32S => Some(little(value, 4)),
+                _ => None,
+            };
+        }
+        let data = |width: usize| (old.len() >= width).then_some(width);
+        match kind {
+            R_AARCH64_ABS64 => return data(8).map(|w| little(value, w)),
+            R_AARCH64_PREL64 => return data(8).map(|w| little(relative, w)),
+            R_AARCH64_ABS32 => return data(4).map(|w| little(value, w)),
+            R_AARCH64_PREL32 => return data(4).map(|w| little(relative, w)),
+            _ => {}
+        }
+        let insn = u32::from_le_bytes(old.get(..4)?.try_into().ok()?);
+        // `field(bits, shift, imm)` puts the low `bits` of `imm` at bit `shift` of the instruction.
+        let field = |bits: u32, shift: u32, imm: u64| {
+            let mask = ((1u32 << bits) - 1) << shift;
+            insn & !mask | (imm as u32) << shift & mask
+        };
+        let adr = |imm: u64| field(2, 29, imm) & !(0x7ffff << 5) | ((imm >> 2) as u32 & 0x7ffff) << 5;
+        let lo12 = value & 0xfff;
+        let insn = match kind {
+            R_AARCH64_CALL26 | R_AARCH64_JUMP26 => field(26, 0, relative >> 2),
+            R_AARCH64_CONDBR19 | R_AARCH64_LD_PREL_LO19 => field(19, 5, relative >> 2),
+            R_AARCH64_TSTBR14 => field(14, 5, relative >> 2),
+            R_AARCH64_ADR_PREL_LO21 => adr(relative),
+            R_AARCH64_ADR_PREL_PG_HI21 | R_AARCH64_ADR_PREL_PG_HI21_NC => adr((value & !0xfff).wrapping_sub(place & !0xfff) >> 12),
+            R_AARCH64_ADD_ABS_LO12_NC | R_AARCH64_LDST8_ABS_LO12_NC => field(12, 10, lo12),
+            R_AARCH64_LDST16_ABS_LO12_NC => field(12, 10, lo12 >> 1),
+            R_AARCH64_LDST32_ABS_LO12_NC => field(12, 10, lo12 >> 2),
+            R_AARCH64_LDST64_ABS_LO12_NC => field(12, 10, lo12 >> 3),
+            R_AARCH64_LDST128_ABS_LO12_NC => field(12, 10, lo12 >> 4),
+            R_AARCH64_MOVW_UABS_G0..=R_AARCH64_MOVW_UABS_G3 => field(16, 5, value >> (16 * ((kind - R_AARCH64_MOVW_UABS_G0) / 2))),
+            _ => return None,
+        };
+        Some(insn.to_le_bytes().to_vec())
+    }
+
+    /// The `.plt` stub at `stub` that jumps through the `.got` slot at `slot`.
+    fn stub(self, stub: u64, slot: u64) -> Vec<u8> {
+        match self {
+            Machine::X86_64 => {
+                let mut bytes = vec![0xff, 0x25];
+                bytes.extend_from_slice(&(slot.wrapping_sub(stub + 6) as u32).to_le_bytes());
+                bytes.resize(STUB as usize, 0xcc);
+                bytes
+            }
+            // `adrp x16, slot; ldr x17, [x16, #slot]; add x16, x16, #slot; br x17`, as GNU ld writes it.
+            Machine::Aarch64 => {
+                let page = (slot & !0xfff).wrapping_sub(stub & !0xfff) >> 12;
+                let lo12 = (slot & 0xfff) as u32;
+                let adrp = 0x9000_0010 | (page as u32 & 3) << 29 | ((page >> 2) as u32 & 0x7ffff) << 5;
+                [adrp, 0xf940_0211 | (lo12 >> 3) << 10, 0x9100_0210 | lo12 << 10, 0xd61f_0220].iter().flat_map(|i| i.to_le_bytes()).collect()
+            }
+        }
+    }
+}
+
+/// `data` as a linked image when it is a relocatable x86-64 or AArch64 ELF file, and unchanged
+/// otherwise.
 pub fn link(data: Vec<u8>) -> Vec<u8> {
     try_link(&data).unwrap_or(data)
 }
 
 fn try_link(data: &[u8]) -> Option<Vec<u8>> {
-    if data.get(..6)? != b"\x7fELF\x02\x01" || u16_at(data, 16)? != ET_REL || u16_at(data, 18)? != EM_X86_64 {
+    if data.get(..6)? != b"\x7fELF\x02\x01" || u16_at(data, 16)? != ET_REL {
         return None;
     }
+    let machine = match u16_at(data, 18)? {
+        EM_X86_64 => Machine::X86_64,
+        EM_AARCH64 => Machine::Aarch64,
+        _ => return None,
+    };
     let (shoff, shnum, shstrndx) = (u64_at(data, 0x28)?, u16_at(data, 0x3c)?, usize::from(u16_at(data, 0x3e)?));
     let mut sections: Vec<Section> = (0..u64::from(shnum)).map(|index| Section::read(data, shoff.checked_add(index * 64)?)).collect::<Option<_>>()?;
     let symtab_index = sections.iter().position(|s| s.kind == SHT_SYMTAB)?;
@@ -81,7 +217,7 @@ fn try_link(data: &[u8]) -> Option<Vec<u8>> {
     let symbols: Vec<Symbol> = symtab.contents(data)?.as_chunks::<24>().0.iter().map(Symbol::read).collect();
     let name = |symbol: &Symbol| cstr(strings, symbol.name);
 
-    let mut next = BASE;
+    let mut next = machine.base();
     for section in sections.iter_mut().filter(|s| s.flags & SHF_ALLOC != 0) {
         section.addr = next.checked_next_multiple_of(section.align.max(1))?;
         next = section.addr.checked_add(section.size)?;
@@ -103,11 +239,11 @@ fn try_link(data: &[u8]) -> Option<Vec<u8>> {
     for r in &relocations {
         let symbol = &symbols[r.symbol];
         let target = &sections[r.section];
-        let patch = (symbol.shndx == SHN_UNDEF && r.kind == R_X86_64_PLT32)
+        let patch = (machine == Machine::X86_64 && symbol.shndx == SHN_UNDEF && r.kind == R_X86_64_PLT32)
             .then(|| thunk(name(symbol), target.contents(data)?, usize::try_from(r.offset).ok()?))
             .flatten();
         if patch.is_none() && symbol.shndx == SHN_UNDEF {
-            if r.kind == R_X86_64_PLT32 {
+            if machine.calls(r.kind) {
                 called.insert(name(symbol))
             } else {
                 referenced.insert(name(symbol))
@@ -150,28 +286,22 @@ fn try_link(data: &[u8]) -> Option<Vec<u8>> {
         let symbol = &symbols[r.symbol];
         let Some(value) = address(symbol).map(|s| s.wrapping_add_signed(r.addend)) else { continue };
         let place = target.addr.wrapping_add(r.offset);
-        let (width, word) = match r.kind {
-            R_X86_64_64 => (8, value),
-            R_X86_64_PC64 => (8, value.wrapping_sub(place)),
-            R_X86_64_PC32 | R_X86_64_PLT32 => (4, value.wrapping_sub(place)),
-            R_X86_64_32 | R_X86_64_32S => (4, value),
-            _ => continue,
-        };
-        if r.offset.checked_add(width).is_none_or(|end| end > target.size) {
-            continue;
-        }
-        put(&mut out, target.offset.wrapping_add(r.offset), &word.to_le_bytes()[..width as usize]);
-        if r.kind == R_X86_64_64 && target.flags & SHF_ALLOC != 0 && in_module(symbol) {
+        let Some(old) = target.contents(data).and_then(|bytes| bytes.get(usize::try_from(r.offset).ok()?..)) else { continue };
+        let Some(bytes) = machine.apply(r.kind, place, value, old).filter(|bytes| bytes.len() <= old.len()) else { continue };
+        put(&mut out, target.offset.wrapping_add(r.offset), &bytes);
+        if machine.stores_pointer(r.kind) && target.flags & SHF_ALLOC != 0 && in_module(symbol) {
             // The kernel's patch lists point into functions. Moved back over the `endbr64`, an
-            // entry of `__mcount_loc` points at a function's start; one of the padding before a
-            // function points at none.
+            // entry of `__mcount_loc` points at a function's start; on x86-64 one of the padding
+            // before a function points at none.
             let pointer = match cstr(old_names, target.name) {
+                PATCHABLE_FUNCTION_ENTRIES if machine == Machine::Aarch64 => Some(ftrace_start(&sections, data, value)),
                 PATCHABLE_FUNCTION_ENTRIES => None,
                 MCOUNT_LOC => Some(value.wrapping_sub(4 * u64::from(code_at(&sections, data, value.wrapping_sub(4), 4) == Some(&ENDBR64[..])))),
                 _ => Some(value),
             };
             if let Some(pointer) = pointer {
-                dynamic_relocations.push(Relocation { section: 0, offset: place, kind: R_X86_64_RELATIVE, symbol: 0, addend: pointer as i64 });
+                let kind = machine.relocation(R_X86_64_RELATIVE, R_AARCH64_RELATIVE);
+                dynamic_relocations.push(Relocation { section: 0, offset: place, kind, symbol: 0, addend: pointer as i64 });
             }
         }
     }
@@ -211,7 +341,8 @@ fn try_link(data: &[u8]) -> Option<Vec<u8>> {
     for (index, &import) in imports.iter().enumerate() {
         add(import, STT_FUNC, SHN_UNDEF, 0, 0);
         let slot = got + 8 * index as u64;
-        dynamic_relocations.push(Relocation { section: 0, offset: slot, kind: R_X86_64_JUMP_SLOT, symbol: index + 1, addend: 0 });
+        let kind = machine.relocation(R_X86_64_JUMP_SLOT, R_AARCH64_JUMP_SLOT);
+        dynamic_relocations.push(Relocation { section: 0, offset: slot, kind, symbol: index + 1, addend: 0 });
     }
     for symbol in symbols.iter().filter(|s| in_module(s) && matches!(s.kind(), STT_FUNC | STT_OBJECT) && !name(s).is_empty() && !is_padding(name(s))) {
         add(name(symbol), symbol.kind(), symbol.shndx, address(symbol)?, symbol.size);
@@ -220,13 +351,7 @@ fn try_link(data: &[u8]) -> Option<Vec<u8>> {
         add(name, STT_OBJECT, extern_index as u16, undefined[name], 8);
     }
 
-    let mut stubs = Vec::with_capacity(imports.len() * STUB as usize);
-    for index in 0..imports.len() as u64 {
-        let (stub, slot) = (plt + STUB * index, got + 8 * index);
-        stubs.extend_from_slice(&[0xff, 0x25]);
-        stubs.extend_from_slice(&(slot.wrapping_sub(stub + 6) as u32).to_le_bytes());
-        stubs.resize(stubs.len() + STUB as usize - 6, 0xcc);
-    }
+    let stubs: Vec<u8> = (0..imports.len() as u64).flat_map(|index| machine.stub(plt + STUB * index, got + 8 * index)).collect();
 
     let mut names = old_names.to_vec();
     let mut new_section = |name: &str, kind: u32, flags: u64, addr: u64, size: u64, link: usize, entsize: u64, align: u64| {
@@ -265,6 +390,22 @@ fn try_link(data: &[u8]) -> Option<Vec<u8>> {
     put(&mut out, 0x3c, &u16::try_from(sections.len()).ok().filter(|&n| n < SHN_LORESERVE)?.to_le_bytes());
     put(&mut out, 0x3e, &(sections.len() as u16 - 1).to_le_bytes());
     Some(out)
+}
+
+/// The start of the AArch64 function whose ftrace `nop`s start at `entry`, as the kernel's
+/// `ftrace_call_adjust` finds it. Built with `-fpatchable-function-entry=4,2`, as for ftrace's
+/// call ops, two of the four `nop`s come before the function, which may open with `bti c` before
+/// the other two; built with `2,0`, as with clang's CFI, both follow the function's `bti c`.
+fn ftrace_start(sections: &[Section], data: &[u8], entry: u64) -> u64 {
+    let word = |at: u64| code_at(sections, data, at, 4).and_then(|bytes| u32_at(bytes, 0));
+    let nops = |at: u64| word(at) == Some(AARCH64_NOP) && word(at + 4) == Some(AARCH64_NOP);
+    if word(entry.wrapping_sub(4)) == Some(BTI_C) {
+        entry - 4
+    } else if nops(entry) && (nops(entry + 8) || word(entry + 8) == Some(BTI_C) && nops(entry + 12)) {
+        entry + 8
+    } else {
+        entry
+    }
 }
 
 /// Whether a function symbol names the padding the Linux kernel puts before each function, for
@@ -459,7 +600,7 @@ fn u64_at(data: &[u8], at: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::thunk;
+    use super::*;
 
     #[test]
     fn a_cs_prefix_is_overwritten_only_where_the_compiler_puts_one() {
@@ -467,5 +608,90 @@ mod tests {
         assert_eq!(thunk(b"__x86_return_thunk", &[0x75, 0x2e, 0xe9, 0, 0, 0, 0], 3), Some((2, vec![0xc3, 0xcc, 0xcc, 0xcc, 0xcc])));
         // `cs call __x86_indirect_thunk_r11` is `call r11`.
         assert_eq!(thunk(b"__x86_indirect_thunk_r11", &[0x2e, 0xe8, 0, 0, 0, 0], 2), Some((0, vec![0x41, 0xff, 0xd3, 0x90, 0x90, 0x90])));
+    }
+
+    #[test]
+    fn an_aarch64_relocation_writes_the_instruction_an_assembler_would() {
+        const MOVW_UABS_G0_NC: u32 = 264;
+        const MOVW_UABS_G1: u32 = 265;
+        const MOVW_UABS_G1_NC: u32 = 266;
+        const MOVW_UABS_G2: u32 = 267;
+        const MOVW_UABS_G2_NC: u32 = 268;
+        const MOVW_SABS_G0: u32 = 270;
+        const PLACE: u64 = 0xffff_8000_0001_2340;
+        const WIDE: u64 = 0x1234_5678_9abc_def0;
+        // The words are llvm-mc's encodings of each instruction with a zero operand and with the
+        // operand that reaches `value` from `PLACE`, such as `bl #0` and `bl #-0x10000`.
+        let rows: [(u32, u32, u64, Option<u32>); 22] = [
+            (R_AARCH64_CALL26, 0x9400_0000, PLACE - 0x10000, Some(0x97ff_c000)),
+            (R_AARCH64_JUMP26, 0x1400_0000, PLACE - 0x40, Some(0x17ff_fff0)),
+            (R_AARCH64_CONDBR19, 0x5400_0001, PLACE - 0x40, Some(0x54ff_fe01)),
+            (R_AARCH64_TSTBR14, 0x3628_0003, PLACE - 0x40, Some(0x362f_fe03)),
+            (R_AARCH64_LD_PREL_LO19, 0x5800_0000, PLACE - 0x40, Some(0x58ff_fe00)),
+            (R_AARCH64_ADR_PREL_LO21, 0x1000_0000, PLACE - 0x33, Some(0x30ff_fe60)),
+            (R_AARCH64_ADR_PREL_PG_HI21, 0x9000_0000, 0xffff_8000_0000_1234, Some(0xf0ff_ff60)),
+            (R_AARCH64_ADR_PREL_PG_HI21_NC, 0x9000_0001, 0xffff_8000_0123_4567, Some(0xd000_9101)),
+            (R_AARCH64_ADD_ABS_LO12_NC, 0x9100_0020, 0xffff_8000_0000_59a0, Some(0x9126_8020)),
+            (R_AARCH64_LDST8_ABS_LO12_NC, 0x3940_0020, 0xffff_8000_0000_59a0, Some(0x3966_8020)),
+            (R_AARCH64_LDST16_ABS_LO12_NC, 0x7940_0020, 0xffff_8000_0000_59a0, Some(0x7953_4020)),
+            (R_AARCH64_LDST32_ABS_LO12_NC, 0xb940_0020, 0xffff_8000_0000_59a0, Some(0xb949_a020)),
+            (R_AARCH64_LDST64_ABS_LO12_NC, 0xf940_0020, 0xffff_8000_0000_59a0, Some(0xf944_d020)),
+            (R_AARCH64_LDST128_ABS_LO12_NC, 0x3dc0_0020, 0xffff_8000_0000_59a0, Some(0x3dc2_6820)),
+            (R_AARCH64_MOVW_UABS_G0, 0xd280_0000, WIDE, Some(0xd29b_de00)),
+            (MOVW_UABS_G0_NC, 0xf280_0000, WIDE, Some(0xf29b_de00)),
+            (MOVW_UABS_G1, 0xd2a0_0000, WIDE, Some(0xd2b3_5780)),
+            (MOVW_UABS_G1_NC, 0xf2a0_0000, WIDE, Some(0xf2b3_5780)),
+            (MOVW_UABS_G2, 0xd2c0_0000, WIDE, Some(0xd2ca_cf00)),
+            (MOVW_UABS_G2_NC, 0xf2c0_0000, WIDE, Some(0xf2ca_cf00)),
+            (R_AARCH64_MOVW_UABS_G3, 0xf2e0_0000, WIDE, Some(0xf2e2_4680)),
+            (MOVW_SABS_G0, 0xd280_0000, WIDE, None),
+        ];
+        for (kind, old, value, new) in rows {
+            let new = new.map(|word| word.to_le_bytes().to_vec());
+            assert_eq!(Machine::Aarch64.apply(kind, PLACE, value, &old.to_le_bytes()), new, "relocation {kind}");
+        }
+
+        let data = [
+            (R_AARCH64_ABS64, WIDE, WIDE.to_le_bytes().to_vec()),
+            (R_AARCH64_ABS32, WIDE, WIDE.to_le_bytes()[..4].to_vec()),
+            (R_AARCH64_PREL64, PLACE - 0x40, (-0x40i64).to_le_bytes().to_vec()),
+            (R_AARCH64_PREL32, PLACE - 0x40, (-0x40i32).to_le_bytes().to_vec()),
+        ];
+        for (kind, value, new) in data {
+            assert_eq!(Machine::Aarch64.apply(kind, PLACE, value, &[0; 8]), Some(new), "relocation {kind}");
+        }
+    }
+
+    #[test]
+    fn an_aarch64_function_starts_where_ftrace_call_adjust_puts_it() {
+        const NOP: u32 = 0xd503_201f;
+        const BTI_C: u32 = 0xd503_245f;
+        const RET: u32 = 0xd65f_03c0;
+        const BASE: u64 = 0xffff_8000_0000_0000;
+        // The layouts the comment on the kernel's `ftrace_call_adjust` lists, each after a `ret`.
+        let words = [
+            RET, NOP, NOP, NOP, NOP, // `-fpatchable-function-entry=4,2`
+            RET, NOP, NOP, BTI_C, NOP, NOP, // the same with `bti c`
+            RET, NOP, NOP, // `-fpatchable-function-entry=2,0`
+            RET, BTI_C, NOP, NOP, // the same with `bti c`
+            RET,
+        ];
+        let data: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let section = Section {
+            name: 0,
+            kind: SHT_PROGBITS,
+            flags: SHF_ALLOC | SHF_EXECINSTR,
+            addr: BASE,
+            offset: 0,
+            size: data.len() as u64,
+            link: 0,
+            info: 0,
+            align: 4,
+            entsize: 0,
+        };
+        // The word each `__patchable_function_entries` entry points at, and the function's start.
+        for (entry, start) in [(1, 3), (6, 8), (12, 12), (16, 15)] {
+            assert_eq!(ftrace_start(&[section], &data, BASE + 4 * entry), BASE + 4 * start, "entry at word {entry}");
+        }
     }
 }
