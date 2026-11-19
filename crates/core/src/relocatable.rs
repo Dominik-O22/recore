@@ -22,60 +22,61 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-const ET_REL: u16 = 1;
-const ET_DYN: u16 = 3;
-const EM_X86_64: u16 = 62;
-const EM_AARCH64: u16 = 183;
+use object::elf::{self, SHN_LORESERVE};
 
-const SHT_PROGBITS: u32 = 1;
-const SHT_SYMTAB: u32 = 2;
-const SHT_STRTAB: u32 = 3;
-const SHT_RELA: u32 = 4;
-const SHT_NOBITS: u32 = 8;
-const SHT_DYNSYM: u32 = 11;
-const SHF_WRITE: u64 = 1;
-const SHF_ALLOC: u64 = 2;
-const SHF_EXECINSTR: u64 = 4;
-const SHF_COMPRESSED: u64 = 0x800;
-const SHN_UNDEF: u16 = 0;
-const SHN_LORESERVE: u16 = 0xff00;
-const SHN_ABS: u16 = 0xfff1;
-const STB_GLOBAL: u8 = 1;
-const STT_NOTYPE: u8 = 0;
-const STT_OBJECT: u8 = 1;
-const STT_FUNC: u8 = 2;
+const ET_REL: u16 = elf::ET_REL.0;
+const ET_DYN: u16 = elf::ET_DYN.0;
+const EM_X86_64: u16 = elf::EM_X86_64.0;
+const EM_AARCH64: u16 = elf::EM_AARCH64.0;
 
-const R_X86_64_64: u32 = 1;
-const R_X86_64_PC32: u32 = 2;
-const R_X86_64_PLT32: u32 = 4;
-const R_X86_64_JUMP_SLOT: u32 = 7;
-const R_X86_64_RELATIVE: u32 = 8;
-const R_X86_64_32: u32 = 10;
-const R_X86_64_32S: u32 = 11;
-const R_X86_64_PC64: u32 = 24;
+const SHT_PROGBITS: u32 = elf::SHT_PROGBITS.0;
+const SHT_SYMTAB: u32 = elf::SHT_SYMTAB.0;
+const SHT_STRTAB: u32 = elf::SHT_STRTAB.0;
+const SHT_RELA: u32 = elf::SHT_RELA.0;
+const SHT_NOBITS: u32 = elf::SHT_NOBITS.0;
+const SHT_DYNSYM: u32 = elf::SHT_DYNSYM.0;
+const SHF_WRITE: u64 = elf::SHF_WRITE.0;
+const SHF_ALLOC: u64 = elf::SHF_ALLOC.0;
+const SHF_EXECINSTR: u64 = elf::SHF_EXECINSTR.0;
+const SHF_COMPRESSED: u64 = elf::SHF_COMPRESSED.0;
+const SHN_UNDEF: u16 = elf::SHN_UNDEF.0;
+const SHN_ABS: u16 = elf::SHN_ABS.0;
+const STB_GLOBAL: u8 = elf::STB_GLOBAL.0;
+const STT_NOTYPE: u8 = elf::STT_NOTYPE.0;
+const STT_OBJECT: u8 = elf::STT_OBJECT.0;
+const STT_FUNC: u8 = elf::STT_FUNC.0;
 
-const R_AARCH64_ABS64: u32 = 257;
-const R_AARCH64_ABS32: u32 = 258;
-const R_AARCH64_PREL64: u32 = 260;
-const R_AARCH64_PREL32: u32 = 261;
-const R_AARCH64_MOVW_UABS_G0: u32 = 263;
-const R_AARCH64_MOVW_UABS_G3: u32 = 269;
-const R_AARCH64_LD_PREL_LO19: u32 = 273;
-const R_AARCH64_ADR_PREL_LO21: u32 = 274;
-const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275;
-const R_AARCH64_ADR_PREL_PG_HI21_NC: u32 = 276;
-const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
-const R_AARCH64_LDST8_ABS_LO12_NC: u32 = 278;
-const R_AARCH64_TSTBR14: u32 = 279;
-const R_AARCH64_CONDBR19: u32 = 280;
-const R_AARCH64_JUMP26: u32 = 282;
-const R_AARCH64_CALL26: u32 = 283;
-const R_AARCH64_LDST16_ABS_LO12_NC: u32 = 284;
-const R_AARCH64_LDST32_ABS_LO12_NC: u32 = 285;
-const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
-const R_AARCH64_LDST128_ABS_LO12_NC: u32 = 299;
-const R_AARCH64_JUMP_SLOT: u32 = 1026;
-const R_AARCH64_RELATIVE: u32 = 1027;
+const R_X86_64_64: u32 = elf::R_X86_64_64.0;
+const R_X86_64_PC32: u32 = elf::R_X86_64_PC32.0;
+const R_X86_64_PLT32: u32 = elf::R_X86_64_PLT32.0;
+const R_X86_64_JUMP_SLOT: u32 = elf::R_X86_64_JUMP_SLOT.0;
+const R_X86_64_RELATIVE: u32 = elf::R_X86_64_RELATIVE.0;
+const R_X86_64_32: u32 = elf::R_X86_64_32.0;
+const R_X86_64_32S: u32 = elf::R_X86_64_32S.0;
+const R_X86_64_PC64: u32 = elf::R_X86_64_PC64.0;
+
+const R_AARCH64_ABS64: u32 = elf::R_AARCH64_ABS64.0;
+const R_AARCH64_ABS32: u32 = elf::R_AARCH64_ABS32.0;
+const R_AARCH64_PREL64: u32 = elf::R_AARCH64_PREL64.0;
+const R_AARCH64_PREL32: u32 = elf::R_AARCH64_PREL32.0;
+const R_AARCH64_MOVW_UABS_G0: u32 = elf::R_AARCH64_MOVW_UABS_G0.0;
+const R_AARCH64_MOVW_UABS_G3: u32 = elf::R_AARCH64_MOVW_UABS_G3.0;
+const R_AARCH64_LD_PREL_LO19: u32 = elf::R_AARCH64_LD_PREL_LO19.0;
+const R_AARCH64_ADR_PREL_LO21: u32 = elf::R_AARCH64_ADR_PREL_LO21.0;
+const R_AARCH64_ADR_PREL_PG_HI21: u32 = elf::R_AARCH64_ADR_PREL_PG_HI21.0;
+const R_AARCH64_ADR_PREL_PG_HI21_NC: u32 = elf::R_AARCH64_ADR_PREL_PG_HI21_NC.0;
+const R_AARCH64_ADD_ABS_LO12_NC: u32 = elf::R_AARCH64_ADD_ABS_LO12_NC.0;
+const R_AARCH64_LDST8_ABS_LO12_NC: u32 = elf::R_AARCH64_LDST8_ABS_LO12_NC.0;
+const R_AARCH64_TSTBR14: u32 = elf::R_AARCH64_TSTBR14.0;
+const R_AARCH64_CONDBR19: u32 = elf::R_AARCH64_CONDBR19.0;
+const R_AARCH64_JUMP26: u32 = elf::R_AARCH64_JUMP26.0;
+const R_AARCH64_CALL26: u32 = elf::R_AARCH64_CALL26.0;
+const R_AARCH64_LDST16_ABS_LO12_NC: u32 = elf::R_AARCH64_LDST16_ABS_LO12_NC.0;
+const R_AARCH64_LDST32_ABS_LO12_NC: u32 = elf::R_AARCH64_LDST32_ABS_LO12_NC.0;
+const R_AARCH64_LDST64_ABS_LO12_NC: u32 = elf::R_AARCH64_LDST64_ABS_LO12_NC.0;
+const R_AARCH64_LDST128_ABS_LO12_NC: u32 = elf::R_AARCH64_LDST128_ABS_LO12_NC.0;
+const R_AARCH64_JUMP_SLOT: u32 = elf::R_AARCH64_JUMP_SLOT.0;
+const R_AARCH64_RELATIVE: u32 = elf::R_AARCH64_RELATIVE.0;
 
 /// The kernel's list of the `call __fentry__` that starts each function it can trace, after the
 /// function's `endbr64` when it has one.
@@ -612,12 +613,6 @@ mod tests {
 
     #[test]
     fn an_aarch64_relocation_writes_the_instruction_an_assembler_would() {
-        const MOVW_UABS_G0_NC: u32 = 264;
-        const MOVW_UABS_G1: u32 = 265;
-        const MOVW_UABS_G1_NC: u32 = 266;
-        const MOVW_UABS_G2: u32 = 267;
-        const MOVW_UABS_G2_NC: u32 = 268;
-        const MOVW_SABS_G0: u32 = 270;
         const PLACE: u64 = 0xffff_8000_0001_2340;
         const WIDE: u64 = 0x1234_5678_9abc_def0;
         // The words are llvm-mc's encodings of each instruction with a zero operand and with the
@@ -638,13 +633,13 @@ mod tests {
             (R_AARCH64_LDST64_ABS_LO12_NC, 0xf940_0020, 0xffff_8000_0000_59a0, Some(0xf944_d020)),
             (R_AARCH64_LDST128_ABS_LO12_NC, 0x3dc0_0020, 0xffff_8000_0000_59a0, Some(0x3dc2_6820)),
             (R_AARCH64_MOVW_UABS_G0, 0xd280_0000, WIDE, Some(0xd29b_de00)),
-            (MOVW_UABS_G0_NC, 0xf280_0000, WIDE, Some(0xf29b_de00)),
-            (MOVW_UABS_G1, 0xd2a0_0000, WIDE, Some(0xd2b3_5780)),
-            (MOVW_UABS_G1_NC, 0xf2a0_0000, WIDE, Some(0xf2b3_5780)),
-            (MOVW_UABS_G2, 0xd2c0_0000, WIDE, Some(0xd2ca_cf00)),
-            (MOVW_UABS_G2_NC, 0xf2c0_0000, WIDE, Some(0xf2ca_cf00)),
+            (elf::R_AARCH64_MOVW_UABS_G0_NC.0, 0xf280_0000, WIDE, Some(0xf29b_de00)),
+            (elf::R_AARCH64_MOVW_UABS_G1.0, 0xd2a0_0000, WIDE, Some(0xd2b3_5780)),
+            (elf::R_AARCH64_MOVW_UABS_G1_NC.0, 0xf2a0_0000, WIDE, Some(0xf2b3_5780)),
+            (elf::R_AARCH64_MOVW_UABS_G2.0, 0xd2c0_0000, WIDE, Some(0xd2ca_cf00)),
+            (elf::R_AARCH64_MOVW_UABS_G2_NC.0, 0xf2c0_0000, WIDE, Some(0xf2ca_cf00)),
             (R_AARCH64_MOVW_UABS_G3, 0xf2e0_0000, WIDE, Some(0xf2e2_4680)),
-            (MOVW_SABS_G0, 0xd280_0000, WIDE, None),
+            (elf::R_AARCH64_MOVW_SABS_G0.0, 0xd280_0000, WIDE, None),
         ];
         for (kind, old, value, new) in rows {
             let new = new.map(|word| word.to_le_bytes().to_vec());

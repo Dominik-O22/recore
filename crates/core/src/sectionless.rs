@@ -14,33 +14,35 @@
 //! - in a writable one, `.data.rel.ro` for the part `PT_GNU_RELRO` protects, `.data` for the
 //!   rest, and `.bss` for the memory beyond the file's bytes.
 
-const PT_LOAD: u32 = 1;
-const PT_DYNAMIC: u32 = 2;
-const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
-const PT_GNU_RELRO: u32 = 0x6474_e552;
-const PT_GNU_PROPERTY: u32 = 0x6474_e553;
-const PT_ARM_EXIDX: u32 = 0x7000_0001;
-const PF_X: u32 = 1;
-const PF_W: u32 = 2;
+use object::elf;
 
-const SHT_PROGBITS: u32 = 1;
-const SHT_STRTAB: u32 = 3;
-const SHT_RELA: u32 = 4;
-const SHT_DYNAMIC: u32 = 6;
-const SHT_NOTE: u32 = 7;
-const SHT_NOBITS: u32 = 8;
-const SHT_REL: u32 = 9;
-const SHT_DYNSYM: u32 = 11;
-const SHT_RELR: u32 = 19;
-const SHT_ARM_EXIDX: u32 = 0x7000_0001;
-const SHF_WRITE: u64 = 1;
-const SHF_ALLOC: u64 = 2;
-const SHF_EXECINSTR: u64 = 4;
+const PT_LOAD: u32 = elf::PT_LOAD.0;
+const PT_DYNAMIC: u32 = elf::PT_DYNAMIC.0;
+const PT_GNU_EH_FRAME: u32 = elf::PT_GNU_EH_FRAME.0;
+const PT_GNU_RELRO: u32 = elf::PT_GNU_RELRO.0;
+const PT_GNU_PROPERTY: u32 = elf::PT_GNU_PROPERTY.0;
+const PT_ARM_EXIDX: u32 = elf::PT_ARM_EXIDX.0;
+const PF_X: u32 = elf::PF_X.0;
+const PF_W: u32 = elf::PF_W.0;
 
-const EM_386: u16 = 3;
-const EM_ARM: u16 = 40;
-const EM_X86_64: u16 = 62;
-const EM_AARCH64: u16 = 183;
+const SHT_PROGBITS: u32 = elf::SHT_PROGBITS.0;
+const SHT_STRTAB: u32 = elf::SHT_STRTAB.0;
+const SHT_RELA: u32 = elf::SHT_RELA.0;
+const SHT_DYNAMIC: u32 = elf::SHT_DYNAMIC.0;
+const SHT_NOTE: u32 = elf::SHT_NOTE.0;
+const SHT_NOBITS: u32 = elf::SHT_NOBITS.0;
+const SHT_REL: u32 = elf::SHT_REL.0;
+const SHT_DYNSYM: u32 = elf::SHT_DYNSYM.0;
+const SHT_RELR: u32 = elf::SHT_RELR.0;
+const SHT_ARM_EXIDX: u32 = elf::SHT_ARM_EXIDX.0;
+const SHF_WRITE: u64 = elf::SHF_WRITE.0;
+const SHF_ALLOC: u64 = elf::SHF_ALLOC.0;
+const SHF_EXECINSTR: u64 = elf::SHF_EXECINSTR.0;
+
+const EM_386: u16 = elf::EM_386.0;
+const EM_ARM: u16 = elf::EM_ARM.0;
+const EM_X86_64: u16 = elf::EM_X86_64.0;
+const EM_AARCH64: u16 = elf::EM_AARCH64.0;
 
 /// Whether `data` is a little-endian ELF file with program headers and no section headers.
 pub fn is_sectionless(data: &[u8]) -> bool {
@@ -154,12 +156,12 @@ impl<'a> Elf<'a> {
         u32_at(self.data, self.offset(addr)?)
     }
 
-    fn dynamic(&self) -> Option<Vec<(u64, u64)>> {
+    fn dynamic(&self) -> Option<Vec<(elf::DynamicTag, u64)>> {
         let segment = self.segments.iter().find(|s| s.kind == PT_DYNAMIC)?;
         let size = if self.wide { 16 } else { 8 };
         let entries = (0..segment.filesz / size)
-            .map(|index| Some((self.word(segment.offset + index * size)?, self.word(segment.offset + index * size + size / 2)?)))
-            .take_while(|entry| entry.is_some_and(|(tag, _)| tag != 0))
+            .map(|index| Some((elf::DynamicTag(self.word(segment.offset + index * size)?.cast_signed()), self.word(segment.offset + index * size + size / 2)?)))
+            .take_while(|entry| entry.is_some_and(|(tag, _)| tag != elf::DT_NULL))
             .collect::<Option<Vec<_>>>()?;
         Some(entries)
     }
@@ -168,13 +170,13 @@ impl<'a> Elf<'a> {
     /// GNU one says where each chain of symbols starts, and the last chain ends at the last. A
     /// GNU table with no chains, in a program that exports nothing, says nothing, and then the
     /// symbols run up to the next table the dynamic section points to.
-    fn symbol_count(&self, tag: impl Fn(u64) -> Option<u64>, symbol_size: u64) -> Option<u64> {
+    fn symbol_count(&self, tag: impl Fn(elf::DynamicTag) -> Option<u64>, symbol_size: u64) -> Option<u64> {
         // The tables' addresses are the file's numbers, so every sum past them is checked.
-        if let Some(hash) = tag(4) {
+        if let Some(hash) = tag(elf::DT_HASH) {
             return self.u32_at_addr(hash.checked_add(4)?).map(u64::from);
         }
-        let symbols = tag(6)?;
-        let chained = tag(0x6fff_fef5).and_then(|hash| {
+        let symbols = tag(elf::DT_SYMTAB)?;
+        let chained = tag(elf::DT_GNU_HASH).and_then(|hash| {
             let (buckets, first, bloom) = (self.u32_at_addr(hash)?, self.u32_at_addr(hash.checked_add(4)?)?, self.u32_at_addr(hash.checked_add(8)?)?);
             let bucket_table = hash.checked_add(16 + u64::from(bloom) * if self.wide { 8 } else { 4 })?;
             let chains = bucket_table.checked_add(4 * u64::from(buckets))?;
@@ -190,7 +192,8 @@ impl<'a> Elf<'a> {
             Some(index + 1)
         });
         // The string table, the version tables, the hash table and the relocations.
-        let next = [5, 0x6fff_fff0, 0x6fff_fffe, 0x6fff_fffc, 0x6fff_fef5, 7, 17, 23].into_iter().filter_map(&tag).filter(|&at| at > symbols).min();
+        let next = [elf::DT_STRTAB, elf::DT_VERSYM, elf::DT_VERNEED, elf::DT_VERDEF, elf::DT_GNU_HASH, elf::DT_RELA, elf::DT_REL, elf::DT_JMPREL]
+            .into_iter().filter_map(&tag).filter(|&at| at > symbols).min();
         chained.or_else(|| next.map(|next| (next - symbols) / symbol_size))
     }
 
@@ -232,7 +235,6 @@ impl<'a> Elf<'a> {
     /// The end of each function the dynamic symbol table at `symbols` defines, from its address
     /// and size, without the Thumb bit.
     fn function_ends(&self, symbols: Option<u64>, count: Option<u64>, size: u64) -> impl Iterator<Item = u64> + '_ {
-        const STT_FUNC: u8 = 2;
         let at = symbols.and_then(|symbols| self.offset(symbols));
         (0..count.unwrap_or(0))
             // The symbols run on together, so the first that starts past the file ends them.
@@ -243,7 +245,7 @@ impl<'a> Elf<'a> {
                 } else {
                     (*entry.get(12)?, u16_at(entry, 14)?, u32_at(entry, 4)?.into(), u32_at(entry, 8)?.into())
                 };
-                (info & 0xF == STT_FUNC && section != 0 && value != 0).then(|| (value & !1).checked_add(length)).flatten()
+                (info & 0xF == elf::STT_FUNC.0 && section != 0 && value != 0).then(|| (value & !1).checked_add(length)).flatten()
             })
     }
 
@@ -294,7 +296,7 @@ impl<'a> Elf<'a> {
 
     fn sections(&self) -> Option<Vec<Shdr>> {
         let dynamic = self.dynamic()?;
-        let tag = |wanted: u64| dynamic.iter().find(|&&(tag, _)| tag == wanted).map(|&(_, value)| value);
+        let tag = |wanted: elf::DynamicTag| dynamic.iter().find(|&&(tag, _)| tag == wanted).map(|&(_, value)| value);
         let word = if self.wide { 8 } else { 4 };
         let mut tables = Vec::new();
         let mut table = |name, kind, addr: Option<u64>, size: Option<u64>, link, entsize| {
@@ -307,14 +309,14 @@ impl<'a> Elf<'a> {
         };
         let symbol_size = if self.wide { 24 } else { 16 };
         let symbol_count = self.symbol_count(tag, symbol_size);
-        table(".dynsym", SHT_DYNSYM, tag(6), symbol_count.map(|count| count * symbol_size), Some(".dynstr"), symbol_size);
-        table(".dynstr", SHT_STRTAB, tag(5), tag(10), None, 0);
+        table(".dynsym", SHT_DYNSYM, tag(elf::DT_SYMTAB), symbol_count.map(|count| count * symbol_size), Some(".dynstr"), symbol_size);
+        table(".dynstr", SHT_STRTAB, tag(elf::DT_STRTAB), tag(elf::DT_STRSZ), None, 0);
         let rela = if self.wide { 24 } else { 12 };
-        table(".rela.dyn", SHT_RELA, tag(7), tag(8), Some(".dynsym"), rela);
-        table(".rel.dyn", SHT_REL, tag(17), tag(18), Some(".dynsym"), 2 * word);
-        let (plt_kind, plt_name, plt_entry) = if tag(20) == Some(7) { (SHT_RELA, ".rela.plt", rela) } else { (SHT_REL, ".rel.plt", 2 * word) };
-        table(plt_name, plt_kind, tag(23), tag(2), Some(".dynsym"), plt_entry);
-        table(".relr.dyn", SHT_RELR, tag(36), tag(35), None, word);
+        table(".rela.dyn", SHT_RELA, tag(elf::DT_RELA), tag(elf::DT_RELASZ), Some(".dynsym"), rela);
+        table(".rel.dyn", SHT_REL, tag(elf::DT_REL), tag(elf::DT_RELSZ), Some(".dynsym"), 2 * word);
+        let (plt_kind, plt_name, plt_entry) = if tag(elf::DT_PLTREL) == Some(elf::DT_RELA.0.cast_unsigned()) { (SHT_RELA, ".rela.plt", rela) } else { (SHT_REL, ".rel.plt", 2 * word) };
+        table(plt_name, plt_kind, tag(elf::DT_JMPREL), tag(elf::DT_PLTRELSZ), Some(".dynsym"), plt_entry);
+        table(".relr.dyn", SHT_RELR, tag(elf::DT_RELR), tag(elf::DT_RELRSZ), None, word);
         for segment in &self.segments {
             match segment.kind {
                 PT_DYNAMIC => table(".dynamic", SHT_DYNAMIC, Some(segment.addr), Some(segment.filesz), Some(".dynstr"), 2 * word),
@@ -331,8 +333,8 @@ impl<'a> Elf<'a> {
                 _ => {}
             }
         }
-        let relocation_size = if tag(20) == Some(7) { rela } else { 2 * word };
-        if let Some((addr, size)) = tag(12).zip(tag(2)).and_then(|(init, size)| self.plt(init & !1, size / relocation_size))
+        let relocation_size = if tag(elf::DT_PLTREL) == Some(elf::DT_RELA.0.cast_unsigned()) { rela } else { 2 * word };
+        if let Some((addr, size)) = tag(elf::DT_INIT).zip(tag(elf::DT_PLTRELSZ)).and_then(|(init, size)| self.plt(init & !1, size / relocation_size))
             && addr.checked_add(size).is_some()
         {
             tables.push(Shdr { name: ".plt", kind: SHT_PROGBITS, flags: SHF_ALLOC | SHF_EXECINSTR, addr, size, link: None, entsize: 0 });
@@ -367,15 +369,15 @@ impl<'a> Elf<'a> {
                 }
             };
             if segment.flags & PF_X != 0 {
-                let fini = tag(13).filter(|&fini| (fini & !1) >= start && (fini & !1) < end);
+                let fini = tag(elf::DT_FINI).filter(|&fini| (fini & !1) >= start && (fini & !1) < end);
                 // Code starts after the last table before the first code the loader runs: GNU ld
                 // puts `.init` there, and lld puts it after `.text`, before the entry point.
-                let first = tag(12).map(|init| init & !1).into_iter().chain(self.word(0x18)).filter(|&at| at >= start && at < end).min().unwrap_or(start);
+                let first = tag(elf::DT_INIT).map(|init| init & !1).into_iter().chain(self.word(0x18)).filter(|&at| at >= start && at < end).min().unwrap_or(start);
                 let code = inside.iter().filter(|t| t.addr + t.size <= first).map(|t| t.addr + t.size).max().unwrap_or(start);
                 // Code runs to the end of `.fini`, which GNU ld places last, and of every function
                 // the image exports, the entry point included. Read-only data may follow.
                 let fini_end = fini.and_then(|fini| self.end_of_short_function(fini));
-                let exported = self.function_ends(tag(6), symbol_count, symbol_size).filter(|&at| at > code && at <= end).max();
+                let exported = self.function_ends(tag(elf::DT_SYMTAB), symbol_count, symbol_size).filter(|&at| at > code && at <= end).max();
                 let entry = self.word(0x18).filter(|&at| at >= code && at < end).map(|at| at + 1);
                 let code_end = [fini_end, exported, entry]
                     .into_iter()
