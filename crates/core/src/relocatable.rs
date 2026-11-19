@@ -59,7 +59,7 @@ const R_AARCH64_ABS32: u32 = 258;
 const R_AARCH64_PREL64: u32 = 260;
 const R_AARCH64_PREL32: u32 = 261;
 const R_AARCH64_MOVW_UABS_G0: u32 = 263;
-const R_AARCH64_MOVW_UABS_G3: u32 = 270;
+const R_AARCH64_MOVW_UABS_G3: u32 = 269;
 const R_AARCH64_LD_PREL_LO19: u32 = 273;
 const R_AARCH64_ADR_PREL_LO21: u32 = 274;
 const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275;
@@ -600,7 +600,7 @@ fn u64_at(data: &[u8], at: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::thunk;
+    use super::*;
 
     #[test]
     fn a_cs_prefix_is_overwritten_only_where_the_compiler_puts_one() {
@@ -608,5 +608,90 @@ mod tests {
         assert_eq!(thunk(b"__x86_return_thunk", &[0x75, 0x2e, 0xe9, 0, 0, 0, 0], 3), Some((2, vec![0xc3, 0xcc, 0xcc, 0xcc, 0xcc])));
         // `cs call __x86_indirect_thunk_r11` is `call r11`.
         assert_eq!(thunk(b"__x86_indirect_thunk_r11", &[0x2e, 0xe8, 0, 0, 0, 0], 2), Some((0, vec![0x41, 0xff, 0xd3, 0x90, 0x90, 0x90])));
+    }
+
+    #[test]
+    fn an_aarch64_relocation_writes_the_instruction_an_assembler_would() {
+        const MOVW_UABS_G0_NC: u32 = 264;
+        const MOVW_UABS_G1: u32 = 265;
+        const MOVW_UABS_G1_NC: u32 = 266;
+        const MOVW_UABS_G2: u32 = 267;
+        const MOVW_UABS_G2_NC: u32 = 268;
+        const MOVW_SABS_G0: u32 = 270;
+        const PLACE: u64 = 0xffff_8000_0001_2340;
+        const WIDE: u64 = 0x1234_5678_9abc_def0;
+        // The words are llvm-mc's encodings of each instruction with a zero operand and with the
+        // operand that reaches `value` from `PLACE`, such as `bl #0` and `bl #-0x10000`.
+        let rows: [(u32, u32, u64, Option<u32>); 22] = [
+            (R_AARCH64_CALL26, 0x9400_0000, PLACE - 0x10000, Some(0x97ff_c000)),
+            (R_AARCH64_JUMP26, 0x1400_0000, PLACE - 0x40, Some(0x17ff_fff0)),
+            (R_AARCH64_CONDBR19, 0x5400_0001, PLACE - 0x40, Some(0x54ff_fe01)),
+            (R_AARCH64_TSTBR14, 0x3628_0003, PLACE - 0x40, Some(0x362f_fe03)),
+            (R_AARCH64_LD_PREL_LO19, 0x5800_0000, PLACE - 0x40, Some(0x58ff_fe00)),
+            (R_AARCH64_ADR_PREL_LO21, 0x1000_0000, PLACE - 0x33, Some(0x30ff_fe60)),
+            (R_AARCH64_ADR_PREL_PG_HI21, 0x9000_0000, 0xffff_8000_0000_1234, Some(0xf0ff_ff60)),
+            (R_AARCH64_ADR_PREL_PG_HI21_NC, 0x9000_0001, 0xffff_8000_0123_4567, Some(0xd000_9101)),
+            (R_AARCH64_ADD_ABS_LO12_NC, 0x9100_0020, 0xffff_8000_0000_59a0, Some(0x9126_8020)),
+            (R_AARCH64_LDST8_ABS_LO12_NC, 0x3940_0020, 0xffff_8000_0000_59a0, Some(0x3966_8020)),
+            (R_AARCH64_LDST16_ABS_LO12_NC, 0x7940_0020, 0xffff_8000_0000_59a0, Some(0x7953_4020)),
+            (R_AARCH64_LDST32_ABS_LO12_NC, 0xb940_0020, 0xffff_8000_0000_59a0, Some(0xb949_a020)),
+            (R_AARCH64_LDST64_ABS_LO12_NC, 0xf940_0020, 0xffff_8000_0000_59a0, Some(0xf944_d020)),
+            (R_AARCH64_LDST128_ABS_LO12_NC, 0x3dc0_0020, 0xffff_8000_0000_59a0, Some(0x3dc2_6820)),
+            (R_AARCH64_MOVW_UABS_G0, 0xd280_0000, WIDE, Some(0xd29b_de00)),
+            (MOVW_UABS_G0_NC, 0xf280_0000, WIDE, Some(0xf29b_de00)),
+            (MOVW_UABS_G1, 0xd2a0_0000, WIDE, Some(0xd2b3_5780)),
+            (MOVW_UABS_G1_NC, 0xf2a0_0000, WIDE, Some(0xf2b3_5780)),
+            (MOVW_UABS_G2, 0xd2c0_0000, WIDE, Some(0xd2ca_cf00)),
+            (MOVW_UABS_G2_NC, 0xf2c0_0000, WIDE, Some(0xf2ca_cf00)),
+            (R_AARCH64_MOVW_UABS_G3, 0xf2e0_0000, WIDE, Some(0xf2e2_4680)),
+            (MOVW_SABS_G0, 0xd280_0000, WIDE, None),
+        ];
+        for (kind, old, value, new) in rows {
+            let new = new.map(|word| word.to_le_bytes().to_vec());
+            assert_eq!(Machine::Aarch64.apply(kind, PLACE, value, &old.to_le_bytes()), new, "relocation {kind}");
+        }
+
+        let data = [
+            (R_AARCH64_ABS64, WIDE, WIDE.to_le_bytes().to_vec()),
+            (R_AARCH64_ABS32, WIDE, WIDE.to_le_bytes()[..4].to_vec()),
+            (R_AARCH64_PREL64, PLACE - 0x40, (-0x40i64).to_le_bytes().to_vec()),
+            (R_AARCH64_PREL32, PLACE - 0x40, (-0x40i32).to_le_bytes().to_vec()),
+        ];
+        for (kind, value, new) in data {
+            assert_eq!(Machine::Aarch64.apply(kind, PLACE, value, &[0; 8]), Some(new), "relocation {kind}");
+        }
+    }
+
+    #[test]
+    fn an_aarch64_function_starts_where_ftrace_call_adjust_puts_it() {
+        const NOP: u32 = 0xd503_201f;
+        const BTI_C: u32 = 0xd503_245f;
+        const RET: u32 = 0xd65f_03c0;
+        const BASE: u64 = 0xffff_8000_0000_0000;
+        // The layouts the comment on the kernel's `ftrace_call_adjust` lists, each after a `ret`.
+        let words = [
+            RET, NOP, NOP, NOP, NOP, // `-fpatchable-function-entry=4,2`
+            RET, NOP, NOP, BTI_C, NOP, NOP, // the same with `bti c`
+            RET, NOP, NOP, // `-fpatchable-function-entry=2,0`
+            RET, BTI_C, NOP, NOP, // the same with `bti c`
+            RET,
+        ];
+        let data: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let section = Section {
+            name: 0,
+            kind: SHT_PROGBITS,
+            flags: SHF_ALLOC | SHF_EXECINSTR,
+            addr: BASE,
+            offset: 0,
+            size: data.len() as u64,
+            link: 0,
+            info: 0,
+            align: 4,
+            entsize: 0,
+        };
+        // The word each `__patchable_function_entries` entry points at, and the function's start.
+        for (entry, start) in [(1, 3), (6, 8), (12, 12), (16, 15)] {
+            assert_eq!(ftrace_start(&[section], &data, BASE + 4 * entry), BASE + 4 * start, "entry at word {entry}");
+        }
     }
 }
