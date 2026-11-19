@@ -1070,14 +1070,12 @@ fn reads_as_a32(bytes: &[u8]) -> bool {
 /// `DT_INIT` and `DT_FINI`, the functions the loader calls before and after the program, with
 /// the Thumb bit as the file gives them.
 fn dynamic_code_pointers(file: &object::File) -> Vec<u64> {
-    use object::{Object, ObjectSection};
-    const DT_INIT: u32 = 12;
-    const DT_FINI: u32 = 13;
+    use object::{Object, ObjectSection, elf};
     let Some(data) = file.section_by_name(".dynamic").and_then(|section| section.data().ok()) else { return Vec::new() };
     data.as_chunks::<8>().0.iter()
         .filter_map(|entry| {
             let (tag, value) = (u32::from_le_bytes(entry[..4].try_into().unwrap()), u32::from_le_bytes(entry[4..].try_into().unwrap()));
-            matches!(tag, DT_INIT | DT_FINI).then_some(u64::from(value))
+            matches!(elf::DynamicTag(tag.into()), elf::DT_INIT | elf::DT_FINI).then_some(u64::from(value))
         })
         .collect()
 }

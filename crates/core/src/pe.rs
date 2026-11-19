@@ -4,6 +4,7 @@
 use rustc_hash::FxHashMap;
 
 use anyhow::{Result, ensure};
+use object::pe::RT_VERSION;
 use object::read::pe::{ImageNtHeaders, Import, PeFile, ResourceDirectoryTable};
 use object::{LittleEndian as LE, Object};
 
@@ -119,7 +120,6 @@ pub fn load<Pe: ImageNtHeaders>(data: &[u8], sections: &[Section]) -> Result<Met
 /// The address and size of the first `RT_VERSION` resource: the first name and the first
 /// language under the type.
 fn version_resource<Pe: ImageNtHeaders>(pe: &PeFile<Pe>, data: &[u8]) -> Result<Option<(u64, u64)>> {
-    const RT_VERSION: u16 = 16;
     let Some(directory) = pe.data_directories().resource_directory(data, &pe.section_table())? else { return Ok(None) };
     let first = |table: ResourceDirectoryTable| table.entries.first().map(|entry| entry.data(directory)).transpose();
     let Some(version) = directory.root()?.entries.iter().find(|entry| entry.name_or_id().id() == Some(RT_VERSION)) else { return Ok(None) };

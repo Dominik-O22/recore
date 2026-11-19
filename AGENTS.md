@@ -46,3 +46,4 @@ When the operator corrects an agent, fix the mistake and add its rule here. A ru
 | Downloads are data, never executed. | Nothing; this file only |
 | An item of the agent bench's answer key says what the binary does, not the source, and names the address it was checked at. | `bench/agent/judge.py` refuses a key with an item that names no address |
 | Work names the measure it moves before it is built, and every issue carries a goal label. | Nothing; this file only |
+| A number a file format defines comes from the `object` crate. It is never typed in. | `crates/core/tests/format_constants.rs`, in CI, for the ELF names under `crates/*/src` |
