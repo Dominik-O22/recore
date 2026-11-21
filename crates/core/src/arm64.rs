@@ -402,10 +402,8 @@ impl Arch for Arm64 {
     const FUNCTION_ALIGN: u64 = 4;
     const ALIGNMENT_IS_EVIDENCE: bool = false;
 
-    /// No instruction starts off a word, so bytes from there decode to none.
     fn decode<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> + 'a {
-        let words = if addr.is_multiple_of(4) { bytes.as_chunks::<4>().0 } else { &[] };
-        words.iter().zip((addr..).step_by(4)).map(|(chunk, addr)| {
+        bytes.as_chunks::<4>().0.iter().zip((addr..).step_by(4)).map(|(chunk, addr)| {
             let word = u32::from_le_bytes(*chunk);
             Decoded { addr, len: 4, insn: Some(Insn { word, addr }) }
         })
