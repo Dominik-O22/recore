@@ -19,8 +19,30 @@ Types are reduced as ghidra/ExportPrototypes.java reduces an archive's: sized in
 and `ulong` by name so that the table serves 32-bit kernels, strings, pointers to numbers, and
 every other pointer as `void *`. A function that takes or returns a struct by value has no such
 spelling and is left out. Lines read `- <return> <name>(<params>)`, sorted by name.
+
+With `--kcfi`, writes kcfi.protos instead: every function type a kernel's BTF holds, by its kCFI
+hash, so that the hash clang puts before a module's function names that function's type.
+
+    python3 -I kernel_protos.py --kcfi <kernel> <normalized|plain> [...] > kcfi.protos
+
+The hash is the low 32 bits of xxHash64 of `_ZTS` and the type's Itanium mangling, with
+`.normalized` after it where the kernel is built with CONFIG_CFI_ICALL_NORMALIZE_INTEGERS: then
+every integer is spelled by its width and sign, `u3i32` for `int`. Each kernel's types are hashed
+in its own spelling. Every FUNC_PROTO counts, since a module's function may have the type of a
+pointer in a kernel struct that no kernel function has. kcfi.protos is made from the two kernels
+above: the GKI 6.12 normalizes and the Pixel's 6.1 does not.
+
+Lines read `<hash> <n|p> <return> (<params>)`, sorted, where `n` is the normalized spelling and
+`p` the plain one. A type is spelled with sized numbers, `char` and `bool`, and a pointer to a
+struct or union keeps its name: `int4 (struct platform_device *)`. An enum is the integer it is
+stored in, and a pointer to a function is `void *`. A type that passes a struct or union by value
+is left out, as is a hash two types share. Where records that hash alike spell differently, as
+`char` and `unsigned char` do when normalized, the spelling most of them have wins.
+
+Both tables are made from Linux kernels, and Linux is licensed under the GPL-2.0.
 """
 
+import collections
 import re
 import struct
 import sys
@@ -182,7 +204,255 @@ def table(btf, exported):
     return {name: line for name, line in lines.items() if line is not None}
 
 
+def xxh64(data):
+    """xxHash64 of `data` with seed 0."""
+    p1, p2, p3, p4, p5, mask = 0x9E3779B185EBCA87, 0xC2B2AE3D27D4EB4F, 0x165667B19E3779F9, 0x85EBCA77C2B2AE63, 0x27D4EB2F165667C5, (1 << 64) - 1
+
+    def rotl(value, bits):
+        return ((value << bits) | (value >> (64 - bits))) & mask
+
+    def mix(acc, lane):
+        return rotl((acc + lane * p2) & mask, 31) * p1 & mask
+
+    def lane(at, size):
+        return int.from_bytes(data[at : at + size], "little")
+
+    at, size = 0, len(data)
+    if size >= 32:
+        acc = [(p1 + p2) & mask, p2, 0, -p1 & mask]
+        while at + 32 <= size:
+            acc = [mix(value, lane(at + 8 * index, 8)) for index, value in enumerate(acc)]
+            at += 32
+        digest = (rotl(acc[0], 1) + rotl(acc[1], 7) + rotl(acc[2], 12) + rotl(acc[3], 18)) & mask
+        for value in acc:
+            digest = ((digest ^ mix(0, value)) * p1 + p4) & mask
+    else:
+        digest = p5
+    digest = (digest + size) & mask
+    while at + 8 <= size:
+        digest = (rotl(digest ^ mix(0, lane(at, 8)), 27) * p1 + p4) & mask
+        at += 8
+    if at + 4 <= size:
+        digest = (rotl(digest ^ (lane(at, 4) * p1 & mask), 23) * p2 + p3) & mask
+        at += 4
+    for byte in data[at:]:
+        digest = rotl(digest ^ (byte * p5 & mask), 11) * p1 & mask
+    for shift, prime in ((33, p2), (29, p3)):
+        digest = (digest ^ (digest >> shift)) * prime & mask
+    return digest ^ (digest >> 32)
+
+
+# The Itanium ABI's codes for C's arithmetic types, by the names BTF gives them.
+BUILTIN = {
+    "_Bool": "b", "char": "c", "signed char": "a", "unsigned char": "h", "short": "s", "short int": "s", "unsigned short": "t",
+    "short unsigned int": "t", "int": "i", "unsigned int": "j", "long": "l", "long int": "l", "unsigned long": "m",
+    "long unsigned int": "m", "long long": "x", "long long int": "x", "unsigned long long": "y", "long long unsigned int": "y",
+    "__int128": "n", "__int128 unsigned": "o", "unsigned __int128": "o", "float": "f", "double": "d", "long double": "e",
+}
+
+
+class Canonical:
+    """A kernel's types as clang mangles them, with typedefs and type tags seen through. A type is
+    a tuple: `("void",)`, `("int", code, size, signed)`, `("float", code, size)`, `("enum", name,
+    size, signed)`, `("struct", name)`, `("union", name)`, `("ptr", type)`, `("qual", "rVK"
+    subset, type)`, `("array", count, type)` or `("func", return, params, variadic)`."""
+
+    def __init__(self, btf):
+        self.btf = btf
+        # An anonymous struct, union or enum mangles as the first typedef that names it.
+        self.typedef_names = {}
+        for kind, _, target, _, name in btf.types:
+            if kind == TYPEDEF and btf.kind(target) in (STRUCT, UNION, ENUM, ENUM64) and btf.types[target][4] == 0:
+                self.typedef_names.setdefault(target, btf.name(name))
+        self.memo = {}
+
+    def type(self, id):
+        if id not in self.memo:
+            self.memo[id] = self.convert(id)
+        return self.memo[id]
+
+    def convert(self, id):
+        if id == 0:
+            return ("void",)
+        kind, info, size, trailer, name = self.btf.types[id]
+        if kind == INT:
+            return ("int", BUILTIN[self.btf.name(name)], size, bool(struct.unpack("<I", trailer)[0] >> 24 & INT_SIGNED))
+        if kind == FLOAT:
+            return ("float", BUILTIN[self.btf.name(name)], size)
+        if kind in (TYPEDEF, TYPE_TAG):
+            return self.type(size)
+        if kind in (CONST, VOLATILE, RESTRICT):
+            qualifiers, inner = {CONST: "K", VOLATILE: "V", RESTRICT: "r"}[kind], self.type(size)
+            if inner[0] == "func":
+                return inner
+            if inner[0] == "qual":
+                qualifiers, inner = qualifiers + inner[1], inner[2]
+            return ("qual", "".join(q for q in "rVK" if q in qualifiers), inner)
+        if kind == PTR:
+            return ("ptr", self.type(size))
+        if kind in (STRUCT, UNION, FWD, ENUM, ENUM64):
+            label = self.btf.name(name) or self.typedef_names.get(id)
+            if not label:
+                raise ValueError("an anonymous type without a typedef")
+            if kind in (ENUM, ENUM64):
+                return ("enum", label, size, bool(info >> 31))
+            return ("union" if kind == UNION or (kind == FWD and info >> 31) else "struct", label)
+        if kind == ARRAY:
+            element, _, count = struct.unpack("<III", trailer)
+            return ("array", count, self.type(element))
+        if kind == FUNC_PROTO:
+            params = self.btf.params(id)
+            variadic = bool(params) and params[-1][1] == 0
+            params = params[:-1] if variadic else params
+            return ("func", self.type(self.btf.returns(id)), tuple(decayed(self.type(type)) for _, type in params), variadic)
+        raise ValueError(f"BTF kind {kind}")
+
+
+def decayed(type):
+    """A parameter's type as its function's type holds it: without qualifiers, and an array or
+    a function as a pointer."""
+    if type[0] == "qual":
+        type = type[2]
+    if type[0] == "array":
+        return ("ptr", type[2])
+    if type[0] == "func":
+        return ("ptr", type)
+    return type
+
+
+def substitution(index):
+    """How the `index`th component written so far is referred to again: `S_`, `S0_` to `SZ_`,
+    `S10_` and on."""
+    if index == 0:
+        return "S_"
+    digits, index = "", index - 1
+    while True:
+        digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"[index % 36] + digits
+        index //= 36
+        if index == 0:
+            return f"S{digits}_"
+
+
+def mangle(function, normalized):
+    """The string whose hash kCFI puts before a function of type `function`."""
+    out, seen = [], {}
+
+    def component(type):
+        kind = type[0]
+        if kind == "int" and normalized:
+            # Normalized integers are candidates for substitution, one per width and sign.
+            key = ("int", type[2], type[3])
+            if key in seen:
+                out.append(substitution(seen[key]))
+            else:
+                width = f"{'i' if type[3] else 'u'}{8 * type[2]}"
+                out.append(f"u{len(width)}{width}")
+                seen[key] = len(seen)
+            return
+        if kind in ("void", "int", "float"):
+            out.append("v" if kind == "void" else type[1])
+            return
+        if type in seen:
+            out.append(substitution(seen[type]))
+            return
+        if kind == "qual":
+            out.append(type[1])
+            component(type[2])
+        elif kind == "ptr":
+            out.append("P")
+            component(type[1])
+        elif kind in ("struct", "union", "enum"):
+            # AArch64's va_list is std::__va_list.
+            out.append("St9__va_list" if type[1] == "__va_list" else f"{len(type[1])}{type[1]}")
+        elif kind == "array":
+            out.append(f"A{type[1] or ''}_")
+            component(type[2])
+        else:
+            signature(type)
+        seen[type] = len(seen)
+
+    def signature(type):
+        _, returns, params, variadic = type
+        out.append("F")
+        component(returns)
+        if not params and not variadic:
+            out.append("v")
+        for param in params:
+            component(param)
+        if variadic:
+            out.append("z")
+        out.append("E")
+
+    out.append("_ZTS")
+    signature(function)
+    return "".join(out) + (".normalized" if normalized else "")
+
+
+def spell(type, pointed_to=False):
+    """How kcfi.protos writes a type, or None for a struct or union passed by value."""
+    kind = type[0]
+    if kind == "qual":
+        return spell(type[2], pointed_to)
+    if kind == "void":
+        return "void"
+    if kind == "int":
+        _, code, size, signed = type
+        return {"b": "bool", "c": "char"}.get(code, f"{'int' if signed else 'uint'}{size}")
+    if kind == "float":
+        return f"float{type[2]}"
+    if kind == "enum":
+        return f"{'int' if type[3] else 'uint'}{type[2]}"
+    if kind in ("struct", "union"):
+        return f"{kind} {type[1]}" if pointed_to else None
+    if kind == "ptr":
+        target = type[1][2] if type[1][0] == "qual" else type[1]
+        target = target[2] if target[0] == "array" else target
+        if target[0] == "func":
+            return "void *"
+        inner = spell(target, True)
+        return inner + ("*" if inner.endswith("*") else " *")
+    raise ValueError(f"no spelling for {kind}")
+
+
+def kcfi_table(btf, normalized):
+    """The line of every function type of the kernel, by its kCFI hash."""
+    canonical = Canonical(btf)
+    spellings = collections.defaultdict(collections.Counter)
+    for id, record in enumerate(btf.types):
+        if record[0] != FUNC_PROTO:
+            continue
+        try:
+            function = canonical.type(id)
+        except (KeyError, ValueError):
+            continue
+        _, returns, params, variadic = function
+        spelled = [spell(returns)] + [spell(param) for param in params]
+        if None in spelled:
+            continue
+        listed = ", ".join(spelled[1:] + ["..."] * variadic) or "void"
+        spellings[mangle(function, normalized)][f"{spelled[0]} ({listed})"] += 1
+    by_hash = collections.defaultdict(list)
+    for mangled in spellings:
+        by_hash[xxh64(mangled.encode()) & 0xFFFFFFFF].append(mangled)
+    return {hash: min(spellings[mangled], key=lambda line: (-spellings[mangled][line], line)) for hash, (mangled, *others) in by_hash.items() if not others}
+
+
+def kcfi_main(args):
+    lines = {}
+    for kernel, spelling in zip(args[::2], args[1::2]):
+        if spelling not in ("normalized", "plain"):
+            sys.exit(f"{spelling}: a kernel's spelling is `normalized` or `plain`")
+        with open(kernel, "rb") as file:
+            btf = Btf(find_btf(file.read()))
+        for hash, line in kcfi_table(btf, spelling == "normalized").items():
+            lines.setdefault((hash, spelling[0]), line)
+    for (hash, spelling), line in sorted(lines.items()):
+        print(f"{hash:08x} {spelling} {line}")
+
+
 def main():
+    if sys.argv[1:2] == ["--kcfi"]:
+        return kcfi_main(sys.argv[2:])
     lines = {}
     for kernel, exported in zip(sys.argv[1::2], sys.argv[2::2]):
         with open(kernel, "rb") as file:
