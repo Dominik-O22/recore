@@ -29,6 +29,9 @@ fn analyzes_as_loaded(fixture: &str) {
     let mut starts: Vec<u64> = analysis.functions.iter().map(|function| function.addr).collect();
     starts.sort_unstable();
     let kcfi: &[&str] = if fixture == "module-arm64.o" { &["kcfi_word", "kcfi_off_word"] } else { &[] };
+    if !kcfi.is_empty() {
+        hashes_read_as_adr(&image);
+    }
     let named = ["remove", "probe", "call_probe", "call_twice", "init_module", "traced", "outer", "inner"];
     let mut expected: Vec<u64> = named.iter().chain(kcfi).map(|name| address(name)).collect();
     expected.sort_unstable();
@@ -55,6 +58,23 @@ fn analyzes_as_loaded(fixture: &str) {
 #[test]
 fn an_aarch64_function_starts_on_a_word() {
     let image = load("module-arm64-unmarked.o");
+    hashes_read_as_adr(&image);
     let off_word: Vec<u64> = recore::analyze(&image).functions.iter().map(|function| function.addr).filter(|addr| !addr.is_multiple_of(4)).collect();
     assert_eq!(off_word, Vec::<u64>::new());
+}
+
+/// What the AArch64 tests stand on: the hash clang chose for `kcfi_word` reads as `adr` to an
+/// instruction of `probe`, and the one for `kcfi_off_word` to a byte off a word in `call_twice`.
+/// Each hash is three words before its function, ahead of the two `nop`s for ftrace.
+fn hashes_read_as_adr(image: &recore::Image) {
+    let address = |name: &str| image.symbol_names.iter().find(|(_, n)| *n == name).map(|(&addr, _)| addr).unwrap();
+    let adr_before = |function: &str| {
+        let at = address(function) - 12;
+        let word = u32::from_le_bytes(image.bytes_from(at).unwrap()[..4].try_into().unwrap());
+        assert_eq!(word & 0x9f00_0000, 0x1000_0000, "the hash of {function} is no `adr`");
+        let offset = i64::from((word >> 5 & 0x7_ffff) << 2 | word >> 29 & 3) << 43 >> 43;
+        at.wrapping_add_signed(offset)
+    };
+    assert_eq!(adr_before("kcfi_word"), address("probe") + 0x48);
+    assert_eq!(adr_before("kcfi_off_word"), address("call_twice") + 0x55);
 }

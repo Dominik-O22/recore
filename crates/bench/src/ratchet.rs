@@ -264,6 +264,22 @@ fn choose(program: &Program, mut server: Server) -> Vec<u64> {
     by_size.into_iter().step_by(step).map(|(_, entry)| entry).filter(|&entry| server.decompile(entry).and_then(|()| server.look_up(entry)).and_then(|()| server.data_flow(entry)).and_then(|()| server.trace(entry)).is_ok()).collect()
 }
 
+/// `program` as [`count`] runs it, with no environment but where to keep what it keeps, and
+/// rayon's work on one thread, so that the count does not depend on how it was split. The
+/// dynamic loader, the allocator and the C++ runtime each go through every variable when a
+/// process starts: an agent's environment of 54 variables added 4% to a process that answers
+/// from what was kept. The decompiler process `recore-mcp` starts inherits this environment.
+/// `HOME` stays, because the decompiler's language files are kept under it, and the length of
+/// their path moves the decompiler's count. Without it they would go to the shared `/tmp`.
+fn measured(program: &Path, kept: &Path) -> Command {
+    let mut command = Command::new(program);
+    command.env_clear().env(recore::cache::DIR_VAR, kept).env(recore::edits::DIR_VAR, kept).env("RAYON_NUM_THREADS", "1");
+    if let Some(home) = std::env::var_os("HOME") {
+        command.env("HOME", home);
+    }
+    command
+}
+
 /// Counts [`Work`] for `binary`, decompiling `functions`, or functions it chooses if there are
 /// none, and prints it as JSON for [`run`]. What `recore-mcp` keeps goes to a directory emptied
 /// before counting: the first call has nothing kept, and no edits a run left behind apply.
@@ -271,12 +287,7 @@ pub fn count(binary: &Path, functions: Vec<u64>) -> Result<()> {
     let program = Program::load(binary)?;
     let tool = crate::suites::sibling("recore-mcp")?;
     let kept = std::path::absolute("target/bench/count")?;
-    let recore_mcp = || {
-        let mut command = Command::new(&tool);
-        // Rayon's work on one thread, so that the count does not depend on how it was split.
-        command.env(recore::cache::DIR_VAR, &kept).env(recore::edits::DIR_VAR, &kept).env("RAYON_NUM_THREADS", "1").env_remove(recore_decomp::types::DEBUG_VAR);
-        command
-    };
+    let recore_mcp = || measured(&tool, &kept);
     let functions = if functions.is_empty() { choose(&program, Server::start(recore_mcp(), binary)?) } else { functions };
     let (first, rest) = functions.split_first().with_context(|| format!("no function of {} to decompile", binary.display()))?;
     let _ = std::fs::remove_dir_all(&kept);
@@ -379,6 +390,16 @@ mod tests {
             let (budget, moved) = finish_with(analysis, false).unwrap();
             assert_eq!((budget["a"], moved.as_str()), (LIMIT, "0 raised, 0 lowered, 0 added"), "{analysis}");
         }
+    }
+
+    #[test]
+    fn a_measured_process_sees_only_the_variables_it_is_given() {
+        let output = measured(Path::new("/usr/bin/env"), Path::new("/kept")).output().unwrap();
+        let mut seen: Vec<String> = String::from_utf8(output.stdout).unwrap().lines().map(str::to_string).collect();
+        seen.sort();
+        let home = std::env::var("HOME").ok().map(|home| format!("HOME={home}"));
+        let expected: Vec<String> = home.into_iter().chain(["RAYON_NUM_THREADS=1".to_string(), format!("{}=/kept", recore::cache::DIR_VAR), format!("{}=/kept", recore::edits::DIR_VAR)]).collect();
+        assert_eq!(seen, expected);
     }
 
     #[test]

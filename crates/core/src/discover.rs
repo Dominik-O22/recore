@@ -1743,14 +1743,17 @@ impl Pointers {
     }
 }
 
-/// The flags of `section` before anything is decoded: on what the file marks as data, and on the
-/// inside of each sized symbol of `symbols`.
-fn initial_flags(image: &Image, symbols: &[(u64, u64)], section: &Section) -> Vec<u8> {
+/// The flags of `section` before anything is decoded: on what the file marks as data, in
+/// `marked`, sorted, and on the inside of each sized symbol of `symbols`. Ranges that overlap, as
+/// those of sections a damaged file lays over each other, are each cut to the section.
+fn initial_flags(marked: &[(u64, u64)], symbols: &[(u64, u64)], section: &Section) -> Vec<u8> {
     let mut flags = vec![0; section.data.len()];
-    let first = image.marked_data.partition_point(|&(_, end)| end <= section.addr);
-    for &(start, end) in image.marked_data[first..].iter().take_while(|&&(start, _)| start < section.end()) {
-        let (from, to) = (start.max(section.addr) - section.addr, end.min(section.end()) - section.addr);
-        flags[from as usize..to as usize].fill(IN_TABLE | MARKED_DATA);
+    let first = marked.partition_point(|&(_, end)| end <= section.addr);
+    for &(start, end) in marked[first..].iter().take_while(|&&(start, _)| start < section.end()) {
+        let (from, to) = (start.max(section.addr), end.min(section.end()));
+        if from < to {
+            flags[(from - section.addr) as usize..(to - section.addr) as usize].fill(IN_TABLE | MARKED_DATA);
+        }
     }
     // Each lies in the section it starts in.
     let first = symbols.partition_point(|&(start, _)| start < section.addr);
@@ -1770,7 +1773,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], symbols: &'a
         .map(|section| Region {
             section,
             insn_len: vec![0; section.data.len()],
-            flags: initial_flags(image, symbols, section),
+            flags: initial_flags(&image.marked_data, symbols, section),
             changed: vec![0; section.data.len() / PAGE + 1],
             scans: vec![None; section.data.len() / PAGE + 1],
             covered: vec![0; section.data.len() / 64 + 2],
@@ -1886,7 +1889,18 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], symbols: &'a
 
 #[cfg(test)]
 mod tests {
-    use super::AddrSet;
+    use super::{AddrSet, MARKED_DATA, initial_flags};
+    use crate::image::Section;
+
+    #[test]
+    fn marked_ranges_that_overlap_are_cut_to_the_section() {
+        let section = Section { name: ".text".into(), addr: 0x1300, data: vec![0; 0x100], file_offset: None, executable: true, writable: false };
+        // The second range reaches into the section. The third starts inside the second and ends
+        // below the section, which ranges of one well-formed file never do.
+        let flags = initial_flags(&[(0x1000, 0x1004), (0x1110, 0x1380), (0x1200, 0x1204)], &[], &section);
+        let marked: Vec<usize> = (0..flags.len()).filter(|&at| flags[at] & MARKED_DATA != 0).collect();
+        assert_eq!(marked, (0..0x80).collect::<Vec<_>>());
+    }
 
     #[test]
     fn a_sorted_set_answers_as_a_bit_set_does() {
