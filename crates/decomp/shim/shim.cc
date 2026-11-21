@@ -1957,8 +1957,8 @@ class CollectPcode : public PcodeEmit {
   }
 };
 
-// How many of the low bytes of `reg` the varnode `vn` covers some of, counted from the low end.
-// 0 where it covers none.
+// How far into `reg` the varnode `vn` reaches, in bytes from the low end: 4 for EAX in RAX, 2
+// for AH. 0 where the two do not overlap.
 static int4 low_bytes(const VarnodeData &reg, const VarnodeData &vn) {
   if (vn.space != reg.space || vn.offset >= reg.offset + reg.size || vn.offset + vn.size <= reg.offset) return 0;
   if (reg.space->isBigEndian()) return (int4)(reg.offset + reg.size - max(vn.offset, reg.offset));
