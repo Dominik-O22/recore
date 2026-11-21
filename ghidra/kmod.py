@@ -15,7 +15,7 @@ moves to the same section and offset in recore's layout.
   kmod.py sample <recore-signatures-dir> <in-dir> <out-dir>
       Keeps of each translated signature report only the functions recore's report has, so that
       `recore-decompile params` scores both decompilers on the same sample.
-  kmod.py diff <bin-dir> <truth-dir> <recore-dir> <ghidra-dir>
+  kmod.py diff <bin-dir> <truth-dir> <recore-dir> <ghidra-dir> [<recore-dir-without-kcfi>]
       Lists by kind the function starts and noreturn calls one tool gets right and the other
       wrong, each kind with a count and an example.
 """
@@ -81,8 +81,7 @@ class Module:
                 yield base + offset, info & 0xFFFFFFFF, name, target
 
     def section_of(self, addr):
-        index = max((i for i, a in self.addrs.items() if a <= addr), key=self.addrs.get, default=None)
-        return index if index is not None and addr < self.addrs[index] + self.headers[index][5] else None
+        return next((i for i, a in self.addrs.items() if a <= addr < a + self.headers[i][5]), None)
 
     def word(self, addr):
         index = self.section_of(addr)
@@ -209,9 +208,10 @@ def sample(recore_dir, in_dir, out_dir):
         json.dump(report, open(os.path.join(out_dir, file), 'w'))
 
 
-def diff(bin_dir, truth_dir, recore_dir, ghidra_dir):
+def diff(bin_dir, truth_dir, recore_dir, ghidra_dir, blanked_dir=None):
     """Sorts each false start and each wrong noreturn call by kind, for the starts and calls
-    where one tool is right and the other wrong."""
+    where one tool is right and the other wrong. `blanked_dir` is recore's analysis of the same
+    modules with the kCFI hashes zeroed, which names what the hashes cause."""
     from collections import Counter, defaultdict
     counts = defaultdict(Counter)
     examples = {}
@@ -247,11 +247,15 @@ def diff(bin_dir, truth_dir, recore_dir, ghidra_dir):
         data = module.data_in_code()
         adrs = module.adr_targets({place for place, _, _, _ in relocations})
         origin = {f['addr']: f.get('origin', '') for f in ours['functions']}
+        blanked = json.load(open(os.path.join(blanked_dir, file))) if blanked_dir else None
+        by_hashes = 'gone once the kCFI hashes are blanked'
 
         def kind_of_start(addr):
             i = bisect.bisect_right(data, (addr, float('inf'))) - 1
             if i >= 0 and addr < data[i][1]:
                 return 'a kCFI type hash read as code'
+            if blanked and addr not in blanked_starts:
+                return by_hashes
             sources = referrers.get(addr, ())
             if '__jump_table' in sources:
                 return 'a jump label target'
@@ -279,6 +283,11 @@ def diff(bin_dir, truth_dir, recore_dir, ghidra_dir):
         in_text = lambda addr: text[0] <= addr < text[1]
         true_starts = {a for a in starts if in_text(a)}
         false = [{f['addr'] for f in tool['functions'] if in_text(f['addr'])} - true_starts for tool in (ours, theirs)]
+        blanked_starts = {f['addr'] for f in blanked['functions']} if blanked else set()
+        for tool, starts_ in zip(('recore', 'Ghidra'), false):
+            for addr in starts_:
+                if addr % 4:
+                    note('false starts at an address not a multiple of 4', tool, addr)
         for addr in false[0] - false[1]:
             note('false starts recore has and Ghidra not', kind_of_start(addr), addr)
         for addr in false[1] - false[0]:
@@ -291,7 +300,8 @@ def diff(bin_dir, truth_dir, recore_dir, ghidra_dir):
         noreturn = set(truth['noreturn_calls'])
         calls = [{a for a in tool['noreturn_calls'] if in_text(a)} for tool in (ours, theirs)]
         for addr in calls[0] - calls[1] - noreturn:
-            note('wrong noreturn calls recore has and Ghidra not', callee(addr), addr)
+            gone = blanked and addr not in blanked['noreturn_calls']
+            note('wrong noreturn calls recore has and Ghidra not', f'{callee(addr)}' + (f', {by_hashes}' if gone else ''), addr)
         for addr in calls[1] - calls[0] - noreturn:
             note('wrong noreturn calls Ghidra has and recore not', callee(addr), addr)
         for addr in noreturn - calls[0] - calls[1]:
@@ -300,10 +310,10 @@ def diff(bin_dir, truth_dir, recore_dir, ghidra_dir):
             note('noreturn calls Ghidra misses', callee(addr), addr)
         for addr in noreturn & calls[1] - calls[0]:
             note('noreturn calls recore misses', callee(addr), addr)
-    for table, kinds in counts.items():
+    for table, kinds in sorted(counts.items()):
         print(f'{table}: {sum(kinds.values())}')
         for kind, count in kinds.most_common(12):
-            print(f'  {count:6}  {kind}  e.g. {examples[(table, kind)]}')
+            print(f'  {count:6}  {kind[:90]}  e.g. {examples[(table, kind)][:120]}')
 
 
 if __name__ == '__main__':

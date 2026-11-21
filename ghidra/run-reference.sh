@@ -27,7 +27,7 @@ one() {
   rm -rf "$OUT/proj/$name"; mkdir -p "$OUT/proj/$name"
   GHIDRA_HEADLESS_MAXMEM=6G GHIDRA_HEADLESS_JAVA_OPTIONS="-Dcpu.core.override=4 $EXTRA" \
     ${GHIDRA_TIMEOUT:+timeout -k 30 "$GHIDRA_TIMEOUT"} "$GHIDRA/support/analyzeHeadless" "$OUT/proj/$name" p -import "${import[@]}" \
-    -scriptPath "$HERE" "${seed[@]}" -postScript ExportRef.java "$OUT/$name.json" -deleteProject \
+    -scriptPath "$HERE" "${seed[@]}" -preScript StartTimer.java -postScript ExportRef.java "$OUT/$name.json" -deleteProject \
     > "$OUT/logs/$name.log" 2>&1
   [ $? = 124 ] && echo "$name" >> "$OUT/timeouts.txt"
   local total; total=$(grep -o 'Total Time *[0-9]* secs' "$OUT/logs/$name.log" | grep -o '[0-9]*' | tail -1)

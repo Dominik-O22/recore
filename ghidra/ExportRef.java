@@ -10,6 +10,9 @@ import ghidra.program.model.listing.*;
 public class ExportRef extends GhidraScript {
 	@Override
 	public void run() throws Exception {
+		String start = System.getProperty("recore.analysis.start");
+		long analysisMs = start == null ? -1 : (System.nanoTime() - Long.parseLong(start)) / 1_000_000;
+
 		long base = currentProgram.getImageBase().getOffset();
 		// Non-PIE executables are loaded at their link address, so nothing is subtracted. Ghidra
 		// loads a position-independent ELF at 0x100000, or at 0x10000 for a 32-bit one, where
@@ -67,8 +70,8 @@ public class ExportRef extends GhidraScript {
 		}
 
 		try (PrintWriter out = new PrintWriter(getScriptArgs()[0])) {
-			out.printf("{\"name\":\"%s\",\"shift\":%d,\"min\":%d,\"instructions\":%d,\"functions\":[%s],\"noreturn_calls\":[%s],\"jump_tables\":[%s],\"blocks\":[%s]}%n",
-				currentProgram.getName(), shift, min.getOffset(), instructions, functions, callReturn, jumpTables, blocks);
+			out.printf("{\"name\":\"%s\",\"analysis_ms\":%d,\"shift\":%d,\"min\":%d,\"instructions\":%d,\"functions\":[%s],\"noreturn_calls\":[%s],\"jump_tables\":[%s],\"blocks\":[%s]}%n",
+				currentProgram.getName(), analysisMs, shift, min.getOffset(), instructions, functions, callReturn, jumpTables, blocks);
 		}
 	}
 }
