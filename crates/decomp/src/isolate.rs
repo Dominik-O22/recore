@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use recore::edits::Edits;
 use recore::structs::{Recovered, auto_function};
 
-use crate::{Converged, Facts, Flow, Instruction, Local, Session, Shape, StructReport, Style};
+use crate::{Converged, Decompiled, Facts, Flow, Instruction, Local, Session, Shape, StructReport, Style};
 
 /// Where switch targets come from.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -471,6 +471,15 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             }
         }
     };
+    // A function whose own code shows no value returned may still return one that a caller
+    // reads, which only the callers show. A call from the function itself shows nothing.
+    let decompile = |session: &mut Session, entry: u64| -> Result<Decompiled> {
+        let decompiled = session.decompile(entry)?;
+        if decompiled.returns_value || !session.returns_what_callers_read(entry, &calls.returning_to_callers(entry)) {
+            return Ok(decompiled);
+        }
+        session.decompile(entry)
+    };
     // Results of functions decompiled ahead of a caller that are as good as asked for.
     let mut ready: HashMap<u64, Event> = HashMap::new();
 
@@ -521,7 +530,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 settle_return(&mut session, addr);
                 prepare(&mut session, &mut importer, &edits, addr, true);
                 session.keep_flow(true);
-                let flow = session.decompile(addr).map(|function| function.flow.unwrap_or_default());
+                let flow = decompile(&mut session, addr).map(|function| function.flow.unwrap_or_default());
                 session.keep_flow(false);
                 send(&Event::Flow(flow.map_err(|error| error.to_string())))?;
                 continue;
@@ -530,7 +539,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 settle_return(&mut session, addr);
                 prepare(&mut session, &mut importer, &edits, addr, true);
                 session.keep_addresses(true);
-                let c_text = session.decompile(addr).map(|function| function.c_text);
+                let c_text = decompile(&mut session, addr).map(|function| function.c_text);
                 session.keep_addresses(false);
                 send(&text(c_text))?;
                 continue;
@@ -538,7 +547,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             Request::Locals(addr) => {
                 settle_return(&mut session, addr);
                 prepare(&mut session, &mut importer, &edits, addr, true);
-                send(&Event::Locals(session.decompile(addr).map(|function| function.locals).map_err(|error| error.to_string())))?;
+                send(&Event::Locals(decompile(&mut session, addr).map(|function| function.locals).map_err(|error| error.to_string())))?;
                 continue;
             }
             Request::Recovered(ref name) => {
@@ -548,7 +557,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                         Some(function) => {
                             settle_return(&mut session, function);
                             prepare(&mut session, &mut importer, &edits, function, true);
-                            let _ = session.decompile(function);
+                            let _ = decompile(&mut session, function);
                             session.recovered(name)
                         }
                         None => None,
@@ -560,7 +569,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             Request::Structs(addr) => {
                 settle_return(&mut session, addr);
                 prepare(&mut session, &mut importer, &edits, addr, true);
-                let report = session.decompile(addr).map_err(|error| error.to_string()).map(|_| session.structs_of(addr).unwrap_or_default());
+                let report = decompile(&mut session, addr).map_err(|error| error.to_string()).map(|_| session.structs_of(addr).unwrap_or_default());
                 send(&Event::Structs(report))?;
                 continue;
             }
@@ -607,14 +616,14 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             session.keep_prototypes(!hands_on_registers);
             prepare(&mut session, &mut importer, &edits, target, false);
             // A failure here only leaves the caller as well off as it was.
-            let _ = session.decompile(target);
+            let _ = decompile(&mut session, target);
             known.insert(target);
         }
         settle_return(&mut session, addr);
         session.keep_prototypes(callees_first || (jumped_to.contains(&addr) && !hands_on_registers));
         let start = Instant::now();
         prepare(&mut session, &mut importer, &edits, addr, true);
-        let result = session.decompile(addr);
+        let result = decompile(&mut session, addr);
         known.insert(addr);
         let ms = start.elapsed().as_secs_f64() * 1e3;
         let event = match result {
@@ -765,14 +774,22 @@ impl<'a> Calls<'a> {
         &calls[calls.partition_point(|call| call.at < start)..calls.partition_point(|call| call.at < end.max(start))]
     }
 
+    /// Indexes into `ranges` of the ranges of the function at `entry`.
+    fn ranges_of(&self, entry: u64) -> impl Iterator<Item = usize> + '_ {
+        let first = self.by_owner.partition_point(|&index| self.ranges[index].2 < entry);
+        self.by_owner[first..].iter().copied().take_while(move |&index| self.ranges[index].2 == entry)
+    }
+
     /// The calls of the function at `entry`, in address order.
     fn of(&self, entry: u64) -> impl Iterator<Item = &'a CallSite> + '_ {
-        let first = self.by_owner.partition_point(|&index| self.ranges[index].2 < entry);
-        self.by_owner[first..]
-            .iter()
-            .take_while(move |&&index| self.ranges[index].2 == entry)
-            .flat_map(|&index| self.in_range(index))
-            .filter(move |call| call.target != CallTarget::Function(entry))
+        self.ranges_of(entry).flat_map(|index| self.in_range(index)).filter(move |call| call.target != CallTarget::Function(entry))
+    }
+
+    /// The calls to the function at `entry` from other functions that come back to the code
+    /// after them.
+    fn returning_to_callers(&self, entry: u64) -> Vec<u64> {
+        let own = |at: u64| self.ranges_of(entry).any(|index| (self.ranges[index].0..self.ranges[index].1).contains(&at));
+        self.calls.iter().filter(|call| call.target == CallTarget::Function(entry) && !call.tail && !call.noreturn && !own(call.at)).map(|call| call.at).collect()
     }
 
     /// The jumps each function leaves by for good, by entry point.

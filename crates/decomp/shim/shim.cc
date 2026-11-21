@@ -1940,6 +1940,147 @@ int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int 
   return ok && returns;
 }
 
+// The raw p-code of one instruction, each operation with its output and inputs.
+class CollectPcode : public PcodeEmit {
+ public:
+  struct Op {
+    OpCode code;
+    bool has_output;
+    VarnodeData output;
+    vector<VarnodeData> inputs;
+  };
+  vector<Op> ops;
+  void dump(const Address &, OpCode code, VarnodeData *output, VarnodeData *inputs, int4 count) override {
+    ops.push_back({code, output != nullptr, output != nullptr ? *output : VarnodeData(), vector<VarnodeData>(inputs, inputs + count)});
+  }
+};
+
+// How many of the low bytes of `reg` the varnode `vn` covers some of, counted from the low end.
+// 0 where it covers none.
+static int4 low_bytes(const VarnodeData &reg, const VarnodeData &vn) {
+  if (vn.space != reg.space || vn.offset >= reg.offset + reg.size || vn.offset + vn.size <= reg.offset) return 0;
+  if (reg.space->isBigEndian()) return (int4)(reg.offset + reg.size - max(vn.offset, reg.offset));
+  return (int4)(min(vn.offset + vn.size, reg.offset + reg.size) - reg.offset);
+}
+
+// Operations whose result is the same whatever value their two inputs share, as `XOR EAX,EAX`
+// clears EAX without reading it.
+static bool same_inputs_give_a_constant(const CollectPcode::Op &op) {
+  switch (op.code) {
+    case CPUI_INT_XOR:
+    case CPUI_INT_SUB:
+    case CPUI_INT_SBORROW:
+    case CPUI_INT_LESS:
+    case CPUI_INT_SLESS:
+    case CPUI_INT_LESSEQUAL:
+    case CPUI_INT_SLESSEQUAL:
+    case CPUI_INT_EQUAL:
+    case CPUI_INT_NOTEQUAL:
+    case CPUI_BOOL_XOR:
+      return op.inputs.size() == 2 && op.inputs[0] == op.inputs[1];
+    default:
+      return false;
+  }
+}
+
+// How many of the low bytes of `result` the code after the call at `call` reads of what the call
+// left there, or 0. It follows the code on from the call and stops at the first read of the
+// register, at a write to any of it, at the next call or return, and at a branch, which leaves the
+// call undecided, as do bytes that do not decode and a run of 40 instructions. A read counts where
+// what was read reaches a register, memory, a branch or a call: an address worked out from the
+// register and used for nothing, as a long `NOP` does, is no read.
+static int4 bytes_read_after(RdSession *session, uint64_t call, const VarnodeData &result) {
+  const Translate *translate = session->arch->translate;
+  AddrSpace *unique = translate->getUniqueSpace();
+  uint64_t at = call;
+  for (int count = 0; count <= 40; ++count) {
+    CollectPcode emit;
+    int4 length;
+    try {
+      length = translate->oneInstruction(emit, session->address(at));
+    } catch (const LowlevelError &) {
+      return 0;
+    }
+    if (count == 0) {  // the call itself
+      at += length;
+      continue;
+    }
+    // Temporaries of this instruction that hold something of the result, with how many of its bytes.
+    map<uintb, int4> holding;
+    bool written = false;
+    for (const CollectPcode::Op &op : emit.ops) {
+      int4 read = 0;
+      bool reads = false;
+      if (!same_inputs_give_a_constant(op)) {
+        for (const VarnodeData &input : op.inputs) {
+          int4 direct = written ? 0 : low_bytes(result, input);
+          auto held = input.space == unique ? holding.find(input.offset) : holding.end();
+          int4 through = held == holding.end() ? 0 : held->second;
+          if (direct > 0 || through > 0) reads = true;
+          read = max(read, max(direct, through));
+        }
+      }
+      if (reads) {
+        if (!op.has_output || op.output.space != unique) return read;
+        holding[op.output.offset] = max(holding[op.output.offset], read);
+      }
+      if (op.has_output && low_bytes(result, op.output) > 0) written = true;
+      switch (op.code) {
+        case CPUI_CALL:
+        case CPUI_CALLIND:
+        case CPUI_RETURN:
+        case CPUI_BRANCH:
+        case CPUI_CBRANCH:
+        case CPUI_BRANCHIND:
+          return 0;
+        default:
+          break;
+      }
+    }
+    if (written) return 0;
+    at += length;
+  }
+  return 0;
+}
+
+// Says that the function at `function` returns a value if the code after one of the `count`
+// calls to it at `calls` reads the register the default convention returns an integer in, as
+// `bytes_read_after` decides it. It then returns as many bytes as the widest such read, of a type
+// the decompilation finds. Answers 1 if one does, and 0 if none does or the function's
+// prototype already says what it returns.
+int rd_returns_what_callers_read(RdSession *session, uint64_t function, const uint64_t *calls, size_t count,
+                                 char *err, size_t errlen) {
+  bool returns = false;
+  bool ok = guarded(err, errlen, [&] {
+    Architecture *arch = session->arch;
+    Funcdata *fd = session->function(function);
+    if (fd->getFuncProto().isOutputLocked()) return;
+    PrototypePieces integer;
+    integer.model = arch->defaultfp;
+    integer.outtype = arch->types->getBase(arch->types->getSizeOfPointer(), TYPE_INT);
+    integer.firstVarArgSlot = -1;
+    vector<ParameterPieces> storage;
+    arch->defaultfp->assignParameterStorage(integer, storage, true);
+    if (storage.empty() || storage[0].addr.isInvalid() || storage[0].addr.getSpace()->getType() != IPTR_PROCESSOR) return;
+    VarnodeData result = {storage[0].addr.getSpace(), storage[0].addr.getOffset(), (uint4)integer.outtype->getSize()};
+    int4 bytes = 0;
+    for (size_t i = 0; i < count; ++i) bytes = max(bytes, bytes_read_after(session, calls[i], result));
+    if (bytes == 0) return;
+    ParameterPieces piece;
+    piece.addr = Address(result.space, result.space->isBigEndian() ? result.offset + result.size - bytes : result.offset);
+    // Of no type but its size, which locks the size and lets the decompilation find the type.
+    piece.type = arch->types->getBase(bytes, TYPE_UNKNOWN);
+    piece.flags = 0;
+    bool model_locked = fd->getFuncProto().isModelLocked();
+    fd->getFuncProto().setOutput(piece);
+    fd->getFuncProto().setOutputLock(true);
+    // Locking the output locks the calling convention with it, which is still to be recovered.
+    fd->getFuncProto().setModelLock(model_locked);
+    returns = true;
+  });
+  return ok && returns;
+}
+
 // With `keep` set, the parameters recovered by each successful rd_decompile are locked into the
 // function's symbol, so that later decompilations of its callers pass at least those parameters.
 void rd_keep_prototypes(RdSession *session, int keep) { session->keep_prototypes = keep != 0; }

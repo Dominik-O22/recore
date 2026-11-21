@@ -757,6 +757,16 @@ impl Session {
         unsafe { ffi::rd_returns_like(self.raw.as_ptr(), function, callee, import.into(), err.as_mut_ptr(), err.len()) != 0 }
     }
 
+    /// States that `function` returns a value if the code after one of `calls`, calls to it that
+    /// come back, reads the register a result comes back in before anything writes it. For a
+    /// function whose own code shows no value returned, as one that ends by calling a function
+    /// of no known prototype does. Says whether one reads it; if so, `function` is from now on
+    /// decompiled as returning as many bytes as the widest such read.
+    pub fn returns_what_callers_read(&mut self, function: u64, calls: &[u64]) -> bool {
+        let mut err = [0 as c_char; 64];
+        unsafe { ffi::rd_returns_what_callers_read(self.raw.as_ptr(), function, calls.as_ptr(), calls.len(), err.as_mut_ptr(), err.len()) != 0 }
+    }
+
     /// With `keep`, every later [`Session::decompile`] prints each line of C after the address of
     /// the instruction the line came from, in a column, where it came from one.
     pub fn keep_addresses(&mut self, keep: bool) {
