@@ -31,6 +31,10 @@ arg() {
   done
 }
 tip() { git rev-parse "refs/heads/$(cat "$HUB/pr/$1/branch")"; }
+# As gh does for an agent, whatever it was asked about a pull request.
+if [ "$1" = pr ]; then
+  printf 'hint: if you need to wait for this pull request, use this instead of polling:\n    gh event listen\n  - It prints the first event\n' >&2
+fi
 # What pr.yml does: a change of Markdown alone gets the status without a run.
 checked() { [ -e "$HUB/status/$1" ] || [ -z "$(git diff --name-only "main...$1" | grep -v '\.md$')" ]; }
 case "$1 $2" in
@@ -200,6 +204,7 @@ is "the first" "$(state "$a")" MERGED
 is "the second" "$(state "$b")" MERGED
 is "the runs of check.sh" "$(($(runs) - before))" 1
 is "main's files" "$(on_main one)$(on_main two)" onetwo
+is "the lines of gh's hints in what it printed" "$(grep -c '^hint\|gh event listen\|It prints' "$work/out")" 0
 tried
 
 case="a train whose run moved a count lands its members one at a time, the second on top of the first"
