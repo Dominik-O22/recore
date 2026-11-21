@@ -33,11 +33,12 @@ pointer in a kernel struct that no kernel function has. kcfi.protos is made from
 above: the GKI 6.12 normalizes and the Pixel's 6.1 does not.
 
 Lines read `<hash> <n|p> <return> (<params>)`, sorted, where `n` is the normalized spelling and
-`p` the plain one. A type is spelled with sized numbers, `char` and `bool`, and a pointer to a
-struct or union keeps its name: `int4 (struct platform_device *)`. An enum is the integer it is
-stored in, and a pointer to a function is `void *`. A type that passes a struct or union by value
-is left out, as is a hash two types share. Where records that hash alike spell differently, as
-`char` and `unsigned char` do when normalized, the spelling most of them have wins.
+`p` the plain one. A type is spelled with sized numbers, and a pointer to a struct or union keeps
+its name: `int4 (struct platform_device *)`. A normalized hash knows an integer's width and sign
+and nothing more, so only `p` lines say `char` and `bool`: `n` lines say `uint1` for `_Bool`,
+`char` and `unsigned char` alike. An enum is the integer it is stored in, and a pointer to a
+function is `void *`. A type that passes a struct or union by value is left out, as is a hash two
+types share and one whose types the table would spell two ways.
 
 Both tables are made from Linux kernels, and Linux is licensed under the GPL-2.0.
 """
@@ -388,16 +389,19 @@ def mangle(function, normalized):
     return "".join(out) + (".normalized" if normalized else "")
 
 
-def spell(type, pointed_to=False):
-    """How kcfi.protos writes a type, or None for a struct or union passed by value."""
+def spell(type, normalized, pointed_to=False):
+    """How kcfi.protos writes a type, or None for a struct or union passed by value. A normalized
+    hash knows an integer's width and sign and no more, so only the plain spelling says `bool` or
+    `char`."""
     kind = type[0]
     if kind == "qual":
-        return spell(type[2], pointed_to)
+        return spell(type[2], normalized, pointed_to)
     if kind == "void":
         return "void"
     if kind == "int":
         _, code, size, signed = type
-        return {"b": "bool", "c": "char"}.get(code, f"{'int' if signed else 'uint'}{size}")
+        plain = {} if normalized else {"b": "bool", "c": "char"}
+        return plain.get(code, f"{'int' if signed else 'uint'}{size}")
     if kind == "float":
         return f"float{type[2]}"
     if kind == "enum":
@@ -409,7 +413,7 @@ def spell(type, pointed_to=False):
         target = target[2] if target[0] == "array" else target
         if target[0] == "func":
             return "void *"
-        inner = spell(target, True)
+        inner = spell(target, normalized, True)
         return inner + ("*" if inner.endswith("*") else " *")
     raise ValueError(f"no spelling for {kind}")
 
@@ -417,7 +421,7 @@ def spell(type, pointed_to=False):
 def kcfi_table(btf, normalized):
     """The line of every function type of the kernel, by its kCFI hash."""
     canonical = Canonical(btf)
-    spellings = collections.defaultdict(collections.Counter)
+    spellings = collections.defaultdict(set)
     for id, record in enumerate(btf.types):
         if record[0] != FUNC_PROTO:
             continue
@@ -426,15 +430,15 @@ def kcfi_table(btf, normalized):
         except (KeyError, ValueError):
             continue
         _, returns, params, variadic = function
-        spelled = [spell(returns)] + [spell(param) for param in params]
+        spelled = [spell(returns, normalized)] + [spell(param, normalized) for param in params]
         if None in spelled:
             continue
         listed = ", ".join(spelled[1:] + ["..."] * variadic) or "void"
-        spellings[mangle(function, normalized)][f"{spelled[0]} ({listed})"] += 1
+        spellings[mangle(function, normalized)].add(f"{spelled[0]} ({listed})")
     by_hash = collections.defaultdict(list)
     for mangled in spellings:
         by_hash[xxh64(mangled.encode()) & 0xFFFFFFFF].append(mangled)
-    return {hash: min(spellings[mangled], key=lambda line: (-spellings[mangled][line], line)) for hash, (mangled, *others) in by_hash.items() if not others}
+    return {hash: line for hash, (mangled, *others) in by_hash.items() if not others for line in spellings[mangled] if len(spellings[mangled]) == 1}
 
 
 def kcfi_main(args):

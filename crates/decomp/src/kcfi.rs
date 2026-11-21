@@ -165,3 +165,17 @@ fn number(text: &str) -> Option<(Base, u64)> {
     };
     Some((base, text[digits..].parse().ok()?))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// can-dev's `can_fd_dlc2len` returns a length, and DWARF says `u8 (u8)`. Normalized, its
+    /// hash is the one `_Bool`, `char` and `unsigned char` share, so the table may say no more.
+    #[test]
+    fn a_normalized_prototype_names_only_an_integers_width_and_sign() {
+        assert_eq!(lookup(0x7e25_2a92, Spelling::Normalized), Some("uint1 (uint1)"));
+        let guessed = TABLE.lines().filter(|line| line.as_bytes()[9] == b'n' && line[11..].split([' ', '(', ')', ',', '*']).any(|word| word == "bool" || word == "char"));
+        assert_eq!(guessed.count(), 0);
+    }
+}
