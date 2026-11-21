@@ -558,7 +558,7 @@ pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) 
     // A decompiler that fails on more functions is broken, not a knock-on of a right change, and
     // the functions it failed on drop out of every other count.
     anyhow::ensure!(!measures.contains(&FAILED), fails);
-    // In the form `recore-corpus compare` prints a loss, which a description's `Worse:` line names.
+    // In the form `recore-corpus compare` prints a loss, which a line of bench/accepted-losses.txt names.
     let name = |path: &Path| path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     let run = format!("{}/{}", debug_dir.parent().map(name).unwrap_or_default(), name(head_dir));
     // Beside each loss, so that whoever accepts one sees whether timeouts are behind it. It is

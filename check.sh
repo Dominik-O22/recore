@@ -8,13 +8,13 @@
 # the binaries it moved in. It fails when a total got worse.
 #
 # Each total that got worse is a loss, printed as a line such as
-# `Worse: corpus-thumb/signatures global types right 812 -> 811 (-1)`. Lines in that form, each
-# with a reason after it, name the losses a change accepts: those of RECORE_WORSE_ACCEPTED, typed
-# one a line, or, when land.sh gives the pull request's description as GitHub renders it in
-# RECORE_WORSE_RENDERED, the lines that page shows (`recore-corpus worse-lines`). A line accepts a
-# loss of its run and count up to the size it names. A loss no line names fails the run, and so
-# does a line that starts `Worse:` out of that form. A line whose loss did not happen only prints.
-# No line accepts a binary that lost its analysis or a decompiler that fails on more functions.
+# `Worse: corpus-thumb/signatures global types right 812 -> 811 (-1)`. A change accepts a loss by
+# adding that line, with a reason after it, to bench/accepted-losses.txt: the lines the file holds
+# in the working tree and did not at the merge base of <ref> and HEAD. A line accepts a loss of its
+# run and count up to the size it names. A loss no added line names fails the run, and so does an
+# added line out of that form, and a line of the base's file the change took out or edited. A line
+# whose loss did not happen only prints. No line accepts a binary that lost its analysis or a
+# decompiler that fails on more functions.
 #
 # Where a corpus has DWARF, the decompiler's signatures are scored too: a fixed sample of each
 # binary's functions, each one's parameter count, whether it returns a value, and what its
@@ -140,8 +140,8 @@ signatures() {
 }
 # compared <dir> <command>...: prints what the comparison of <dir> with the base's says. Exit
 # status 3 says that all it found wrong is totals that got worse, each on a `Worse:` line, which go
-# to $losses for a description to name, with the `Left out:` line of a comparison of signatures.
-# Any other failure is worse whatever a description says.
+# to $losses for a line of bench/accepted-losses.txt to name, with the `Left out:` line of a comparison of signatures.
+# Any other failure is worse whatever that file says.
 compared() {
   local dir="$1" output status=0
   shift
@@ -204,18 +204,23 @@ for in in "$corpora"/*/; do
     signatures "$in"
   fi
 done
-# Every loss, and whether a Worse: line names it. One no line names, and a line out of form, is
-# worse.
-named="${RECORE_WORSE_ACCEPTED:-}"
-[ -z "${RECORE_WORSE_RENDERED:-}" ] || named="$("$build/recore-corpus" worse-lines <<<"$RECORE_WORSE_RENDERED")"
+# Every loss, and whether a line the change added to the record names it. The record is read from
+# the working tree, so that a line can be tried before it is committed, and held to the one at the
+# merge base: lines main added since the branch left it are not this change's.
 accepted=0
-if [ -s "$losses" ] || grep -q '^Worse:' <<<"$named"; then
-  echo "losses:"
-  if ! judged="$("$build/recore-corpus" losses -- "$(cat "$losses")" "$named")"; then
-    mapfile -t unmatched < <(grep -E '^(not named|unread) ' <<<"$judged" || true)
-    worse+=("${unmatched[@]:-losses that recore-corpus could not hold to the Worse: lines}")
+if [ -n "$against" ]; then
+  record=bench/accepted-losses.txt
+  git show "$(git merge-base "$against" HEAD):$record" >target/corpus/accepted-losses.base 2>/dev/null || : >target/corpus/accepted-losses.base
+  [ -e "$record" ] || record=/dev/null
+  if ! judged="$("$build/recore-corpus" losses "$losses" target/corpus/accepted-losses.base "$record")"; then
+    mapfile -t unmatched < <(grep -E '^(not named|unread|removed) ' <<<"$judged" || true)
+    worse+=("${unmatched[@]:-losses that recore-corpus could not hold to bench/accepted-losses.txt}")
+    ! grep -q '^not named ' <<<"$judged" || echo "to accept a loss, add its line with the reason after it to bench/accepted-losses.txt" >&2
   fi
-  sed 's/^/  /' <<<"$judged"
+  if [ -n "$judged" ]; then
+    echo "losses:"
+    sed 's/^/  /' <<<"$judged"
+  fi
   accepted="$(grep -c '^accepted ' <<<"$judged" || true)"
 fi
 # The ratchet and the cost measure the build that ships, which a --quick run does not build.

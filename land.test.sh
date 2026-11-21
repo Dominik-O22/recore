@@ -14,10 +14,8 @@ mkdir -p "$work/bin" "$HUB/pr" "$HUB/status" "$HUB/comment" "$HUB/red"
 
 cat >"$work/bin/gh" <<'EOF'
 #!/usr/bin/env bash
-# A pull request is a directory of its state, branch and description, and of its description as
-# GitHub renders it when that is not one paragraph a line; a commit's `check` status is a file of
-# what it said. A branch named in $HUB/red fails its tests, and a pull request with a file named
-# `unrendered` cannot be read.
+# A pull request is a directory of its state, branch and description; a commit's `check` status is
+# a file of what it said. A branch named in $HUB/red fails its tests.
 set -euo pipefail
 git() { command git --git-dir="$HUB/remote.git" "$@"; }
 # arg <flag> <arguments>...: what follows that flag.
@@ -100,15 +98,6 @@ case "$1 $2" in
     for word in "$@"; do
       case "$word" in
         */required_status_checks/contexts) printf 'test\nbudget\ncheck\n' ;;
-        */pulls/*)
-          pr="$HUB/pr/${word##*/}"
-          [ ! -e "$pr/unrendered" ]
-          if [ -e "$pr/html" ]; then
-            cat "$pr/html"
-          else
-            tr -d '\r' <"$pr/body" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s|.*|<p>&</p>|'
-          fi
-          ;;
         */commits/*/statuses) cat "$HUB/status/$(basename "$(dirname "$word")")" 2>/dev/null || true ;;
         */statuses/*) sha="${word##*/}" ;;
         description=*) echo "${word#description=}" >"$HUB/status/$sha" ;;
@@ -130,17 +119,17 @@ git clone -q "$work/remote.git" "$work/clone" 2>/dev/null
 cd "$work/clone"
 mkdir bench
 echo '{"a": {"work": 2}}' >bench/budget.json
+printf '# Every loss a change accepted.\n' >bench/accepted-losses.txt
+echo 'bench/accepted-losses.txt merge=union' >.gitattributes
 echo target/ >.gitignore
 cat >check.sh <<'EOF'
 #!/usr/bin/env bash
 # What a run does is up to the files the change adds: one named `fails`, one that `costs` time
 # unless that was accepted, one that `moves` a count, one that `loses` as many of a count as its
-# first word says, which a `Worse:` line may accept, one that `breaks` a binary's analysis, which none
-# accepts, one that `lowers` the budget and one that `raises` it. Once, the owner of the branch
-# named in $HUB/pushes pushes to it while the run is on, and queues the pull request named in
-# $HUB/queues again; the owner of the pull request named in $HUB/edits adds a `Worse:` line to its
-# description, and the owner of the one named in $HUB/hides puts its lines in a comment, which
-# leaves the page without them.
+# first word says, which a line the change adds to bench/accepted-losses.txt may accept, one that
+# `breaks` a binary's analysis, which none accepts, one that `lowers` the budget and one that
+# `raises` it. Once, the owner of the branch named in $HUB/pushes pushes to it while the run is
+# on, and queues the pull request named in $HUB/queues again.
 adds() { [ -n "$(git diff --name-only "$against" HEAD -- "$1")" ]; }
 against="$2"
 git rev-parse HEAD >>"$RUNS"
@@ -155,26 +144,6 @@ if [ -e "$HUB/pushes" ]; then
     rm "$HUB/queues"
   fi
 fi
-if [ -e "$HUB/edits" ]; then
-  echo "Worse: corpus/recore starts found 10 -> 5 (-5) added after the check" >>"$HUB/pr/$(cat "$HUB/edits")/body"
-  rm "$HUB/edits"
-fi
-if [ -e "$HUB/hides" ]; then
-  pr="$HUB/pr/$(cat "$HUB/hides")"
-  printf '<!--\n%s\n-->\n' "$(cat "$pr/body")" >"$pr/body"
-  : >"$pr/html"
-  rm "$HUB/hides"
-fi
-# As recore-corpus worse-lines reads the pages the test's gh renders, which land.sh runs as built
-# here.
-mkdir -p target/release
-cat >target/release/recore-corpus <<'CORPUS'
-#!/usr/bin/env bash
-sed -n 's|^<p>\(Worse:.*\)</p>$|\1|p' | sed 's/&gt;/>/g; s/&lt;/</g; s/&amp;/\&/g'
-CORPUS
-chmod +x target/release/recore-corpus
-named="$RECORE_WORSE_ACCEPTED"
-[ -z "$RECORE_WORSE_RENDERED" ] || named="$(target/release/recore-corpus worse-lines <<<"$RECORE_WORSE_RENDERED")"
 if adds fails; then
   echo "worse than $against: target/corpus/corpus/recore"
   exit 1
@@ -187,9 +156,13 @@ if adds breaks; then
   echo "worse than $against: target/corpus/corpus/recore"
   exit 1
 fi
-# As check.sh holds the run's losses to the `Worse:` lines, for the one count of the one run a
-# change loses here: a line accepts the loss up to the size it names, a line whose loss did not
-# happen only prints, and a loss no line names or a line out of form fails the run.
+# As check.sh holds the run's losses to the lines the change added to the record since the merge
+# base, for the one count of the one run a change loses here: a line accepts the loss up to the
+# size it names, a line whose loss did not happen only prints, and a loss no line names, an added
+# line out of form and a line taken out fail the run.
+record() { grep -v '^#' | grep . | sort || true; }
+before="$(git show "$(git merge-base "$against" HEAD):bench/accepted-losses.txt" | record)"
+after="$(record <bench/accepted-losses.txt)"
 size="$(cat loses 2>/dev/null || true)" size="${size%% *}"
 [[ "$size" =~ ^[0-9]+$ ]] || size=1
 lost='' judged='' failing='' accepted=0
@@ -202,7 +175,10 @@ while IFS= read -r line; do
   elif [ "${BASH_REMATCH[1]}" -ge "$size" ] && [ "$accepted" -eq 0 ]; then
     judged+="accepted   $lost ${BASH_REMATCH[2]}"$'\n'"           left out for a timeout or after a lost worker, 0 in the base and 2 here"$'\n' accepted=1
   fi
-done < <(grep '^Worse:' <<<"$named" || true)
+done < <(comm -13 <(echo "$before") <(echo "$after") | grep . || true)
+while IFS= read -r line; do
+  judged+="removed    $line"$'\n' failing+="removed    $line; "
+done < <(comm -23 <(echo "$before") <(echo "$after") | grep . || true)
 if [ -n "$lost" ] && [ "$accepted" -eq 0 ]; then
   judged="not named  $lost"$'\n'"$judged" failing="not named  $lost; $failing"
 fi
@@ -236,9 +212,8 @@ git add -A
 git commit -qm "A repository to land changes in"
 git push -q origin HEAD:main
 
-# change <file> [content] [description] [rendering]: a pull request off main that adds that file,
-# and the HTML GitHub renders its description as, when that is not one paragraph a line. Its
-# number is in $pr.
+# change <file> [content] [description]: a pull request off main that adds that file. Its number is
+# in $pr.
 pr=0
 change() {
   pr=$((pr + 1))
@@ -253,8 +228,15 @@ change() {
   echo OPEN >"$HUB/pr/$pr/state"
   echo "change-$pr" >"$HUB/pr/$pr/branch"
   echo "${3:-}" >"$HUB/pr/$pr/body"
-  [ -z "${4+set}" ] || printf '%s' "$4" >"$HUB/pr/$pr/html"
 }
+# names <line>: the pull request just made adds that line to bench/accepted-losses.txt.
+names() {
+  printf '%s\n' "$1" >>bench/accepted-losses.txt
+  git commit -qam "Name a loss"
+  git push -q origin "change-$pr"
+}
+# A line that accepts the loss of one of `starts found` that a change of `loses` makes.
+named="Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there"
 # land <pr>...: runs land.sh on them. Its output is in $work/out and its exit status in $status.
 land() {
   status=0
@@ -344,17 +326,9 @@ is "the runs of check.sh" "$(($(runs) - before))" 2
 is "the trains opened" "$(($(trains) - trains_before))" 0
 tried
 
-case="a loss no Worse: line names is turned away"
+case="a change whose added lines name every loss lands alone, and two plain changes ride a train"
 change loses && a=$pr
-land "$a"
-is "the exit status" "$status" 1
-is "the change" "$(state "$a")" OPEN
-is "what it was told" "$(grep -c 'not named  Worse: corpus/recore starts found 10 -> 9 (-1)' "$HUB/comment/$a")" 1
-echo CLOSED >"$HUB/pr/$a/state"
-tried
-
-case="a change whose Worse: lines name every loss lands alone, and the others in a train"
-change loses loses "$(printf 'Moves a call.\r\n\r\nWorse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there\r\n')" && a=$pr
+names "$named"
 change seventeen && b=$pr
 change eighteen && c=$pr
 before=$(runs) trains_before=$(trains)
@@ -366,8 +340,18 @@ is "the trains opened" "$(($(trains) - trains_before))" 1
 is "the runs of check.sh" "$(($(runs) - before))" 2
 tried
 
+case="a loss no line the change adds names is turned away, though main's record has the line, and told the line to add"
+change loses "1 again" && a=$pr
+land "$a"
+is "the exit status" "$status" 1
+is "the change" "$(state "$a")" OPEN
+is "what it was told" "$(grep -c '`worse than [0-9a-f]*: not named  Worse: corpus/recore starts found 10 -> 9 (-1)`' "$HUB/comment/$a")" 1
+echo CLOSED >"$HUB/pr/$a/state"
+tried
+
 case="a loss smaller than its line names lands, and the merge commit holds the loss the run measured"
-change loses "1 smaller" "$(printf 'Moves a call.\n\nWorse: corpus/recore starts found 12 -> 9 (-3) the truth is wrong there\n')" && a=$pr
+change loses "1 smaller" && a=$pr
+names "Worse: corpus/recore starts found 12 -> 9 (-3) the truth is wrong there"
 base=$(main_at)
 land "$a"
 is "the exit status" "$status" 0
@@ -379,29 +363,12 @@ is "the merge commit's message" "$(git --git-dir="$work/remote.git" log -1 --for
 Losses accepted by the run of check.sh on $(git --git-dir="$work/remote.git" rev-parse --short=12 "change-$a") against ${base:0:12}:
 Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there
   left out for a timeout or after a lost worker, 0 in the base and 2 here"
-is "the comment that says what was accepted" "$(cat "$HUB/comment/$a")" "\`land.sh\` merged this with the losses its run of check.sh on $(git --git-dir="$work/remote.git" rev-parse --short=12 "change-$a") against ${base:0:12} accepted, each as the run measured it and with the reason its line gave:
-
-- \`Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there\`
-  \`left out for a timeout or after a lost worker, 0 in the base and 2 here\`"
-change loses "1 muted" "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
-touch "$HUB/mute"
-land "$a"
-rm "$HUB/mute"
-is "the exit status when GitHub takes no comment" "$status" 0
-is "that change" "$(state "$a")" MERGED
+is "the comments it got" "$(cat "$HUB/comment/$a" 2>/dev/null | wc -l)" 0
 tried
 
-case="a Worse: line the page does not show, in a comment of the description, accepts nothing"
-change loses "1 commented" "$(printf 'Moves a call.\n<!--\nWorse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there\n-->')" '<p>Moves a call.</p>' && a=$pr
-land "$a"
-is "the exit status" "$status" 1
-is "the change" "$(state "$a")" OPEN
-is "what it was told" "$(grep -c 'not named  Worse: corpus/recore starts found 10 -> 9 (-1)' "$HUB/comment/$a")" 1
-echo CLOSED >"$HUB/pr/$a/state"
-tried
-
-case="a loss larger than its line names is turned away, and told the line to write"
-change loses "3 larger" "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
+case="a loss larger than its line names is turned away, and told the line to add"
+change loses "3 larger" && a=$pr
+names "$named"
 land "$a"
 is "the exit status" "$status" 1
 is "the change" "$(state "$a")" OPEN
@@ -409,60 +376,49 @@ is "what it was told" "$(grep -c 'not named  Worse: corpus/recore starts found 1
 echo CLOSED >"$HUB/pr/$a/state"
 tried
 
-case="a Worse: line whose loss did not happen does not turn the change away"
-change nineteen nineteen "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
+case="a line whose loss did not happen does not turn the change away"
+change nineteen && a=$pr
+names "Worse: corpus/recore starts found 40 -> 39 (-1) a loss no run shows"
 land "$a"
 is "the exit status" "$status" 0
 is "the change" "$(state "$a")" MERGED
 is "the losses its merge commit names" "$(git --git-dir="$work/remote.git" log -1 --format=%b main | grep -c '^Worse:' || true)" 0
 tried
 
-case="a change whose Worse: lines changed between its check and the merge is turned away"
-change loses "1 edited" "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
-echo "$a" >"$HUB/edits"
-land "$a"
+case="a change that takes out or edits a line of the record is turned away"
+change twenty-four && a=$pr
+sed -i 's/(-1) the truth is wrong there/(-1) the truth was wrong there/' bench/accepted-losses.txt
+git commit -qam "Edit a line"
+git push -q origin "change-$a"
+change twenty-five && b=$pr
+grep -v 'found 12 -> 9' bench/accepted-losses.txt >bench/edited || true
+mv bench/edited bench/accepted-losses.txt
+git commit -qam "Take out a line"
+git push -q origin "change-$b"
+land "$a" "$b"
 is "the exit status" "$status" 1
-is "the change" "$(state "$a")" OPEN
-is "what it was told" "$(grep -c 'Worse: lines its description shows changed' "$HUB/comment/$a")" 1
+is "both" "$(state "$a")$(state "$b")" OPENOPEN
+is "what the one that edited was told" "$(grep -c "removed    $named" "$HUB/comment/$a")" 1
+is "what the one that took out was told" "$(grep -c 'removed    Worse: corpus/recore starts found 12 -> 9 (-3)' "$HUB/comment/$b")" 1
 echo CLOSED >"$HUB/pr/$a/state"
+echo CLOSED >"$HUB/pr/$b/state"
 tried
 
-case="a change whose Worse: lines the page stopped showing after its check is turned away"
-change loses "1 hidden" "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
-echo "$a" >"$HUB/hides"
-land "$a"
-is "the exit status" "$status" 1
-is "the change" "$(state "$a")" OPEN
-is "what it was told" "$(grep -c 'Worse: lines its description shows changed' "$HUB/comment/$a")" 1
-echo CLOSED >"$HUB/pr/$a/state"
-tried
-
-case="a description GitHub does not render stops the landing, and leaves it queued"
-change twenty-three && a=$pr
-touch "$HUB/pr/$a/unrendered"
-before=$(runs)
-land "$a"
-is "the exit status" "$status" 1
-is "the change" "$(state "$a")" OPEN
-is "what is queued" "$(ls "$work/clone/target/landing/queue")" "$a"
-is "the runs of check.sh" "$(($(runs) - before))" 0
-is "the comments it got" "$(cat "$HUB/comment/$a" 2>/dev/null | wc -l)" 0
-rm "$HUB/pr/$a/unrendered"
-land "$a"
-is "the change, once GitHub renders it" "$(state "$a")" MERGED
-tried
-
-case="a Worse: line added after the check to a description that had none is turned away"
-change twenty-two && a=$pr
-echo "$a" >"$HUB/edits"
-land "$a"
-is "the exit status" "$status" 1
-is "what it was told" "$(grep -c 'Worse: lines its description shows changed' "$HUB/comment/$a")" 1
-echo CLOSED >"$HUB/pr/$a/state"
+case="two changes that each add a line land one after the other, with no conflict on the record"
+change twenty-six && a=$pr
+names "Worse: corpus/recore starts found 20 -> 19 (-1) the first"
+change twenty-seven && b=$pr
+names "Worse: corpus/recore starts found 30 -> 29 (-1) the second"
+land "$a" "$b"
+is "the exit status" "$status" 0
+is "both" "$(state "$a")$(state "$b")" MERGEDMERGED
+is "the record's last lines on main" "$(on_main bench/accepted-losses.txt | tail -2 | sort)" "Worse: corpus/recore starts found 20 -> 19 (-1) the first
+Worse: corpus/recore starts found 30 -> 29 (-1) the second"
 tried
 
 case="a loss accepted with a budget the run lowered says so in the status of the commit that holds the budget"
-change loses "1 lowered" "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
+change loses "1 lowered" && a=$pr
+names "$named"
 echo "lowers, with a loss" >lowers
 git add lowers
 git commit -qm "Add lowers"
@@ -473,24 +429,20 @@ is "the change" "$(state "$a")" MERGED
 is "the status of its head" "$(status_of "$a")" "passed against ${base:0:12}, accepting 1 named loss, before the budget it lowered"
 tried
 
-case="what a comment quotes of a description is cut short and in a code span, and a comment that fails stops no landing"
-change loses "1 quoted" "Worse: @someone $(printf 'x%.0s' {1..70000})" && a=$pr
-change twenty && b=$pr
+case="what a comment quotes of a line of the record is cut short, in a code span and without control characters, and a comment that fails stops no landing"
+change twenty && a=$pr
+names "Worse: @someone"$'\r\r'"@octocat hi $(printf 'x%.0s' {1..70000})"
+change twenty-one && b=$pr
 land "$a" "$b"
 is "the exit status" "$status" 1
 is "the one turned away" "$(state "$a")" OPEN
 is "the other" "$(state "$b")" MERGED
 is "the comments it got" "$(grep -c 'did not land this' "$HUB/comment/$a")" 1
-is "a mention outside a code span" "$(sed 's/`[^`]*`//g' "$HUB/comment/$a" | grep -c '@someone' || true)" 0
-echo CLOSED >"$HUB/pr/$a/state"
-change loses "1 returns" "Worse: x" "$(printf '<p>Worse: x\r\r@octocat hi</p>')" && a=$pr
-land "$a"
-is "the exit status of one whose line holds carriage returns" "$status" 1
+is "a mention outside a code span" "$(sed 's/`[^`]*`//g' "$HUB/comment/$a" | grep -c '@' || true)" 0
 is "the carriage returns its comment quotes" "$(grep -c $'\r' "$HUB/comment/$a" || true)" 0
-is "a mention outside a code span" "$(sed 's/`[^`]*`//g' "$HUB/comment/$a" | grep -c '@octocat' || true)" 0
 echo CLOSED >"$HUB/pr/$a/state"
 change loses "1 muted" && a=$pr
-change twenty-one && b=$pr
+change twenty-two && b=$pr
 touch "$HUB/mute"
 land "$a" "$b"
 rm "$HUB/mute"
@@ -500,8 +452,9 @@ is "the other" "$(state "$b")" MERGED
 echo CLOSED >"$HUB/pr/$a/state"
 tried
 
-case="a binary that lost its analysis is turned away, whatever its Worse: lines say"
-change breaks breaks "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
+case="a binary that lost its analysis is turned away, whatever the record says"
+change breaks && a=$pr
+names "$named"
 land "$a"
 is "the exit status" "$status" 1
 is "the change" "$(state "$a")" OPEN

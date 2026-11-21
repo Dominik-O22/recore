@@ -2,9 +2,9 @@
 //! count it made worse. The rounded percentages `score` prints hide a loss of a few dozen
 //! functions in a corpus of a hundred thousand, and a gain in one binary hides a loss in another.
 //!
-//! A total that got worse is a loss, printed as a `Worse:` line. A pull request's description may
-//! name a loss with that line and a reason, and [`crate::losses::judge`] holds the losses of a run
-//! to those lines.
+//! A total that got worse is a loss, printed as a `Worse:` line. A change may accept a loss by
+//! adding that line with a reason to `bench/accepted-losses.txt`, and [`crate::losses::judge`]
+//! holds the losses of a run to the lines it added.
 
 use crate::losses::Loss;
 use crate::score::Score;
