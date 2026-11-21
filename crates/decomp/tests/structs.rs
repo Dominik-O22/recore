@@ -65,6 +65,25 @@ fn a_parameter_declared_to_point_to_a_struct_with_no_layout_shows_its_fields_und
     assert!(c_text.contains("param_1->field_0x8->field_0x4 = param_2;"), "{c_text}");
 }
 
+/// DWARF can give a struct a size and no field the reader keeps. That size is a layout of sorts,
+/// so the parameter stays as the prototype says, and the struct recovered for it, whose field
+/// at 8 points to another, is not.
+#[test]
+fn a_parameter_declared_to_point_to_a_struct_of_known_size_keeps_its_type() {
+    let mut session = session("structs.elf");
+    let mut types = types::Types::new(8);
+    let conn = types.named(types::Named::Struct, "conn", 0x20).0;
+    let pointer = types.add(Type::Pointer(conn));
+    let int = types.add(Type::Base { base: types::Base::Int, size: 4 });
+    let params = vec![(String::new(), pointer), (String::new(), int)];
+    let prototype = types.add(Type::Function(types::Prototype { returns: int, params, variadic: false, convention: None }));
+    types.functions.push(types::Function { addr: ELF_TOUCH, name: String::new(), prototype });
+    types::Importer::new(&types, Default::default()).functions(&mut session, [ELF_TOUCH]);
+    let c_text = session.decompile(ELF_TOUCH).unwrap().c_text;
+    assert!(c_text.contains("(conn *param_1,int4 param_2)"), "{c_text}");
+    assert!(!c_text.contains("param_1->field_0x8->"), "{c_text}");
+}
+
 #[test]
 fn a_list_points_to_its_own_struct() {
     let mut session = session("structs.elf");
