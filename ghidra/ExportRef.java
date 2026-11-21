@@ -6,6 +6,7 @@ import java.io.PrintWriter;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.symbol.FlowType;
 
 public class ExportRef extends GhidraScript {
 	@Override
@@ -55,8 +56,8 @@ public class ExportRef extends GhidraScript {
 			}
 			// A jump given call semantics (a tail call) also has no fallthrough. Only an instruction
 			// that is a call before any override counts, on every instruction set.
-			if (ins.getFlowType().isCall() && ins.getPrototype().getFlowType(ins.getInstructionContext()).isCall() &&
-				ins.getFallThrough() == null) {
+			FlowType raw = ins.getPrototype().getFlowType(ins.getInstructionContext());
+			if (ins.getFlowType().isCall() && raw.isCall() && raw.hasFallthrough() && ins.getFallThrough() == null) {
 				callReturn.append(callReturn.length() > 0 ? "," : "").append(ins.getAddress().getOffset() - shift);
 			}
 		}

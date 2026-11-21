@@ -8,6 +8,9 @@ ghidra=$1 corpus=$(realpath "$2") jobs=$3
 shift 3
 scripts=$(dirname "$(realpath "$0")")
 out=$(realpath -m "${OUT:-$corpus/ghidra-decomp}")
+# Ghidra refuses a project under a directory whose name starts with a dot, and every binary
+# would fail with only its log to say so.
+case "$out/" in */.*) echo "run-signatures.sh: $out has a part that starts with a dot, which Ghidra refuses" >&2; exit 1 ;; esac
 mkdir -p "$out/proj"
 run() {
     local name=$1 project=$out/proj/$1

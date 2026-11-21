@@ -10,6 +10,9 @@ GHIDRA="$1"; OUT="$(realpath -m "$2")"; JOBS="${3:-4}"; EXTRA="${4:-}"
 # CORPUS is the corpus to run over, the x86-64 one in the directory corpus/store.py names unless set.
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CORPUS="${CORPUS:-${RECORE_CORPORA:-$HOME/recore-corpora}/corpus}"
+# Ghidra refuses a project under a directory whose name starts with a dot, and says so only in
+# each binary's log.
+case "$OUT/" in */.*) echo "run-reference.sh: $OUT has a part that starts with a dot, which Ghidra refuses" >&2; exit 1 ;; esac
 mkdir -p "$OUT/logs" "$OUT/proj"
 
 one() {
@@ -29,7 +32,8 @@ one() {
     ${GHIDRA_TIMEOUT:+timeout -k 30 "$GHIDRA_TIMEOUT"} "$GHIDRA/support/analyzeHeadless" "$OUT/proj/$name" p -import "${import[@]}" \
     -scriptPath "$HERE" "${seed[@]}" -preScript StartTimer.java -postScript ExportRef.java "$OUT/$name.json" -deleteProject \
     > "$OUT/logs/$name.log" 2>&1
-  [ $? = 124 ] && echo "$name" >> "$OUT/timeouts.txt"
+  # 137 when Ghidra ignored the first signal and had to be killed.
+  case $? in 124 | 137) echo "$name" >> "$OUT/timeouts.txt" ;; esac
   local total; total=$(grep -o 'Total Time *[0-9]* secs' "$OUT/logs/$name.log" | grep -o '[0-9]*' | tail -1)
   echo "$name ${total:-NA} $((SECONDS - start))" >> "$OUT/times.txt"
   rm -rf "$OUT/proj/$name"
