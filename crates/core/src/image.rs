@@ -190,6 +190,9 @@ pub struct Image {
     pub banking: Banking,
     /// What a layout says built the image. Without it the machine and the format decide.
     pub compiler: Option<Compiler>,
+    /// A Linux kernel module, which has a `.modinfo` section: its imports are the kernel's
+    /// functions, so a name such as `panic` is the kernel's and never returns.
+    pub kernel_module: bool,
     /// Where the code of a 32-bit ARM image changes instruction set, as `(address, set)` sorted
     /// by address: each holds up to the next. What comes before the first is in its set. Empty
     /// for every other machine.
@@ -227,6 +230,7 @@ impl Image {
             symbol_extents: Vec::new(),
             banking: Banking::default(),
             compiler: None,
+            kernel_module: false,
             instruction_sets: Vec::new(),
             marked_data: Vec::new(),
             il2cpp: None,
@@ -334,6 +338,7 @@ impl Image {
             branch_targets_marked,
             name,
             entry: file.entry(),
+            kernel_module: file.section_by_name(".modinfo").is_some(),
             sections,
             import_slots,
             exports,

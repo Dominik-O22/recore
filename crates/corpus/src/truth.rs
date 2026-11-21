@@ -57,7 +57,7 @@ pub struct Truth {
     /// with nothing emitted after it. Lists every call to such a callee.
     #[serde(default)]
     pub terminal_calls: Vec<u64>,
-    /// Imported function names that never return, according to DWARF.
+    /// Imported function names that never return, according to DWARF or to a list of names.
     pub noreturn_imports: Vec<String>,
     /// Bytes inside function ranges that did not decode. Non-zero means data in code.
     pub undecodable_bytes: u64,
@@ -360,9 +360,17 @@ fn elf(binary_path: &Path, binary: &object::File, debug: &object::File) -> Resul
     let noreturn_addrs: HashSet<u64> = by_addr.values().filter(|f| f.noreturn).map(|f| f.addr).collect();
 
     let slots = import_slots(binary);
-    // AArch64 reaches imports by a direct call to a PLT stub; x86-64 truth does not resolve stubs.
+    // A kernel module imports the kernel's functions, and objtool's list says which of them never
+    // return where there is no DWARF to say it, as the vendor modules have none. Where there is,
+    // the list has no say, so that DWARF still shows a name the list has wrong.
+    let kernel_module = binary.section_by_name(".modinfo").is_some();
+    let listed = kernel_module && debug.section_by_name(".debug_info").is_none_or(|section| section.size() == 0);
+    // Both reach imports by a direct call to a PLT stub. On x86-64 the truth resolves only the
+    // stubs that recore's link writes for a kernel module; resolving a program's would move the
+    // user-space truth.
     let (stubs, data) = match architecture {
         Architecture::Aarch64 => (aarch64::plt_stubs(binary), aarch64::data_ranges(binary, debug)),
+        _ if kernel_module => (x86::plt_stubs(binary), Vec::new()),
         _ => Default::default(),
     };
     let scans = by_addr.values().filter_map(|function| {
@@ -381,7 +389,10 @@ fn elf(binary_path: &Path, binary: &object::File, debug: &object::File) -> Resul
         noreturn_addrs: &noreturn_addrs,
         stubs: &stubs,
         slots: &slots,
-        is_noreturn_import: &|name| !is_conditionally_noreturn(name) && (noreturn.declared.contains(name) || is_runtime_noreturn(name)),
+        is_noreturn_import: &|name| {
+            !is_conditionally_noreturn(name)
+                && (noreturn.declared.contains(name) || is_runtime_noreturn(name) || (listed && recore::noreturn::KERNEL_NAMES.contains(&name)))
+        },
         widen_slots: false,
     };
     let calls = classify(scans, &callees);
@@ -535,6 +546,34 @@ mod tests {
             unit.get_mut(definition).set(gimli::DW_AT_low_pc, AttributeValue::Address(Address::Constant(0x40)));
         });
         assert_eq!(found.addrs, HashSet::from([0x40]));
+    }
+
+    #[test]
+    fn a_kernel_modules_call_to_panic_never_returns_and_a_programs_returns() {
+        for fixture in ["module.o", "module-arm64.o"] {
+            let module = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/fixtures").join(fixture)).unwrap();
+            // The same file under another section name than `.modinfo` is no kernel module.
+            let at = module.windows(9).position(|name| name == b".modinfo\0").unwrap();
+            let mut program = module.clone();
+            program[at + 1] = b'M';
+            for (bytes, noreturn) in [(module, true), (program, false)] {
+                let linked = recore::relocatable::link(bytes);
+                let file = object::File::parse(&*linked).unwrap();
+                let truth = elf(Path::new(fixture), &file, &file).unwrap();
+                let imports = if noreturn { vec!["panic".to_string()] } else { Vec::new() };
+                assert_eq!((truth.noreturn_calls.len(), truth.noreturn_imports), (usize::from(noreturn), imports), "{fixture}");
+            }
+        }
+    }
+
+    #[test]
+    fn dwarf_that_declares_panic_as_returning_overrules_the_kernels_list() {
+        let module = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/fixtures/module-dwarf-arm64.o")).unwrap();
+        let linked = recore::relocatable::link(module);
+        let file = object::File::parse(&*linked).unwrap();
+        let truth = elf(Path::new("module-dwarf-arm64.o"), &file, &file).unwrap();
+        assert!(truth.functions.iter().any(|function| function.name == "checked"));
+        assert_eq!((truth.noreturn_calls.len(), truth.noreturn_imports), (0, Vec::<String>::new()));
     }
 
     #[test]

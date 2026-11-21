@@ -1,12 +1,28 @@
 //! x86 function scan, decoded with iced-x86.
 
+use std::collections::HashMap;
+
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
+use object::{Object, ObjectSection};
 
 use super::{Callee, Scan};
 
 /// Whether operand 0 is memory at a fixed address, with no base or index register.
 pub fn is_absolute_memory(instr: &Instruction) -> bool {
     instr.op0_kind() == OpKind::Memory && instr.memory_base() == Register::None && instr.memory_index() == Register::None
+}
+
+/// Maps each `.plt` stub that is a lone `jmp [rip+slot]` to its slot, as the stubs are that
+/// [`recore::relocatable::link`] writes for a kernel module: one every 16 bytes.
+pub fn plt_stubs(binary: &object::File) -> HashMap<u64, u64> {
+    let Some((section, Ok(data))) = binary.section_by_name(".plt").map(|s| (s.address(), s.data())) else { return HashMap::new() };
+    (0..data.len())
+        .step_by(16)
+        .filter_map(|offset| {
+            let instr = Decoder::with_ip(64, &data[offset..], section + offset as u64, DecoderOptions::NONE).decode();
+            (instr.mnemonic() == Mnemonic::Jmp && instr.is_ip_rel_memory_operand()).then(|| (instr.ip(), instr.ip_rel_memory_address()))
+        })
+        .collect()
 }
 
 /// Decodes one function body linearly as 32- or 64-bit code.

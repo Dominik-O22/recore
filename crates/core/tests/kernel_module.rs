@@ -38,7 +38,7 @@ fn analyzes_as_loaded(fixture: &str) {
         let started: Vec<u64> = recore::analyze(&without_sizes).functions.iter().map(|function| function.addr).filter(|addr| targets.contains(addr)).collect();
         assert_eq!(started, Vec::<u64>::new());
     }
-    let named = ["remove", "probe", "call_probe", "call_twice", "init_module", "traced", "outer", "inner"];
+    let named = ["remove", "probe", "call_probe", "call_twice", "init_module", "traced", "checked", "outer", "inner"];
     let mut expected: Vec<u64> = named.iter().chain(kcfi).map(|name| address(name)).collect();
     expected.sort_unstable();
     assert_eq!(starts, expected, "{fixture}");
@@ -52,11 +52,36 @@ fn analyzes_as_loaded(fixture: &str) {
             CallTarget::Function(_) => None,
         })
         .collect();
-    assert_eq!(called, BTreeSet::from(["kfree", "kmalloc", "printk"]));
+    assert_eq!(called, BTreeSet::from(["kfree", "kmalloc", "panic", "printk"]));
     assert!(image.symbol_names.values().any(|name| name == "jiffies"));
 
     let pointed_to: BTreeSet<u64> = image.relative_targets.iter().map(|&(_, target)| target).collect();
     assert!(pointed_to.contains(&address("probe")) && pointed_to.contains(&address("remove")));
+}
+
+/// `panic` is the kernel's, which never returns, in a module alone. In a program that is no
+/// kernel module an import of that name is some library's own function.
+#[test]
+fn a_call_to_the_kernels_panic_never_returns_only_in_a_kernel_module() {
+    for fixture in ["module.o", "module-arm64.o"] {
+        let mut image = load(fixture);
+        assert!(image.kernel_module, "{fixture}");
+        assert_eq!(panic_calls(&image), (1, 1), "{fixture}");
+        image.kernel_module = false;
+        assert_eq!(panic_calls(&image), (1, 0), "{fixture}");
+    }
+}
+
+/// How many calls to `panic` the analysis finds, and how many of them never return.
+fn panic_calls(image: &recore::Image) -> (usize, usize) {
+    let analysis = recore::analyze(image);
+    let calls: Vec<u64> = analysis
+        .calls
+        .iter()
+        .filter(|call| matches!(call.target, CallTarget::Import(slot) if image.import_slots[&slot] == "panic"))
+        .map(|call| call.at)
+        .collect();
+    (calls.len(), calls.iter().filter(|at| analysis.noreturn_calls.contains(at)).count())
 }
 
 /// Without the mapping symbols nothing says the hashes are data, and they are decoded. The one

@@ -290,6 +290,7 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
         symbol_extents: Vec::new(),
         banking: Default::default(),
         compiler: None,
+        kernel_module: false,
         instruction_sets: Vec::new(),
         marked_data: Vec::new(),
         il2cpp: None,

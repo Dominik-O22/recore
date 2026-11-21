@@ -458,7 +458,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
             Flow::CallIndirect(slot) | Flow::JumpIndirect(slot) => slot,
             _ => None,
         };
-        slot.and_then(|slot| self.image.import_slots.get(&slot)).is_some_and(|name| is_noreturn_import(name))
+        slot.and_then(|slot| self.image.import_slots.get(&slot)).is_some_and(|name| is_noreturn_import(self.image, name))
     }
 
     /// The frame containing `addr`, when unwind information covers it.
