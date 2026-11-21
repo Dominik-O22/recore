@@ -235,7 +235,9 @@ fn write(config: &Config, base: &Path, out: &Path, functions: Vec<Function>) -> 
     for (i, chunk) in chunks.iter().enumerate() {
         let dir = out.join(format!("c{i}/src"));
         std::fs::create_dir_all(&dir)?;
-        let mut code = format!("#![allow(arithmetic_overflow, unconditional_panic, unused_comparisons, overflowing_literals, non_snake_case, clippy::all)]\nuse {module}::*;\n");
+        // A flag p-code computes may compare an unsigned value with 0, as the carry of `cmp eax, 0`
+        // is `eax < 0`, and lifted code is not written for clippy's style.
+        let mut code = format!("#![allow(unused_comparisons, clippy::all)]\nuse {module}::*;\n");
         for (_, text) in chunk {
             code.push_str(&call.replace_all(text, "dispatch(c, 0x$1)"));
         }
@@ -267,14 +269,14 @@ fn write(config: &Config, base: &Path, out: &Path, functions: Vec<Function>) -> 
     writeln!(main, "    {}(all);\n}}", bin.run)?;
     std::fs::write(out.join(format!("{}/src/main.rs", bin.name)), main)?;
     let members: Vec<String> = std::iter::once(bin.name.clone()).chain((0..n).map(|i| format!("c{i}"))).map(|m| format!("\"{m}\"")).collect();
-    let mut workspace = format!("[workspace]\nresolver = \"3\"\nmembers = [{}]\n\n[profile.release]\nopt-level = 1\ncodegen-units = 16\ndebug = \"line-tables-only\"\noverflow-checks = false\n\n", members.join(", "));
+    let mut workspace = format!("[workspace]\nresolver = \"3\"\nmembers = [{}]\n\n[profile.release]\nopt-level = 1\ncodegen-units = 16\ndebug = \"line-tables-only\"\n\n", members.join(", "));
     if !config.optimize.is_empty() {
         workspace.push_str("# The machine, host, renderer and ports are small and run on every instruction: optimize them fully.\n");
         for package in &config.optimize {
             writeln!(workspace, "[profile.release.package.{package}]\nopt-level = 3\n")?;
         }
     }
-    workspace.push_str("[profile.dev]\nopt-level = 0\ndebug = \"line-tables-only\"\noverflow-checks = false\n");
+    workspace.push_str("[profile.dev]\nopt-level = 0\ndebug = \"line-tables-only\"\n");
     std::fs::write(out.join("Cargo.toml"), workspace)?;
     Ok(count)
 }
