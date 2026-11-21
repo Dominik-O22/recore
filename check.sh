@@ -8,13 +8,13 @@
 # the binaries it moved in. It fails when a total got worse.
 #
 # Each total that got worse is a loss, printed as a line such as
-# `Worse: corpus-thumb/signatures global types right 812 -> 811 (-1)`. RECORE_WORSE_ACCEPTED holds
-# text whose lines in that form, each with a reason after it, name the losses a change accepts,
-# and land.sh gives it the pull request's description. A line accepts a loss of its run and count
-# up to the size it names, and counts only where GitHub shows it, not in an HTML comment. A loss
-# no line names fails the run, and so does a line that starts `Worse:` out of that form. A line
-# whose loss did not happen only prints. No line accepts a binary that lost its analysis or a
-# decompiler that fails on more functions.
+# `Worse: corpus-thumb/signatures global types right 812 -> 811 (-1)`. Lines in that form, each
+# with a reason after it, name the losses a change accepts: those of RECORE_WORSE_ACCEPTED, typed
+# one a line, or, when land.sh gives the pull request's description as GitHub renders it in
+# RECORE_WORSE_RENDERED, the lines that page shows (`recore-corpus worse-lines`). A line accepts a
+# loss of its run and count up to the size it names. A loss no line names fails the run, and so
+# does a line that starts `Worse:` out of that form. A line whose loss did not happen only prints.
+# No line accepts a binary that lost its analysis or a decompiler that fails on more functions.
 #
 # Where a corpus has DWARF, the decompiler's signatures are scored too: a fixed sample of each
 # binary's functions, each one's parameter count, whether it returns a value, and what its
@@ -204,12 +204,14 @@ for in in "$corpora"/*/; do
     signatures "$in"
   fi
 done
-# Every loss, and whether a line of RECORE_WORSE_ACCEPTED names it. One it does not, and a line
-# out of form, is worse.
+# Every loss, and whether a Worse: line names it. One no line names, and a line out of form, is
+# worse.
+named="${RECORE_WORSE_ACCEPTED:-}"
+[ -z "${RECORE_WORSE_RENDERED:-}" ] || named="$("$build/recore-corpus" worse-lines <<<"$RECORE_WORSE_RENDERED")"
 accepted=0
-if [ -s "$losses" ] || grep -q '^Worse:' <<<"${RECORE_WORSE_ACCEPTED:-}"; then
+if [ -s "$losses" ] || grep -q '^Worse:' <<<"$named"; then
   echo "losses:"
-  if ! judged="$("$build/recore-corpus" losses -- "$(cat "$losses")" "${RECORE_WORSE_ACCEPTED:-}")"; then
+  if ! judged="$("$build/recore-corpus" losses -- "$(cat "$losses")" "$named")"; then
     mapfile -t unmatched < <(grep -E '^(not named|unread) ' <<<"$judged" || true)
     worse+=("${unmatched[@]:-losses that recore-corpus could not hold to the Worse: lines}")
   fi

@@ -23,11 +23,13 @@
 #   - A pull request whose description has a `Budget:` line, or that was queued with
 #     `--accept-cost` (its check then runs with RECORE_COST_ACCEPTED=1), lands alone, so that what
 #     it was let past is not let past for another.
-#   - So does one whose description has `Worse:` lines, which name the losses its check accepts:
-#     the check runs with the description as RECORE_WORSE_ACCEPTED, and fails on a loss no line
-#     names. A train's one run could not say whose loss it was. A description whose `Worse:` lines
-#     changed after its check is turned away, and the merge commit's message holds each loss the
-#     run accepted, as it measured it, with its reason, whatever the description says later.
+#   - So does one whose description holds `Worse:`, since its lines may name the losses its check
+#     accepts: the check runs with the description as GitHub renders it, as
+#     RECORE_WORSE_RENDERED, and holds the run's losses to the lines that page shows. A train's
+#     one run could not say whose loss it was. A pull request whose page shows other `Worse:`
+#     lines just before the merge than its check read is turned away. The merge commit's message,
+#     and a comment on the pull request, hold each loss the run accepted, as it measured it, with
+#     its reason, whatever the description says later.
 #
 # A run that lowered bench/budget.json and changed nothing else is committed here, and that commit
 # gets the status without a run of its own: it differs from the commit that passed only in the
@@ -117,15 +119,19 @@ finish() {
 
 # quoted <text>: a line of a run's output, which can hold lines of a description, as a comment
 # quotes it: cut short, since a comment holds 65,536 characters at most, and in a code span, so
-# that an @mention in it notifies no one.
+# that an @mention in it notifies no one. A backtick or a control character, such as a carriage
+# return that GitHub reads as a line break, would end the span.
 quoted() {
-  local text="${1//\`/}"
+  local text="${1//[[:cntrl:]\`]/}"
   [ ${#text} -le 2000 ] || text="${text:0:2000}..."
   [ -z "$text" ] || printf '`%s`' "$text"
 }
 
-# worse_lines <description>: its `Worse:` lines, which name the losses its check accepts.
-worse_lines() { tr -d '\r' <<<"$1" | grep '^Worse:' || true; }
+# rendered <pr>: its description as GitHub renders it, the page its reviewer reads.
+rendered() { gh api "repos/{owner}/{repo}/pulls/$1" -H 'Accept: application/vnd.github.full+json' --jq '.body_html // ""'; }
+# worse_lines <rendering>: the `Worse:` lines that page shows, read with the recore-corpus that
+# check.sh built in the landing checkout.
+worse_lines() { "$tree/target/release/recore-corpus" worse-lines <<<"$1"; }
 
 # current <pr>: whether it is still open at the head that was queued. If not, that is its answer.
 current() {
@@ -149,7 +155,7 @@ current() {
 rides() {
   local body
   body="$(field "$1" body)"
-  [ -z "${alone[$1]:-}" ] && [ -z "$(sed -n 2p "$queue/$1")" ] && ! grep -Eq '^Budget: .+|^Worse:' <<<"$body"
+  [ -z "${alone[$1]:-}" ] && [ -z "$(sed -n 2p "$queue/$1")" ] && ! grep -Eq '^Budget: .+|Worse:' <<<"$body"
 }
 
 # at <commit>: the landing checkout at that commit, with nothing left of an earlier run but its
@@ -208,15 +214,19 @@ green() {
 # landing checkout is at, a head that holds main. Fails, and says why in $why, when it did not
 # merge. A train's run also fails when it moved a count.
 settle() {
-  local pr="$1" branch="$2" cost='' log="$logs/$1.log" head body checked='' now dirty grew compared passed accepted='' message='' title tries=0
+  local pr="$1" branch="$2" cost='' log="$logs/$1.log" head page named checked='' now dirty grew compared passed accepted='' message='' title note line tries=0
   [[ "$3" != *cost* ]] || cost=1
   head="$(git -C "$tree" rev-parse HEAD)"
   if reads "$head"; then
-    body="$(field "$pr" body)" || need "" "the description of #$pr"
+    page="$(rendered "$pr")" || need "" "how it renders the description of #$pr"
     checked=1
     echo "#$pr: check.sh on ${head:0:12} against ${base:0:12}, its output in $log"
-    if ! (cd "$tree" && RECORE_COST_ACCEPTED="$cost" RECORE_WORSE_ACCEPTED="$body" ./check.sh --against "$base") >"$log" 2>&1; then
+    if ! (cd "$tree" && RECORE_COST_ACCEPTED="$cost" RECORE_WORSE_ACCEPTED='' RECORE_WORSE_RENDERED="$page" ./check.sh --against "$base") >"$log" 2>&1; then
       why="check.sh failed on ${head:0:12} against ${base:0:12}: $(quoted "$(grep '^worse' "$log" | tail -1 || true)") ($log)"
+      return 1
+    fi
+    if ! named="$(worse_lines "$page")"; then
+      why="the recore-corpus that check.sh built could not read the description of #$pr"
       return 1
     fi
     # Every comparison check.sh makes is headed `<this run> against <the base's>`, and says
@@ -252,16 +262,18 @@ settle() {
     fi
   fi
   green "$pr" "$head" || return 1
-  # Editing a description moves no head, so its `Worse:` lines are held to those the check saw.
-  if [ -n "$checked" ]; then
-    now="$(field "$pr" body)" || need "" "the description of #$pr"
-    if [ "$(worse_lines "$now")" != "$(worse_lines "$body")" ]; then
-      why="its description's Worse: lines changed after its check ran on ${head:0:12}, so queue it again"
-      return 1
-    fi
-  fi
   # GitHub can take a few seconds after the last check to call a pull request mergeable.
-  until gh pr merge "$pr" --merge --match-head-commit "$head" ${message:+--body "$message"} >"$logs/$pr.merge" 2>&1; do
+  while :; do
+    # Editing a description moves no head, so the `Worse:` lines its page shows are held to those
+    # the check read, as late before each try to merge as this script can.
+    if [ -n "$checked" ]; then
+      now="$(rendered "$pr")" || need "" "how it renders the description of #$pr"
+      if [ "$(worse_lines "$now")" != "$named" ]; then
+        why="the Worse: lines its description shows changed after its check ran on ${head:0:12}, so queue it again"
+        return 1
+      fi
+    fi
+    gh pr merge "$pr" --merge --match-head-commit "$head" ${message:+--body "$message"} >"$logs/$pr.merge" 2>&1 && break
     # An attempt that merged it and then lost its answer is not one to make again.
     [ "$(field "$pr" state || true)" != MERGED ] || break
     tries=$((tries + 1))
@@ -271,6 +283,18 @@ settle() {
     fi
     sleep 10
   done
+  # The page says what was accepted, whatever its description says. It merged, so a comment
+  # GitHub does not take leaves that to the merge commit.
+  if [ -n "$accepted" ]; then
+    note="\`land.sh\` merged this with the losses its run of check.sh on ${head:0:12} against ${base:0:12} accepted, each as the run measured it and with the reason its line gave:"$'\n'
+    while IFS= read -r line; do
+      case "$line" in
+        "  "*) note+=$'\n'"  $(quoted "${line#  }")" ;;
+        *) note+=$'\n'"- $(quoted "$line")" ;;
+      esac
+    done <<<"$accepted"
+    gh pr comment "$pr" --body "$note" >/dev/null || echo "#$pr: GitHub took no comment on the losses it accepted, which its merge commit holds" >&2
+  fi
 }
 
 # single <pr>: lands it on its own, with main merged into its branch first when it is behind.

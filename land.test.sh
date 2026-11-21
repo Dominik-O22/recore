@@ -14,8 +14,10 @@ mkdir -p "$work/bin" "$HUB/pr" "$HUB/status" "$HUB/comment" "$HUB/red"
 
 cat >"$work/bin/gh" <<'EOF'
 #!/usr/bin/env bash
-# A pull request is a directory of its state, branch and description; a commit's `check` status
-# is a file of what it said. A branch named in $HUB/red fails its tests.
+# A pull request is a directory of its state, branch and description, and of its description as
+# GitHub renders it when that is not one paragraph a line; a commit's `check` status is a file of
+# what it said. A branch named in $HUB/red fails its tests, and a pull request with a file named
+# `unrendered` cannot be read.
 set -euo pipefail
 git() { command git --git-dir="$HUB/remote.git" "$@"; }
 # arg <flag> <arguments>...: what follows that flag.
@@ -98,6 +100,15 @@ case "$1 $2" in
     for word in "$@"; do
       case "$word" in
         */required_status_checks/contexts) printf 'test\nbudget\ncheck\n' ;;
+        */pulls/*)
+          pr="$HUB/pr/${word##*/}"
+          [ ! -e "$pr/unrendered" ]
+          if [ -e "$pr/html" ]; then
+            cat "$pr/html"
+          else
+            tr -d '\r' <"$pr/body" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s|.*|<p>&</p>|'
+          fi
+          ;;
         */commits/*/statuses) cat "$HUB/status/$(basename "$(dirname "$word")")" 2>/dev/null || true ;;
         */statuses/*) sha="${word##*/}" ;;
         description=*) echo "${word#description=}" >"$HUB/status/$sha" ;;
@@ -127,8 +138,9 @@ cat >check.sh <<'EOF'
 # first word says, which a `Worse:` line may accept, one that `breaks` a binary's analysis, which none
 # accepts, one that `lowers` the budget and one that `raises` it. Once, the owner of the branch
 # named in $HUB/pushes pushes to it while the run is on, and queues the pull request named in
-# $HUB/queues again; and the owner of the pull request named in $HUB/edits adds a `Worse:` line to
-# its description.
+# $HUB/queues again; the owner of the pull request named in $HUB/edits adds a `Worse:` line to its
+# description, and the owner of the one named in $HUB/hides puts its lines in a comment, which
+# leaves the page without them.
 adds() { [ -n "$(git diff --name-only "$against" HEAD -- "$1")" ]; }
 against="$2"
 git rev-parse HEAD >>"$RUNS"
@@ -147,6 +159,22 @@ if [ -e "$HUB/edits" ]; then
   echo "Worse: corpus/recore starts found 10 -> 5 (-5) added after the check" >>"$HUB/pr/$(cat "$HUB/edits")/body"
   rm "$HUB/edits"
 fi
+if [ -e "$HUB/hides" ]; then
+  pr="$HUB/pr/$(cat "$HUB/hides")"
+  printf '<!--\n%s\n-->\n' "$(cat "$pr/body")" >"$pr/body"
+  : >"$pr/html"
+  rm "$HUB/hides"
+fi
+# As recore-corpus worse-lines reads the pages the test's gh renders, which land.sh runs as built
+# here.
+mkdir -p target/release
+cat >target/release/recore-corpus <<'CORPUS'
+#!/usr/bin/env bash
+sed -n 's|^<p>\(Worse:.*\)</p>$|\1|p' | sed 's/&gt;/>/g; s/&lt;/</g; s/&amp;/\&/g'
+CORPUS
+chmod +x target/release/recore-corpus
+named="$RECORE_WORSE_ACCEPTED"
+[ -z "$RECORE_WORSE_RENDERED" ] || named="$(target/release/recore-corpus worse-lines <<<"$RECORE_WORSE_RENDERED")"
 if adds fails; then
   echo "worse than $against: target/corpus/corpus/recore"
   exit 1
@@ -174,7 +202,7 @@ while IFS= read -r line; do
   elif [ "${BASH_REMATCH[1]}" -ge "$size" ] && [ "$accepted" -eq 0 ]; then
     judged+="accepted   $lost ${BASH_REMATCH[2]}"$'\n'"           left out for a timeout or after a lost worker, 0 in the base and 2 here"$'\n' accepted=1
   fi
-done < <(tr -d '\r' <<<"$RECORE_WORSE_ACCEPTED" | grep '^Worse:' || true)
+done < <(grep '^Worse:' <<<"$named" || true)
 if [ -n "$lost" ] && [ "$accepted" -eq 0 ]; then
   judged="not named  $lost"$'\n'"$judged" failing="not named  $lost; $failing"
 fi
@@ -208,8 +236,9 @@ git add -A
 git commit -qm "A repository to land changes in"
 git push -q origin HEAD:main
 
-# change <file> [content] [description]: a pull request off main that adds that file. Its number
-# is in $pr.
+# change <file> [content] [description] [rendering]: a pull request off main that adds that file,
+# and the HTML GitHub renders its description as, when that is not one paragraph a line. Its
+# number is in $pr.
 pr=0
 change() {
   pr=$((pr + 1))
@@ -224,6 +253,7 @@ change() {
   echo OPEN >"$HUB/pr/$pr/state"
   echo "change-$pr" >"$HUB/pr/$pr/branch"
   echo "${3:-}" >"$HUB/pr/$pr/body"
+  [ -z "${4+set}" ] || printf '%s' "$4" >"$HUB/pr/$pr/html"
 }
 # land <pr>...: runs land.sh on them. Its output is in $work/out and its exit status in $status.
 land() {
@@ -349,6 +379,25 @@ is "the merge commit's message" "$(git --git-dir="$work/remote.git" log -1 --for
 Losses accepted by the run of check.sh on $(git --git-dir="$work/remote.git" rev-parse --short=12 "change-$a") against ${base:0:12}:
 Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there
   left out for a timeout or after a lost worker, 0 in the base and 2 here"
+is "the comment that says what was accepted" "$(cat "$HUB/comment/$a")" "\`land.sh\` merged this with the losses its run of check.sh on $(git --git-dir="$work/remote.git" rev-parse --short=12 "change-$a") against ${base:0:12} accepted, each as the run measured it and with the reason its line gave:
+
+- \`Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there\`
+  \`left out for a timeout or after a lost worker, 0 in the base and 2 here\`"
+change loses "1 muted" "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
+touch "$HUB/mute"
+land "$a"
+rm "$HUB/mute"
+is "the exit status when GitHub takes no comment" "$status" 0
+is "that change" "$(state "$a")" MERGED
+tried
+
+case="a Worse: line the page does not show, in a comment of the description, accepts nothing"
+change loses "1 commented" "$(printf 'Moves a call.\n<!--\nWorse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there\n-->')" '<p>Moves a call.</p>' && a=$pr
+land "$a"
+is "the exit status" "$status" 1
+is "the change" "$(state "$a")" OPEN
+is "what it was told" "$(grep -c 'not named  Worse: corpus/recore starts found 10 -> 9 (-1)' "$HUB/comment/$a")" 1
+echo CLOSED >"$HUB/pr/$a/state"
 tried
 
 case="a loss larger than its line names is turned away, and told the line to write"
@@ -374,8 +423,33 @@ echo "$a" >"$HUB/edits"
 land "$a"
 is "the exit status" "$status" 1
 is "the change" "$(state "$a")" OPEN
-is "what it was told" "$(grep -c 'Worse: lines changed' "$HUB/comment/$a")" 1
+is "what it was told" "$(grep -c 'Worse: lines its description shows changed' "$HUB/comment/$a")" 1
 echo CLOSED >"$HUB/pr/$a/state"
+tried
+
+case="a change whose Worse: lines the page stopped showing after its check is turned away"
+change loses "1 hidden" "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
+echo "$a" >"$HUB/hides"
+land "$a"
+is "the exit status" "$status" 1
+is "the change" "$(state "$a")" OPEN
+is "what it was told" "$(grep -c 'Worse: lines its description shows changed' "$HUB/comment/$a")" 1
+echo CLOSED >"$HUB/pr/$a/state"
+tried
+
+case="a description GitHub does not render stops the landing, and leaves it queued"
+change twenty-three && a=$pr
+touch "$HUB/pr/$a/unrendered"
+before=$(runs)
+land "$a"
+is "the exit status" "$status" 1
+is "the change" "$(state "$a")" OPEN
+is "what is queued" "$(ls "$work/clone/target/landing/queue")" "$a"
+is "the runs of check.sh" "$(($(runs) - before))" 0
+is "the comments it got" "$(cat "$HUB/comment/$a" 2>/dev/null | wc -l)" 0
+rm "$HUB/pr/$a/unrendered"
+land "$a"
+is "the change, once GitHub renders it" "$(state "$a")" MERGED
 tried
 
 case="a Worse: line added after the check to a description that had none is turned away"
@@ -383,7 +457,7 @@ change twenty-two && a=$pr
 echo "$a" >"$HUB/edits"
 land "$a"
 is "the exit status" "$status" 1
-is "what it was told" "$(grep -c 'Worse: lines changed' "$HUB/comment/$a")" 1
+is "what it was told" "$(grep -c 'Worse: lines its description shows changed' "$HUB/comment/$a")" 1
 echo CLOSED >"$HUB/pr/$a/state"
 tried
 
@@ -408,6 +482,12 @@ is "the one turned away" "$(state "$a")" OPEN
 is "the other" "$(state "$b")" MERGED
 is "the comments it got" "$(grep -c 'did not land this' "$HUB/comment/$a")" 1
 is "a mention outside a code span" "$(sed 's/`[^`]*`//g' "$HUB/comment/$a" | grep -c '@someone' || true)" 0
+echo CLOSED >"$HUB/pr/$a/state"
+change loses "1 returns" "Worse: x" "$(printf '<p>Worse: x\r\r@octocat hi</p>')" && a=$pr
+land "$a"
+is "the exit status of one whose line holds carriage returns" "$status" 1
+is "the carriage returns its comment quotes" "$(grep -c $'\r' "$HUB/comment/$a" || true)" 0
+is "a mention outside a code span" "$(sed 's/`[^`]*`//g' "$HUB/comment/$a" | grep -c '@octocat' || true)" 0
 echo CLOSED >"$HUB/pr/$a/state"
 change loses "1 muted" && a=$pr
 change twenty-one && b=$pr
