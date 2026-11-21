@@ -1,0 +1,84 @@
+<p dir="auto"><code class="notranslate">./check.sh --against</code> failed on any corpus total that got worse, and nothing could accept one. A cost had two ways through, <code class="notranslate">Budget:</code> and <code class="notranslate">--accept-cost</code>. A loss had none. That blocks <a class="issue-link js-issue-link" data-error-text="Failed to load title" data-id="6534358332" data-permission-text="Title is private" data-url="https://github.com/Dominik-O22/recore/issues/217" data-hovercard-type="pull_request" data-hovercard-url="/Dominik-O22/recore/pull/217/hovercard" href="https://github.com/Dominik-O22/recore/pull/217">#217</a>, which makes 1,255 functions newly right on "returns a value or not" and loses 1 global type on <code class="notranslate">corpus-thumb</code> as a knock-on. It also blocks <a class="issue-link js-issue-link" data-error-text="Failed to load title" data-id="6533602188" data-permission-text="Title is private" data-url="https://github.com/Dominik-O22/recore/issues/212" data-hovercard-type="pull_request" data-hovercard-url="/Dominik-O22/recore/pull/212/hovercard" href="https://github.com/Dominik-O22/recore/pull/212">#212</a>, which has 2, 4 and 4 more "parameters wrongly called a pointer" beside about 800 parameter types newly right on each of three corpora.</p>
+<p dir="auto">Decided on 2026-11-21. Asked whether a pull request should be able to accept a named loss, the operator chose "Add a Worse: line", described as: "Like the existing Budget: line. A PR whose description names each total it worsens, the count and the reason may land, alone, with its own full run."</p>
+<h2 dir="auto">What it does now</h2>
+<p dir="auto"><code class="notranslate">recore-corpus compare</code> and <code class="notranslate">recore-decompile params --against</code> print each total that got worse as a line, and exit 3 when that is all they found wrong:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="Worse: corpus-thumb/signatures returns a value or not right 4089 -&gt; 3858 (-231)"><pre class="notranslate"><code class="notranslate">Worse: corpus-thumb/signatures returns a value or not right 4089 -&gt; 3858 (-231)
+</code></pre></div>
+<p dir="auto">A description names the loss with that line at the start of a line of its own, and the reason after it. A real one, from the dry run below:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="Worse: corpus-thumb/signatures returns a value or not right 4089 -&gt; 3858 (-231) the base is the head of feat/returns-from-callers, which this branch lacks"><pre class="notranslate"><code class="notranslate">Worse: corpus-thumb/signatures returns a value or not right 4089 -&gt; 3858 (-231) the base is the head of feat/returns-from-callers, which this branch lacks
+</code></pre></div>
+<ul dir="auto">
+<li>
+<p dir="auto"><code class="notranslate">check.sh</code> collects the losses and holds them to the <code class="notranslate">Worse:</code> lines of <code class="notranslate">RECORE_WORSE_ACCEPTED</code> with a new <code class="notranslate">recore-corpus losses</code>. It prints each loss as <code class="notranslate">accepted</code> or <code class="notranslate">not named</code>, and each line that names nothing of the run as <code class="notranslate">not lost</code>, <code class="notranslate">unread</code> or <code class="notranslate">hidden</code>. A loss no line names fails the run, and so does any line starting <code class="notranslate">Worse:</code> that is not a loss line with a reason, <code class="notranslate">Worse: none</code> too.</p>
+</li>
+<li>
+<p dir="auto">A line is an upper bound. It accepts a loss of its run and count as large as it names or smaller, so the totals may differ from the run's and the fall may be smaller. A larger fall is <code class="notranslate">not named</code>, printed as the line to write. A line whose loss did not happen prints as <code class="notranslate">not lost</code> and fails nothing.</p>
+</li>
+<li>
+<p dir="auto">With each signature loss, the run prints how many functions the base and the head left out for a timeout or after a lost worker. It is no gate, since it moves with the load, but it shows whether a slower decompiler is behind an accepted loss.</p>
+</li>
+<li>
+<p dir="auto">A line counts only where GitHub shows it. Nothing counts inside an HTML comment (also one never closed, which hides the rest of the page), a processing instruction, a declaration, CDATA, a tag's attributes, the content of an element such as <code class="notranslate">&lt;video&gt;</code> or <code class="notranslate">&lt;rp&gt;</code>, or the title of a link reference definition. I checked each against GitHub's own renderer. A <code class="notranslate">&lt;details&gt;</code> block counts: it folds, and a click shows it. The rule errs toward hiding, so a line it hides wrongly fails the run as <code class="notranslate">not named</code> and prints as <code class="notranslate">hidden</code>, never the other way.</p>
+</li>
+<li>
+<p dir="auto"><code class="notranslate">land.sh</code> gives the run the description as <code class="notranslate">RECORE_WORSE_ACCEPTED</code>. A pull request with a <code class="notranslate">Worse:</code> line never rides a train, since a train's one run cannot say whose loss it was.</p>
+</li>
+<li>
+<p dir="auto">Editing a description moves no head. So before it merges, <code class="notranslate">land.sh</code> reads the description again and turns the pull request away when its <code class="notranslate">Worse:</code> lines differ from those the check saw.</p>
+</li>
+<li>
+<p dir="auto">The merge commit keeps its subject and records what the run accepted, as the run measured it, so <code class="notranslate">git log</code> on <code class="notranslate">main</code> keeps it whatever the description says later. Built by <code class="notranslate">land.sh</code>'s own extraction from the log of the dry run with all three lines named:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="Merge pull request #218 from Dominik-O22/gate/worse-line
+
+Let a Worse: line in a description accept a loss it names
+
+Losses accepted by the run of check.sh on 2641f274b6e3 against b8b93ca8829e:
+Worse: corpus-thumb/signatures parameter counts right 3703 -&gt; 3702 (-1) the base is the head of feat/returns-from-callers, which this branch lacks
+  left out for a timeout or after a lost worker, 0 in the base and 0 here
+Worse: corpus-thumb/signatures returns a value or not right 4089 -&gt; 3858 (-231) the same
+  left out for a timeout or after a lost worker, 0 in the base and 0 here
+Worse: corpus-thumb/signatures parameter types right 5904 -&gt; 5894 (-10) the same
+  left out for a timeout or after a lost worker, 0 in the base and 0 here"><pre class="notranslate"><code class="notranslate">Merge pull request #218 from Dominik-O22/gate/worse-line
+
+Let a Worse: line in a description accept a loss it names
+
+Losses accepted by the run of check.sh on 2641f274b6e3 against b8b93ca8829e:
+Worse: corpus-thumb/signatures parameter counts right 3703 -&gt; 3702 (-1) the base is the head of feat/returns-from-callers, which this branch lacks
+  left out for a timeout or after a lost worker, 0 in the base and 0 here
+Worse: corpus-thumb/signatures returns a value or not right 4089 -&gt; 3858 (-231) the same
+  left out for a timeout or after a lost worker, 0 in the base and 0 here
+Worse: corpus-thumb/signatures parameter types right 5904 -&gt; 5894 (-10) the same
+  left out for a timeout or after a lost worker, 0 in the base and 0 here
+</code></pre></div>
+</li>
+<li>
+<p dir="auto">The <code class="notranslate">check</code> status of a run that accepted losses says so: <code class="notranslate">passed against &lt;base&gt;, accepting 3 named losses</code>. check.sh prints that line, and <code class="notranslate">land.sh</code> reuses it for a commit whose budget it lowered.</p>
+</li>
+<li>
+<p dir="auto">What a comment from <code class="notranslate">land.sh</code> quotes of a run is cut to 2,000 characters and sits in a code span, so an <code class="notranslate">@mention</code> in a description notifies no one. A comment GitHub refuses no longer stops the landing for the rest of the queue.</p>
+</li>
+<li>
+<p dir="auto">By hand: <code class="notranslate">RECORE_WORSE_ACCEPTED="$(gh pr view &lt;pr&gt; --json body -q .body)" ./check.sh --against origin/main</code>. Nothing ties the <code class="notranslate">check</code> status of such a run to a description.</p>
+</li>
+</ul>
+<p dir="auto">No line accepts a binary that lost its analysis, a decompiler that fails or crashes on more functions, the tests, the instruction budget (<code class="notranslate">Budget:</code>), or time and memory (<code class="notranslate">--accept-cost</code>). CI has no corpora, so nothing checks a line against a run before the landing does. Lines added before the check and seen by nobody are for review: the reviewer of a pull request reads its <code class="notranslate">Worse:</code> lines.</p>
+<p dir="auto">The examples here are indented, so they are not <code class="notranslate">Worse:</code> lines.</p>
+<h2 dir="auto">Review</h2>
+<p dir="auto">A review of the first version found that a <code class="notranslate">Worse:</code> line inside an HTML comment accepted a loss with nothing on the page. It also found that the description was read once and never pinned, that exact matching would fail honest landings because signature counts move with timeouts, and that a slower decompiler could pass its timeouts off as accepted knock-ons. Smaller findings covered comments that could @mention people or stop the queue, a <code class="notranslate">.trim()</code> no test held, and the status text on the lowered-budget path. Each is fixed as above, and each has a test that failed before its fix: the Rust tests in <code class="notranslate">crates/corpus/src/losses.rs</code> and <code class="notranslate">params.rs</code>, and the new <code class="notranslate">land.test.sh</code> cases.</p>
+<h2 dir="auto">Verification</h2>
+<ul dir="auto">
+<li><code class="notranslate">crates/corpus/src/losses.rs</code> tests the line's form, the upper bound, which standings fail, a reason of spaces, every kind of hidden text above, and what GitHub shows.</li>
+<li><code class="notranslate">./land.test.sh</code> passes, 27 cases. New ones: a loss smaller than its line lands and its merge commit holds the loss the run measured; a larger one is turned away with the line to write; a line whose loss did not happen lands; a description whose <code class="notranslate">Worse:</code> lines changed after the check is turned away, also one that had none; the status on the lowered-budget path names the accepted loss; a long <code class="notranslate">@mention</code> line is cut short and quoted, and a refused comment stops no landing.</li>
+<li><code class="notranslate">check.sh</code> itself cannot be driven without corpora and a base build, so its <code class="notranslate">compared</code>, exit status 3, losses file and call to <code class="notranslate">losses</code> are covered by the dry run, not by a test.</li>
+<li>Dry run with a store of <code class="notranslate">corpus-thumb</code> alone under <code class="notranslate">target/</code>, <code class="notranslate">--quick --against</code> the head of <code class="notranslate">feat/returns-from-callers</code> (<a class="commit-link" data-hovercard-type="commit" data-hovercard-url="https://github.com/Dominik-O22/recore/commit/b8b93ca8829e70594537a3951b9063c781146704/hovercard" href="https://github.com/Dominik-O22/recore/commit/b8b93ca8829e70594537a3951b9063c781146704"><tt>b8b93ca</tt></a>), where this branch is the worse one:
+<ul dir="auto">
+<li>no lines: three <code class="notranslate">not named</code> losses (parameter counts -1, returns -231, parameter types -10), exit 1.</li>
+<li>all three named: three <code class="notranslate">accepted</code>, <code class="notranslate">passed against b8b93ca8829e, accepting 3 named losses</code>, exit 0.</li>
+<li>returns named as -240 rather than -231: three <code class="notranslate">accepted</code>, exit 0.</li>
+<li>the returns line inside <code class="notranslate">&lt;!-- --&gt;</code>: that loss <code class="notranslate">not named</code>, the line <code class="notranslate">hidden</code>, exit 1.</li>
+</ul>
+</li>
+<li><code class="notranslate">cargo test --profile ci --workspace</code> and <code class="notranslate">cargo clippy --profile ci --workspace --all-targets -- -D warnings</code> pass.</li>
+<li><code class="notranslate">./check.sh --quick --against origin/main</code> on <a class="commit-link" data-hovercard-type="commit" data-hovercard-url="https://github.com/Dominik-O22/recore/commit/3b8b09eefa64503b98f2c156f75651c2274fcd5a/hovercard" href="https://github.com/Dominik-O22/recore/commit/3b8b09eefa64503b98f2c156f75651c2274fcd5a"><tt>3b8b09e</tt></a>: passed, 47 comparisons over every tuned corpus, each "no count changed", no losses section.</li>
+</ul>
+<p dir="auto">🤖 Generated with <a href="https://claude.com/claude-code" rel="nofollow">Claude Code</a></p>

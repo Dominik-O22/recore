@@ -5,6 +5,7 @@ mod compare;
 mod jumptables;
 mod losses;
 mod references;
+mod rendered;
 mod score;
 mod signatures;
 mod signatures_score;
@@ -82,11 +83,15 @@ enum Command {
     /// with the binaries it moved in. Fails when a binary lost its analysis, and otherwise with
     /// exit status 3 when a total got worse, each total printed as a `Worse:` line.
     Compare { base: PathBuf, head: PathBuf },
-    /// Holds the `Worse:` lines of the comparisons of a run, in `found`, to the `Worse:` lines of
-    /// `named`, such as a pull request's description, where GitHub shows them. Fails on a loss no
-    /// line names with a reason, its count and at least how far it moved, and on a `Worse:` line
-    /// out of that form. A line that names no loss of the run only prints.
+    /// Holds the `Worse:` lines of the comparisons of a run, in `found`, to the lines of `named`
+    /// that start `Worse:`. Fails on a loss no line names with a reason, its count and at least
+    /// how far it moved, and on a `Worse:` line out of that form. A line that names no loss of the
+    /// run only prints.
     Losses { found: String, named: String },
+    /// Prints the lines that start `Worse:` of a page GitHub rendered, read as HTML on stdin,
+    /// such as a pull request's `body_html`: those of its paragraphs and list items, also in a
+    /// quote or a `<details>` block, and none that the page does not show.
+    WorseLines,
 }
 
 fn binaries(corpus: &Path) -> Result<Vec<PathBuf>> {
@@ -328,6 +333,11 @@ fn main() -> Result<()> {
         }
         Command::Compare { base, head } => run_compare(&cli.corpus, &base, &head),
         Command::Losses { found, named } => run_losses(&found, &named),
+        Command::WorseLines => {
+            let html = std::io::read_to_string(std::io::stdin())?;
+            rendered::lines(&html).iter().filter(|line| line.starts_with("Worse:")).for_each(|line| println!("{line}"));
+            Ok(())
+        }
         Command::Score { dirs, detail } => dirs.iter().try_for_each(|dir| run_score(&cli.corpus, dir, detail)),
     }
 }

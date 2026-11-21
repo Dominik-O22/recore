@@ -1,8 +1,6 @@
-//! Holds the losses of a run, the totals that got worse, to the `Worse:` lines of a pull
-//! request's description, each of which accepts a loss it names with a reason.
-//!
-//! A line counts only where GitHub shows it, since the reviewer reads the rendered page: nothing
-//! inside an HTML comment or other HTML GitHub renders as nothing counts (see [`shown`]).
+//! Holds the losses of a run, the totals that got worse, to `Worse:` lines, each of which
+//! accepts a loss it names with a reason. The lines are a pull request's as the page GitHub
+//! renders shows them (see [`crate::rendered`]), or typed for a run by hand.
 
 use std::fmt;
 
@@ -60,11 +58,9 @@ pub enum Standing {
     NotNamed,
     /// A line that names a count the run did not lose.
     NotLost,
-    /// A line GitHub shows that starts `Worse:` and is not a loss in the form [`Loss`] prints
-    /// with a reason after it, such as `Worse: none`.
+    /// A line that starts `Worse:` and is not a loss in the form [`Loss`] prints with a reason
+    /// after it, such as `Worse: none`.
     Unread,
-    /// A line that starts `Worse:` where GitHub does not show it, which accepts nothing.
-    Hidden,
 }
 
 impl Standing {
@@ -74,7 +70,6 @@ impl Standing {
             Standing::NotNamed => "not named",
             Standing::NotLost => "not lost",
             Standing::Unread => "unread",
-            Standing::Hidden => "hidden",
         }
     }
 
@@ -91,28 +86,22 @@ impl Standing {
 pub struct Judged<'a> {
     pub standing: Standing,
     /// An accepted loss as the run lost it, with the reason of the line that accepted it. A loss
-    /// no line names as the line to write. A line of the description as GitHub shows it.
+    /// no line names as the line to write. A `Worse:` line as it was named.
     pub line: String,
     pub note: Option<&'a str>,
 }
 
-/// Holds the losses a run printed, its `Worse:` lines in `found`, to the `Worse:` lines of
-/// `description`: each loss and each line, with how it stands. A run prints what it left out
-/// of the counts of a run on a line `Left out: <corpus>/<run> <what>`.
-pub fn judge<'a>(found: &'a str, description: &str) -> Vec<Judged<'a>> {
+/// Holds the losses a run printed, its `Worse:` lines in `found`, to the lines of `named` that
+/// start `Worse:`: each loss and each line, with how it stands. A run prints what it left out of
+/// the counts of a run on a line `Left out: <corpus>/<run> <what>`.
+pub fn judge<'a>(found: &'a str, named: &str) -> Vec<Judged<'a>> {
     let notes: Vec<(&str, &str)> = found.lines().filter_map(|line| line.strip_prefix("Left out: ")?.split_once(' ')).collect();
     let note = |run: &str| notes.iter().find(|(of, _)| *of == run).map(|(_, note)| *note);
-    let shown = shown(description);
-    let mut hidden = Vec::new();
-    let mut named = Vec::new();
-    for (raw, line) in description.split('\n').zip(shown.split('\n')) {
-        let (raw, line) = (raw.trim_end_matches('\r'), line.trim_end_matches('\r'));
-        if line.starts_with("Worse:") {
-            named.push((line, Loss::parse(line).filter(|(_, why)| !why.is_empty())));
-        } else if raw.starts_with("Worse:") {
-            hidden.push(raw);
-        }
-    }
+    let named: Vec<_> = named
+        .lines()
+        .filter(|line| line.starts_with("Worse:"))
+        .map(|line| (line, Loss::parse(line).filter(|(_, why)| !why.is_empty())))
+        .collect();
     let lost: Vec<Loss> = found.lines().filter_map(|line| Some(Loss::parse(line)?.0)).collect();
     let losses = lost.iter().map(|loss| {
         let accepting = named.iter().filter_map(|(_, named)| named.as_ref()).find(|(named, _)| named.covers(loss));
@@ -130,117 +119,7 @@ pub fn judge<'a>(found: &'a str, description: &str) -> Vec<Judged<'a>> {
         };
         Some(Judged { standing, line: line.to_string(), note: None })
     });
-    let hidden = hidden.into_iter().map(|line| Judged { standing: Standing::Hidden, line: line.to_string(), note: None });
-    losses.chain(lines).chain(hidden).collect()
-}
-
-/// Elements that have no content, or no closing tag, so hide nothing after them.
-const VOID: [&str; 13] = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
-/// Elements whose content GitHub shows: a `<details>` folds it, and a click opens it.
-const SHOWN: [&str; 2] = ["details", "summary"];
-/// What opens HTML that GitHub renders as nothing, and what closes it: a comment, CDATA, a
-/// processing instruction and a declaration. Unclosed, it runs to the end, as it does there.
-const UNSEEN: [(&str, &str); 4] = [("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>"), ("<!", ">")];
-
-/// `text` as GitHub shows it, line for line, with what it renders as nothing left out: HTML
-/// comments and the other constructs of [`UNSEEN`], tags with their attributes, the content of
-/// an element other than [`SHOWN`] and [`VOID`] ones, such as `<video>` or `<rp>`, and link
-/// reference definitions, whose titles may run over several lines.
-///
-/// It errs toward hiding: the content of an element GitHub shows, or HTML inside a code span,
-/// is hidden here too. A line hidden that should not be accepts nothing, so its loss fails the
-/// run as one no line names, and the run prints the line as hidden.
-fn shown(text: &str) -> String {
-    enum In {
-        Text,
-        Unseen(&'static str),
-        Tag { quote: Option<char> },
-        Definition,
-    }
-    let (mut state, mut tag, mut open, mut out) = (In::Text, String::new(), Vec::<String>::new(), String::new());
-    for (index, line) in text.split('\n').enumerate() {
-        if index > 0 {
-            out.push('\n');
-        }
-        match state {
-            In::Definition if line.trim().is_empty() => state = In::Text,
-            In::Text if definition(line) => state = In::Definition,
-            _ => {}
-        }
-        let mut rest = line;
-        while let Some(c) = rest.chars().next() {
-            match &mut state {
-                In::Definition => break,
-                In::Unseen(closer) => match rest.find(*closer) {
-                    Some(at) => {
-                        rest = &rest[at + closer.len()..];
-                        state = In::Text;
-                    }
-                    None => break,
-                },
-                In::Tag { quote } => {
-                    rest = &rest[c.len_utf8()..];
-                    match *quote {
-                        Some(q) if c == q => *quote = None,
-                        Some(_) => {}
-                        None if c == '"' || c == '\'' => *quote = Some(c),
-                        None if c == '>' => {
-                            close(&tag, &mut open);
-                            state = In::Text;
-                        }
-                        None => tag.push(c),
-                    }
-                }
-                In::Text => {
-                    if let Some((opener, closer)) = UNSEEN.iter().find(|(opener, _)| rest.starts_with(opener)) {
-                        rest = &rest[opener.len()..];
-                        state = In::Unseen(closer);
-                    } else if starts_tag(rest) {
-                        rest = &rest[1..];
-                        tag.clear();
-                        state = In::Tag { quote: None };
-                    } else {
-                        rest = &rest[c.len_utf8()..];
-                        if open.is_empty() {
-                            out.push(c);
-                        }
-                    }
-                }
-            }
-        }
-        if let In::Tag { quote: None } = state {
-            tag.push(' ');
-        }
-    }
-    out
-}
-
-/// Whether `text` starts with a tag, `<name` or `</name` and then a space, `/` or `>`, rather
-/// than an autolink such as `<https://...>` or a `<` of prose.
-fn starts_tag(text: &str) -> bool {
-    let name = text.strip_prefix('<').map(|rest| rest.strip_prefix('/').unwrap_or(rest)).unwrap_or_default();
-    let end = name.find(|c: char| !c.is_ascii_alphanumeric() && c != '-').unwrap_or(name.len());
-    name.starts_with(|c: char| c.is_ascii_alphabetic()) && name[end..].chars().next().is_none_or(|c| c.is_whitespace() || c == '/' || c == '>')
-}
-
-/// Takes the tag that `>` closed, its text from after `<` on, into the elements open.
-fn close(tag: &str, open: &mut Vec<String>) {
-    let (end, name) = tag.strip_prefix('/').map_or((false, tag), |name| (true, name));
-    let name = name.split(|c: char| c.is_whitespace() || c == '/').next().unwrap_or_default().to_ascii_lowercase();
-    if end {
-        if let Some(at) = open.iter().rposition(|open| *open == name) {
-            open.truncate(at);
-        }
-    } else if !tag.trim_end().ends_with('/') && !VOID.contains(&name.as_str()) && !SHOWN.contains(&name.as_str()) {
-        open.push(name);
-    }
-}
-
-/// Whether a line starts a link reference definition, `[label]: <destination> "title"`, after
-/// the marks of a list or a quote: GitHub shows none of it, and its title runs to a blank line.
-fn definition(line: &str) -> bool {
-    let rest = line.trim_start_matches(|c: char| c.is_whitespace() || "->*+.)".contains(c) || c.is_ascii_digit());
-    rest.starts_with('[') && rest.contains("]:")
+    losses.chain(lines).collect()
 }
 
 #[cfg(test)]
@@ -288,7 +167,7 @@ mod tests {
 
     #[test]
     fn only_a_loss_not_named_and_a_line_out_of_form_fail_the_run() {
-        let fails: Vec<Standing> = [Standing::Accepted, Standing::NotNamed, Standing::NotLost, Standing::Unread, Standing::Hidden].into_iter().filter(|s| s.fails()).collect();
+        let fails: Vec<Standing> = [Standing::Accepted, Standing::NotNamed, Standing::NotLost, Standing::Unread].into_iter().filter(|s| s.fails()).collect();
         assert_eq!(fails, [Standing::NotNamed, Standing::Unread]);
         // A line whose loss did not happen is printed, and the run goes on.
         assert_eq!(standings(&judge("", &format!("{FOUND} why"))), [(Standing::NotLost, format!("{FOUND} why"))]);
@@ -303,52 +182,6 @@ mod tests {
         }
         // A line that does not start the description's line is no `Worse:` line.
         assert_eq!(judge("", &format!("  {FOUND} why")), []);
-    }
-
-    #[test]
-    fn a_line_github_does_not_show_accepts_nothing() {
-        let line = "Worse: corpus/recore starts found 100 -> 97 (-3) hidden";
-        for description in [
-            // A comment over several lines, on one line around the line's reason, and one never
-            // closed, which hides the rest of the page.
-            format!("Fixes x.\n<!--\n{line}\n-->"),
-            format!("<!-- a template's hint -->\n<!--\n\n{line}\n-->\n"),
-            format!("Fixes x.\n<!--\n{line}"),
-            // The other constructs GitHub renders as nothing.
-            format!("<?php\n{line}\n?>"),
-            format!("<!DOCTYPE\n{line}\n>"),
-            format!("<![CDATA[\n{line}\n]]>"),
-            // An attribute, quoted across lines and holding a `>`, and an attribute left open
-            // across a blank line, which takes the rest of the page.
-            format!("<a title=\"x > y\n{line}\n\">x</a>"),
-            format!("<div title=\"\n\n{line}\n\">"),
-            // The content of an element GitHub drops or a browser does not show.
-            format!("<video>\n{line}\n</video>"),
-            format!("<ruby>x<rp>\n{line}\n</rp></ruby>"),
-            // The title of a link reference definition, alone or in a list.
-            format!("[x]: /url \"\n{line}\n\""),
-            format!("- [x]: /url '\n{line}\n'"),
-        ] {
-            assert_eq!(standings(&judge(FOUND, &description)), [(Standing::NotNamed, FOUND.into()), (Standing::Hidden, line.into())], "{description:?}");
-        }
-        // A reason in a comment is no reason.
-        assert_eq!(judge(FOUND, &format!("{FOUND} <!-- why -->"))[1].standing, Standing::Unread);
-    }
-
-    #[test]
-    fn a_line_github_shows_counts() {
-        let line = format!("{FOUND} why");
-        for description in [
-            // A `<details>` folds it, and a click shows it.
-            format!("<details><summary>Losses</summary>\n\n{line}\n</details>"),
-            // After a comment or an element that closed, or an autolink.
-            format!("<!-- a template's hint -->\n{line}"),
-            format!("<!--\nhint\n-->{line}"),
-            format!("<b>Losses</b><br>\n<img src=\"x.png\">\n<https://example.com>\n{line}"),
-            format!("[x]: /url\n\n{line}"),
-        ] {
-            assert_eq!(standings(&judge(FOUND, &description)), [(Standing::Accepted, line.clone())], "{description:?}");
-        }
     }
 
     #[test]
