@@ -623,8 +623,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     }
                     // A function that is nothing but a jump forwards to another function.
                     // Not to padding: a jump the linker puts in to step over an area it keeps
-                    // for patches lands on the filler after it.
-                    Flow::Jump(target) if decoded.addr == start && self.starts.contains_key(&start) && !self.is_padding_at(target) => {
+                    // for patches lands on the filler after it. Nor inside a sized symbol,
+                    // where it goes on in that function.
+                    Flow::Jump(target)
+                        if decoded.addr == start && self.starts.contains_key(&start) && !self.is_padding_at(target) && self.symbol_around(target).is_none() =>
+                    {
                         self.add_start(target, Origin::Thunk);
                         true
                     }
