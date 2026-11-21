@@ -48,6 +48,24 @@ fn data_at_a_section_start_is_not_decoded() {
     assert!(!fixture.is_function(fixture.address("hashed") + 4), "the word before `hashed` is no `bl`");
 }
 
+/// Data that ends a section runs to the section's end, with no mark after it to close it.
+#[test]
+fn data_at_a_section_end_is_not_decoded() {
+    let fixture = Fixture::load();
+    let words = fixture.address("tail") + 0x10;
+    assert!(!fixture.is_function(words), "the words after `tail` are no function");
+    assert!(fixture.analysis.calls.iter().all(|call| call.at != words), "the first of them is no `bl`");
+}
+
+/// A mark says what its own section holds. One whose address lies in the section after it marks
+/// nothing there.
+#[test]
+fn a_mark_outside_its_section_marks_nothing() {
+    let fixture = Fixture::load();
+    let (call, helper) = (fixture.address("strayed") + 8, fixture.address("strayed") + 0x14);
+    assert!(fixture.analysis.calls.iter().any(|c| c.at == call && c.target == CallTarget::Function(helper)), "strayed calls its helper");
+}
+
 /// The jump back after a warning's trap is the last instruction before the next function's kCFI
 /// hash. It is decoded, so the block it ends belongs to the function it jumps back into.
 #[test]

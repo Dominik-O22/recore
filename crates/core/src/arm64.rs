@@ -689,7 +689,10 @@ pub(crate) fn marked_data(file: &object::File) -> Vec<(u64, u64)> {
                 _ => return None,
             };
             let index = symbol.section_index()?;
-            (file.section_by_index(index).ok()?.kind() == SectionKind::Text).then_some((index.0, symbol.address(), code))
+            let section = file.section_by_index(index).ok()?;
+            // A mark outside its section would mark another section's bytes.
+            let inside = (section.address()..=section.address().saturating_add(section.size())).contains(&symbol.address());
+            (section.kind() == SectionKind::Text && inside).then_some((index.0, symbol.address(), code))
         })
         .chain(file.sections().filter(|section| section.kind() == SectionKind::Text).map(|section| (section.index().0, section.address().saturating_add(section.size()), true)))
         .collect();

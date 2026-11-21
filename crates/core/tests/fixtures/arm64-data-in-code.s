@@ -107,3 +107,38 @@ jumps_fail:
 	.type after_jumps, %function
 after_jumps:
 	ret
+
+// Data at a section's end, with no mark after it: two words that read as `bl tail+8; ret`.
+	.section .text.tail, "ax"
+	.globl tail
+	.type tail, %function
+tail:
+	mov x0, xzr
+	ret
+	add x0, x0, #4
+	ret
+	.word 0x97fffffe
+	.word 0xd65f03c0
+
+// Marks placed past their own section's end, over the call in the section after it.
+	.section .text.stray, "ax"
+	.globl stray
+	.type stray, %function
+stray:
+	mov x0, xzr
+	ret
+	.set "$d.stray", stray + 0x10
+	.set "$x.stray", stray + 0x20
+
+	.section .text.strayed, "ax"
+	.globl strayed
+	.type strayed, %function
+strayed:
+	stp x29, x30, [sp, #-16]!
+	mov x0, xzr
+	bl strayed_helper
+	ldp x29, x30, [sp], #16
+	ret
+strayed_helper:
+	add x0, x0, #5
+	ret
