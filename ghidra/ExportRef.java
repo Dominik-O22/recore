@@ -6,10 +6,14 @@ import java.io.PrintWriter;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.symbol.FlowType;
 
 public class ExportRef extends GhidraScript {
 	@Override
 	public void run() throws Exception {
+		String start = System.getProperty("recore.analysis.start");
+		long analysisMs = start == null ? -1 : (System.nanoTime() - Long.parseLong(start)) / 1_000_000;
+
 		long base = currentProgram.getImageBase().getOffset();
 		// Non-PIE executables are loaded at their link address, so nothing is subtracted. Ghidra
 		// loads a position-independent ELF at 0x100000, or at 0x10000 for a 32-bit one, where
@@ -28,8 +32,8 @@ public class ExportRef extends GhidraScript {
 			f.getBody().forEach(r -> ranges.append(ranges.length() > 0 ? "," : "")
 				.append('[').append(r.getMinAddress().getOffset() - shift).append(',')
 				.append(r.getMaxAddress().getOffset() - shift + 1).append(']'));
-			functions.append(String.format("{\"addr\":%d,\"ranges\":[%s],\"noreturn\":%b,\"thunk\":%b}",
-				f.getEntryPoint().getOffset() - shift, ranges, f.hasNoReturn(), f.isThunk()));
+			functions.append(String.format("{\"addr\":%d,\"ranges\":[%s],\"noreturn\":%b,\"thunk\":%b,\"name\":\"%s\"}",
+				f.getEntryPoint().getOffset() - shift, ranges, f.hasNoReturn(), f.isThunk(), f.getName().replace("\\", "\\\\").replace("\"", "\\\"")));
 		}
 
 		StringBuilder callReturn = new StringBuilder();
@@ -50,16 +54,25 @@ public class ExportRef extends GhidraScript {
 						ins.getAddress().getOffset() - shift, targets));
 				}
 			}
-			// A jump given call semantics (a tail call) also has no fallthrough; only real calls count.
-			if (ins.getMnemonicString().startsWith("CALL") && ins.getFlowType().isCall() &&
-				ins.getFallThrough() == null) {
+			// A jump given call semantics (a tail call) also has no fallthrough. Only an instruction
+			// that is a call before any override counts, on every instruction set.
+			FlowType raw = ins.getPrototype().getFlowType(ins.getInstructionContext());
+			if (ins.getFlowType().isCall() && raw.isCall() && raw.hasFallthrough() && ins.getFallThrough() == null) {
 				callReturn.append(callReturn.length() > 0 ? "," : "").append(ins.getAddress().getOffset() - shift);
 			}
 		}
 
+		// A relocatable file's addresses are Ghidra's own placement of its sections, which
+		// ghidra/kmod.py maps to recore's by these blocks.
+		StringBuilder blocks = new StringBuilder();
+		for (ghidra.program.model.mem.MemoryBlock block : currentProgram.getMemory().getBlocks()) {
+			blocks.append(blocks.length() > 0 ? "," : "").append(String.format("{\"name\":\"%s\",\"start\":%d,\"size\":%d,\"comment\":\"%s\"}",
+				block.getName(), block.getStart().getOffset(), block.getSize(), block.getComment() == null ? "" : block.getComment().replace("\"", "'")));
+		}
+
 		try (PrintWriter out = new PrintWriter(getScriptArgs()[0])) {
-			out.printf("{\"name\":\"%s\",\"shift\":%d,\"min\":%d,\"instructions\":%d,\"functions\":[%s],\"noreturn_calls\":[%s],\"jump_tables\":[%s]}%n",
-				currentProgram.getName(), shift, min.getOffset(), instructions, functions, callReturn, jumpTables);
+			out.printf("{\"name\":\"%s\",\"analysis_ms\":%d,\"shift\":%d,\"min\":%d,\"instructions\":%d,\"functions\":[%s],\"noreturn_calls\":[%s],\"jump_tables\":[%s],\"blocks\":[%s]}%n",
+				currentProgram.getName(), analysisMs, shift, min.getOffset(), instructions, functions, callReturn, jumpTables, blocks);
 		}
 	}
 }

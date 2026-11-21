@@ -2,6 +2,7 @@
 # Runs Ghidra headless over every corpus binary and exports its analysis as JSON.
 # Usage: run-reference.sh <ghidra-home> <out-dir> [jobs] [extra java opts]
 # Skips binaries whose JSON already exists, so it can be re-run after an interruption.
+# GHIDRA_TIMEOUT, in seconds, stops Ghidra on a binary that takes longer, which timeouts.txt lists.
 # A Cortex-M layout is loaded as its raw image at its flash base, with the handlers of its vector
 # table as the entry points, and its JSON is named after the layout.
 set -uo pipefail
@@ -9,6 +10,9 @@ GHIDRA="$1"; OUT="$(realpath -m "$2")"; JOBS="${3:-4}"; EXTRA="${4:-}"
 # CORPUS is the corpus to run over, the x86-64 one in the directory corpus/store.py names unless set.
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CORPUS="${CORPUS:-${RECORE_CORPORA:-$HOME/recore-corpora}/corpus}"
+# Ghidra refuses a project under a directory whose name starts with a dot, and says so only in
+# each binary's log.
+case "$OUT/" in */.*) echo "run-reference.sh: $OUT has a part that starts with a dot, which Ghidra refuses" >&2; exit 1 ;; esac
 mkdir -p "$OUT/logs" "$OUT/proj"
 
 one() {
@@ -25,14 +29,17 @@ one() {
   local start=$SECONDS
   rm -rf "$OUT/proj/$name"; mkdir -p "$OUT/proj/$name"
   GHIDRA_HEADLESS_MAXMEM=6G GHIDRA_HEADLESS_JAVA_OPTIONS="-Dcpu.core.override=4 $EXTRA" \
-    "$GHIDRA/support/analyzeHeadless" "$OUT/proj/$name" p -import "${import[@]}" \
-    -scriptPath "$HERE" "${seed[@]}" -postScript ExportRef.java "$OUT/$name.json" -deleteProject \
+    ${GHIDRA_TIMEOUT:+timeout -k 30 "$GHIDRA_TIMEOUT"} "$GHIDRA/support/analyzeHeadless" "$OUT/proj/$name" p -import "${import[@]}" \
+    -scriptPath "$HERE" "${seed[@]}" -preScript StartTimer.java -postScript ExportRef.java "$OUT/$name.json" -deleteProject \
     > "$OUT/logs/$name.log" 2>&1
+  # 137 when Ghidra ignored the first signal and had to be killed. Without a limit, 137 is some
+  # other kill, such as the kernel's for memory.
+  case $? in 124 | 137) [ -n "${GHIDRA_TIMEOUT:-}" ] && echo "$name" >> "$OUT/timeouts.txt" ;; esac
   local total; total=$(grep -o 'Total Time *[0-9]* secs' "$OUT/logs/$name.log" | grep -o '[0-9]*' | tail -1)
   echo "$name ${total:-NA} $((SECONDS - start))" >> "$OUT/times.txt"
   rm -rf "$OUT/proj/$name"
 }
-export -f one; export GHIDRA OUT HERE EXTRA
+export -f one; export GHIDRA OUT HERE EXTRA GHIDRA_TIMEOUT
 # Largest first so the long ones do not all land at the end.
 ls -S "$CORPUS"/bin/* | xargs -P "$JOBS" -I{} bash -c 'one {}'
 echo "done: $(ls "$OUT"/*.json 2>/dev/null | wc -l) exported"
