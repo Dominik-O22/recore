@@ -194,7 +194,13 @@ impl Program {
 
     /// Calls and tail calls that go to the function or import slot at `target`.
     pub fn calls_to(&self, target: u64) -> impl Iterator<Item = &CallSite> {
-        self.calls_to.get(&target).into_iter().flatten().map(|&index| &self.analysis.calls[index])
+        self.call_indices_to(target).iter().map(|&index| &self.analysis.calls[index])
+    }
+
+    /// Indices in `Analysis::calls` of [`Program::calls_to`], in address order, for a caller that
+    /// picks some of the many calls a function can have without going through them all.
+    pub fn call_indices_to(&self, target: u64) -> &[usize] {
+        self.calls_to.get(&target).map_or(&[], Vec::as_slice)
     }
 
     /// Message sends whose selector only the method at `method` implements in this image.

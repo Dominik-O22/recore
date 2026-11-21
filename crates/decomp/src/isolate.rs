@@ -198,10 +198,11 @@ pub const CALLER_SAMPLE: usize = 32;
 /// a value where its own code shows none and the code after one of them reads the result.
 pub fn returning_callers(program: &Program, entry: u64) -> Vec<u64> {
     let body = program.body(entry);
-    let step = program.calls_to(entry).count().div_ceil(CALLER_SAMPLE).max(1);
-    program
-        .calls_to(entry)
-        .step_by(step)
+    let calls = program.call_indices_to(entry);
+    calls
+        .iter()
+        .step_by(calls.len().div_ceil(CALLER_SAMPLE).max(1))
+        .map(|&index| &program.analysis.calls[index])
         .filter(|call| !call.tail && !call.noreturn && !body.iter().any(|&(start, end)| (start..end).contains(&call.at)))
         .map(|call| call.at)
         .collect()
