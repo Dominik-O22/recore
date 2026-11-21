@@ -3,6 +3,7 @@
 mod classes;
 mod compare;
 mod jumptables;
+mod losses;
 mod references;
 mod score;
 mod signatures;
@@ -11,7 +12,7 @@ mod truth;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 
@@ -78,8 +79,15 @@ enum Command {
         detail: bool,
     },
     /// Scores two analyzer output directories binary by binary and prints each count that moved,
-    /// with the binaries it moved in. Fails when a total got worse or a binary lost its analysis.
+    /// with the binaries it moved in. Fails when a binary lost its analysis, and otherwise with
+    /// exit status 3 when a total got worse, each total printed as a `Worse:` line.
     Compare { base: PathBuf, head: PathBuf },
+    /// Holds the `Worse:` lines of the comparisons of a run, in the file `found`, to the lines a
+    /// change added to the record of accepted losses, which is the file `before` at the base and
+    /// `after` now. Fails on a loss no added line names with a reason, its count and at least how
+    /// far it moved, on an added line out of that form, and on a line taken out of the record. An
+    /// added line that names no loss of the run only prints.
+    Losses { found: PathBuf, before: PathBuf, after: PathBuf },
 }
 
 fn binaries(corpus: &Path) -> Result<Vec<PathBuf>> {
@@ -223,17 +231,42 @@ fn score_dir(corpus: &Path, dir: &Path) -> Result<Vec<(String, score::Score)>> {
         .collect())
 }
 
+/// The exit status of a comparison whose only failing is a total that got worse, which a
+/// `Worse:` line may accept. check.sh tells it from a failing no such line accepts.
+const LOSSES_ONLY: i32 = 3;
+
 fn run_compare(corpus: &Path, base: &Path, head: &Path) -> Result<()> {
     let (changes, missing) = compare::compare(&score_dir(corpus, base)?, &score_dir(corpus, head)?);
     println!("{} against {}", head.display(), base.display());
     compare::print(&changes, &missing);
-    let worse = changes.iter().filter(|c| c.worse).count();
-    anyhow::ensure!(
-        worse == 0 && missing.is_empty(),
-        "{} is worse than its base: {worse} counts fell, {} binaries have no analysis",
-        head.display(),
-        missing.len()
-    );
+    let name = |path: &Path| path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let run = format!("{}/{}", name(corpus), name(head));
+    let losses = compare::losses(&changes, &run);
+    losses.iter().for_each(|loss| println!("{loss}"));
+    anyhow::ensure!(missing.is_empty(), "{} is worse than its base: {} binaries have no analysis", head.display(), missing.len());
+    if !losses.is_empty() {
+        eprintln!("{} is worse than its base: {} counts fell", head.display(), losses.len());
+        std::process::exit(LOSSES_ONLY);
+    }
+    Ok(())
+}
+
+/// Prints how each loss in `found` and each line the record gained from `before` to `after` or
+/// lost stands, one line each that starts with its standing, and under a loss what its run left
+/// out of the counts. Fails on a loss no added line names, on a line out of form, and on a line
+/// taken out.
+fn run_losses(found: &Path, before: &Path, after: &Path) -> Result<()> {
+    let read = |path: &Path| std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()));
+    let (found, before, after) = (read(found)?, read(before)?, read(after)?);
+    let judged = losses::judge(&found, &before, &after);
+    for judged in &judged {
+        println!("{:9}  {}", judged.standing.label(), judged.line);
+        if let Some(note) = judged.note {
+            println!("{:9}  left out {note}", "");
+        }
+    }
+    let failing = judged.iter().filter(|judged| judged.standing.fails()).count();
+    anyhow::ensure!(failing == 0, "{failing} of the losses and the lines of the record do not match");
     Ok(())
 }
 
@@ -298,6 +331,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Compare { base, head } => run_compare(&cli.corpus, &base, &head),
+        Command::Losses { found, before, after } => run_losses(&found, &before, &after),
         Command::Score { dirs, detail } => dirs.iter().try_for_each(|dir| run_score(&cli.corpus, dir, detail)),
     }
 }

@@ -127,7 +127,8 @@ enum Command {
         out_dir: PathBuf,
         debug_dir: PathBuf,
         /// Another `corpus` run of the same functions, by the build to compare with. Prints each
-        /// count that moved over the functions both runs decompiled, and fails when one fell.
+        /// count that moved over the functions both runs decompiled. Fails when more functions
+        /// failed, and otherwise with exit status 3 when a count fell, each on a `Worse:` line.
         #[arg(long)]
         against: Option<PathBuf>,
         #[arg(long, default_value_t = std::thread::available_parallelism().map_or(1, usize::from))]
