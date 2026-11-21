@@ -15,6 +15,7 @@ mod ffi;
 pub mod flow;
 pub mod il2cpp;
 pub mod isolate;
+pub mod kcfi;
 mod mangled;
 pub mod pdb;
 pub mod prototypes;

@@ -28,7 +28,7 @@ fn analyzes_as_loaded(fixture: &str) {
 
     let mut starts: Vec<u64> = analysis.functions.iter().map(|function| function.addr).collect();
     starts.sort_unstable();
-    let kcfi: &[&str] = if fixture == "module-arm64.o" { &["kcfi_word", "kcfi_off_word"] } else { &[] };
+    let kcfi: &[&str] = if fixture == "module-arm64.o" { &["kcfi_word", "kcfi_off_word", "kernel_probe"] } else { &[] };
     if !kcfi.is_empty() {
         // The symbols' sizes alone keep the `adr` targets from starting functions, and a stripped
         // module keeps none. Without them the `$d` marks must.

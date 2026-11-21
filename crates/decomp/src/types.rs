@@ -735,14 +735,16 @@ pub fn debug_file(path: &Path, image: &Image) -> Option<PathBuf> {
 }
 
 /// The types in the debug information of the image at `path`, if it has any that can be read,
-/// or else those of the managed program of an IL2CPP build. Why debug information could not be
-/// read goes to stderr: the decompiler works without. [`DEBUG_VAR`] set to `off` keeps both
-/// out.
+/// or else those of the managed program of an IL2CPP build, or else the prototypes a kernel
+/// module's kCFI hashes name. Why debug information could not be read goes to stderr: the
+/// decompiler works without. [`DEBUG_VAR`] set to `off` keeps all three out.
 pub fn load(path: &Path, image: &Image) -> Option<Types> {
     if std::env::var(DEBUG_VAR).is_ok_and(|setting| setting == "off") {
         return None;
     }
-    let Some(file) = debug_file(path, image) else { return image.il2cpp.as_deref().map(crate::il2cpp::types) };
+    let Some(file) = debug_file(path, image) else {
+        return image.il2cpp.as_deref().map(crate::il2cpp::types).or_else(|| crate::kcfi::types(image).map(|(_, types)| types));
+    };
     let loaded = if file.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("pdb")) {
         crate::pdb::types(&file, image)
     } else {
