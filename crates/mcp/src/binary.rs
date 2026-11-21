@@ -1,12 +1,13 @@
 //! Binaries kept loaded between requests, with the lookups the tools share.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use recore::Image;
-use recore::edits::{Edits, EditsFile};
+use recore::edits::{Edits, EditsFile, Stamp};
 use recore::program::Program;
 use recore_decomp::isolate::{FunctionRecord, Options, Worker};
 use recore::structs::Recovered;
@@ -20,14 +21,18 @@ const KEPT: usize = 8;
 
 /// An analyzed binary and its decompiler process.
 pub struct Binary {
-    path: PathBuf,
+    /// The binary's path with every link resolved, so that two spellings of it find one binary,
+    /// and the file name it was given, which names its edits file.
+    key: (PathBuf, OsString),
     /// Modification time and size of the file when it was loaded.
     stamp: (SystemTime, u64),
     pub program: Program,
-    /// The names, comments and types given to this binary, as saved.
+    /// The names, comments and types given to this binary, as saved when last read.
     pub edits: Edits,
     /// Where `edits` are saved.
     edits_file: EditsFile,
+    /// The stamp of the file `edits` were read from, or `None` if there was none.
+    edits_stamp: Option<Stamp>,
     /// The name the analysis gave each of `program.analysis.functions`, before edits.
     found_names: Vec<Option<String>>,
     /// Time spent loading and analyzing.
@@ -49,7 +54,7 @@ fn worker(path: &Path, start: bool) -> Worker {
 }
 
 impl Binary {
-    fn load(path: &Path, stamp: (SystemTime, u64), start_worker: bool) -> Result<Binary> {
+    fn load(path: &Path, key: (PathBuf, OsString), stamp: (SystemTime, u64), start_worker: bool) -> Result<Binary> {
         let start = Instant::now();
         // A child started now reads the analysis kept on disk at the same time as this process.
         // Without one it is started once this process has kept its own, so the binary is
@@ -66,30 +71,50 @@ impl Binary {
         let analysis_ms = start.elapsed().as_secs_f64() * 1e3;
 
         let edits_file = EditsFile::of(path)?;
+        let edits_stamp = edits_file.stamp();
         let edits = edits_file.load()?;
         let found_names = analysis.functions.iter().map(|function| function.name.clone()).collect();
         edits.apply(&mut analysis);
         let program = Program::new(image, analysis);
         // What loading freed would otherwise be held while queries are answered.
         recore_decomp::give_back_freed_memory();
-        Ok(Binary { path: path.to_path_buf(), stamp, program, edits, edits_file, found_names, analysis_ms, worker })
+        Ok(Binary { key, stamp, program, edits, edits_file, edits_stamp, found_names, analysis_ms, worker })
     }
 
-    /// Changes the binary's edits and saves them. The decompiler process takes names, comments
-    /// and named structs as it runs. A declaration, a type, a name taken away or a struct whose
-    /// layout grows replaces it with one that starts from the new edits, so the next
-    /// decompilation waits for it to set up again.
-    pub fn edit(&mut self, change: impl FnOnce(&mut Edits)) -> Result<()> {
-        let mut edits = self.edits.clone();
-        change(&mut edits);
-        edits.save(&self.edits_file)?;
+    /// Changes the binary's edits as saved now, which may hold edits another process saved since
+    /// they were read, and saves them. Nothing is saved if `change` fails.
+    pub fn edit<T>(&mut self, change: impl FnOnce(&mut Edits) -> Result<T>) -> Result<T> {
+        let (edits, stamp, out) = self.edits_file.update(change)?;
+        self.edits_stamp = Some(stamp);
+        self.take(edits);
+        Ok(out)
+    }
+
+    /// Reads the edits again if another process saved them since they were read.
+    fn refresh(&mut self) -> Result<()> {
+        let stamp = self.edits_file.stamp();
+        if stamp != self.edits_stamp {
+            let edits = self.edits_file.load()?;
+            self.edits_stamp = stamp;
+            self.take(edits);
+        }
+        Ok(())
+    }
+
+    /// Makes `edits` the binary's edits. The decompiler process takes names, comments and named
+    /// structs as it runs. A declaration, a type, a name taken away or a struct whose layout
+    /// grows replaces it with one that starts from the new edits, so the next decompilation
+    /// waits for it to set up again.
+    fn take(&mut self, edits: Edits) {
+        if edits == self.edits {
+            return;
+        }
         self.edits = edits;
         for (function, found) in self.program.analysis.functions.iter_mut().zip(&self.found_names) {
             function.name.clone_from(found);
         }
         self.edits.apply(&mut self.program.analysis);
         self.worker.update(&self.edits, QUICK);
-        Ok(())
     }
 
     /// Where this binary's edits are saved.
@@ -170,30 +195,34 @@ impl Cache {
         Cache { binaries: Vec::new(), start_workers }
     }
 
-    /// The binary at `path`, analyzed now unless it was before and the file has not changed.
+    /// The binary at `path`, analyzed now unless it was before and the file has not changed,
+    /// with the edits saved last.
     pub fn get(&mut self, path: &Path) -> Result<&mut Binary> {
         let metadata = std::fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
         // A FIFO would never end, /dev/zero would fill memory, and /dev/stdin is the protocol.
         anyhow::ensure!(metadata.is_file(), "{} is not a regular file", path.display());
+        let resolved = std::fs::canonicalize(path).with_context(|| format!("cannot read {}", path.display()))?;
+        let key = (resolved, path.file_name().unwrap_or_default().to_os_string());
         let stamp = (metadata.modified()?, metadata.len());
-        let binary = match self.binaries.iter().position(|binary| binary.path == path) {
+        let binary = match self.binaries.iter().position(|binary| binary.key == key) {
             Some(index) if self.binaries[index].stamp == stamp => self.binaries.remove(index),
             stale => {
                 // Dropping a binary ends its decompiler process.
                 stale.map(|index| self.binaries.remove(index));
-                Binary::load(path, stamp, self.start_workers).with_context(|| format!("cannot load {}", path.display()))?
+                Binary::load(path, key, stamp, self.start_workers).with_context(|| format!("cannot load {}", path.display()))?
             }
         };
         self.binaries.insert(0, binary);
         self.binaries.truncate(KEPT);
-        Ok(&mut self.binaries[0])
+        let binary = &mut self.binaries[0];
+        binary.refresh()?;
+        Ok(binary)
     }
 
     /// Two binaries at once, for a tool that compares them.
     pub fn pair(&mut self, first: &Path, second: &Path) -> Result<(&mut Binary, &mut Binary)> {
-        anyhow::ensure!(first != second, "{} is given twice", first.display());
-        self.get(first)?;
-        self.get(second)?;
+        let first_key = self.get(first)?.key.clone();
+        anyhow::ensure!(self.get(second)?.key != first_key, "{} is given twice", first.display());
         let (second, first) = self.binaries.split_at_mut(1);
         Ok((&mut first[0], &mut second[0]))
     }

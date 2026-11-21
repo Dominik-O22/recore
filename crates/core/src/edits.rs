@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,10 @@ use crate::structs::{FieldType, Layout, NameError, Recovered, Slot, auto_functio
 
 /// Names the directory edits are kept in, instead of the user's data directory.
 pub const DIR_VAR: &str = "RECORE_EDITS_DIR";
+
+/// The modification time and size of a saved edits file, which change when it is saved again,
+/// unless the same number of bytes is saved within the clock tick of the file system.
+pub type Stamp = (SystemTime, u64);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Edits {
@@ -94,12 +99,35 @@ impl EditsFile {
         &self.0
     }
 
-    /// The edits made so far; none if there is no file yet.
+    /// The edits made so far; none if there is no file yet. A file that cannot be read is an
+    /// error, never no edits, so that no save replaces what it holds.
     pub fn load(&self) -> Result<Edits> {
         match read(&self.0) {
             Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => Ok(Edits::default()),
-            result => result,
+            result => result.with_context(|| format!("the edits saved for this binary cannot be read; repair {:?}, or move it away to start again with none", self.0)),
         }
+    }
+
+    /// When the file was last saved; `None` while there is none.
+    pub fn stamp(&self) -> Option<Stamp> {
+        let metadata = std::fs::metadata(&self.0).ok()?;
+        Some((metadata.modified().ok()?, metadata.len()))
+    }
+
+    /// Reads the edits saved now, lets `change` change them and saves them, with the edits
+    /// directory locked throughout, so that every edit another process or another [`EditsFile`]
+    /// saved first is kept. Nothing is saved if `change` fails. Returns the edits as saved and
+    /// their stamp.
+    pub fn update<T>(&self, change: impl FnOnce(&mut Edits) -> Result<T>) -> Result<(Edits, Stamp, T)> {
+        let dir = self.0.parent().context("edits file has a directory")?;
+        std::fs::create_dir_all(dir)?;
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(".lock"))?;
+        // Released when `lock` closes.
+        lock.lock().with_context(|| format!("locking {dir:?}"))?;
+        let mut edits = self.load()?;
+        let out = change(&mut edits)?;
+        let stamp = edits.save(self)?;
+        Ok((edits, stamp, out))
     }
 }
 
@@ -138,13 +166,19 @@ impl Edits {
     }
 
     /// Writes the edits to `file`, through a temporary file so that a reader never sees half of
-    /// them. The temporary file is this process's own, so two processes may write at once.
-    pub fn save(&self, file: &EditsFile) -> Result<()> {
+    /// them, and returns the file's stamp. The temporary file is this process's own, so two
+    /// processes may write at once, but the one that writes last replaces what the other
+    /// wrote: [`EditsFile::update`] keeps both.
+    pub fn save(&self, file: &EditsFile) -> Result<Stamp> {
         let file = &file.0;
         std::fs::create_dir_all(file.parent().context("edits file has a directory")?)?;
         let partial = file.with_extension(format!("json.{}.partial", std::process::id()));
         std::fs::write(&partial, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&partial, file).with_context(|| format!("writing {file:?}"))
+        // Renaming keeps the time and size, and any later save changes them.
+        let metadata = std::fs::metadata(&partial)?;
+        let stamp = (metadata.modified()?, metadata.len());
+        std::fs::rename(&partial, file).with_context(|| format!("writing {file:?}"))?;
+        Ok(stamp)
     }
 
     /// Checks what serde cannot see one struct at a time: names, and that every struct a field
@@ -327,6 +361,32 @@ mod tests {
         assert_eq!(edits.names[&0x401000], "main");
         std::fs::remove_file(&old).unwrap();
         assert_eq!(EditsFile::in_dir(&dir, &binary).unwrap().load().unwrap(), edits);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Writers that update at once each keep every edit the others saved, and a file that
+    /// cannot be read stops them rather than being replaced.
+    #[test]
+    fn updates_at_once_keep_every_edit() {
+        let dir = std::env::current_exe().unwrap().with_file_name("edits-update-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = EditsFile(dir.join("prog.json"));
+        std::thread::scope(|scope| {
+            for writer in 0..4u64 {
+                let file = &file;
+                scope.spawn(move || {
+                    for edit in 0..25 {
+                        file.update(|edits| Ok(edits.names.insert(writer * 100 + edit, format!("f_{writer}_{edit}")))).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(file.load().unwrap().names.len(), 100);
+
+        std::fs::write(file.path(), "{\"names\":").unwrap();
+        let refused = file.update(|_| Ok(())).unwrap_err();
+        assert!(format!("{refused:#}").contains("move it away to start again with none"), "{refused:#}");
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "{\"names\":");
         let _ = std::fs::remove_dir_all(dir);
     }
 

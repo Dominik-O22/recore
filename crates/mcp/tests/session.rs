@@ -473,3 +473,33 @@ fn an_8051_function_runs_on_the_registers_and_memory_it_is_given() {
     drop(client);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn edits_from_two_writers_both_stay() {
+    // `total` and `start` of the decompiler's fixture.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/types.elf");
+    let respelled = path.replace("/tests/", "/tests/./");
+    let edits = edits_dir();
+    let mut server = Client::start_in(&edits);
+    server.tool("rename", json!({ "path": path, "addr": "0x401000", "name": "sum_list" })).unwrap();
+
+    // A shell saves an edit while the server holds the binary, and the server sees it.
+    let cli = Command::new(SERVER).env(recore::edits::DIR_VAR, &edits).args(["rename", path, "0x40104c", "from_cli"]).output().unwrap();
+    assert!(cli.status.success(), "{}", String::from_utf8_lossy(&cli.stderr));
+    let function = server.tool("function", json!({ "path": path, "name": "from_cli" })).unwrap();
+    assert!(function.starts_with("function 0x40104c(from_cli):"), "{function}");
+
+    // The same file spelled another way is the same binary, and no save drops another's edit.
+    server.tool("comment", json!({ "path": respelled, "addr": "0x401000", "text": "walks the list" })).unwrap();
+    server.tool("rename", json!({ "path": path, "addr": "0x401000", "name": "from_server" })).unwrap();
+    let summary = server.tool("summary", json!({ "path": respelled })).unwrap();
+    assert!(summary.contains("edits: 2 names, 0 named variables, 1 comments"), "{summary}");
+
+    drop(server);
+    let mut fresh = Client::start_in(&edits);
+    assert!(fresh.tool("summary", json!({ "path": path })).unwrap().contains("edits: 2 names, 0 named variables, 1 comments"));
+    for (addr, name) in [("0x401000", "from_server"), ("0x40104c", "from_cli")] {
+        let function = fresh.tool("function", json!({ "path": path, "name": name })).unwrap();
+        assert!(function.starts_with(&format!("function {addr}({name}):")), "{function}");
+    }
+}
