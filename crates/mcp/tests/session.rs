@@ -129,6 +129,18 @@ fn a_declared_prototype_wins_over_the_one_a_kcfi_hash_names() {
 }
 
 #[test]
+fn a_declaration_under_a_functions_automatic_name_wins_over_its_hash() {
+    // `module-arm64.o` without `kernel_probe`'s symbol, so the function goes by its address.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/module-unnamed.o");
+    let mut client = Client::start_in(&edits_dir());
+    let decompile = |client: &mut Client| client.tool("decompile", json!({ "path": path, "functions": ["0xffff800000000258"], "timeout": 60.0 })).unwrap();
+    assert!(decompile(&mut client).contains("int4 func_0xffff800000000258(platform_device *param_1)\n"));
+    client.tool("declare", json!({ "path": path, "code": "extern int8 func_0xffff800000000258(void *device);" })).unwrap();
+    let c_text = decompile(&mut client);
+    assert!(c_text.contains("int8 func_0xffff800000000258(void *device)\n"), "{c_text}");
+}
+
+#[test]
 fn a_variable_keeps_the_name_it_is_given() {
     // `total` of the decompiler's fixture: a loop over a list that sums into one temporary.
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/types.elf");

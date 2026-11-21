@@ -248,7 +248,10 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     let mut importer = importer;
     if let Some(importer) = &mut importer {
         let declared = declared_functions(&edits.declarations);
-        importer.declared(facts.names.iter().filter(|(_, name)| declared.contains(name.as_str())).map(|name| name.0));
+        let named: HashSet<u64> = facts.names.iter().map(|name| name.0).collect();
+        // A function with no name goes by the one the engine gives it, `func_0x` and its address.
+        let unnamed = declared.iter().filter_map(|name| u64::from_str_radix(name.strip_prefix("func_0x")?, 16).ok()).filter(|addr| !named.contains(addr));
+        importer.declared(facts.names.iter().filter(|(_, name)| declared.contains(name.as_str())).map(|name| name.0).chain(unnamed));
     }
     // From here on a fact the engine refuses is reported and costs only itself, or the facts
     // after it in the same call: a worker that stopped here would leave every function of the
