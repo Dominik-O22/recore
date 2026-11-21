@@ -54,6 +54,10 @@ patience="${RECORE_LAND_PATIENCE:-2700}"
 train_branch=landing-train
 mkdir -p "$queue" "$answers" "$logs" "$(dirname "$lock")"
 
+# Asked about a pull request by an agent, gh adds eight lines on stderr on how to wait for one: a
+# line that starts `hint:` and indented ones under it. A landing asks every few seconds, so those
+# lines are left out of what gh says there, and what went wrong still shows.
+gh() { command gh "$@" 2> >(grep -v '^hint: \|^  ' >&2); }
 # field <pr> <name>: one fact about a pull request.
 field() { gh pr view "$1" --json "$2" -q ".$2"; }
 # need <answer> <what>: stops the landing, with the queue as it is, when gh gave no answer. Going
