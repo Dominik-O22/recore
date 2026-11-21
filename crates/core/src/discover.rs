@@ -1729,7 +1729,7 @@ impl Pointers {
 }
 
 /// The flags of `section` before anything is decoded: on what the file marks as data.
-fn marked_data(image: &Image, section: &Section) -> Vec<u8> {
+fn initial_flags(image: &Image, section: &Section) -> Vec<u8> {
     let mut flags = vec![0; section.data.len()];
     let first = image.marked_data.partition_point(|&(_, end)| end <= section.addr);
     for &(start, end) in image.marked_data[first..].iter().take_while(|&&(start, _)| start < section.end()) {
@@ -1747,7 +1747,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         .map(|section| Region {
             section,
             insn_len: vec![0; section.data.len()],
-            flags: marked_data(image, section),
+            flags: initial_flags(image, section),
             changed: vec![0; section.data.len() / PAGE + 1],
             scans: vec![None; section.data.len() / PAGE + 1],
             covered: vec![0; section.data.len() / 64 + 2],

@@ -692,7 +692,7 @@ pub(crate) fn marked_data(file: &object::File) -> Vec<(u64, u64)> {
             let section = file.section_by_index(symbol.section_index()?).ok()?;
             (section.kind() == SectionKind::Text).then_some((symbol.address(), data))
         })
-        .chain(text().map(|section| (section.address() + section.size(), false)))
+        .chain(text().map(|section| (section.address().saturating_add(section.size()), false)))
         .collect();
     marks.sort_unstable();
     marks.windows(2).filter(|pair| pair[0].1 && pair[0].0 < pair[1].0).map(|pair| (pair[0].0, pair[1].0)).collect()
