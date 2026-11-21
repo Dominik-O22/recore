@@ -2,6 +2,7 @@
 # Runs Ghidra headless over every corpus binary and exports its analysis as JSON.
 # Usage: run-reference.sh <ghidra-home> <out-dir> [jobs] [extra java opts]
 # Skips binaries whose JSON already exists, so it can be re-run after an interruption.
+# GHIDRA_TIMEOUT, in seconds, stops Ghidra on a binary that takes longer, which timeouts.txt lists.
 # A Cortex-M layout is loaded as its raw image at its flash base, with the handlers of its vector
 # table as the entry points, and its JSON is named after the layout.
 set -uo pipefail
@@ -25,14 +26,15 @@ one() {
   local start=$SECONDS
   rm -rf "$OUT/proj/$name"; mkdir -p "$OUT/proj/$name"
   GHIDRA_HEADLESS_MAXMEM=6G GHIDRA_HEADLESS_JAVA_OPTIONS="-Dcpu.core.override=4 $EXTRA" \
-    "$GHIDRA/support/analyzeHeadless" "$OUT/proj/$name" p -import "${import[@]}" \
+    ${GHIDRA_TIMEOUT:+timeout -k 30 "$GHIDRA_TIMEOUT"} "$GHIDRA/support/analyzeHeadless" "$OUT/proj/$name" p -import "${import[@]}" \
     -scriptPath "$HERE" "${seed[@]}" -postScript ExportRef.java "$OUT/$name.json" -deleteProject \
     > "$OUT/logs/$name.log" 2>&1
+  [ $? = 124 ] && echo "$name" >> "$OUT/timeouts.txt"
   local total; total=$(grep -o 'Total Time *[0-9]* secs' "$OUT/logs/$name.log" | grep -o '[0-9]*' | tail -1)
   echo "$name ${total:-NA} $((SECONDS - start))" >> "$OUT/times.txt"
   rm -rf "$OUT/proj/$name"
 }
-export -f one; export GHIDRA OUT HERE EXTRA
+export -f one; export GHIDRA OUT HERE EXTRA GHIDRA_TIMEOUT
 # Largest first so the long ones do not all land at the end.
 ls -S "$CORPUS"/bin/* | xargs -P "$JOBS" -I{} bash -c 'one {}'
 echo "done: $(ls "$OUT"/*.json 2>/dev/null | wc -l) exported"

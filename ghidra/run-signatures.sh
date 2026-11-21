@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # Analyzes binaries with stock Ghidra and writes each one's decompiled signatures.
 # Usage: run-signatures.sh <ghidra-home> <corpus-dir> <jobs> <binary name>...
-# Reports go to <corpus-dir>/ghidra-decomp/<name>.json, with the wall time in <name>.time.
+# Reports go to <name>.json in OUT, <corpus-dir>/ghidra-decomp unless set, with the wall time in
+# <name>.time. A report that exists is kept, so an interrupted run resumes.
 set -euo pipefail
 ghidra=$1 corpus=$(realpath "$2") jobs=$3
 shift 3
 scripts=$(dirname "$(realpath "$0")")
-out=$corpus/ghidra-decomp
-mkdir -p "$out"
+out=$(realpath -m "${OUT:-$corpus/ghidra-decomp}")
+mkdir -p "$out/proj"
 run() {
-    local name=$1 project
-    project=$(mktemp -d)
+    local name=$1 project=$out/proj/$1
+    [ -s "$out/$name.json" ] && return 0
+    rm -rf "$project"; mkdir -p "$project"
     local start=$SECONDS
     "$ghidra/support/analyzeHeadless" "$project" p -import "$corpus/bin/$name" -scriptPath "$scripts" \
-        -postScript ExportSignatures.java "$out/$name.json" > "$out/$name.log" 2>&1 || true
+        -postScript ExportSignatures.java "$out/$name.json" -deleteProject > "$out/$name.log" 2>&1 || true
     echo $((SECONDS - start)) > "$out/$name.time"
     rm -rf "$project"
 }
