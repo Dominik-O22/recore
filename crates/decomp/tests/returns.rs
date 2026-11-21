@@ -58,6 +58,20 @@ fn one_decompilation_returns_what_a_caller_reads() {
 }
 
 #[test]
+fn a_function_with_no_return_left_returns_what_a_caller_reads() {
+    // The function at 0x1010 calls through a pointer and runs into bytes that do not decode, so
+    // the engine finds no return in it: call [rdi]; then 0xff 0xff.
+    let mut code = called(&[0x83, 0xc0, 0x01, 0xc3]);
+    code.truncate(0x12);
+    code.extend([0xff, 0xff]);
+    let mut session = Session::new(&vendored_spec_dir().unwrap(), Target::X86_64Gcc, &[Section { addr: 0x1000, data: &code, readonly: true, code: true }]).unwrap();
+    session.callers(0x1010, &[0x1000]);
+    let function = session.decompile(0x1010).unwrap();
+    assert!(function.bad_data, "{}", function.c_text);
+    assert!(function.returns_value, "{}", function.c_text);
+}
+
+#[test]
 fn a_caller_that_sets_the_register_first_reads_nothing() {
     // xor eax, eax; ret
     assert!(!returns_value("caller-sets", &called(&[0x31, 0xc0, 0xc3])));

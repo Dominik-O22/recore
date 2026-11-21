@@ -2100,9 +2100,10 @@ static int4 bytes_callers_read(RdSession *session, uint64_t function, const Varn
 }
 
 // Called where the engine found no value returned in the code of `fd`. If a caller reads the
-// result register after a call to it, makes the trial of that register in `active` the output,
-// as wide as the widest read, or the whole register where it also passes an argument. Says
-// whether it did.
+// result register after a call to it, makes that register the output, as wide as the widest
+// read, or the whole register where it also passes an argument. It marks the register's trial
+// in `active` and says it did. Where no return could pass the value, it sets the output of the
+// prototype instead.
 static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamActive &active) {
   Architecture *arch = session->arch;
   PrototypePieces integer;
@@ -2122,6 +2123,22 @@ static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamAct
   if (whole) bytes = result.size;
   bool big = result.space->isBigEndian();
   Address low(result.space, big ? result.offset + result.size - bytes : result.offset);
+  session->result_from_callers = true;
+  if (none_of(fd.beginOp(CPUI_RETURN), fd.endOp(CPUI_RETURN), [](PcodeOp *op) { return !op->isDead() && op->getHaltType() == 0; })) {
+    // No return to pass the value, as where the flow ran into bytes that do not decode. The
+    // prototype says what the callers show, until the decompilation ends: see rd_decompile.
+    ParameterPieces piece;
+    piece.addr = low;
+    // Of no type but its size, which locks the size and lets the decompilation find the type.
+    piece.type = arch->types->getBase(bytes, TYPE_UNKNOWN);
+    piece.flags = 0;
+    bool model_locked = fd.getFuncProto().isModelLocked();
+    fd.getFuncProto().setOutput(piece);
+    fd.getFuncProto().setOutputLock(true);
+    // Locking the output locks the calling convention with it, which is still to be recovered.
+    fd.getFuncProto().setModelLock(model_locked);
+    return false;
+  }
   // The trial that holds the low end of the register, if the function's code touches it.
   int4 index = 0;
   for (; index < active.getNumTrials(); ++index) {
@@ -2156,7 +2173,6 @@ static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamAct
     trial.setAddress(low, bytes);
   }
   trial.markActive();
-  session->result_from_callers = true;
   return true;
 }
 
@@ -3173,6 +3189,8 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     // that argument.
     fd->getFuncProto().setOutputLock(false);
   }
+  // A result only the callers show is this decompilation's.
+  if (fd != nullptr && session->result_from_callers) fd->getFuncProto().setOutputLock(false);
   guarded(nullptr, 0, [&] { set_kept_registers(session, addr, false); });
   if (inlined) fd->getFuncProto().setInline(true);
   session->image->current = ~(uint64_t)0;
