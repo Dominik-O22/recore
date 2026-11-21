@@ -478,7 +478,8 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         if decompiled.returns_value || !session.returns_what_callers_read(entry, &calls.returning_to_callers(entry)) {
             return Ok(decompiled);
         }
-        session.decompile(entry)
+        // A failure here leaves the function as its own code has it.
+        Ok(session.decompile(entry).unwrap_or(decompiled))
     };
     // Results of functions decompiled ahead of a caller that are as good as asked for.
     let mut ready: HashMap<u64, Event> = HashMap::new();

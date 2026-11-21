@@ -608,6 +608,8 @@ struct RdSession {
   map<uint64_t, ParameterPieces> outputs;
   // Functions whose result rd_returns_like settled, until they are next decompiled.
   set<uint64_t> returns_like;
+  // Functions whose result rd_returns_what_callers_read settled, for their next decompilation.
+  set<uint64_t> read_by_callers;
   // The registers rd_keep_registers named for each function.
   map<uint64_t, vector<VarnodeData>> kept_registers;
   // recore's side of struct recovery, which plans the structs: see rd_set_struct_hooks.
@@ -2046,8 +2048,8 @@ static int4 bytes_read_after(RdSession *session, uint64_t call, const VarnodeDat
 // Says that the function at `function` returns a value if the code after one of the `count`
 // calls to it at `calls` reads the register the default convention returns an integer in, as
 // `bytes_read_after` decides it. It then returns as many bytes as the widest such read, of a type
-// the decompilation finds. Answers 1 if one does, and 0 if none does or the function's
-// prototype already says what it returns.
+// the decompilation finds, for its next decompilation only. Answers 1 if one does, and 0 if
+// none does or the function's prototype already says what it returns.
 int rd_returns_what_callers_read(RdSession *session, uint64_t function, const uint64_t *calls, size_t count,
                                  char *err, size_t errlen) {
   bool returns = false;
@@ -2080,6 +2082,7 @@ int rd_returns_what_callers_read(RdSession *session, uint64_t function, const ui
     fd->getFuncProto().setOutputLock(true);
     // Locking the output locks the calling convention with it, which is still to be recovered.
     fd->getFuncProto().setModelLock(model_locked);
+    session->read_by_callers.insert(function);
     returns = true;
   });
   return ok && returns;
@@ -3086,6 +3089,13 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     // register of its first argument, a result kept without the parameters costs every call
     // that argument.
     fd->getFuncProto().setOutputLock(false);
+  }
+  if (fd != nullptr && session->read_by_callers.erase(addr) != 0) {
+    // The size of a result only its callers show is a guess where a register also passes an
+    // argument, so it stays this decompilation's: other functions find what they make of the
+    // call themselves, and one that jumps here is told nothing of it.
+    fd->getFuncProto().setOutputLock(false);
+    session->outputs.erase(addr);
   }
   guarded(nullptr, 0, [&] { set_kept_registers(session, addr, false); });
   if (inlined) fd->getFuncProto().setInline(true);
