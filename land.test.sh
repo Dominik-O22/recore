@@ -44,6 +44,7 @@ case "$1 $2" in
       headRefOid) tip "$3" ;;
       headRefName) cat "$HUB/pr/$3/branch" ;;
       baseRefName) echo main ;;
+      title) echo "A change" ;;
       body) cat "$HUB/pr/$3/body" ;;
     esac
     ;;
@@ -57,7 +58,8 @@ case "$1 $2" in
     head="$(arg --match-head-commit "$@")"
     # As main's protection does: the head that was named, up to date, with its status.
     [ "$(tip "$3")" = "$head" ] && git merge-base --is-ancestor main "$head" && checked "$head"
-    commit="$(git commit-tree "$(git merge-tree --write-tree main "$head")" -p main -p "$head" -m "Merge pull request #$3")"
+    body="$(arg --body "$@")"
+    commit="$(git commit-tree "$(git merge-tree --write-tree main "$head")" -p main -p "$head" -m "Merge pull request #$3" ${body:+-m "$body"})"
     git update-ref refs/heads/main "$commit"
     # A pull request whose head main now holds is merged, however it got there.
     for pr in "$HUB"/pr/*; do
@@ -79,7 +81,12 @@ case "$1 $2" in
     arg --comment "$@" >>"$HUB/comment/$3"
     git update-ref -d "refs/heads/$(cat "$HUB/pr/$3/branch")"
     ;;
-  "pr comment") arg --body "$@" >>"$HUB/comment/$3" ;;
+  "pr comment")
+    # As GitHub does past 65,536 characters, and while $HUB/mute is there.
+    body="$(arg --body "$@")"
+    [ ! -e "$HUB/mute" ] && [ "${#body}" -le 65536 ]
+    echo "$body" >>"$HUB/comment/$3"
+    ;;
   "pr list")
     for pr in "$HUB"/pr/*; do
       if [ "$(cat "$pr/state")" = OPEN ] && [ "$(cat "$pr/branch")" = "$(arg --head "$@")" ]; then
@@ -116,10 +123,12 @@ echo target/ >.gitignore
 cat >check.sh <<'EOF'
 #!/usr/bin/env bash
 # What a run does is up to the files the change adds: one named `fails`, one that `costs` time
-# unless that was accepted, one that `moves` a count, one that `loses` a count, which a `Worse:`
-# line may accept, one that `breaks` a binary's analysis, which none accepts, one that `lowers` the
-# budget and one that `raises` it. Once, the owner of the branch named in $HUB/pushes pushes to it
-# while the run is on, and queues the pull request named in $HUB/queues again.
+# unless that was accepted, one that `moves` a count, one that `loses` as many of a count as its
+# first word says, which a `Worse:` line may accept, one that `breaks` a binary's analysis, which none
+# accepts, one that `lowers` the budget and one that `raises` it. Once, the owner of the branch
+# named in $HUB/pushes pushes to it while the run is on, and queues the pull request named in
+# $HUB/queues again; and the owner of the pull request named in $HUB/edits adds a `Worse:` line to
+# its description.
 adds() { [ -n "$(git diff --name-only "$against" HEAD -- "$1")" ]; }
 against="$2"
 git rev-parse HEAD >>"$RUNS"
@@ -134,6 +143,10 @@ if [ -e "$HUB/pushes" ]; then
     rm "$HUB/queues"
   fi
 fi
+if [ -e "$HUB/edits" ]; then
+  echo "Worse: corpus/recore starts found 10 -> 5 (-5) added after the check" >>"$HUB/pr/$(cat "$HUB/edits")/body"
+  rm "$HUB/edits"
+fi
 if adds fails; then
   echo "worse than $against: target/corpus/corpus/recore"
   exit 1
@@ -146,30 +159,48 @@ if adds breaks; then
   echo "worse than $against: target/corpus/corpus/recore"
   exit 1
 fi
-# As check.sh holds the run's losses to the `Worse:` lines: each named with a reason, and no line
-# that names something else.
-lost='' named="$(grep '^Worse:' <<<"$RECORE_WORSE_ACCEPTED" || true)"
-! adds loses || lost="Worse: corpus/recore starts found 10 -> 9 (-1)"
-if [ -n "$lost" ] && [[ "$named" != "$lost "?* || "$named" == *$'\n'* ]]; then
-  echo "worse than $against: not named  $lost"
-  exit 1
-elif [ -z "$lost" ] && [ -n "$named" ]; then
-  echo "worse than $against: not lost   $named"
-  exit 1
+# As check.sh holds the run's losses to the `Worse:` lines, for the one count of the one run a
+# change loses here: a line accepts the loss up to the size it names, a line whose loss did not
+# happen only prints, and a loss no line names or a line out of form fails the run.
+size="$(cat loses 2>/dev/null || true)" size="${size%% *}"
+[[ "$size" =~ ^[0-9]+$ ]] || size=1
+lost='' judged='' failing='' accepted=0
+! adds loses || lost="Worse: corpus/recore starts found 10 -> $((10 - size)) (-$size)"
+while IFS= read -r line; do
+  if ! [[ "$line" =~ ^Worse:\ corpus/recore\ starts\ found\ [0-9]+\ -\>\ [0-9]+\ \(-([0-9]+)\)\ +([^ ].*)$ ]]; then
+    judged+="unread     $line"$'\n' failing+="unread     $line; "
+  elif [ -z "$lost" ]; then
+    judged+="not lost   $line"$'\n'
+  elif [ "${BASH_REMATCH[1]}" -ge "$size" ] && [ "$accepted" -eq 0 ]; then
+    judged+="accepted   $lost ${BASH_REMATCH[2]}"$'\n'"           left out for a timeout or after a lost worker, 0 in the base and 2 here"$'\n' accepted=1
+  fi
+done < <(tr -d '\r' <<<"$RECORE_WORSE_ACCEPTED" | grep '^Worse:' || true)
+if [ -n "$lost" ] && [ "$accepted" -eq 0 ]; then
+  judged="not named  $lost"$'\n'"$judged" failing="not named  $lost; $failing"
 fi
 echo "target/corpus/corpus/recore against base/corpus/corpus/recore"
 if [ -n "$lost" ]; then
-  echo "  worse   starts found                    10 -> 9 (-1)"
-  echo "  accepted   $lost"
+  echo "  worse   starts found                    10 -> $((10 - size)) (-$size)"
 elif adds moves; then
   # A gain and a loss that cancel, which the comparison of signatures prints nothing for.
   echo "  parameter types compared in 10 functions, global types in 10 uses"
 else
   echo "  no count changed"
 fi
-! adds lowers || echo '{"a": {"work": 1}}' >bench/budget.json
+if [ -n "$judged" ]; then
+  echo "losses:"
+  sed 's/^/  /' <<<"${judged%$'\n'}"
+fi
+if [ -n "$failing" ]; then
+  echo "worse than $against: ${failing%; }"
+  exit 1
+fi
+passed="passed against ${against:0:12}"
+[ "$accepted" -eq 0 ] || passed+=", accepting 1 named loss"
+echo "$passed"
+! adds lowers || echo "{\"a\": {\"work\": $(($(jq .a.work bench/budget.json) - 1))}}" >bench/budget.json
 ! adds raises || echo '{"a": {"work": 3}}' >bench/budget.json
-[ -n "$(git status --porcelain)" ] || gh api --silent "repos/{owner}/{repo}/statuses/$(git rev-parse HEAD)" -f state=success -f context=check -f description="passed against ${against:0:12}"
+[ -n "$(git status --porcelain)" ] || gh api --silent "repos/{owner}/{repo}/statuses/$(git rev-parse HEAD)" -f state=success -f context=check -f description="$passed"
 EOF
 chmod +x check.sh
 echo "echo \"main's copy was run with: \$*\"" >land.sh
@@ -208,6 +239,8 @@ is() {
   fi
 }
 state() { cat "$HUB/pr/$1/state"; }
+status_of() { cat "$HUB/status/$(git --git-dir="$work/remote.git" rev-parse "change-$1")"; }
+main_at() { git --git-dir="$work/remote.git" rev-parse main; }
 runs() { wc -l <"$RUNS"; }
 trains() { grep -l landing-train "$HUB"/pr/*/branch | wc -l; }
 on_main() { git --git-dir="$work/remote.git" show "main:$1" 2>/dev/null; }
@@ -303,12 +336,87 @@ is "the trains opened" "$(($(trains) - trains_before))" 1
 is "the runs of check.sh" "$(($(runs) - before))" 2
 tried
 
-case="a Worse: line that names a loss the run does not show is turned away"
-change nineteen nineteen "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
+case="a loss smaller than its line names lands, and the merge commit holds the loss the run measured"
+change loses "1 smaller" "$(printf 'Moves a call.\n\nWorse: corpus/recore starts found 12 -> 9 (-3) the truth is wrong there\n')" && a=$pr
+base=$(main_at)
+land "$a"
+is "the exit status" "$status" 0
+is "the change" "$(state "$a")" MERGED
+is "its status" "$(status_of "$a")" "passed against ${base:0:12}, accepting 1 named loss"
+is "the merge commit's subject" "$(git --git-dir="$work/remote.git" log -1 --format=%s main)" "Merge pull request #$a"
+is "the merge commit's message" "$(git --git-dir="$work/remote.git" log -1 --format=%b main)" "A change
+
+Losses accepted by the run of check.sh on $(git --git-dir="$work/remote.git" rev-parse --short=12 "change-$a") against ${base:0:12}:
+Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there
+  left out for a timeout or after a lost worker, 0 in the base and 2 here"
+tried
+
+case="a loss larger than its line names is turned away, and told the line to write"
+change loses "3 larger" "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
 land "$a"
 is "the exit status" "$status" 1
 is "the change" "$(state "$a")" OPEN
-is "what it was told" "$(grep -c 'not lost   Worse: corpus/recore' "$HUB/comment/$a")" 1
+is "what it was told" "$(grep -c 'not named  Worse: corpus/recore starts found 10 -> 7 (-3)' "$HUB/comment/$a")" 1
+echo CLOSED >"$HUB/pr/$a/state"
+tried
+
+case="a Worse: line whose loss did not happen does not turn the change away"
+change nineteen nineteen "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
+land "$a"
+is "the exit status" "$status" 0
+is "the change" "$(state "$a")" MERGED
+is "the losses its merge commit names" "$(git --git-dir="$work/remote.git" log -1 --format=%b main | grep -c '^Worse:' || true)" 0
+tried
+
+case="a change whose Worse: lines changed between its check and the merge is turned away"
+change loses "1 edited" "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
+echo "$a" >"$HUB/edits"
+land "$a"
+is "the exit status" "$status" 1
+is "the change" "$(state "$a")" OPEN
+is "what it was told" "$(grep -c 'Worse: lines changed' "$HUB/comment/$a")" 1
+echo CLOSED >"$HUB/pr/$a/state"
+tried
+
+case="a Worse: line added after the check to a description that had none is turned away"
+change twenty-two && a=$pr
+echo "$a" >"$HUB/edits"
+land "$a"
+is "the exit status" "$status" 1
+is "what it was told" "$(grep -c 'Worse: lines changed' "$HUB/comment/$a")" 1
+echo CLOSED >"$HUB/pr/$a/state"
+tried
+
+case="a loss accepted with a budget the run lowered says so in the status of the commit that holds the budget"
+change loses "1 lowered" "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
+echo "lowers, with a loss" >lowers
+git add lowers
+git commit -qm "Add lowers"
+git push -q origin "change-$a"
+base=$(main_at)
+land "$a"
+is "the change" "$(state "$a")" MERGED
+is "the status of its head" "$(status_of "$a")" "passed against ${base:0:12}, accepting 1 named loss, before the budget it lowered"
+tried
+
+case="what a comment quotes of a description is cut short and in a code span, and a comment that fails stops no landing"
+change loses "1 quoted" "Worse: @someone $(printf 'x%.0s' {1..70000})" && a=$pr
+change twenty && b=$pr
+land "$a" "$b"
+is "the exit status" "$status" 1
+is "the one turned away" "$(state "$a")" OPEN
+is "the other" "$(state "$b")" MERGED
+is "the comments it got" "$(grep -c 'did not land this' "$HUB/comment/$a")" 1
+is "a mention outside a code span" "$(sed 's/`[^`]*`//g' "$HUB/comment/$a" | grep -c '@someone' || true)" 0
+echo CLOSED >"$HUB/pr/$a/state"
+change loses "1 muted" && a=$pr
+change twenty-one && b=$pr
+touch "$HUB/mute"
+land "$a" "$b"
+rm "$HUB/mute"
+is "the exit status" "$status" 1
+is "the one turned away, untold" "$(state "$a")" OPEN
+is "the other" "$(state "$b")" MERGED
 echo CLOSED >"$HUB/pr/$a/state"
 tried
 
