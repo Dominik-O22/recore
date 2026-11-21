@@ -2099,13 +2099,10 @@ static int4 bytes_callers_read(RdSession *session, uint64_t function, const Varn
   return bytes;
 }
 
-// Called where the engine found no value returned in the code of `fd`. If a caller reads the
-// result register after a call to it, makes that register the output, as wide as the widest
-// read, or the whole register where it also passes an argument. It marks the register's trial
-// in `active` and says it did. Where no return could pass the value, it sets the output of the
-// prototype instead.
-static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamActive &active) {
-  Architecture *arch = session->arch;
+// The register the default convention returns a pointer-sized integer in, and in `whole` whether
+// it also passes an argument. Where it does, a result narrower than it would have the engine split
+// the argument the function takes there into pieces, and type neither as a pointer.
+static bool result_register(Architecture *arch, VarnodeData &result, bool &whole) {
   PrototypePieces integer;
   integer.model = arch->defaultfp;
   integer.outtype = arch->types->getBase(arch->types->getSizeOfPointer(), TYPE_INT);
@@ -2113,11 +2110,21 @@ static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamAct
   vector<ParameterPieces> storage;
   arch->defaultfp->assignParameterStorage(integer, storage, true);
   if (storage.empty() || storage[0].addr.isInvalid() || storage[0].addr.getSpace()->getType() != IPTR_PROCESSOR) return false;
-  VarnodeData result = {storage[0].addr.getSpace(), storage[0].addr.getOffset(), (uint4)integer.outtype->getSize()};
-  // Where the register also passes an argument, a result narrower than it would have the
-  // engine split the argument the function takes there into pieces, and type neither as a
-  // pointer.
-  bool whole = arch->defaultfp->possibleInputParam(storage[0].addr, result.size);
+  result = {storage[0].addr.getSpace(), storage[0].addr.getOffset(), (uint4)integer.outtype->getSize()};
+  whole = arch->defaultfp->possibleInputParam(storage[0].addr, result.size);
+  return true;
+}
+
+// Called where the engine found no value returned in the code of `fd`. If a caller reads the
+// result register after a call to it, makes that register the output, as wide as the widest
+// read, or the whole register where it also passes an argument. It marks the register's trial
+// in `active` and says it did. Where no return could pass the value, it sets the output of the
+// prototype instead.
+static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamActive &active) {
+  Architecture *arch = session->arch;
+  VarnodeData result;
+  bool whole;
+  if (!result_register(arch, result, whole)) return false;
   int4 bytes = bytes_callers_read(session, session->offset(fd.getAddress()), result, whole ? 1 : (int4)result.size);
   if (bytes == 0) return false;
   if (whole) bytes = result.size;
@@ -2181,6 +2188,18 @@ static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamAct
 // code after one of them reads the result register, it returns what that reads.
 void rd_callers(RdSession *session, uint64_t function, const uint64_t *calls, size_t count) {
   session->callers = {function, vector<uint64_t>(calls, calls + count)};
+}
+
+// Whether the code after one of the calls rd_callers gave for the function at `function` reads
+// the result register, without decompiling it. Its next decompilation reads none of them again.
+int rd_callers_read(RdSession *session, uint64_t function) {
+  bool read = false;
+  guarded(nullptr, 0, [&] {
+    VarnodeData result;
+    bool whole;
+    read = result_register(session->arch, result, whole) && bytes_callers_read(session, function, result, whole ? 1 : (int4)result.size) > 0;
+  });
+  return read;
 }
 
 // With `keep` set, the parameters recovered by each successful rd_decompile are locked into the

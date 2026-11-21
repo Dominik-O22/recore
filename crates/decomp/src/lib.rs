@@ -767,6 +767,14 @@ impl Session {
         unsafe { ffi::rd_callers(self.raw.as_ptr(), function, calls.as_ptr(), calls.len()) }
     }
 
+    /// Whether the code after one of `calls`, calls to `function` given as for
+    /// [`Session::callers`], reads the register a result comes back in, without decompiling
+    /// `function`. Its next decompilation does not read them again.
+    pub fn callers_read(&mut self, function: u64, calls: &[u64]) -> bool {
+        self.callers(function, calls);
+        unsafe { ffi::rd_callers_read(self.raw.as_ptr(), function) != 0 }
+    }
+
     /// With `keep`, every later [`Session::decompile`] prints each line of C after the address of
     /// the instruction the line came from, in a column, where it came from one.
     pub fn keep_addresses(&mut self, keep: bool) {

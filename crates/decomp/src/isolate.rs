@@ -640,9 +640,9 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             Request::Decompile(addr) | Request::Parameters(addr) => addr,
         };
         if let (Request::Decompile(_), Some((event, with_callers))) = (&request, ready.remove(&addr)) {
-            // One that came out void before its callers were given may return what they read.
+            // One that came out void before its callers were given returns a value if they read it.
             let void = matches!(&event, Event::Done { record, .. } if !record.returns_value);
-            if with_callers || !void || !given.contains_key(&addr) {
+            if with_callers || !void || !given.get(&addr).is_some_and(|calls| session.callers_read(addr, calls)) {
                 send(&event)?;
                 continue;
             }
