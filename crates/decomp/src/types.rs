@@ -391,7 +391,10 @@ impl<'a> Writer<'a> {
             Type::Composite { name, union, size, .. } => {
                 if !std::mem::replace(&mut self.written[id as usize], true) {
                     let meta = if *union { "union" } else { "struct" };
-                    let _ = writeln!(self.out, r#"<type name="{}"{} id="{}" metatype="{meta}" size="{}" incomplete="true"/>"#, escaped(name), self.label_attribute(id), self.ident(id), (*size).max(1));
+                    // One only declared keeps size 0 in the engine too, as `void` has. At size 1
+                    // the engine would print `p + 0xd8` for bytes past a pointer to it, which C
+                    // reads as steps over elements.
+                    let _ = writeln!(self.out, r#"<type name="{}"{} id="{}" metatype="{meta}" size="{size}" incomplete="true"/>"#, escaped(name), self.label_attribute(id), self.ident(id));
                     self.pending.push(id);
                 }
             }
