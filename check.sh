@@ -210,7 +210,14 @@ done
 accepted=0
 if [ -n "$against" ]; then
   record=bench/accepted-losses.txt
-  git show "$(git merge-base "$against" HEAD):$record" >target/corpus/accepted-losses.base 2>/dev/null || : >target/corpus/accepted-losses.base
+  # Through a link the lines would sit in a file the diff of the record does not show.
+  if [ -L "$record" ] || { [ -e "$record" ] && [ ! -f "$record" ]; }; then
+    worse+=("$record is no regular file")
+  fi
+  # Without a merge base `git show :path` would read the index, and every line would look old.
+  from="$(git merge-base "$against" HEAD)" || from=
+  [ -n "$from" ] || worse+=("$against and HEAD share no commit, so the lines this change added to $record cannot be told")
+  git show "${from:-HEAD}:$record" >target/corpus/accepted-losses.base 2>/dev/null || : >target/corpus/accepted-losses.base
   [ -e "$record" ] || record=/dev/null
   if ! judged="$("$build/recore-corpus" losses "$losses" target/corpus/accepted-losses.base "$record")"; then
     mapfile -t unmatched < <(grep -E '^(not named|unread|removed) ' <<<"$judged" || true)

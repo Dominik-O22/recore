@@ -1,8 +1,9 @@
-# Every corpus total a change made worse and landed with, one loss a line, with its reason:
+# Every loss of a corpus total that a change was let to land with, one a line, with its reason:
 #   Worse: <corpus>/<run> <count> <base> -> <head> (<difference>) <reason>
 # `./check.sh --against <base>` prints the line of each total that got worse. A change accepts a
 # loss by adding that line here with the reason after it, and the reviewer reads the lines its
-# diff adds. A line accepts a loss of its run and count as large as it names or smaller. Only the
+# diff adds. A line accepts a loss of its run and count as large as it names or smaller, so it
+# may name more than the run lost: its difference has to be what its two totals give. Only the
 # lines a change adds count, and a change that adds one lands alone. No line accepts a binary
 # that lost its analysis or a decompiler that fails on more functions.
 # This file is a record and only grows: a change that takes out or edits a line here fails its

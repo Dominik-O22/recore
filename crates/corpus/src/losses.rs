@@ -104,7 +104,10 @@ pub fn judge<'a>(found: &'a str, before: &'a str, after: &'a str) -> Vec<Judged<
     let notes: Vec<(&str, &str)> = found.lines().filter_map(|line| line.strip_prefix("Left out: ")?.split_once(' ')).collect();
     let note = |run: &str| notes.iter().find(|(of, _)| *of == run).map(|(_, note)| *note);
     let named: Vec<_> = minus(after, before).into_iter().map(|line| (line, Loss::parse(line).filter(|(_, why)| !why.is_empty()))).collect();
-    let lost: Vec<Loss> = found.lines().filter_map(|line| Some(Loss::parse(line)?.0)).collect();
+    // A loss the run printed and this cannot read fails as `unread`, where dropping it would pass it.
+    let (lost, garbled): (Vec<_>, Vec<_>) = found.lines().filter(|line| line.starts_with("Worse:")).map(|line| (line, Loss::parse(line))).partition(|(_, loss)| loss.is_some());
+    let lost: Vec<Loss> = lost.into_iter().filter_map(|(_, loss)| Some(loss?.0)).collect();
+    let garbled = garbled.into_iter().map(|(line, _)| Judged { standing: Standing::Unread, line: line.to_string(), note: None });
     let losses = lost.iter().map(|loss| {
         let accepting = named.iter().filter_map(|(_, named)| named.as_ref()).find(|(named, _)| named.covers(loss));
         let (standing, line) = match accepting {
@@ -122,7 +125,7 @@ pub fn judge<'a>(found: &'a str, before: &'a str, after: &'a str) -> Vec<Judged<
         Some(Judged { standing, line: line.to_string(), note: None })
     });
     let removed = minus(before, after).into_iter().map(|line| Judged { standing: Standing::Removed, line: line.to_string(), note: None });
-    losses.chain(lines).chain(removed).collect()
+    losses.chain(garbled).chain(lines).chain(removed).collect()
 }
 
 /// The lines of the record in `from` that `taken` does not hold, each as often as `from` holds it
@@ -242,6 +245,21 @@ mod tests {
         let before = format!("{BEFORE}{FOUND} first\n");
         let after = format!("# The record.\n{FOUND} first\n{earlier}\n");
         assert_eq!(judge("", &before, &after), []);
+    }
+
+    #[test]
+    fn the_record_counts_a_line_as_often_as_it_holds_it() {
+        let earlier = "Worse: corpus-arm64/recore starts found 7 -> 6 (-1) an earlier change";
+        let again = "Worse: corpus-arm64/recore starts found 7 -> 6 (-1)";
+        // A second change that loses what an earlier one lost adds the same line once more.
+        assert_eq!(standings(&judge(again, BEFORE, &adding(earlier))), [(Standing::Accepted, earlier.into())]);
+        assert_eq!(standings(&judge("", &adding(earlier), BEFORE)), [(Standing::Removed, earlier.into())]);
+    }
+
+    #[test]
+    fn a_loss_of_the_run_that_cannot_be_read_fails() {
+        let garbled = "Worse: corpus/recore weird -> count 100 -> 98 (-2)";
+        assert_eq!(standings(&judge(garbled, BEFORE, BEFORE)), [(Standing::Unread, garbled.into())]);
     }
 
     #[test]
