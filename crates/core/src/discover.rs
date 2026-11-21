@@ -19,7 +19,8 @@ struct Region<'a> {
     /// Per byte, the length of the decoded instruction that begins there, or zero.
     insn_len: Vec<u8>,
     /// Per byte, what is known about the address: [`FOLLOWS_BREAK`], [`ASKED_AS_START`],
-    /// [`REFERENCED`] and [`IN_TABLE`]. One array, so that looking up a call's target touches one place in memory.
+    /// [`REFERENCED`], [`IN_TABLE`] and [`MARKED_DATA`]. One array, so that looking up a call's
+    /// target touches one place in memory.
     flags: Vec<u8>,
     /// Per page, the time `insn_len` or a [`FOLLOWS_BREAK`] flag last changed in it, on the
     /// explorer's clock.
@@ -42,6 +43,8 @@ const REFERENCED: u8 = 4;
 /// The byte is part of a jump table that lies among the code, of a literal pool, or of data the
 /// file marks as such.
 const IN_TABLE: u8 = 8;
+/// The file marks the byte as data, which also makes it [`IN_TABLE`].
+const MARKED_DATA: u8 = 16;
 
 /// The gap scan works through a section in pages of this many bytes.
 const PAGE: usize = 4096;
@@ -1523,9 +1526,10 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         let Some(insn) = decoded.insn else { break };
                         // What sits right before a table aligns it, as MSVC's `mov edi, edi` does:
                         // the code that jumps through the table was decoded from its function. Not
-                        // so before a literal pool, which follows the end of a function's code.
+                        // so before a literal pool or the data a file marks, which follow the end
+                        // of a function's code.
                         let before_table = || {
-                            !A::LITERAL_POOLS && self.regions[index].flags.get((scanned_to - section.addr) as usize).is_some_and(|flags| flags & IN_TABLE != 0)
+                            !A::LITERAL_POOLS && self.regions[index].flags.get((scanned_to - section.addr) as usize).is_some_and(|flags| flags & (IN_TABLE | MARKED_DATA) == IN_TABLE)
                         };
                         if A::is_padding(insn) || before_table() {
                             skipped_padding = true;
@@ -1724,13 +1728,13 @@ impl Pointers {
     }
 }
 
-/// The flags of `section` before anything is decoded: [`IN_TABLE`] on what the file marks as data.
+/// The flags of `section` before anything is decoded: on what the file marks as data.
 fn marked_data(image: &Image, section: &Section) -> Vec<u8> {
     let mut flags = vec![0; section.data.len()];
     let first = image.marked_data.partition_point(|&(_, end)| end <= section.addr);
     for &(start, end) in image.marked_data[first..].iter().take_while(|&&(start, _)| start < section.end()) {
         let (from, to) = (start.max(section.addr) - section.addr, end.min(section.end()) - section.addr);
-        flags[from as usize..to as usize].fill(IN_TABLE);
+        flags[from as usize..to as usize].fill(IN_TABLE | MARKED_DATA);
     }
     flags
 }
