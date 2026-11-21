@@ -2066,6 +2066,10 @@ int rd_returns_what_callers_read(RdSession *session, uint64_t function, const ui
     int4 bytes = 0;
     for (size_t i = 0; i < count; ++i) bytes = max(bytes, bytes_read_after(session, calls[i], result));
     if (bytes == 0) return;
+    // Where the register also passes an argument, a result narrower than it would have the
+    // engine split the argument the function takes there into pieces, and type neither as a
+    // pointer.
+    if (arch->defaultfp->possibleInputParam(storage[0].addr, result.size)) bytes = result.size;
     ParameterPieces piece;
     piece.addr = Address(result.space, result.space->isBigEndian() ? result.offset + result.size - bytes : result.offset);
     // Of no type but its size, which locks the size and lets the decompilation find the type.
