@@ -57,8 +57,8 @@ const WINDOWS_NAMES: &[&str] = &[
 
 /// Linux kernel functions that never return, which a kernel module imports. objtool's list of
 /// them, `tools/objtool/noreturns.h`, as of Linux 7.4-rc3. It holds every noreturn callee that
-/// DWARF names in the kernel module corpora.
-const KERNEL_NAMES: &[&str] = &[
+/// DWARF names in the kernel module corpora. The corpus truth takes it too.
+pub const KERNEL_NAMES: &[&str] = &[
     "__fortify_panic",
     "__ia32_sys_exit",
     "__ia32_sys_exit_group",

@@ -158,7 +158,7 @@ pub fn score(truth: &Truth, jump_tables: Option<&JumpTables>, analysis: &Analysi
         }
     }
 
-    let truth_calls: HashSet<u64> = truth.noreturn_calls.iter().copied().collect();
+    let truth_calls: HashSet<u64> = truth.noreturn_calls.iter().copied().filter(|&addr| in_text(addr)).collect();
     let terminal_calls: HashSet<u64> = truth.terminal_calls.iter().copied().collect();
     s.truth_noreturn_calls = truth_calls.len() as u64;
     for call in analysis.noreturn_calls.iter().filter(|&&addr| in_text(addr)).collect::<HashSet<_>>() {
@@ -261,9 +261,9 @@ mod tests {
     }
 
     #[test]
-    fn a_noreturn_call_is_found_or_extra_and_extra_ones_inside_no_function_are_not_counted() {
+    fn a_noreturn_call_is_found_or_extra_and_ones_inside_no_function_or_past_text_are_not_counted() {
         let mut truth = truth();
-        truth.noreturn_calls = vec![0x1010, 0x1020];
+        truth.noreturn_calls = vec![0x1010, 0x1020, 0x3004];
         truth.terminal_calls = vec![0x1030];
         let mut reported = starts(&[]);
         reported.noreturn_calls = vec![0x1010, 0x1010, 0x1030, 0x1040, 0x1a00, 0x3000];
