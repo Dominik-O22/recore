@@ -9,6 +9,10 @@ extern void *kmalloc(unsigned long size);
 extern void kfree(void *p);
 extern int printk(const char *fmt, ...);
 extern unsigned long jiffies;
+extern void panic(const char *fmt, ...) __attribute__((noreturn));
+
+// What MODULE_LICENSE leaves, in the section every module has.
+static const char license[] __attribute__((section(".modinfo"), used)) = "license=GPL";
 
 static int probe(int id) {
     void *p = kmalloc(id);
@@ -59,6 +63,12 @@ int kcfi_off_word(struct u0341202 *p) {
 __attribute__((noipa)) void traced(unsigned long value) {
     printk("value %lu\n", value);
     printk("at %lx\n", ({ __label__ here; here: (unsigned long)&&here; }));
+}
+
+__attribute__((noipa)) int checked(int value) {
+    if (value > 4)
+        panic("bad value %d\n", value);
+    return value * 3;
 }
 
 // Hand-written code may name an entry inside a routine, whose symbol's size covers it.

@@ -248,14 +248,14 @@ fn walk(function: &Function, noreturn: &FxHashSet<u64>, program: &Program, mut r
         false => seen_outside.insert(index),
     };
     let target_returns = |target: u64| match imports.stub(target) {
-        Some(name) => !is_noreturn_import(name),
+        Some(name) => !is_noreturn_import(imports.image, name),
         None => !noreturn.contains(&target),
     };
 
     // What a call or jump through a slot reaches: an import, a local function through a
     // relocated pointer, or something unknown that is assumed to return.
     let slot_returns = |slot: Option<u64>| match (imports.slot(slot), slot.and_then(|s| program.pointer_slots.get(&s))) {
-        (Some(name), _) => !is_noreturn_import(name),
+        (Some(name), _) => !is_noreturn_import(imports.image, name),
         (None, Some(&target)) => !noreturn.contains(&target),
         (None, None) => true,
     };
@@ -900,7 +900,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
                         .then(|| (CallTarget::Function(target), noreturn.contains(&target), tail))
                 };
                 let import = |slot: u64, tail: bool| {
-                    imports.slot(Some(slot)).map(|name| (CallTarget::Import(slot), is_noreturn_import(name), tail))
+                    imports.slot(Some(slot)).map(|name| (CallTarget::Import(slot), is_noreturn_import(image, name), tail))
                 };
                 // A slot holds either an import or a relocated pointer to a local function.
                 let through_slot =
@@ -933,7 +933,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         .into_iter()
         .map(|slot| {
             let name = image.import_slots[&slot].clone();
-            Import { slot, noreturn: is_noreturn_import(&name), name }
+            Import { slot, noreturn: is_noreturn_import(image, &name), name }
         })
         .collect();
     import_list.sort_unstable_by_key(|import| import.slot);
