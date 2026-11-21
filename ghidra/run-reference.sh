@@ -32,8 +32,9 @@ one() {
     ${GHIDRA_TIMEOUT:+timeout -k 30 "$GHIDRA_TIMEOUT"} "$GHIDRA/support/analyzeHeadless" "$OUT/proj/$name" p -import "${import[@]}" \
     -scriptPath "$HERE" "${seed[@]}" -preScript StartTimer.java -postScript ExportRef.java "$OUT/$name.json" -deleteProject \
     > "$OUT/logs/$name.log" 2>&1
-  # 137 when Ghidra ignored the first signal and had to be killed.
-  case $? in 124 | 137) echo "$name" >> "$OUT/timeouts.txt" ;; esac
+  # 137 when Ghidra ignored the first signal and had to be killed. Without a limit, 137 is some
+  # other kill, such as the kernel's for memory.
+  case $? in 124 | 137) [ -n "${GHIDRA_TIMEOUT:-}" ] && echo "$name" >> "$OUT/timeouts.txt" ;; esac
   local total; total=$(grep -o 'Total Time *[0-9]* secs' "$OUT/logs/$name.log" | grep -o '[0-9]*' | tail -1)
   echo "$name ${total:-NA} $((SECONDS - start))" >> "$OUT/times.txt"
   rm -rf "$OUT/proj/$name"
