@@ -19,7 +19,8 @@ struct Region<'a> {
     /// Per byte, the length of the decoded instruction that begins there, or zero.
     insn_len: Vec<u8>,
     /// Per byte, what is known about the address: [`FOLLOWS_BREAK`], [`ASKED_AS_START`],
-    /// [`REFERENCED`] and [`IN_TABLE`]. One array, so that looking up a call's target touches one place in memory.
+    /// [`REFERENCED`], [`IN_TABLE`] and [`MARKED_DATA`]. One array, so that looking up a call's
+    /// target touches one place in memory.
     flags: Vec<u8>,
     /// Per page, the time `insn_len` or a [`FOLLOWS_BREAK`] flag last changed in it, on the
     /// explorer's clock.
@@ -39,8 +40,11 @@ const FOLLOWS_BREAK: u8 = 1;
 const ASKED_AS_START: u8 = 2;
 /// Something calls the address, takes it, exports it, or points to it from data.
 const REFERENCED: u8 = 4;
-/// The byte is part of a jump table that lies among the code, or of a literal pool.
+/// The byte is part of a jump table that lies among the code, of a literal pool, or of data the
+/// file marks as such.
 const IN_TABLE: u8 = 8;
+/// The file marks the byte as data, which also makes it [`IN_TABLE`].
+const MARKED_DATA: u8 = 16;
 
 /// The gap scan works through a section in pages of this many bytes.
 const PAGE: usize = 4096;
@@ -1522,9 +1526,10 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         let Some(insn) = decoded.insn else { break };
                         // What sits right before a table aligns it, as MSVC's `mov edi, edi` does:
                         // the code that jumps through the table was decoded from its function. Not
-                        // so before a literal pool, which follows the end of a function's code.
+                        // so before a literal pool or the data a file marks, which follow the end
+                        // of a function's code.
                         let before_table = || {
-                            !A::LITERAL_POOLS && self.regions[index].flags.get((scanned_to - section.addr) as usize).is_some_and(|flags| flags & IN_TABLE != 0)
+                            !A::LITERAL_POOLS && self.regions[index].flags.get((scanned_to - section.addr) as usize).is_some_and(|flags| flags & (IN_TABLE | MARKED_DATA) == IN_TABLE)
                         };
                         if A::is_padding(insn) || before_table() {
                             skipped_padding = true;
@@ -1723,6 +1728,21 @@ impl Pointers {
     }
 }
 
+/// The flags of `section` before anything is decoded: on what the file marks as data, in
+/// `marked`, sorted. Ranges that overlap, as those of sections a damaged file lays over each
+/// other, are each cut to the section.
+fn initial_flags(marked: &[(u64, u64)], section: &Section) -> Vec<u8> {
+    let mut flags = vec![0; section.data.len()];
+    let first = marked.partition_point(|&(_, end)| end <= section.addr);
+    for &(start, end) in marked[first..].iter().take_while(|&&(start, _)| start < section.end()) {
+        let (from, to) = (start.max(section.addr), end.min(section.end()));
+        if from < to {
+            flags[(from - section.addr) as usize..(to - section.addr) as usize].fill(IN_TABLE | MARKED_DATA);
+        }
+    }
+    flags
+}
+
 fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'a Pointers, known_lengths: FxHashMap<u64, usize>, rejected: FxHashSet<u64>) -> Explorer<'a, A> {
     let regions = image
         .sections
@@ -1731,7 +1751,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         .map(|section| Region {
             section,
             insn_len: vec![0; section.data.len()],
-            flags: vec![0; section.data.len()],
+            flags: initial_flags(&image.marked_data, section),
             changed: vec![0; section.data.len() / PAGE + 1],
             scans: vec![None; section.data.len() / PAGE + 1],
             covered: vec![0; section.data.len() / 64 + 2],
@@ -1847,7 +1867,18 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
 
 #[cfg(test)]
 mod tests {
-    use super::AddrSet;
+    use super::{AddrSet, MARKED_DATA, initial_flags};
+    use crate::image::Section;
+
+    #[test]
+    fn marked_ranges_that_overlap_are_cut_to_the_section() {
+        let section = Section { name: ".text".into(), addr: 0x1300, data: vec![0; 0x100], file_offset: None, executable: true, writable: false };
+        // The second range reaches into the section. The third starts inside the second and ends
+        // below the section, which ranges of one well-formed file never do.
+        let flags = initial_flags(&[(0x1000, 0x1004), (0x1110, 0x1380), (0x1200, 0x1204)], &section);
+        let marked: Vec<usize> = (0..flags.len()).filter(|&at| flags[at] & MARKED_DATA != 0).collect();
+        assert_eq!(marked, (0..0x80).collect::<Vec<_>>());
+    }
 
     #[test]
     fn a_sorted_set_answers_as_a_bit_set_does() {

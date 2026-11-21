@@ -414,11 +414,15 @@ impl Arch for Arm64 {
     type Decoder<'a> = (&'a [u8], u64, usize, Insn);
 
     fn decoder<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> Self::Decoder<'a> {
-        (bytes, addr, 0, Insn { word: 0, addr })
+        let mut decoder = (bytes, addr, 0, Insn { word: 0, addr });
+        Self::seek(&mut decoder, 0);
+        decoder
     }
 
+    /// No instruction starts off a word, so from there the decoder has none to give, as at the
+    /// end of its bytes. From a word it stays on words.
     fn seek(decoder: &mut Self::Decoder<'_>, offset: usize) {
-        decoder.2 = offset;
+        decoder.2 = if (decoder.1 + offset as u64).is_multiple_of(4) { offset } else { decoder.0.len() };
     }
 
     fn decode_next<'d>((bytes, base, offset, insn): &'d mut Self::Decoder<'_>) -> Option<Decoded<&'d Insn>> {
@@ -459,6 +463,11 @@ impl Arch for Arm64 {
                 _ => None,
             },
         }
+    }
+
+    /// `adr` forms the address of any byte, but only one on a word can be code.
+    fn code_pointer(_: &Image, target: u64) -> bool {
+        target.is_multiple_of(4)
     }
 
     fn memory_reference(insn: &Insn, state: &State) -> Option<u64> {
@@ -663,6 +672,35 @@ impl Arch for Arm64 {
         }
         stubs
     }
+}
+
+/// `[start, end)` of the data among the code that the file's mapping symbols mark, sorted: from
+/// each `$d` to the next mapping symbol in its section, `$x` for code, or to the section's end.
+/// A `$d` and a `$x` at one address mark no data: LLVM emits both for `.space 0` among code.
+pub(crate) fn marked_data(file: &object::File) -> Vec<(u64, u64)> {
+    use object::{Object, ObjectSection, ObjectSymbol, SectionKind};
+    // `(section, address, is code)`, so that at one address a `$d` sorts before what closes it.
+    let mut marks: Vec<(usize, u64, bool)> = file
+        .symbols()
+        .filter_map(|symbol| {
+            let code = match symbol.name().ok()?.split('.').next()? {
+                "$d" => false,
+                "$x" => true,
+                _ => return None,
+            };
+            let index = symbol.section_index()?;
+            let section = file.section_by_index(index).ok()?;
+            // A mark outside its section would mark another section's bytes.
+            let inside = (section.address()..=section.address().saturating_add(section.size())).contains(&symbol.address());
+            (section.kind() == SectionKind::Text && inside).then_some((index.0, symbol.address(), code))
+        })
+        .chain(file.sections().filter(|section| section.kind() == SectionKind::Text).map(|section| (section.index().0, section.address().saturating_add(section.size()), true)))
+        .collect();
+    marks.sort_unstable();
+    let mut data: Vec<(u64, u64)> =
+        marks.windows(2).filter(|pair| pair[0].0 == pair[1].0 && !pair[0].2 && pair[0].1 < pair[1].1).map(|pair| (pair[0].1, pair[1].1)).collect();
+    data.sort_unstable();
+    data
 }
 
 #[cfg(test)]

@@ -189,6 +189,9 @@ pub struct Image {
     /// by address: each holds up to the next. What comes before the first is in its set. Empty
     /// for every other machine.
     pub instruction_sets: Vec<(u64, InstructionSet)>,
+    /// `[start, end)` of the data among the code that an AArch64 ELF file marks with `$d`
+    /// mapping symbols, sorted: kCFI's type hash before each function, literal pools, tables.
+    pub marked_data: Vec<(u64, u64)>,
     /// The managed program of a Unity IL2CPP build, read from the `global-metadata.dat` that
     /// ships with it.
     pub il2cpp: Option<std::sync::Arc<crate::il2cpp::Il2Cpp>>,
@@ -219,6 +222,7 @@ impl Image {
             banking: Banking::default(),
             compiler: None,
             instruction_sets: Vec::new(),
+            marked_data: Vec::new(),
             il2cpp: None,
         }
     }
@@ -337,10 +341,13 @@ impl Image {
             banking: Banking::default(),
             compiler: None,
             instruction_sets: Vec::new(),
+            marked_data: Vec::new(),
             il2cpp: None,
         };
-        if machine == Machine::Arm {
-            crate::arm::load(&file, &mut image);
+        match machine {
+            Machine::Arm => crate::arm::load(&file, &mut image),
+            Machine::Aarch64 => image.marked_data = crate::arm64::marked_data(&file),
+            _ => {}
         }
         Ok(image)
     }
