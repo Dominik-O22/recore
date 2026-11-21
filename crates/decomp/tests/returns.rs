@@ -4,7 +4,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use recore_decomp::isolate::{Options, Status, Worker};
+use recore::program::Program;
+use recore_decomp::isolate::{Options, Status, Worker, returning_callers};
+use recore_decomp::{Section, Session, Target, vendored_spec_dir};
 
 /// Whether the worker takes the function at 0x1010 of `code`, raw x86-64 code at 0x1000, for one
 /// that returns a value. Execution starts at 0x1000.
@@ -19,7 +21,10 @@ fn returns_value(name: &str, code: &[u8]) -> bool {
         command.arg("worker");
         command
     };
-    let (record, c_text) = Worker::new(command, &dir.join("image.toml"), &Options::default()).decompile(0x1010, Duration::from_secs(60));
+    let mut worker = Worker::new(command, &dir.join("image.toml"), &Options::default());
+    let program = Program::load(&dir.join("image.toml")).unwrap();
+    worker.callers(0x1010, || returning_callers(&program, 0x1010));
+    let (record, c_text) = worker.decompile(0x1010, Duration::from_secs(60));
     assert_eq!(record.status, Status::Ok, "{:?}", record.message);
     println!("{}", c_text.unwrap_or_default());
     record.returns_value
@@ -39,6 +44,17 @@ fn called(after: &[u8]) -> Vec<u8> {
 fn a_function_returns_what_a_caller_reads() {
     // add eax, 1; ret
     assert!(returns_value("caller-reads", &called(&[0x83, 0xc0, 0x01, 0xc3])));
+}
+
+#[test]
+fn one_decompilation_returns_what_a_caller_reads() {
+    // add eax, 1; ret: the caller reads the low four bytes.
+    let code = called(&[0x83, 0xc0, 0x01, 0xc3]);
+    let mut session = Session::new(&vendored_spec_dir().unwrap(), Target::X86_64Gcc, &[Section { addr: 0x1000, data: &code, readonly: true, code: true }]).unwrap();
+    session.callers(0x1010, &[0x1000]);
+    let function = session.decompile(0x1010).unwrap();
+    assert!(function.returns_value, "{}", function.c_text);
+    assert_eq!(function.return_shape.size, 4, "{}", function.c_text);
 }
 
 #[test]

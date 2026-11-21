@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use recore::image::{Format, Machine};
+use recore::program::Program;
 use recore::report::{Analysis, CallSite, CallTarget};
 use serde::{Deserialize, Serialize};
 
@@ -163,6 +164,20 @@ enum Request {
     Recovered(String),
     /// Decompile the function for what struct recovery made of its objects.
     Structs(u64),
+    /// Calls to the function from other functions that come back, as [`returning_callers`]
+    /// picks them, for each later decompilation of it. Not answered.
+    Callers(u64, Vec<u64>),
+}
+
+impl Request {
+    /// The function the request decompiles, if it decompiles one.
+    fn function(&self) -> Option<u64> {
+        match self {
+            Request::Decompile(addr) | Request::Parameters(addr) | Request::Flow(addr) | Request::Locals(addr) | Request::Addressed(addr) | Request::Structs(addr) => Some(*addr),
+            Request::Recovered(name) => auto_function(name),
+            _ => None,
+        }
+    }
 }
 
 /// The bytes of address space this process holds, where the system says.
@@ -175,7 +190,22 @@ fn address_space() -> Option<u64> {
 /// The most calls to a function whose code after them is read to see whether they take its
 /// result. Reading each of the tens of thousands of calls some functions have would cost more
 /// than decompiling them.
-const CALLER_SAMPLE: usize = 32;
+pub const CALLER_SAMPLE: usize = 32;
+
+/// Up to [`CALLER_SAMPLE`] of the calls to the function at `entry` that come back to the code
+/// after them, from other functions, picked at even steps through all the calls to it. Given to a
+/// [`Worker`] with [`Worker::callers`], they let the decompiler take the function as returning
+/// a value where its own code shows none and the code after one of them reads the result.
+pub fn returning_callers(program: &Program, entry: u64) -> Vec<u64> {
+    let body = program.body(entry);
+    let step = program.calls_to(entry).count().div_ceil(CALLER_SAMPLE).max(1);
+    program
+        .calls_to(entry)
+        .step_by(step)
+        .filter(|call| !call.tail && !call.noreturn && !body.iter().any(|&(start, end)| (start..end).contains(&call.at)))
+        .map(|call| call.at)
+        .collect()
+}
 
 /// Callees with more code than this, in bytes, are not decompiled ahead of their callers. The few
 /// large functions take most of the time, and leaving them out costs no measurable accuracy.
@@ -476,15 +506,15 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             }
         }
     };
+    // The calls to each function the parent gave with Request::Callers.
+    let mut given: HashMap<u64, Vec<u64>> = HashMap::new();
     // A function whose own code shows no value returned may still return one that a caller
-    // reads, which only the callers show. A call from the function itself shows nothing.
-    let decompile = |session: &mut Session, entry: u64| -> Result<Decompiled> {
-        let decompiled = session.decompile(entry)?;
-        if decompiled.returns_value || !session.returns_what_callers_read(entry, &calls.returning_to_callers(entry)) {
-            return Ok(decompiled);
+    // reads, which only the callers show. The session reads them only for such a function.
+    let decompile = |session: &mut Session, given: &HashMap<u64, Vec<u64>>, entry: u64| -> Result<Decompiled> {
+        if let Some(calls) = given.get(&entry) {
+            session.callers(entry, calls);
         }
-        // A failure here leaves the function as its own code has it.
-        Ok(session.decompile(entry).unwrap_or(decompiled))
+        session.decompile(entry)
     };
     // Results of functions decompiled ahead of a caller that are as good as asked for.
     let mut ready: HashMap<u64, Event> = HashMap::new();
@@ -536,7 +566,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 settle_return(&mut session, addr);
                 prepare(&mut session, &mut importer, &edits, addr, true);
                 session.keep_flow(true);
-                let flow = decompile(&mut session, addr).map(|function| function.flow.unwrap_or_default());
+                let flow = decompile(&mut session, &given, addr).map(|function| function.flow.unwrap_or_default());
                 session.keep_flow(false);
                 send(&Event::Flow(flow.map_err(|error| error.to_string())))?;
                 continue;
@@ -545,7 +575,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 settle_return(&mut session, addr);
                 prepare(&mut session, &mut importer, &edits, addr, true);
                 session.keep_addresses(true);
-                let c_text = decompile(&mut session, addr).map(|function| function.c_text);
+                let c_text = decompile(&mut session, &given, addr).map(|function| function.c_text);
                 session.keep_addresses(false);
                 send(&text(c_text))?;
                 continue;
@@ -553,7 +583,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             Request::Locals(addr) => {
                 settle_return(&mut session, addr);
                 prepare(&mut session, &mut importer, &edits, addr, true);
-                send(&Event::Locals(decompile(&mut session, addr).map(|function| function.locals).map_err(|error| error.to_string())))?;
+                send(&Event::Locals(decompile(&mut session, &given, addr).map(|function| function.locals).map_err(|error| error.to_string())))?;
                 continue;
             }
             Request::Recovered(ref name) => {
@@ -563,7 +593,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                         Some(function) => {
                             settle_return(&mut session, function);
                             prepare(&mut session, &mut importer, &edits, function, true);
-                            let _ = decompile(&mut session, function);
+                            let _ = decompile(&mut session, &given, function);
                             session.recovered(name)
                         }
                         None => None,
@@ -575,7 +605,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             Request::Structs(addr) => {
                 settle_return(&mut session, addr);
                 prepare(&mut session, &mut importer, &edits, addr, true);
-                let report = decompile(&mut session, addr).map_err(|error| error.to_string()).map(|_| session.structs_of(addr).unwrap_or_default());
+                let report = decompile(&mut session, &given, addr).map_err(|error| error.to_string()).map(|_| session.structs_of(addr).unwrap_or_default());
                 send(&Event::Structs(report))?;
                 continue;
             }
@@ -601,6 +631,10 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 send(&Event::Edited(done))?;
                 continue;
             }
+            Request::Callers(function, calls) => {
+                given.insert(function, calls);
+                continue;
+            }
             Request::Decompile(addr) | Request::Parameters(addr) => addr,
         };
         if let (Request::Decompile(_), Some(event)) = (&request, ready.remove(&addr)) {
@@ -614,22 +648,24 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         if matches!(request, Request::Parameters(_)) && callees_first {
             tail_chain(&tail_callees, addr, &small, TAIL_DEPTH, &mut jumped_first);
         }
-        // Decompiled for a caller's sake with every callee of its own known, a function comes
-        // out as it would when asked for, so the result is kept for then.
-        let keep = matches!(request, Request::Parameters(_)) && unknown(addr).iter().all(|callee| jumped_first.contains(callee));
+        // Decompiled for a caller's sake with every callee of its own known, and its own callers
+        // given, a function comes out as it would when asked for, so the result is kept for then.
+        let keep = matches!(request, Request::Parameters(_)) && given.contains_key(&addr) && unknown(addr).iter().all(|callee| jumped_first.contains(callee));
         for target in jumped_first {
             settle_return(&mut session, target);
             session.keep_prototypes(!hands_on_registers);
             prepare(&mut session, &mut importer, &edits, target, false);
             // A failure here only leaves the caller as well off as it was.
-            let _ = decompile(&mut session, target);
+            let _ = session.decompile(target);
             known.insert(target);
         }
         settle_return(&mut session, addr);
         session.keep_prototypes(callees_first || (jumped_to.contains(&addr) && !hands_on_registers));
         let start = Instant::now();
         prepare(&mut session, &mut importer, &edits, addr, true);
-        let result = decompile(&mut session, addr);
+        // Reading the callers costs more than what it changes in a function decompiled only for
+        // the parameters it takes, whose result no one sees.
+        let result = if matches!(request, Request::Decompile(_)) || keep { decompile(&mut session, &given, addr) } else { session.decompile(addr) };
         known.insert(addr);
         let ms = start.elapsed().as_secs_f64() * 1e3;
         let event = match result {
@@ -760,9 +796,6 @@ struct Calls<'a> {
     ranges: Vec<(u64, u64, u64)>,
     /// Indexes into `ranges`, by owner and then by start.
     by_owner: Vec<usize>,
-    /// Indexes into `calls` of the calls that come back, by the function they call: made the first
-    /// time a function's callers are asked for, which most sessions never do.
-    to: std::cell::OnceCell<recore::FxHashMap<u64, Vec<u32>>>,
 }
 
 impl<'a> Calls<'a> {
@@ -772,7 +805,7 @@ impl<'a> Calls<'a> {
         ranges.sort_unstable();
         let mut by_owner: Vec<usize> = (0..ranges.len()).collect();
         by_owner.sort_by_key(|&index| ranges[index].2);
-        Calls { calls: &analysis.calls, ranges, by_owner, to: Default::default() }
+        Calls { calls: &analysis.calls, ranges, by_owner }
     }
 
     /// The calls in range `index`: up to its end, or to where the next range starts.
@@ -783,32 +816,14 @@ impl<'a> Calls<'a> {
         &calls[calls.partition_point(|call| call.at < start)..calls.partition_point(|call| call.at < end.max(start))]
     }
 
-    /// Indexes into `ranges` of the ranges of the function at `entry`.
-    fn ranges_of(&self, entry: u64) -> impl Iterator<Item = usize> + '_ {
-        let first = self.by_owner.partition_point(|&index| self.ranges[index].2 < entry);
-        self.by_owner[first..].iter().copied().take_while(move |&index| self.ranges[index].2 == entry)
-    }
-
     /// The calls of the function at `entry`, in address order.
     fn of(&self, entry: u64) -> impl Iterator<Item = &'a CallSite> + '_ {
-        self.ranges_of(entry).flat_map(|index| self.in_range(index)).filter(move |call| call.target != CallTarget::Function(entry))
-    }
-
-    /// Up to [`CALLER_SAMPLE`] of the calls to the function at `entry` from other functions that
-    /// come back to the code after them, spread over all of them.
-    fn returning_to_callers(&self, entry: u64) -> Vec<u64> {
-        let to = self.to.get_or_init(|| {
-            let mut to: recore::FxHashMap<u64, Vec<u32>> = recore::FxHashMap::default();
-            for (index, call) in self.calls.iter().enumerate() {
-                if let (CallTarget::Function(target), false, false) = (call.target, call.tail, call.noreturn) {
-                    to.entry(target).or_default().push(index as u32);
-                }
-            }
-            to
-        });
-        let own = |at: u64| self.ranges_of(entry).any(|index| (self.ranges[index].0..self.ranges[index].1).contains(&at));
-        let calls: Vec<u64> = to.get(&entry).into_iter().flatten().map(|&index| self.calls[index as usize].at).filter(|&at| !own(at)).collect();
-        calls.iter().copied().step_by(calls.len().div_ceil(CALLER_SAMPLE).max(1)).collect()
+        let first = self.by_owner.partition_point(|&index| self.ranges[index].2 < entry);
+        self.by_owner[first..]
+            .iter()
+            .take_while(move |&&index| self.ranges[index].2 == entry)
+            .flat_map(|&index| self.in_range(index))
+            .filter(move |call| call.target != CallTarget::Function(entry))
     }
 
     /// The jumps each function leaves by for good, by entry point.
@@ -834,6 +849,8 @@ struct Process {
     stderr: Option<JoinHandle<String>>,
     /// The child has reported that its session is set up.
     ready: bool,
+    /// The functions whose callers the child was given.
+    told: HashSet<u64>,
 }
 
 /// How a request went wrong, with the child gone.
@@ -864,7 +881,7 @@ impl Process {
             let _ = stderr.read_to_string(&mut text);
             text
         });
-        Ok(Process { child, stdin, events, stderr: Some(drain), ready: false })
+        Ok(Process { child, stdin, events, stderr: Some(drain), ready: false, told: HashSet::new() })
     }
 
     /// Waits for the child to finish setting up.
@@ -885,12 +902,20 @@ impl Process {
         }
     }
 
-    /// Sends one request and waits up to `timeout` for the answer. Setup still under way does
-    /// not count towards `timeout`.
-    fn ask(&mut self, request: Request, timeout: Duration) -> Result<Event, Failure> {
+    /// Sends one request and waits up to `timeout` for the answer, with the calls to the function
+    /// it decompiles first if `callers` has them and the child was not given them yet. Setup
+    /// still under way does not count towards `timeout`.
+    fn ask(&mut self, request: Request, callers: &HashMap<u64, Vec<u64>>, timeout: Duration) -> Result<Event, Failure> {
         self.wait_ready()?;
+        let mut lines = String::new();
+        if let Some((&function, calls)) = request.function().and_then(|function| callers.get_key_value(&function))
+            && self.told.insert(function)
+        {
+            lines = serde_json::to_string(&Request::Callers(function, calls.clone())).expect("plain data") + "\n";
+        }
+        lines += &serde_json::to_string(&request).expect("plain data");
         // A failed write means the child is gone, which the receive below reports.
-        let _ = writeln!(self.stdin, "{}", serde_json::to_string(&request).expect("plain data")).and_then(|()| self.stdin.flush());
+        let _ = writeln!(self.stdin, "{lines}").and_then(|()| self.stdin.flush());
         match self.events.recv_timeout(timeout) {
             Ok(Event::Ready) | Err(RecvTimeoutError::Disconnected) => Err(Failure { status: Status::Crash, message: self.end(false) }),
             Ok(event) => Ok(event),
@@ -940,6 +965,8 @@ pub struct Worker {
     avoid: HashSet<u64>,
     /// Whether a child has been lost to a timeout or a crash.
     lost: bool,
+    /// The calls to each function given with [`Worker::callers`].
+    callers: HashMap<u64, Vec<u64>>,
 }
 
 impl Worker {
@@ -961,7 +988,17 @@ impl Worker {
             command.arg(&binary).arg(&json);
             command
         };
-        Worker { command: Box::new(command), options: options.clone(), process: None, avoid: HashSet::new(), lost: false }
+        Worker { command: Box::new(command), options: options.clone(), process: None, avoid: HashSet::new(), lost: false, callers: HashMap::new() }
+    }
+
+    /// Gives the calls to `function` from other functions that come back, as
+    /// [`returning_callers`] picks them, for every later decompilation of it that is shown: one
+    /// asked for, and one ahead of a caller that is kept for when it is. `calls` runs the first
+    /// time a function is given. A function whose own code shows no value returned is then
+    /// taken as returning one where the code after one of these calls reads the result.
+    /// Without them it stays as its own code has it.
+    pub fn callers(&mut self, function: u64, calls: impl FnOnce() -> Vec<u64>) {
+        self.callers.entry(function).or_insert_with(calls);
     }
 
     /// Decompiles one function. If the child dies or exceeds `timeout`, the record says so.
@@ -1146,8 +1183,9 @@ impl Worker {
 
     /// Asks the child, starting one if the last one is gone.
     fn ask(&mut self, request: Request, timeout: Duration) -> Result<Event, Failure> {
-        let process = self.process()?;
-        let result = process.ask(request, timeout);
+        self.process()?;
+        let process = self.process.as_mut().expect("started above");
+        let result = process.ask(request, &self.callers, timeout);
         // Only a child that had set up held any parameters to lose.
         let held = process.ready;
         if result.is_err() {

@@ -757,15 +757,14 @@ impl Session {
         unsafe { ffi::rd_returns_like(self.raw.as_ptr(), function, callee, import.into(), err.as_mut_ptr(), err.len()) != 0 }
     }
 
-    /// States that `function` returns a value if the code after one of `calls`, calls to it that
-    /// come back, reads the register a result comes back in before anything writes it. For a
-    /// function whose own code shows no value returned, as one that ends by calling a function
-    /// of no known prototype does. Says whether one reads it; if so, the next decompilation of
-    /// `function`, and only that one, takes it as returning as many bytes as the widest such
-    /// read, or the whole register where the register also passes an argument.
-    pub fn returns_what_callers_read(&mut self, function: u64, calls: &[u64]) -> bool {
-        let mut err = [0 as c_char; 64];
-        unsafe { ffi::rd_returns_what_callers_read(self.raw.as_ptr(), function, calls.as_ptr(), calls.len(), err.as_mut_ptr(), err.len()) != 0 }
+    /// Gives `calls`, calls to `function` from other functions that come back, for its next
+    /// decompilation. If its own code shows no value returned, as that of one that ends by
+    /// calling a function of no known prototype does, and the code after one of them reads the
+    /// register a result comes back in before anything writes it, that decompilation takes it
+    /// as returning as many bytes as the widest such read, or the whole register where the
+    /// register also passes an argument. The session reads each function's callers once.
+    pub fn callers(&mut self, function: u64, calls: &[u64]) {
+        unsafe { ffi::rd_callers(self.raw.as_ptr(), function, calls.as_ptr(), calls.len()) }
     }
 
     /// With `keep`, every later [`Session::decompile`] prints each line of C after the address of

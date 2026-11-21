@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use recore_decomp::isolate::{FunctionRecord, Options, Status, Worker};
+use recore::program::Program;
+use recore_decomp::isolate::{FunctionRecord, Options, Status, Worker, returning_callers};
 
 use crate::report::{BinaryReport, Slow, Summary};
 
@@ -167,6 +168,15 @@ pub fn run_shard(options: &Options, timeout: Duration, binary: &Path, addrs: &[u
         command
     };
     let mut worker = Worker::new(command, binary, options);
+    // The calls to each function, from the analysis the worker keeps on disk. A binary that does
+    // not load decompiles without them and fails in the worker.
+    if let Ok(image) = recore::Image::load(binary) {
+        let analysis = recore::cache::analyze(binary, &image);
+        let program = Program::new(image, analysis);
+        for &addr in addrs {
+            worker.callers(addr, || returning_callers(&program, addr));
+        }
+    }
     let mut records = Vec::new();
     let mut c_texts = Vec::new();
     for &addr in addrs {
