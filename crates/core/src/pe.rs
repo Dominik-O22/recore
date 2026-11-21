@@ -8,7 +8,7 @@ use object::pe::RT_VERSION;
 use object::read::pe::{ImageNtHeaders, Import, PeFile, ResourceDirectoryTable};
 use object::{LittleEndian as LE, Object};
 
-use crate::image::Section;
+use crate::image::{Section, SectionFinder};
 
 /// What a PE file contributes to an `Image` beyond its sections.
 pub struct Metadata {
@@ -62,8 +62,9 @@ pub fn load<Pe: ImageNtHeaders>(data: &[u8], sections: &[Section]) -> Result<Met
         u64::from_le_bytes(raw)
     };
     // The value at a relocated slot: a pointer of the image's own width.
+    let finder = SectionFinder::new(sections);
     let read_pointer = |addr: u64, size: usize| {
-        let section = sections.iter().find(|s| s.contains(addr))?;
+        let section = finder.find(addr)?;
         Some(read_word(section.data.get((addr - section.addr) as usize..)?.get(..size)?))
     };
     let mut relative_targets = Vec::new();
@@ -87,7 +88,7 @@ pub fn load<Pe: ImageNtHeaders>(data: &[u8], sections: &[Section]) -> Result<Met
         // exception: in an image based at 0x400000, "ons\0" and the UTF-16 "s\0t\0" land in
         // its code, so a word that reads as text beside another that does is text. Resources
         // hold offsets, never addresses.
-        let in_image = |value: u64| sections.iter().any(|s| s.contains(value));
+        let in_image = |value: u64| finder.find(value).is_some();
         let is_text = |word: &[u8]| word.iter().all(|&byte| byte == 0 || byte == b' ' || byte.is_ascii_graphic()) && word.iter().any(|&byte| byte != 0);
         for section in sections.iter().filter(|s| !s.executable && s.name != ".rsrc") {
             let words: Vec<&[u8]> = section.data.chunks_exact(pointer_size as usize).collect();
@@ -139,8 +140,9 @@ fn function_frames(pdata: &Section, sections: &[Section], base: u64) -> Vec<(u64
     /// `UNW_FLAG_CHAININFO`: this entry continues the function described by another.
     const CHAINED: u8 = 0x4;
     let rva = |bytes: &[u8]| u64::from(u32::from_le_bytes(bytes.try_into().unwrap()));
+    let finder = SectionFinder::new(sections);
     let is_chained = |unwind: u64| {
-        let section = sections.iter().find(|s| s.contains(unwind));
+        let section = finder.find(unwind);
         // The first byte holds the version in its low three bits and the flags above them.
         section.and_then(|s| s.data.get((unwind - s.addr) as usize)).is_some_and(|&first| first >> 3 & CHAINED != 0)
     };
