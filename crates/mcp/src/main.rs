@@ -64,23 +64,25 @@ fn main() -> Result<()> {
 
     let mut cache = Cache::new(true);
     let mut out = std::io::stdout().lock();
-    for line in std::io::stdin().lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(reply) = handle(&mut cache, &line) {
+    let mut input = std::io::stdin().lock();
+    // Bytes, not text: a line that is not UTF-8 gets a parse error like any other bad JSON.
+    let mut line = Vec::new();
+    while input.read_until(b'\n', &mut line)? > 0 {
+        if !line.trim_ascii().is_empty()
+            && let Some(reply) = handle(&mut cache, &line)
+        {
             writeln!(out, "{reply}")?;
             out.flush()?;
         }
+        line.clear();
     }
     Ok(())
 }
 
 /// Answers one message. Notifications and the client's own responses get no answer.
-fn handle(cache: &mut Cache, line: &str) -> Option<Value> {
+fn handle(cache: &mut Cache, line: &[u8]) -> Option<Value> {
     let failure = |id: Value, code: i32, message: String| json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } });
-    let message: Value = match serde_json::from_str(line) {
+    let message: Value = match serde_json::from_slice(line) {
         Ok(message) => message,
         Err(error) => return Some(failure(Value::Null, PARSE_ERROR, format!("not JSON: {error}"))),
     };

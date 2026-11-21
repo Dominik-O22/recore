@@ -30,6 +30,9 @@ fn speaks_the_protocol() {
     client.send("not json");
     assert_eq!(client.receive()["error"]["code"], -32700);
     assert_eq!(client.request("ping", json!({}))["result"], json!({}));
+    client.send_bytes(b"\xff");
+    assert_eq!(client.receive()["error"]["code"], -32700);
+    assert_eq!(client.request("ping", json!({}))["result"], json!({}));
 }
 
 #[test]
@@ -53,6 +56,8 @@ fn answers_queries_and_reports_bad_input_as_tool_errors() {
     let missing = client.request("tools/call", json!({ "name": "summary", "arguments": { "path": "/nonexistent/binary" } }));
     assert_eq!(missing["result"]["isError"], true);
     assert!(missing["result"]["content"][0]["text"].as_str().unwrap().contains("cannot read /nonexistent/binary"));
+    // Only a regular file is read: a FIFO or a device could hang the server.
+    assert!(client.tool("summary", json!({ "path": "/dev/null" })).unwrap_err().contains("/dev/null is not a regular file"));
 }
 
 #[test]
