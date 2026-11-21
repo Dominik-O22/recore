@@ -249,8 +249,12 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     if let Some(importer) = &mut importer {
         let declared = declared_functions(&edits.declarations);
         let named: HashSet<u64> = facts.names.iter().map(|name| name.0).collect();
-        // A function with no name goes by the one the engine gives it, `func_0x` and its address.
-        let unnamed = declared.iter().filter_map(|name| u64::from_str_radix(name.strip_prefix("func_0x")?, 16).ok()).filter(|addr| !named.contains(addr));
+        // A function with no name goes by the one the engine gives it, `func_0x` and its address
+        // padded to the width of the space, or on a 64-bit machine to 8 or 12 digits where it can.
+        let size = image.machine.pointer_size() as usize;
+        let digits = |addr: u64| if size == 8 { [8, 12, 16][usize::from(addr >> 32 != 0) + usize::from(addr >> 48 != 0)] } else { 2 * size };
+        let automatic = |name: &str| u64::from_str_radix(name.strip_prefix("func_0x")?, 16).ok().filter(|&addr| name == format!("func_0x{addr:0width$x}", width = digits(addr)));
+        let unnamed = declared.iter().filter_map(|name| automatic(name)).filter(|addr| !named.contains(addr));
         importer.declared(facts.names.iter().filter(|(_, name)| declared.contains(name.as_str())).map(|name| name.0).chain(unnamed));
     }
     // From here on a fact the engine refuses is reported and costs only itself, or the facts
