@@ -19,8 +19,8 @@ struct Region<'a> {
     /// Per byte, the length of the decoded instruction that begins there, or zero.
     insn_len: Vec<u8>,
     /// Per byte, what is known about the address: [`FOLLOWS_BREAK`], [`ASKED_AS_START`],
-    /// [`REFERENCED`], [`IN_TABLE`] and [`MARKED_DATA`]. One array, so that looking up a call's
-    /// target touches one place in memory.
+    /// [`REFERENCED`], [`IN_TABLE`], [`MARKED_DATA`] and [`IN_SYMBOL`]. One array, so that
+    /// looking up a call's target touches one place in memory.
     flags: Vec<u8>,
     /// Per page, the time `insn_len` or a [`FOLLOWS_BREAK`] flag last changed in it, on the
     /// explorer's clock.
@@ -45,6 +45,9 @@ const REFERENCED: u8 = 4;
 const IN_TABLE: u8 = 8;
 /// The file marks the byte as data, which also makes it [`IN_TABLE`].
 const MARKED_DATA: u8 = 16;
+/// The address lies strictly inside a function an ELF symbol gives a size, where only what the
+/// file says starts another: a symbol or an unwind frame.
+const IN_SYMBOL: u8 = 32;
 
 /// The gap scan works through a section in pages of this many bytes.
 const PAGE: usize = 4096;
@@ -314,9 +317,6 @@ struct Explorer<'a, A: Arch> {
     known_lengths: FxHashMap<u64, usize>,
     /// `[start, end)` ranges from `.eh_frame`. Nothing strictly inside one becomes an entry point.
     frames: &'a [(u64, u64)],
-    /// [`Image::symbol_extents`] with those that overlap joined. Only what the file itself says
-    /// starts a function strictly inside one, and a call from outside it.
-    symbols: &'a [(u64, u64)],
     /// Counts the page scans of the gap search, and dates changes to what those scans read.
     clock: u32,
     /// `[start, end)` of every section that holds no code, sorted.
@@ -389,10 +389,9 @@ impl<'a, A: Arch> Explorer<'a, A> {
         index > 0 && addr > self.frames[index - 1].0 && addr < self.frames[index - 1].1
     }
 
-    /// The sized symbol that `addr` lies strictly inside.
-    fn symbol_around(&self, addr: u64) -> Option<(u64, u64)> {
-        let index = self.symbols.partition_point(|&(start, _)| start <= addr);
-        self.symbols[..index].last().copied().filter(|&(start, end)| addr > start && addr < end)
+    /// Whether `addr` lies strictly inside a sized symbol.
+    fn in_symbol(&self, addr: u64) -> bool {
+        self.region_index(addr).is_some_and(|index| self.regions[index].flags[(addr - self.regions[index].section.addr) as usize] & IN_SYMBOL != 0)
     }
 
     fn add_start(&mut self, addr: u64, origin: Origin) {
@@ -422,7 +421,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
             return;
         }
         *flags |= ASKED_AS_START;
-        if !matches!(origin, Origin::Export | Origin::Frame | Origin::Call) && self.symbol_around(addr).is_some() {
+        if *flags & IN_SYMBOL != 0 && !matches!(origin, Origin::Export | Origin::Frame) {
             return;
         }
         // Code that only falls or jumps into the inside of a frame is its function's. In a frame
@@ -606,12 +605,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     Flow::Call(target) => {
                         if !speculative {
                             self.calls.push((decoded.addr, target));
-                            // A call within a sized symbol to a label of its own, as `call 1f`
-                            // reads the program counter, starts nothing.
-                            let within = self.symbol_around(target).is_some_and(|(start, end)| decoded.addr >= start && decoded.addr < end);
-                            if !within {
-                                self.add_start(target, Origin::Call);
-                            }
+                            self.add_start(target, Origin::Call);
                         }
                         false
                     }
@@ -626,7 +620,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     // for patches lands on the filler after it. Nor inside a sized symbol,
                     // where it goes on in that function.
                     Flow::Jump(target)
-                        if decoded.addr == start && self.starts.contains_key(&start) && !self.is_padding_at(target) && self.symbol_around(target).is_none() =>
+                        if decoded.addr == start && self.starts.contains_key(&start) && !self.is_padding_at(target) && !self.in_symbol(target) =>
                     {
                         self.add_start(target, Origin::Thunk);
                         true
@@ -1642,7 +1636,8 @@ pub fn is_function_section(section: &Section) -> bool {
     section.executable && !section.is_stubs()
 }
 
-pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
+/// `symbols` are the sized symbols of [`Image::symbol_extents`] in function sections, sorted.
+pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)], symbols: &[(u64, u64)]) -> Discovery {
     // A table with no bounds check is read until something implausible, which can run into the
     // next table and send decoding to addresses that are not code. The first pass learns where
     // such tables really end; the second starts clean with that knowledge.
@@ -1651,10 +1646,9 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
         let _phase = phase::scope("discover/pointers");
         Pointers::new(image)
     };
-    let symbols = merge_overlapping(&image.symbol_extents);
     // A first pass that learns a length stops recording what only a last pass has to report.
     let run = |rejected: &FxHashSet<u64>| {
-        let first = explore::<A>(image, frames, &symbols, &pointers, FxHashMap::default(), rejected.clone());
+        let first = explore::<A>(image, frames, symbols, &pointers, FxHashMap::default(), rejected.clone());
         let lengths = first.learned_lengths();
         debug_assert!(first.recording || !lengths.is_empty());
         if lengths.is_empty() {
@@ -1662,7 +1656,7 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
         } else {
             // Its maps of the code are as large as the second pass's.
             drop(first);
-            explore::<A>(image, frames, &symbols, &pointers, lengths, rejected.clone())
+            explore::<A>(image, frames, symbols, &pointers, lengths, rejected.clone())
         }
     };
     let mut explorer = run(&FxHashSet::default());
@@ -1725,18 +1719,6 @@ fn merge_touching(ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     merged
 }
 
-/// Sorted ranges with those that overlap joined, but not those that only touch.
-fn merge_overlapping(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
-    for &(start, end) in ranges {
-        match merged.last_mut() {
-            Some(last) if start < last.1 => last.1 = last.1.max(end),
-            _ => merged.push((start, end)),
-        }
-    }
-    merged
-}
-
 /// What the image's relative relocations say, in the forms exploring looks them up.
 struct Pointers {
     /// Slot address to target.
@@ -1761,13 +1743,21 @@ impl Pointers {
     }
 }
 
-/// The flags of `section` before anything is decoded: on what the file marks as data.
-fn initial_flags(image: &Image, section: &Section) -> Vec<u8> {
+/// The flags of `section` before anything is decoded: on what the file marks as data, and on the
+/// inside of each sized symbol of `symbols`.
+fn initial_flags(image: &Image, symbols: &[(u64, u64)], section: &Section) -> Vec<u8> {
     let mut flags = vec![0; section.data.len()];
     let first = image.marked_data.partition_point(|&(_, end)| end <= section.addr);
     for &(start, end) in image.marked_data[first..].iter().take_while(|&&(start, _)| start < section.end()) {
         let (from, to) = (start.max(section.addr) - section.addr, end.min(section.end()) - section.addr);
         flags[from as usize..to as usize].fill(IN_TABLE | MARKED_DATA);
+    }
+    // Each lies in the section it starts in.
+    let first = symbols.partition_point(|&(start, _)| start < section.addr);
+    for &(start, end) in symbols[first..].iter().take_while(|&&(start, _)| start < section.end()) {
+        if let Some(inside) = flags.get_mut((start + 1 - section.addr) as usize..(end - section.addr) as usize) {
+            inside.iter_mut().for_each(|flags| *flags |= IN_SYMBOL);
+        }
     }
     flags
 }
@@ -1780,7 +1770,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], symbols: &'a
         .map(|section| Region {
             section,
             insn_len: vec![0; section.data.len()],
-            flags: initial_flags(image, section),
+            flags: initial_flags(image, symbols, section),
             changed: vec![0; section.data.len() / PAGE + 1],
             scans: vec![None; section.data.len() / PAGE + 1],
             covered: vec![0; section.data.len() / 64 + 2],
@@ -1806,7 +1796,6 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], symbols: &'a
         pointer_values: &pointers.values,
         known_lengths,
         frames,
-        symbols,
         clock: 0,
         recording: true,
         unbounded: 0,

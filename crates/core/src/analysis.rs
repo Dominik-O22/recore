@@ -514,10 +514,19 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
     let frame_end: FxHashMap<u64, u64> = frames.iter().chain(&image.banking.tables).copied().collect();
     // A sized symbol says where its function ends too, but code may follow it up to the next
     // entry that no symbol names. Of symbols at one address, the largest.
-    let symbol_end: FxHashMap<u64, u64> = image.symbol_extents.iter().copied().collect();
+    let mut symbols: Vec<(u64, u64)> = image
+        .symbol_extents
+        .iter()
+        .filter_map(|&(start, end)| {
+            let section = image.section_at(start).filter(|s| is_function_section(s))?;
+            Some((start, end.min(section.end())))
+        })
+        .collect();
+    symbols.sort_unstable();
+    let symbol_end: FxHashMap<u64, u64> = symbols.iter().copied().collect();
 
     drop(_phase);
-    let mut discovery = discover::<A>(image, &frames);
+    let mut discovery = discover::<A>(image, &frames, &symbols);
     _phase = phase::scope("setup");
     let tables: FxHashMap<u64, &[u64]> = discovery.jump_tables.iter().map(|t| (t.jump, t.targets.as_slice())).collect();
 
@@ -658,8 +667,9 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             let index = inline_tables.partition_point(|&(start, _)| start <= addr);
             index > 0 && addr < inline_tables[index - 1].1
         };
-        let after_call = |f: &Function, control: &Control| {
-            if (control.next == f.end && frame_end.contains_key(&f.start)) || symbol_end.get(&f.start) == Some(&control.next) {
+        // `ends`: where the file says the function ends, at its frame's end or its symbol's.
+        let after_call = |f: &Function, ends: [Option<u64>; 2], control: &Control| {
+            if ends.contains(&Some(control.next)) {
                 return After::Ends;
             }
             // Read the bytes themselves: a trap that pads the end of a function has been
@@ -680,7 +690,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .par_iter()
             .chain(&chunks)
             .flat_map_iter(|f| {
-                f.calls().filter_map(|(control, target)| match after_call(f, control) {
+                let ends = [frame_end.contains_key(&f.start).then_some(f.end), symbol_end.get(&f.start).copied()];
+                f.calls().filter_map(move |(control, target)| match after_call(f, ends, control) {
                     After::Ends => Some((target, None)),
                     After::Code => Some((target, Some(control.next))),
                     After::Nothing => None,
