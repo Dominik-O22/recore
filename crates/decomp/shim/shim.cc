@@ -2380,11 +2380,12 @@ class Objects {
 
 // The struct with no layout that a parameter is declared to point to, as a kCFI hash or a DWARF
 // declaration names one, or null. Such a lock says no more than the name, so struct recovery
-// may give the parameter a struct of its own that prints under that name.
+// may give the parameter a struct of its own that prints under that name. A struct whose size
+// is known, though none of its fields is, keeps the lock.
 static const Datatype *declared_struct(const Varnode *vn) {
   if (!vn->isInput() || vn->getType()->getMetatype() != TYPE_PTR) return nullptr;
   const Datatype *to = static_cast<const TypePointer *>(vn->getType())->getPtrTo();
-  return to->getMetatype() == TYPE_STRUCT && to->isIncomplete() ? to : nullptr;
+  return to->getMetatype() == TYPE_STRUCT && to->isIncomplete() && to->getSize() == 0 ? to : nullptr;
 }
 
 // Whether a value can hold one of the pointers struct recovery follows.
