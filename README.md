@@ -288,4 +288,4 @@ The speed table compares Ghidra's `Total Time` per binary with the wall time of 
 
 ## Licence
 
-Apache 2.0. The vendored decompiler engine is Apache 2.0 from the Ghidra project, with zlib under its own licence. The prototypes in `crates/decomp/data/*.protos` come from Ghidra's type archives, under the same licence.
+Apache 2.0. The vendored decompiler engine is Apache 2.0 from the Ghidra project, with zlib under its own licence. The prototypes in `crates/decomp/data/win32.protos`, `clib.protos` and `macos.protos` come from Ghidra's type archives, under the same licence. `crates/decomp/data/kcfi.protos` holds function types taken from Linux kernels' BTF, and Linux is licensed under the GPL-2.0.
