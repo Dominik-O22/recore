@@ -176,9 +176,29 @@ fn address_space() -> Option<u64> {
 /// large functions take most of the time, and leaving them out costs no measurable accuracy.
 const CALLEE_LIMIT: u64 = 4096;
 
+/// Ends this process within a fifth of a second of its parent's death. The parent enforces the
+/// time limit, and a child busy with a function does not read stdin, so without this a killed
+/// parent leaves its child running for as long as the function takes, which may be forever.
+///
+/// It watches for the process being reparented, which works on macOS as well as Linux.
+/// `PR_SET_PDEATHSIG` would not: it fires when the parent *thread* that spawned the child exits,
+/// which a short-lived thread starting a worker would make kill a live child. A parent that dies
+/// before this runs goes unnoticed; the child then sets up, reads end of file and exits.
+fn exit_with_parent() {
+    let parent = std::os::unix::process::parent_id();
+    std::thread::spawn(move || {
+        while std::os::unix::process::parent_id() == parent {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // No unwinding or exit handlers: the engine is running on another thread.
+        unsafe { libc::_exit(1) }
+    });
+}
+
 /// The child side: loads `binary`, then answers each request on stdin with one line on stdout,
 /// until stdin closes. `options` is the JSON that [`Worker::new`] passed along.
 pub fn serve(binary: &Path, options: &str) -> Result<()> {
+    exit_with_parent();
     // Setting up frees much of what it builds, and the process lives on.
     let give_back = crate::GiveBackFreed::after(0);
     let options: Options = serde_json::from_str(options)?;
