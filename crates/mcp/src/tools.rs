@@ -235,7 +235,7 @@ static TOOLS: LazyLock<[Tool; 22]> = LazyLock::new(|| {
         ),
         on_binary(
             "structs",
-            "The structs a function's pointers got: each parameter that points to one, and each struct field that points to another, with the struct's name and how much the code reads and writes through it. With `refused`, also each pointer the code reads fields through that got no struct, and why: so `*(int8 *)(param_1 + 0x28)` can be told from a struct that was never tried. Costs one decompilation.",
+            "The structs a function's pointers got: each parameter that points to one, and each struct field that points to another, with the struct's name, the name the C prints it as where that differs, and how much the code reads and writes through it. With `refused`, also each pointer the code reads fields through that got no struct, and why: so `*(int8 *)(param_1 + 0x28)` can be told from a struct that was never tried. Costs one decompilation.",
             structs,
         ),
         on_binary(
@@ -252,7 +252,7 @@ static TOOLS: LazyLock<[Tool; 22]> = LazyLock::new(|| {
         ),
         on_binary(
             "rename",
-            "Names a function (at its entry address), a data address, with `var` a variable inside a function, or a struct or one of its fields. The name is saved for this binary and used everywhere from then on, the decompiler's C included. An empty name removes it. Give `addr` and `name`, or several in `names`. A struct the decompiler recovered, such as `S_401a20_RDI`, is kept under the name given, with the structs it points to, and callers that pass the pointer on show it too. Giving a second struct a name already taken says the two are one type: their fields merge, or the rename is refused with the offsets that clash. `S_401a20_RDI.field_0x10` names a field.",
+            "Names a function (at its entry address), a data address, with `var` a variable inside a function, or a struct or one of its fields. The name is saved for this binary and used everywhere from then on, the decompiler's C included. An empty name removes it. Give `addr` and `name`, or several in `names`. A struct the decompiler recovered, such as `S_401a20_RDI`, is kept under the name given, with the structs it points to, and callers that pass the pointer on show it too. Giving a second struct a name already taken says the two are one type: their fields merge, or the rename is refused with the offsets that clash. `S_401a20_RDI.field_0x10` names a field. A field also goes by the name the C prints its struct as, such as `usb_interface.field_0xe8` where a kernel prototype says `usb_interface *`, while one recovered struct prints as that.",
             edit::rename,
         ),
         on_binary("comment", "Attaches a note to an address, saved for this binary and shown by `function`, `disassemble` and `decompile`. Empty text removes it.", edit::comment),
@@ -263,7 +263,7 @@ static TOOLS: LazyLock<[Tool; 22]> = LazyLock::new(|| {
         ),
         on_binary(
             "type",
-            "The layout of a data type: size, alignment, and each field of a struct or union with its offset, or the values of an enum. A struct kept with `rename` also lists the functions passed a pointer to it. Without `name`, lists what `declare` and `rename` have recorded.",
+            "The layout of a data type: size, alignment, and each field of a struct or union with its offset, or the values of an enum. A struct kept with `rename` also lists the functions passed a pointer to it. A struct with no layout, such as one a kernel prototype names, lists the recovered structs the C prints under its name. Without `name`, lists what `declare` and `rename` have recorded.",
             edit::type_,
         ),
     ]
@@ -1177,7 +1177,10 @@ fn structs(binary: &mut Binary, args: Structs) -> Result<String> {
         let count = object.accesses.len();
         let reach = format!("{count} {}, +{low:#x} to +{high:#x}", if count == 1 { "access" } else { "accesses" });
         match &object.decision {
-            Ok(name) => writeln!(out, "{place}: {name}{}, {reach}", if object.named { " (named)" } else { "" })?,
+            Ok(name) => {
+                let printed = object.label.as_ref().map_or_else(String::new, |label| format!(", printed as {label}"));
+                writeln!(out, "{place}: {name}{}{printed}, {reach}", if object.named { " (named)" } else { "" })?
+            }
             Err(refusal) => writeln!(out, "{place}: no struct, {}; {reach}", refusal.reason())?,
         }
     }

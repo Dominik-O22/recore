@@ -177,6 +177,9 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         list: usize,
     },
+    /// Prints how many functions of the kernel modules in a directory have a kCFI hash before
+    /// them, how many take a prototype from it, and how many modules hash in each spelling.
+    Kcfi { bin_dir: PathBuf },
     /// Reads a binary's debug information and gives its types to a decompiler session, printing
     /// what was found and how long each step took, and how long a child takes to be ready with
     /// the debug information and without.
@@ -216,6 +219,7 @@ fn main() -> Result<()> {
         }
         Command::Noise { out_dir, list } => noise::report(&out_dir, list.as_deref()),
         Command::Imports { bin_dir, list } => imports::coverage(&bin_dir, list),
+        Command::Kcfi { bin_dir } => imports::kcfi(&bin_dir),
         Command::DebugInfo { binary } => imports::debug_info(&binary),
         Command::Worker { binary, options } => isolate::serve(&binary, &options),
     }

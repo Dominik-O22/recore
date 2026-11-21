@@ -93,6 +93,7 @@ struct RdDecompiled {
 struct RdObject {
   int64_t low, high;
   uint8_t locked, global, number;
+  const char *label;
 };
 struct RdRoot {
   uint32_t object;
@@ -2377,6 +2378,16 @@ class Objects {
   }
 };
 
+// The struct with no layout that a parameter is declared to point to, as a kCFI hash or a DWARF
+// declaration names one, or null. Such a lock says no more than the name, so struct recovery
+// may give the parameter a struct of its own that prints under that name. A struct whose size
+// is known, though none of its fields is, keeps the lock.
+static const Datatype *declared_struct(const Varnode *vn) {
+  if (!vn->isInput() || vn->getType()->getMetatype() != TYPE_PTR) return nullptr;
+  const Datatype *to = static_cast<const TypePointer *>(vn->getType())->getPtrTo();
+  return to->getMetatype() == TYPE_STRUCT && to->isIncomplete() && to->getSize() == 0 ? to : nullptr;
+}
+
 // Whether a value can hold one of the pointers struct recovery follows.
 static bool pointer_value(const Varnode *vn, int4 word) {
   return vn->getSize() == word && !vn->isConstant() && !vn->isAnnotation() && !vn->isSpacebase() && !vn->isFree();
@@ -2563,8 +2574,9 @@ static void gather(RdSession *session, Funcdata &fd, Gathered &out) {
       out.links.push_back({(uint32_t)i, field.first - bases[i], at});
     }
   }
-  out.objects.assign(classes.size(), RdObject{INT64_MAX, INT64_MIN, 0, 0, 0});
+  out.objects.assign(classes.size(), RdObject{INT64_MAX, INT64_MIN, 0, 0, 0, nullptr});
   out.root_nodes.assign(classes.size(), {});
+  vector<const Datatype *> declared(classes.size(), nullptr);
   for (const Varnode *vn : objects.nodes) {
     pair<int, int64_t> at = objects.find(vn);
     auto found = numbers.find(at.first);
@@ -2573,9 +2585,18 @@ static void gather(RdSession *session, Funcdata &fd, Gathered &out) {
     int64_t offset = at.second - bases[found->second];
     object.low = min(object.low, offset);
     object.high = max(object.high, offset);
-    object.locked |= vn->isTypeLock();
+    if (vn->isTypeLock()) {
+      const Datatype *to = declared_struct(vn);
+      const Datatype *&held = declared[found->second];
+      if (to == nullptr || (held != nullptr && held != to))
+        object.locked = 1;
+      else
+        held = to;
+    }
     object.global |= vn->isPersist();
   }
+  for (size_t i = 0; i < classes.size(); ++i)
+    if (declared[i] != nullptr && out.objects[i].locked == 0) out.objects[i].label = declared[i]->getDisplayName().c_str();
   for (const Varnode *vn : numeric) {
     auto found = numbers.find(objects.find(vn).first);
     if (found != numbers.end()) out.objects[found->second].number = 1;
@@ -2658,7 +2679,7 @@ static void recover_structs(RdSession *session, Funcdata &fd) {
     if (type == nullptr) continue;
     Datatype *pointer = arch->types->getTypePointer(data->getAddrSize(), type, data->getWordSize());
     for (Varnode *root : gathered.root_nodes[i])
-      if (!root->isTypeLock()) root->updateType(pointer, true, false);
+      if (!root->isTypeLock() || declared_struct(root) != nullptr) root->updateType(pointer, true, true);
   }
 }
 
