@@ -431,7 +431,8 @@ type Compared = (String, Counts, Counts, [usize; 4]);
 
 /// The [`MEASURES`] of `base` and of `head`, two runs of the same functions of one binary, and
 /// how many functions have their parameters' types scored in both, how many uses of a global,
-/// and how many functions each run left out for coming after a lost worker.
+/// and how many functions each run left out of every count for the load: those that reached
+/// the time limit, and those that came after a worker lost a child.
 fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &Typed) -> (Counts, Counts, [usize; 4]) {
     // Neither a function that timed out nor one decompiled after a timeout lost its worker the
     // parameters it had kept: either depends on the load, not on the change.
@@ -483,7 +484,7 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
             counts[1] += usize::from(expected.returns_value == Some(returns_value));
         }
     }
-    let left_out = |report: &BinaryReport| report.functions.iter().filter(|r| r.after_failure).count();
+    let left_out = |report: &BinaryReport| report.functions.iter().filter(|r| r.status == Status::Timeout || (r.after_failure && r.status == Status::Ok)).count();
     (base_counts, head_counts, [typed_in_both, globals_in_both, left_out(base), left_out(head)])
 }
 
@@ -515,9 +516,11 @@ pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) 
     let both = |index: usize| binaries.iter().map(|binary| binary.3[index]).sum::<usize>();
     println!("  parameter types compared in {} functions, global types in {} uses", both(0), both(1));
     // A head that makes a callee fail every time leaves the rest of its shard out of the
-    // comparison, so many more left out here than in the base can hide what changed.
+    // comparison, and a slower one more functions at the time limit, so many more left out here
+    // than in the base can hide what changed.
+    let left_out = format!("for a timeout or after a lost worker, {} in the base and {} here", both(2), both(3));
     if both(2) + both(3) > 0 {
-        println!("  left out for coming after a worker lost a child to a timeout or a crash: {} in the base, {} here", both(2), both(3));
+        println!("  left out {left_out}");
     }
 
     let mut worse = Vec::new();
@@ -557,6 +560,9 @@ pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) 
     // In the form `recore-corpus compare` prints a loss, which a description's `Worse:` line names.
     let name = |path: &Path| path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     let run = format!("{}/{}", debug_dir.parent().map(name).unwrap_or_default(), name(head_dir));
+    // Beside each loss, so that whoever accepts one sees whether timeouts are behind it. It is
+    // no gate: under load it moves by itself.
+    println!("Left out: {run} {left_out}");
     for (measure, base, head) in worse {
         println!("Worse: {run} {measure} {base} -> {head} ({:+})", head as i64 - base as i64);
     }
@@ -589,7 +595,7 @@ mod tests {
         // 0x10 now reads as returning a value, and 0x20 timed out.
         let head = run(&[(0x10, Status::Ok, 1, true), (0x20, Status::Timeout, 0, false), (0x30, Status::Ok, 0, false)]);
         let typed = Typed::default();
-        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0]));
+        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 1]));
         // A function that fails drops out of the comparison, and counts as failed.
         let head = run(&[(0x10, Status::Error, 0, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, false)]);
         assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 1, 1, 0, 0, 0, 0, 0], [0, 0, 0, 0]));

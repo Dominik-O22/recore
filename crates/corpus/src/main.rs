@@ -3,6 +3,7 @@
 mod classes;
 mod compare;
 mod jumptables;
+mod losses;
 mod references;
 mod score;
 mod signatures;
@@ -82,8 +83,9 @@ enum Command {
     /// exit status 3 when a total got worse, each total printed as a `Worse:` line.
     Compare { base: PathBuf, head: PathBuf },
     /// Holds the `Worse:` lines of the comparisons of a run, in `found`, to the `Worse:` lines of
-    /// `named`, such as a pull request's description. Fails unless each loss is named with a
-    /// reason, by its count and how far it moved, and each line in `named` names one.
+    /// `named`, such as a pull request's description, where GitHub shows them. Fails on a loss no
+    /// line names with a reason, its count and at least how far it moved, and on a `Worse:` line
+    /// out of that form. A line that names no loss of the run only prints.
     Losses { found: String, named: String },
 }
 
@@ -249,12 +251,18 @@ fn run_compare(corpus: &Path, base: &Path, head: &Path) -> Result<()> {
 }
 
 /// Prints how each loss in `found` and each `Worse:` line in `named` stands, one line each that
-/// starts with its standing, and fails unless every loss is accepted and every line names one.
+/// starts with its standing, and under a loss what its run left out of the counts. Fails on a loss
+/// no line names and on a line out of form.
 fn run_losses(found: &str, named: &str) -> Result<()> {
-    let judged = compare::judge(found, named);
-    judged.iter().for_each(|(standing, line)| println!("{:9}  {line}", standing.label()));
-    let unaccepted = judged.iter().filter(|(standing, _)| *standing != compare::Standing::Accepted).count();
-    anyhow::ensure!(unaccepted == 0, "{unaccepted} of the losses and the Worse: lines do not match");
+    let judged = losses::judge(found, named);
+    for judged in &judged {
+        println!("{:9}  {}", judged.standing.label(), judged.line);
+        if let Some(note) = judged.note {
+            println!("{:9}  left out {note}", "");
+        }
+    }
+    let failing = judged.iter().filter(|judged| judged.standing.fails()).count();
+    anyhow::ensure!(failing == 0, "{failing} of the losses and the Worse: lines do not match");
     Ok(())
 }
 

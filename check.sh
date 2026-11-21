@@ -10,9 +10,11 @@
 # Each total that got worse is a loss, printed as a line such as
 # `Worse: corpus-thumb/signatures global types right 812 -> 811 (-1)`. RECORE_WORSE_ACCEPTED holds
 # text whose lines in that form, each with a reason after it, name the losses a change accepts,
-# and land.sh gives it the pull request's description. A loss no line names still fails the run,
-# and so does a line that names a loss the run does not show, or shows by another amount. No
-# line accepts a binary that lost its analysis or a decompiler that fails on more functions.
+# and land.sh gives it the pull request's description. A line accepts a loss of its run and count
+# up to the size it names, and counts only where GitHub shows it, not in an HTML comment. A loss
+# no line names fails the run, and so does a line that starts `Worse:` out of that form. A line
+# whose loss did not happen only prints. No line accepts a binary that lost its analysis or a
+# decompiler that fails on more functions.
 #
 # Where a corpus has DWARF, the decompiler's signatures are scored too: a fixed sample of each
 # binary's functions, each one's parameter count, whether it returns a value, and what its
@@ -138,13 +140,14 @@ signatures() {
 }
 # compared <dir> <command>...: prints what the comparison of <dir> with the base's says. Exit
 # status 3 says that all it found wrong is totals that got worse, each on a `Worse:` line, which go
-# to $losses for a description to name. Any other failure is worse whatever a description says.
+# to $losses for a description to name, with the `Left out:` line of a comparison of signatures.
+# Any other failure is worse whatever a description says.
 compared() {
   local dir="$1" output status=0
   shift
   output="$("$@")" || status=$?
   echo "$output"
-  if [ "$status" -ne 0 ] && { [ "$status" -ne 3 ] || ! grep '^Worse: ' <<<"$output" >>"$losses"; }; then
+  if [ "$status" -ne 0 ] && { [ "$status" -ne 3 ] || ! grep -E '^(Worse|Left out): ' <<<"$output" >>"$losses"; }; then
     worse+=("$dir")
   fi
 }
@@ -202,12 +205,12 @@ for in in "$corpora"/*/; do
   fi
 done
 # Every loss, and whether a line of RECORE_WORSE_ACCEPTED names it. One it does not, and a line
-# that names no loss of this run, is worse.
+# out of form, is worse.
 accepted=0
 if [ -s "$losses" ] || grep -q '^Worse:' <<<"${RECORE_WORSE_ACCEPTED:-}"; then
   echo "losses:"
   if ! judged="$("$build/recore-corpus" losses -- "$(cat "$losses")" "${RECORE_WORSE_ACCEPTED:-}")"; then
-    mapfile -t unmatched < <(grep -v '^accepted ' <<<"$judged" || true)
+    mapfile -t unmatched < <(grep -E '^(not named|unread) ' <<<"$judged" || true)
     worse+=("${unmatched[@]:-losses that recore-corpus could not hold to the Worse: lines}")
   fi
   sed 's/^/  /' <<<"$judged"
@@ -225,10 +228,11 @@ if [ ${#worse[@]} -gt 0 ]; then
   exit 1
 fi
 # `main` takes a commit only with this status, so it says that this run passed on that commit, and
-# how many losses it passed with. A budget this run lowered is left to commit, and the commit then
-# needs a run of its own.
+# how many losses it passed with. A budget this run lowered is left to commit, and land.sh then
+# gives the commit this line as its status.
 passed="passed against ${against:0:12}"
 [ "$accepted" -eq 0 ] || passed+=", accepting $accepted named loss$([ "$accepted" -eq 1 ] || echo es)"
+[ -z "$against" ] || echo "$passed"
 if [ -n "$quick" ]; then
   echo "no check status: a --quick run leaves out the ratchet and the cost, so run without it last" >&2
 elif [ -z "$against" ] || [ -n "$uncommitted$(git status --porcelain)" ] || [ "$head" != "$(git rev-parse HEAD)" ]; then
