@@ -176,10 +176,14 @@ mod tests {
 
     /// can-dev's `can_fd_dlc2len` returns a length, and DWARF says `u8 (u8)`. Normalized, its
     /// hash is the one `_Bool`, `char` and `unsigned char` share, so the table may say no more.
+    /// Behind a pointer it guesses `char`, so that `bt_err`'s format string prints.
     #[test]
     fn a_normalized_prototype_names_only_an_integers_width_and_sign() {
         assert_eq!(lookup(0x7e25_2a92, Spelling::Normalized), Some("uint1 (uint1)"));
-        let guessed = TABLE.lines().filter(|line| line.as_bytes()[9] == b'n' && line[11..].split([' ', '(', ')', ',', '*']).any(|word| word == "bool" || word == "char"));
+        assert_eq!(lookup(0xa477_955b, Spelling::Normalized), Some("void (char *, ...)"));
+        let guessed = TABLE.lines().filter(|line| line.as_bytes()[9] == b'n').filter(|line| {
+            line[11..].split(['(', ')', ',']).map(str::trim).any(|spelled| spelled == "char" || spelled.trim_end_matches([' ', '*']) == "bool")
+        });
         assert_eq!(guessed.count(), 0);
     }
 }

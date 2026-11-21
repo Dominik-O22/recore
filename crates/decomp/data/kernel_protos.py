@@ -35,8 +35,8 @@ above: the GKI 6.12 normalizes and the Pixel's 6.1 does not.
 Lines read `<hash> <n|p> <return> (<params>)`, sorted, where `n` is the normalized spelling and
 `p` the plain one. A type is spelled with sized numbers, and a pointer to a struct or union keeps
 its name: `int4 (struct platform_device *)`. A normalized hash knows an integer's width and sign
-and nothing more, so only `p` lines say `char` and `bool`: `n` lines say `uint1` for `_Bool`,
-`char` and `unsigned char` alike. An enum is the integer it is stored in, and a pointer to a
+and nothing more, so only `p` lines say `bool`, and `n` lines say `uint1` for `_Bool`, `char` and
+`unsigned char` alike. Behind a pointer `n` lines guess `char`, so that strings print. An enum is the integer it is stored in, and a pointer to a
 function is `void *`. A type that passes a struct or union by value is left out, as is a hash two
 types share and one whose types the table would spell two ways.
 
@@ -391,8 +391,10 @@ def mangle(function, normalized):
 
 def spell(type, normalized, pointed_to=False):
     """How kcfi.protos writes a type, or None for a struct or union passed by value. A normalized
-    hash knows an integer's width and sign and no more, so only the plain spelling says `bool` or
-    `char`."""
+    hash knows an integer's width and sign and no more, so only the plain spelling says `bool`, and
+    the normalized one says `char` only for a 1-byte unsigned integer pointed to. That one is a
+    guess: the decompiler prints a string literal only through a `char` pointer, and a `u8` buffer
+    typed `char *` still prints as bytes unless it points at string data."""
     kind = type[0]
     if kind == "qual":
         return spell(type[2], normalized, pointed_to)
@@ -400,6 +402,8 @@ def spell(type, normalized, pointed_to=False):
         return "void"
     if kind == "int":
         _, code, size, signed = type
+        if normalized and pointed_to and size == 1 and not signed:
+            return "char"
         plain = {} if normalized else {"b": "bool", "c": "char"}
         return plain.get(code, f"{'int' if signed else 'uint'}{size}")
     if kind == "float":
