@@ -6,13 +6,16 @@
 //! prototypes of Ghidra's type archives with types reduced to numbers, strings and pointers:
 //! `data/win32.protos` from the 32-bit Windows archive, `data/clib.protos` from the 64-bit C
 //! library archive (glibc and what Linux programs commonly link) and `data/macos.protos` from
-//! the macOS archive. `ghidra/ExportPrototypes.java` writes those files. A C++ import that none
-//! of them lists takes the parameters its mangled name gives.
+//! the macOS archive. `ghidra/ExportPrototypes.java` writes those files. A kernel module's
+//! imports are the Linux kernel's exports instead, which `data/kernel.protos` describes, made
+//! from the kernel's BTF by `data/kernel_protos.py`. A C++ import that none of them lists takes
+//! the parameters its mangled name gives.
 
 use std::collections::HashSet;
 
 use anyhow::Result;
 
+use recore::Image;
 use recore::image::Format;
 
 use crate::{Session, Target, mangled};
@@ -46,24 +49,49 @@ const TYPES: &[&str] = &[
 const WINDOWS: &str = include_str!("../data/win32.protos");
 const CLIB: &str = include_str!("../data/clib.protos");
 const MACOS: &str = include_str!("../data/macos.protos");
+const KERNEL: &str = include_str!("../data/kernel.protos");
 
-/// The archives that describe the imports of an image of `format`, the most trusted first.
-fn archives(format: Format) -> &'static [&'static str] {
-    match format {
-        Format::Pe => &[WINDOWS],
-        Format::Elf => &[CLIB],
-        // The C library archive covers libraries the macOS one lacks, such as OpenSSL's newer
-        // functions, and both describe the same C interface.
-        Format::MachO => &[MACOS, CLIB],
-        // A raw image imports nothing.
-        Format::Raw => &[],
+/// Whose functions an image imports, which decides the archives that describe them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Platform {
+    Windows,
+    Linux,
+    /// A Linux kernel module, which can call the kernel's functions and no library's.
+    LinuxKernel,
+    MacOs,
+    /// A raw image, which imports nothing.
+    Bare,
+}
+
+impl Platform {
+    pub fn of(image: &Image) -> Platform {
+        match image.format {
+            Format::Pe => Platform::Windows,
+            Format::Elf if image.kernel_module => Platform::LinuxKernel,
+            Format::Elf => Platform::Linux,
+            Format::MachO => Platform::MacOs,
+            Format::Raw => Platform::Bare,
+        }
     }
 }
 
-/// The entry for a function in the archives of `format`, as (convention, prototype); the
+/// The archives that describe the imports of `platform`, the most trusted first.
+fn archives(platform: Platform) -> &'static [&'static str] {
+    match platform {
+        Platform::Windows => &[WINDOWS],
+        Platform::Linux => &[CLIB],
+        Platform::LinuxKernel => &[KERNEL],
+        // The C library archive covers libraries the macOS one lacks, such as OpenSSL's newer
+        // functions, and both describe the same C interface.
+        Platform::MacOs => &[MACOS, CLIB],
+        Platform::Bare => &[],
+    }
+}
+
+/// The entry for a function in the archives of `platform`, as (convention, prototype); the
 /// convention is `-` if unknown.
-fn archived(format: Format, name: &str) -> Option<(&'static str, &'static str)> {
-    let mut found = archives(format).iter().filter_map(|archive| entry(archive, name));
+fn archived(platform: Platform, name: &str) -> Option<(&'static str, &'static str)> {
+    let mut found = archives(platform).iter().filter_map(|archive| entry(archive, name));
     let first = found.next()?;
     // The macOS headers declare some functions in the old style, without parameters, which the
     // archive records as taking none. Another archive that lists parameters knows better.
@@ -474,10 +502,10 @@ fn declaration(target: Target, convention: &str, prototype: &str) -> String {
     format!("extern {convention}{prototype};")
 }
 
-/// Every prototype of the first archive for `format` by function name, as the declaration
+/// Every prototype of the first archive for `platform` by function name, as the declaration
 /// [`declare`] would make for it on `target`.
-pub fn archive_declarations(target: Target, format: Format) -> impl Iterator<Item = (&'static str, String)> {
-    let entries = archives(format)[0].lines().filter_map(|line| line.split_once(' '));
+pub fn archive_declarations(target: Target, platform: Platform) -> impl Iterator<Item = (&'static str, String)> {
+    let entries = archives(platform)[0].lines().filter_map(|line| line.split_once(' '));
     entries.map(move |(convention, prototype)| (name_of(prototype), declaration(target, convention, prototype)))
 }
 
@@ -486,19 +514,19 @@ pub fn known() -> impl Iterator<Item = &'static str> {
     C_RUNTIME.iter().chain(WIN32).chain(GLIBC).chain(RUNTIME).map(|prototype| name_of(prototype))
 }
 
-/// Where [`declare`] takes the prototype of the import `name` of an image of `format` from:
+/// Where [`declare`] takes the prototype of the import `name` of `platform` from:
 /// `table` for the C runtime and Win32 ones written by hand, `added table` for the glibc and
 /// language runtime ones, `archive`, `mangled name` for a C++ function whose name says what it
 /// takes, or `None` if it has none. A mangled name counts as it would on x86-64, so this also
 /// names the ones that 32-bit ARM and Windows leave undeclared.
-pub fn source(format: Format, name: &str) -> Option<&'static str> {
+pub fn source(platform: Platform, name: &str) -> Option<&'static str> {
     let listed = |table: &[&str]| table.iter().any(|prototype| name_of(prototype) == name);
     if listed(C_RUNTIME) || listed(WIN32) {
         Some("table")
     } else if listed(GLIBC) || listed(RUNTIME) {
         Some("added table")
     } else {
-        archived(format, name).map(|_| "archive").or_else(|| (!mangled::declarations(&[name], Target::X86_64Gcc).is_empty()).then_some("mangled name"))
+        archived(platform, name).map(|_| "archive").or_else(|| (!mangled::declarations(&[name], Target::X86_64Gcc).is_empty()).then_some("mangled name"))
     }
 }
 
@@ -508,13 +536,13 @@ fn name_of(prototype: &str) -> &str {
     head.rsplit([' ', '*']).next().unwrap_or(head)
 }
 
-/// Gives every import in `imports` that the tables or the archives of `format` know its
+/// Gives every import in `imports` that the tables or the archives of `platform` know its
 /// prototype. The imports must already be declared in the session.
-pub fn declare<'a>(session: &mut Session, target: Target, format: Format, imports: impl Iterator<Item = &'a str>) -> Result<()> {
+pub fn declare<'a>(session: &mut Session, target: Target, platform: Platform, imports: impl Iterator<Item = &'a str>) -> Result<()> {
     let imports: Vec<&str> = imports.collect();
     let mut wanted: HashSet<&str> = imports.iter().copied().collect();
     let pointer = if target.pointer_bytes() == 4 { "uint4" } else { "uint8" };
-    let long = if format == Format::Pe || target.pointer_bytes() == 4 { "4" } else { "8" };
+    let long = if platform == Platform::Windows || target.pointer_bytes() == 4 { "4" } else { "8" };
     for declaration in TYPES {
         session.declare(&declaration.replace("{ptr}", pointer).replace("{long}", long))?;
     }
@@ -533,7 +561,7 @@ pub fn declare<'a>(session: &mut Session, target: Target, format: Format, import
     wanted.sort_unstable();
     let mut unknown = Vec::new();
     for name in wanted {
-        let Some((convention, prototype)) = archived(format, name) else {
+        let Some((convention, prototype)) = archived(platform, name) else {
             unknown.push(name);
             continue;
         };

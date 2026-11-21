@@ -98,15 +98,14 @@ fn flow_passes_an_entry_inside_the_functions_own_range() {
 
 #[test]
 fn every_builtin_prototype_parses() {
-    use recore::image::Format;
-    use recore_decomp::prototypes;
-    for (target, format) in [(Target::X86Windows, Format::Pe), (Target::X86_64Windows, Format::Pe), (Target::X86_64Gcc, Format::Elf), (Target::X86Gcc, Format::Elf)] {
+    use recore_decomp::prototypes::{self, Platform};
+    for (target, platform) in [(Target::X86Windows, Platform::Windows), (Target::X86_64Windows, Platform::Windows), (Target::X86_64Gcc, Platform::Linux), (Target::X86Gcc, Platform::Linux)] {
         let mut session = Session::new(&vendored_spec_dir().unwrap(), target, &[Section { addr: 0x1000, data: &[0xc3], readonly: true, code: true }]).unwrap();
         for (index, name) in prototypes::known().enumerate() {
             session.add_import(0x2000 + 8 * index as u64, name, false).unwrap();
         }
         // The archives are left out here: a failure in the tables written by hand is an error.
-        prototypes::declare(&mut session, target, format, prototypes::known()).unwrap();
+        prototypes::declare(&mut session, target, platform, prototypes::known()).unwrap();
     }
 }
 
@@ -247,11 +246,11 @@ fn a_function_that_comes_back_from_a_call_into_the_next_one_calls_it() {
 /// The engine's C parser accepts the exported prototypes of every archive, bar a few.
 #[test]
 fn archive_prototypes_parse() {
-    use recore::image::Format;
-    for (target, format) in [(Target::X86Windows, Format::Pe), (Target::X86_64Gcc, Format::Elf), (Target::Aarch64, Format::MachO)] {
+    use recore_decomp::prototypes::Platform;
+    for (target, platform) in [(Target::X86Windows, Platform::Windows), (Target::X86_64Gcc, Platform::Linux), (Target::Aarch64, Platform::MacOs), (Target::Aarch64, Platform::LinuxKernel), (Target::Arm, Platform::LinuxKernel)] {
         let mut session = Session::new(&vendored_spec_dir().unwrap(), target, &[Section { addr: 0x1000, data: &[0xc3], readonly: true, code: true }]).unwrap();
-        recore_decomp::prototypes::declare(&mut session, target, format, std::iter::empty()).unwrap();
-        let declarations: Vec<(&str, String)> = recore_decomp::prototypes::archive_declarations(target, format).collect();
+        recore_decomp::prototypes::declare(&mut session, target, platform, std::iter::empty()).unwrap();
+        let declarations: Vec<(&str, String)> = recore_decomp::prototypes::archive_declarations(target, platform).collect();
         let mut rejected = Vec::new();
         for (index, (name, declaration)) in declarations.iter().enumerate() {
             session.add_import(0x10_0000 + 4 * index as u64, name, false).unwrap();
@@ -259,20 +258,43 @@ fn archive_prototypes_parse() {
                 rejected.push(format!("{declaration}: {error}"));
             }
         }
-        assert!(rejected.len() * 200 < declarations.len(), "{format:?}: {} of {} rejected, such as {:?}", rejected.len(), declarations.len(), &rejected[..rejected.len().min(5)]);
+        assert!(rejected.len() * 200 < declarations.len(), "{platform:?}: {} of {} rejected, such as {:?}", rejected.len(), declarations.len(), &rejected[..rejected.len().min(5)]);
     }
+}
+
+/// A kernel module's import takes the prototype of the kernel's export of that name, and a
+/// program's import of the same name takes none: it calls a library, not the kernel.
+#[test]
+fn a_kernel_module_imports_take_the_kernels_prototypes() {
+    use recore::image::{Format, Machine};
+    // call [rip+0xffa] (the slot at 0x2000); ret
+    let code = [0xff, 0x15, 0xfa, 0x0f, 0x00, 0x00, 0xc3];
+    let decompile = |kernel_module: bool| {
+        let text = recore::image::Section { name: ".text".into(), addr: 0x1000, data: code.to_vec(), file_offset: None, executable: true, writable: false };
+        let got = recore::image::Section { name: ".got".into(), addr: 0x2000, data: vec![0; 8], file_offset: None, executable: false, writable: true };
+        let mut image = recore::Image { kernel_module, ..recore::Image::bare("test".into(), Format::Elf, Machine::X86_64, 0x1000, vec![text, got]) };
+        image.import_slots.insert(0x2000, "memdup_user".into());
+        let analysis = recore::analyze(&image);
+        Session::from_image(&image, &analysis).unwrap().decompile(0x1000).unwrap()
+    };
+    let module = decompile(true);
+    let types: Vec<&str> = module.params.iter().map(|param| param.type_name.as_str()).collect();
+    assert_eq!(types, ["void *", "size_t"], "{}", module.c_text);
+    assert!(module.c_text.contains("memdup_user(param_1,param_2)"), "{}", module.c_text);
+    let program = decompile(false);
+    assert!(program.params.is_empty() && program.c_text.contains("memdup_user();"), "{}", program.c_text);
 }
 
 /// A Linux import takes its arguments from the C library archive: `long` is as wide as the
 /// target makes it, and a function no table written by hand lists still gets its three.
 #[test]
 fn elf_imports_take_archive_prototypes() {
-    use recore::image::Format;
+    use recore_decomp::prototypes::Platform;
     // mov edi, 3; call [rip+0xff5] (the slot at 0x2000); ret
     let code = [0xbf, 0x03, 0x00, 0x00, 0x00, 0xff, 0x15, 0xf5, 0x0f, 0x00, 0x00, 0xc3];
     let mut session = session(&code);
     session.add_import(0x2000, "lseek", false).unwrap();
-    recore_decomp::prototypes::declare(&mut session, Target::X86_64Gcc, Format::Elf, ["lseek"].into_iter()).unwrap();
+    recore_decomp::prototypes::declare(&mut session, Target::X86_64Gcc, Platform::Linux, ["lseek"].into_iter()).unwrap();
     let function = session.decompile(0x1000).unwrap();
     let types: Vec<&str> = function.params.iter().map(|param| param.type_name.as_str()).collect();
     // The first register is taken by the constant, and kept as a parameter to hold its place.
