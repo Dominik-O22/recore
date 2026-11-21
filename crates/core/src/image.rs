@@ -170,6 +170,11 @@ pub struct Image {
     /// functions next to each other that unwind alike. What calls or points into such a frame
     /// is a function all the same, and the frame ends a function only where no other starts.
     pub frames_merge: bool,
+    /// `[start, end)` of every function of an ELF `.dynsym` with a size, in the order of that
+    /// table: in a linked image its exports, in a kernel module, which recore links into a
+    /// `.dynsym` of its own, the functions of `.symtab`. Ranges overlap where hand-written code
+    /// names an entry inside a routine.
+    pub symbol_extents: Vec<(u64, u64)>,
     /// Pointers stored in data by relative relocations, as `(slot address, target)`. Targets in
     /// code are function pointers or, in computed-goto tables, labels.
     pub relative_targets: Vec<(u64, u64)>,
@@ -219,6 +224,7 @@ impl Image {
             version_resource: None,
             data_in_code: matches!(format, Format::Pe | Format::Raw),
             frames_merge: false,
+            symbol_extents: Vec::new(),
             banking: Banking::default(),
             compiler: None,
             instruction_sets: Vec::new(),
@@ -281,16 +287,16 @@ impl Image {
         zero_filled.sort_unstable();
 
         let is_pe = file.format() == object::BinaryFormat::Pe;
-        let (import_slots, relative_targets, relocations_stripped, exports, frames, version_resource) = if is_pe {
+        let (import_slots, relative_targets, relocations_stripped, exports, symbol_extents, frames, version_resource) = if is_pe {
             let pe = if file.is_64() {
                 crate::pe::load::<object::pe::ImageNtHeaders64>(&data, &sections)?
             } else {
                 crate::pe::load::<object::pe::ImageNtHeaders32>(&data, &sections)?
             };
-            (pe.import_slots, pe.relative_targets, pe.relocations_stripped, pe.exports, pe.frames, pe.version_resource)
+            (pe.import_slots, pe.relative_targets, pe.relocations_stripped, pe.exports, Vec::new(), pe.frames, pe.version_resource)
         } else {
-            let (import_slots, relative_targets, exports, frames) = elf_metadata(&file, &sections);
-            (import_slots, relative_targets, false, exports, frames, None)
+            let (import_slots, relative_targets, exports, symbol_extents, frames) = elf_metadata(&file, &sections);
+            (import_slots, relative_targets, false, exports, symbol_extents, frames, None)
         };
 
         let machine = match file.architecture() {
@@ -338,6 +344,7 @@ impl Image {
             // ARM code reads its constants from pools among it.
             data_in_code: is_pe || machine == Machine::Arm,
             frames_merge: false,
+            symbol_extents,
             banking: Banking::default(),
             compiler: None,
             instruction_sets: Vec::new(),
@@ -388,9 +395,10 @@ impl Image {
     }
 }
 
-/// Imports, relocated pointers, exports and unwind frames of an ELF image.
+/// Imports, relocated pointers, exports, the extents of sized exports and unwind frames of an ELF
+/// image.
 #[allow(clippy::type_complexity)]
-fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, String>, Vec<(u64, u64)>, Vec<u64>, Vec<(u64, u64)>) {
+fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, String>, Vec<(u64, u64)>, Vec<u64>, Vec<(u64, u64)>, Vec<(u64, u64)>) {
     let sections = SectionFinder::new(sections);
     let mut import_slots = FxHashMap::default();
     let mut relative_targets = Vec::new();
@@ -422,18 +430,20 @@ fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, St
         relative_targets.extend(relr_slots(&relr, word).into_iter().filter_map(|slot| Some((slot, read_word(&sections, slot, word)?))));
     }
 
-    let exports = file
+    let functions: Vec<(u64, u64)> = file
         .dynamic_symbols()
         .filter(|s| s.kind() == SymbolKind::Text && s.address() != 0 && s.is_definition())
-        .map(|s| s.address())
+        .map(|s| (s.address(), s.size()))
         .collect();
+    let exports = functions.iter().map(|&(address, _)| address).collect();
+    let symbol_extents = functions.iter().filter(|&&(_, size)| size > 0).map(|&(address, size)| (address, address.saturating_add(size))).collect();
 
     let frames = file
         .section_by_name(".eh_frame")
         .and_then(|s| Some(parse_frames(&s.uncompressed_data().ok()?, s.address())))
         .unwrap_or_default();
 
-    (import_slots, relative_targets, exports, frames)
+    (import_slots, relative_targets, exports, symbol_extents, frames)
 }
 
 /// Finds the section that holds each of a loader's addresses, of sections sorted by address.

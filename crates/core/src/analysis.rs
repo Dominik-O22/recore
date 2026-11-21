@@ -9,7 +9,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rayon::prelude::*;
 
 use crate::arch::{Arch, Flow, TextPointer};
-use crate::discover::{discover, is_function_section};
+use crate::discover::{discover, is_function_section, symbol_holding};
 use crate::image::{Format, Image, Machine};
 use crate::noreturn::is_noreturn_import;
 use crate::phase;
@@ -512,9 +512,21 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         .collect();
     // A table of trampoline entries is code with a known extent, like a function with a frame.
     let frame_end: FxHashMap<u64, u64> = frames.iter().chain(&image.banking.tables).copied().collect();
+    // A sized symbol says where its function ends too, but code may follow it up to the next
+    // entry that no symbol names. Of symbols at one address, the largest.
+    let mut symbols: Vec<(u64, u64)> = image
+        .symbol_extents
+        .iter()
+        .filter_map(|&(start, end)| {
+            let section = image.section_at(start).filter(|s| is_function_section(s))?;
+            Some((start, end.min(section.end())))
+        })
+        .collect();
+    symbols.sort_unstable();
+    let symbol_end: FxHashMap<u64, u64> = symbols.iter().copied().collect();
 
     drop(_phase);
-    let mut discovery = discover::<A>(image, &frames);
+    let mut discovery = discover::<A>(image, &frames, &symbols);
     _phase = phase::scope("setup");
     let tables: FxHashMap<u64, &[u64]> = discovery.jump_tables.iter().map(|t| (t.jump, t.targets.as_slice())).collect();
 
@@ -591,8 +603,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         };
 
         // A chunk that several functions jump to the top of is a function they all tail-call,
-        // not a cold block of one of them, and so is one that opens like a function.
-        // Only jumps to the top of a chunk matter, and most images have no chunks at all.
+        // not a cold block of one of them, and so is one that opens like a function. Not inside a
+        // sized symbol. Only jumps to the top of a chunk matter, and most images have no chunks.
         let mut jumped_to: FxHashMap<u64, FxHashSet<u64>> = chunks.iter().map(|chunk| (chunk.start, FxHashSet::default())).collect();
         if !chunks.is_empty() {
             for function in &functions {
@@ -608,6 +620,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         let tail_called: Vec<u64> = chunks
             .iter()
             .map(|chunk| chunk.start)
+            .filter(|&start| symbol_holding(&symbols, start).is_none())
             .filter(|start| {
                 let sources = jumped_to.get(start).map_or(0, FxHashSet::len);
                 let opens_function = || {
@@ -655,8 +668,9 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             let index = inline_tables.partition_point(|&(start, _)| start <= addr);
             index > 0 && addr < inline_tables[index - 1].1
         };
-        let after_call = |f: &Function, control: &Control| {
-            if control.next == f.end && frame_end.contains_key(&f.start) {
+        // `ends`: where the file says the function ends, at its frame's end or its symbol's.
+        let after_call = |f: &Function, ends: [Option<u64>; 2], control: &Control| {
+            if ends.contains(&Some(control.next)) {
                 return After::Ends;
             }
             // Read the bytes themselves: a trap that pads the end of a function has been
@@ -677,7 +691,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .par_iter()
             .chain(&chunks)
             .flat_map_iter(|f| {
-                f.calls().filter_map(|(control, target)| match after_call(f, control) {
+                let ends = [frame_end.contains_key(&f.start).then_some(f.end), symbol_end.get(&f.start).copied()];
+                f.calls().filter_map(move |(control, target)| match after_call(f, ends, control) {
                     After::Ends => Some((target, None)),
                     After::Code => Some((target, Some(control.next))),
                     After::Nothing => None,
@@ -777,16 +792,17 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         // Code in a function's extent that no path from its entry reaches belongs to a
         // different function: it follows a call that never returns, and nothing else marked it
         // as an entry point. Functions with a frame are left alone, since the frame already
-        // gives their extent.
+        // gives their extent, and so is the inside of a sized symbol.
         _phase = phase::scope("unreached splits");
         let splits: Vec<u64> = functions
             .par_iter()
             .filter(|f| !frame_end.contains_key(&f.start) && !image.data_in_code)
             .filter_map(|f| {
                 let reached = walk(f, &noreturn, &program, |_, _| {});
-                (reached.complete && reached.reach_end < f.end)
-                    .then(|| next_function_start::<A>(image, reached.reach_end, f.end))
-                    .flatten()
+                // A function a call started inside a symbol is bounded by that symbol too.
+                let symbol = symbol_end.get(&f.start).copied().or_else(|| symbol_holding(&symbols, f.start).map(|(_, end)| end));
+                let from = symbol.map_or(reached.reach_end, |end| end.max(reached.reach_end));
+                (reached.complete && from < f.end).then(|| next_function_start::<A>(image, from, f.end)).flatten()
             })
             .collect();
         let before = discovery.starts.len();
@@ -1093,7 +1109,10 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         });
         let comes_back = !stops && last.is_some_and(|control| matches!(control.flow, Flow::Call(target) if has_return(target)));
         let code_to_end = code_pieces(f.start, f.end, inline_tables).last().is_some_and(|(from, to)| from < to && to == f.end);
-        ((A::RUNS_ON && !stops) || falls_through || comes_back).then_some(f.end).filter(|&end| is_start(end) && code_to_end)
+        // A sized symbol that ends short of the next entry says what lies between is not its code.
+        // One that ends past it holds the next entry's symbol.
+        let symbol_to_end = symbol_end.get(&f.start).is_none_or(|&end| end >= f.end);
+        ((A::RUNS_ON && !stops) || falls_through || comes_back).then_some(f.end).filter(|&end| is_start(end) && code_to_end && symbol_to_end)
     };
     Analysis {
         sends,

@@ -455,6 +455,7 @@ impl Layout {
             // its literal pools and switch tables from among its code.
             data_in_code: matches!(self.machine, Machine::I8051 | Machine::Thumb),
             frames_merge: false,
+            symbol_extents: Vec::new(),
             banking,
             compiler: self.compiler,
             instruction_sets: Vec::new(),

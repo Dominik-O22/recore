@@ -1,8 +1,9 @@
 //! A Linux kernel module, for x86-64 or AArch64, analyzes as if the kernel had loaded it: its
-//! functions where its symbols put them, its calls to the kernel named, and on x86-64 its calls
-//! and jumps through the kernel's thunks read as the returns and indirect calls the kernel
-//! patches them to. On AArch64 the type hash kCFI puts before each function is data, and two of
-//! them read as `adr` into other functions: see module.c.
+//! functions where its symbols put them, and none inside one where no symbol names it, its calls
+//! to the kernel named, and on x86-64 its calls and jumps through the kernel's thunks read as the
+//! returns and indirect calls the kernel patches them to. On AArch64 the type hash kCFI puts
+//! before each function is data, and two of them read as `adr` into other functions: see
+//! module.c.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -29,9 +30,16 @@ fn analyzes_as_loaded(fixture: &str) {
     starts.sort_unstable();
     let kcfi: &[&str] = if fixture == "module-arm64.o" { &["kcfi_word", "kcfi_off_word"] } else { &[] };
     if !kcfi.is_empty() {
-        hashes_read_as_adr(&image);
+        // The symbols' sizes alone keep the `adr` targets from starting functions, and a stripped
+        // module keeps none. Without them the `$d` marks must.
+        let targets = hashes_read_as_adr(&image);
+        let mut without_sizes = load(fixture);
+        without_sizes.symbol_extents.clear();
+        let started: Vec<u64> = recore::analyze(&without_sizes).functions.iter().map(|function| function.addr).filter(|addr| targets.contains(addr)).collect();
+        assert_eq!(started, Vec::<u64>::new());
     }
-    let mut expected: Vec<u64> = ["remove", "probe", "call_probe", "call_twice", "init_module"].iter().chain(kcfi).map(|name| address(name)).collect();
+    let named = ["remove", "probe", "call_probe", "call_twice", "init_module", "traced", "outer", "inner"];
+    let mut expected: Vec<u64> = named.iter().chain(kcfi).map(|name| address(name)).collect();
     expected.sort_unstable();
     assert_eq!(starts, expected, "{fixture}");
     assert_eq!(image.entry, address("init_module"));
@@ -53,18 +61,21 @@ fn analyzes_as_loaded(fixture: &str) {
 
 /// Without the mapping symbols nothing says the hashes are data, and they are decoded. The one
 /// that reads as an `adr` off a word still starts no function: no AArch64 instruction is there.
+/// Nor do the symbols' sizes say so, as a stripped module keeps none.
 #[test]
 fn an_aarch64_function_starts_on_a_word() {
-    let image = load("module-arm64-unmarked.o");
+    let mut image = load("module-arm64-unmarked.o");
     hashes_read_as_adr(&image);
+    image.symbol_extents.clear();
     let off_word: Vec<u64> = recore::analyze(&image).functions.iter().map(|function| function.addr).filter(|addr| !addr.is_multiple_of(4)).collect();
     assert_eq!(off_word, Vec::<u64>::new());
 }
 
 /// What the AArch64 tests stand on: the hash clang chose for `kcfi_word` reads as `adr` to an
 /// instruction of `probe`, and the one for `kcfi_off_word` to a byte off a word in `call_twice`.
-/// Each hash is three words before its function, ahead of the two `nop`s for ftrace.
-fn hashes_read_as_adr(image: &recore::Image) {
+/// Each hash is three words before its function, ahead of the two `nop`s for ftrace. Returns the
+/// two targets.
+fn hashes_read_as_adr(image: &recore::Image) -> [u64; 2] {
     let address = |name: &str| image.symbol_names.iter().find(|(_, n)| *n == name).map(|(&addr, _)| addr).unwrap();
     let adr_before = |function: &str| {
         let at = address(function) - 12;
@@ -73,6 +84,7 @@ fn hashes_read_as_adr(image: &recore::Image) {
         let offset = i64::from((word >> 5 & 0x7_ffff) << 2 | word >> 29 & 3) << 43 >> 43;
         at.wrapping_add_signed(offset)
     };
-    assert_eq!(adr_before("kcfi_word"), address("probe") + 0x48);
-    assert_eq!(adr_before("kcfi_off_word"), address("call_twice") + 0x55);
+    let targets = [adr_before("kcfi_word"), adr_before("kcfi_off_word")];
+    assert_eq!(targets, [address("probe") + 0x48, address("call_twice") + 0x55]);
+    targets
 }

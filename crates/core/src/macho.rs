@@ -287,6 +287,7 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
         version_resource: None,
         data_in_code: false,
         frames_merge: false,
+        symbol_extents: Vec::new(),
         banking: Default::default(),
         compiler: None,
         instruction_sets: Vec::new(),
