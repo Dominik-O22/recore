@@ -46,7 +46,7 @@ const IN_TABLE: u8 = 8;
 /// The file marks the byte as data, which also makes it [`IN_TABLE`].
 const MARKED_DATA: u8 = 16;
 /// The address lies strictly inside a function an ELF symbol gives a size, where only what the
-/// file says starts another: a symbol or an unwind frame.
+/// file says starts another: a symbol or an unwind frame, or a call from outside the symbol.
 const IN_SYMBOL: u8 = 32;
 
 /// The gap scan works through a section in pages of this many bytes.
@@ -317,6 +317,8 @@ struct Explorer<'a, A: Arch> {
     known_lengths: FxHashMap<u64, usize>,
     /// `[start, end)` ranges from `.eh_frame`. Nothing strictly inside one becomes an entry point.
     frames: &'a [(u64, u64)],
+    /// The sized symbols of [`Image::symbol_extents`] in function sections, sorted.
+    symbols: &'a [(u64, u64)],
     /// Counts the page scans of the gap search, and dates changes to what those scans read.
     clock: u32,
     /// `[start, end)` of every section that holds no code, sorted.
@@ -394,7 +396,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
         self.region_index(addr).is_some_and(|index| self.regions[index].flags[(addr - self.regions[index].section.addr) as usize] & IN_SYMBOL != 0)
     }
 
-    fn add_start(&mut self, addr: u64, origin: Origin) {
+    /// `caller` is the call instruction, when a call asks.
+    fn add_start(&mut self, addr: u64, origin: Origin, caller: Option<u64>) {
         let referenced = matches!(origin, Origin::Call | Origin::AddressTaken | Origin::DataPointer | Origin::Export | Origin::Thunk);
         let weak = self.evidence(addr, origin) == Evidence::MaybeNumber;
         let Some(index) = self.region_index(addr) else {
@@ -420,10 +423,15 @@ impl<'a, A: Arch> Explorer<'a, A> {
         if weak && self.rejected.contains(&addr) {
             return;
         }
-        *flags |= ASKED_AS_START;
-        if *flags & IN_SYMBOL != 0 && !matches!(origin, Origin::Export | Origin::Frame) {
+        // Inside a sized symbol a call from outside it starts a function too. That depends on who
+        // asks, so the address is asked again.
+        if *flags & IN_SYMBOL != 0
+            && !matches!(origin, Origin::Export | Origin::Frame)
+            && !caller.is_some_and(|from| symbol_holding(self.symbols, addr).is_some_and(|(start, end)| !(start..end).contains(&from)))
+        {
             return;
         }
+        *flags |= ASKED_AS_START;
         // Code that only falls or jumps into the inside of a frame is its function's. In a frame
         // that may hold several functions, the gap search vouches for one that opens as one.
         if !self.inside_frame(addr) || self.image.frames_merge && (referenced || origin == Origin::GapAligned) {
@@ -575,7 +583,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     }
                     if let Some(target) = taken.filter(|_| !speculative) {
                         if in_code {
-                            self.add_start(target, Origin::AddressTaken);
+                            self.add_start(target, Origin::AddressTaken, None);
                         } else {
                             self.data_refs.push(target);
                         }
@@ -605,7 +613,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     Flow::Call(target) => {
                         if !speculative {
                             self.calls.push((decoded.addr, target));
-                            self.add_start(target, Origin::Call);
+                            self.add_start(target, Origin::Call, Some(decoded.addr));
                         }
                         false
                     }
@@ -622,7 +630,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     Flow::Jump(target)
                         if decoded.addr == start && self.starts.contains_key(&start) && !self.is_padding_at(target) && !self.in_symbol(target) =>
                     {
-                        self.add_start(target, Origin::Thunk);
+                        self.add_start(target, Origin::Thunk, None);
                         true
                     }
                     Flow::Jump(target) => {
@@ -909,7 +917,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
             }
         }
         let before = self.starts.len();
-        promoted.into_iter().for_each(|addr| self.add_start(addr, Origin::TailCall));
+        promoted.into_iter().for_each(|addr| self.add_start(addr, Origin::TailCall, None));
         self.starts.len() != before
     }
 
@@ -964,7 +972,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
         }
         for target in found {
             if self.region_index(target).is_some() && A::code_pointer(self.image, target) {
-                self.add_start(target, Origin::DataPointer);
+                self.add_start(target, Origin::DataPointer, None);
             }
         }
         self.starts.len() != before
@@ -1616,7 +1624,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         }
                     }
                     if is_start {
-                        self.add_start(addr, if marked { Origin::GapEndbr } else { Origin::GapAligned });
+                        self.add_start(addr, if marked { Origin::GapEndbr } else { Origin::GapAligned }, None);
                     } else {
                         self.queue_entry(addr);
                     }
@@ -1634,6 +1642,12 @@ impl<'a, A: Arch> Explorer<'a, A> {
 /// Code sections that hold functions. PLT stubs are resolved to imports instead.
 pub fn is_function_section(section: &Section) -> bool {
     section.executable && !section.is_stubs()
+}
+
+/// The symbol of `symbols`, sorted, that holds `addr` strictly inside it. Of nested ones, the
+/// innermost.
+pub fn symbol_holding(symbols: &[(u64, u64)], addr: u64) -> Option<(u64, u64)> {
+    symbols[..symbols.partition_point(|&(start, _)| start < addr)].iter().rev().find(|&&(_, end)| addr < end).copied()
 }
 
 /// `symbols` are the sized symbols of [`Image::symbol_extents`] in function sections, sorted.
@@ -1799,6 +1813,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], symbols: &'a
         pointer_values: &pointers.values,
         known_lengths,
         frames,
+        symbols,
         clock: 0,
         recording: true,
         unbounded: 0,
@@ -1830,7 +1845,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], symbols: &'a
     {
         let _phase = phase::scope("discover/seeds");
         for (seed, origin) in seeds {
-            explorer.add_start(seed, origin);
+            explorer.add_start(seed, origin, None);
         }
     }
     let mut decoders: Decoders<A> = explorer.regions.iter().map(|_| None).collect();

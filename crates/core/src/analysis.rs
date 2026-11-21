@@ -1107,7 +1107,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         let comes_back = !stops && last.is_some_and(|control| matches!(control.flow, Flow::Call(target) if has_return(target)));
         let code_to_end = code_pieces(f.start, f.end, inline_tables).last().is_some_and(|(from, to)| from < to && to == f.end);
         // A sized symbol that ends short of the next entry says what lies between is not its code.
-        let symbol_to_end = symbol_end.get(&f.start).is_none_or(|&end| end == f.end);
+        // One that ends past it holds the next entry's symbol.
+        let symbol_to_end = symbol_end.get(&f.start).is_none_or(|&end| end >= f.end);
         ((A::RUNS_ON && !stops) || falls_through || comes_back).then_some(f.end).filter(|&end| is_start(end) && code_to_end && symbol_to_end)
     };
     Analysis {
