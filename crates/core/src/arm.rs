@@ -1004,6 +1004,9 @@ pub(crate) fn load(file: &object::File, image: &mut Image) {
     for export in &mut image.exports {
         *export &= !1;
     }
+    for (start, end) in &mut image.symbol_extents {
+        (*start, *end) = (*start & !1, *end & !1);
+    }
     image.symbol_names = std::mem::take(&mut image.symbol_names).into_iter().map(|(addr, name)| (if is_code(addr & !1) { addr & !1 } else { addr }, name)).collect();
     for (_, target) in image.relative_targets.iter_mut().filter(|(_, target)| is_code(*target & !1)) {
         *target &= !1;

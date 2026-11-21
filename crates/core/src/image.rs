@@ -170,6 +170,9 @@ pub struct Image {
     /// functions next to each other that unwind alike. What calls or points into such a frame
     /// is a function all the same, and the frame ends a function only where no other starts.
     pub frames_merge: bool,
+    /// `[start, end)` of every function an ELF symbol gives a size, sorted, cut at the end of
+    /// its section. Ranges overlap where hand-written code names an entry inside a routine.
+    pub symbol_extents: Vec<(u64, u64)>,
     /// Pointers stored in data by relative relocations, as `(slot address, target)`. Targets in
     /// code are function pointers or, in computed-goto tables, labels.
     pub relative_targets: Vec<(u64, u64)>,
@@ -219,6 +222,7 @@ impl Image {
             version_resource: None,
             data_in_code: matches!(format, Format::Pe | Format::Raw),
             frames_merge: false,
+            symbol_extents: Vec::new(),
             banking: Banking::default(),
             compiler: None,
             instruction_sets: Vec::new(),
@@ -319,6 +323,8 @@ impl Image {
             })
             .unwrap_or_default();
 
+        let symbol_extents = if is_pe { Vec::new() } else { symbol_extents(&file, &sections) };
+
         let mut image = Image {
             zero_filled,
             format: if is_pe { Format::Pe } else { Format::Elf },
@@ -338,6 +344,7 @@ impl Image {
             // ARM code reads its constants from pools among it.
             data_in_code: is_pe || machine == Machine::Arm,
             frames_merge: false,
+            symbol_extents,
             banking: Banking::default(),
             compiler: None,
             instruction_sets: Vec::new(),
@@ -434,6 +441,22 @@ fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, St
         .unwrap_or_default();
 
     (import_slots, relative_targets, exports, frames)
+}
+
+/// See [`Image::symbol_extents`]. On 32-bit ARM the start still carries the Thumb bit.
+fn symbol_extents(file: &object::File, sections: &[Section]) -> Vec<(u64, u64)> {
+    let sections = SectionFinder::new(sections);
+    let mut extents: Vec<(u64, u64)> = file
+        .dynamic_symbols()
+        .filter(|s| s.kind() == SymbolKind::Text && s.is_definition() && s.size() > 0)
+        .filter_map(|s| {
+            let section = sections.find(s.address()).filter(|section| section.executable)?;
+            Some((s.address(), s.address().saturating_add(s.size()).min(section.end())))
+        })
+        .collect();
+    extents.sort_unstable();
+    extents.dedup();
+    extents
 }
 
 /// Finds the section that holds each of a loader's addresses, of sections sorted by address.

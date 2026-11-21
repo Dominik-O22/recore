@@ -314,6 +314,9 @@ struct Explorer<'a, A: Arch> {
     known_lengths: FxHashMap<u64, usize>,
     /// `[start, end)` ranges from `.eh_frame`. Nothing strictly inside one becomes an entry point.
     frames: &'a [(u64, u64)],
+    /// [`Image::symbol_extents`] with those that overlap joined. Only what the file itself says
+    /// starts a function strictly inside one, and a call from outside it.
+    symbols: &'a [(u64, u64)],
     /// Counts the page scans of the gap search, and dates changes to what those scans read.
     clock: u32,
     /// `[start, end)` of every section that holds no code, sorted.
@@ -386,6 +389,12 @@ impl<'a, A: Arch> Explorer<'a, A> {
         index > 0 && addr > self.frames[index - 1].0 && addr < self.frames[index - 1].1
     }
 
+    /// The sized symbol that `addr` lies strictly inside.
+    fn symbol_around(&self, addr: u64) -> Option<(u64, u64)> {
+        let index = self.symbols.partition_point(|&(start, _)| start <= addr);
+        self.symbols[..index].last().copied().filter(|&(start, end)| addr > start && addr < end)
+    }
+
     fn add_start(&mut self, addr: u64, origin: Origin) {
         let referenced = matches!(origin, Origin::Call | Origin::AddressTaken | Origin::DataPointer | Origin::Export | Origin::Thunk);
         let weak = self.evidence(addr, origin) == Evidence::MaybeNumber;
@@ -413,6 +422,10 @@ impl<'a, A: Arch> Explorer<'a, A> {
             return;
         }
         *flags |= ASKED_AS_START;
+        let stated = matches!(origin, Origin::Export | Origin::Frame | Origin::Call);
+        if !stated && self.symbol_around(addr).is_some() {
+            return;
+        }
         // Code that only falls or jumps into the inside of a frame is its function's. In a frame
         // that may hold several functions, the gap search vouches for one that opens as one.
         if !self.inside_frame(addr) || self.image.frames_merge && (referenced || origin == Origin::GapAligned) {
@@ -594,7 +607,12 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     Flow::Call(target) => {
                         if !speculative {
                             self.calls.push((decoded.addr, target));
-                            self.add_start(target, Origin::Call);
+                            // A call within a sized symbol to a label of its own, as `call 1f`
+                            // reads the program counter, starts nothing.
+                            let within = self.symbol_around(target).is_some_and(|(start, end)| decoded.addr >= start && decoded.addr < end);
+                            if !within {
+                                self.add_start(target, Origin::Call);
+                            }
                         }
                         false
                     }
@@ -1631,9 +1649,10 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
         let _phase = phase::scope("discover/pointers");
         Pointers::new(image)
     };
+    let symbols = merge_overlapping(&image.symbol_extents);
     // A first pass that learns a length stops recording what only a last pass has to report.
     let run = |rejected: &FxHashSet<u64>| {
-        let first = explore::<A>(image, frames, &pointers, FxHashMap::default(), rejected.clone());
+        let first = explore::<A>(image, frames, &symbols, &pointers, FxHashMap::default(), rejected.clone());
         let lengths = first.learned_lengths();
         debug_assert!(first.recording || !lengths.is_empty());
         if lengths.is_empty() {
@@ -1641,7 +1660,7 @@ pub fn discover<A: Arch>(image: &Image, frames: &[(u64, u64)]) -> Discovery {
         } else {
             // Its maps of the code are as large as the second pass's.
             drop(first);
-            explore::<A>(image, frames, &pointers, lengths, rejected.clone())
+            explore::<A>(image, frames, &symbols, &pointers, lengths, rejected.clone())
         }
     };
     let mut explorer = run(&FxHashSet::default());
@@ -1704,6 +1723,18 @@ fn merge_touching(ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     merged
 }
 
+/// Sorted ranges with those that overlap joined, but not those that only touch.
+fn merge_overlapping(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for &(start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start < last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
 /// What the image's relative relocations say, in the forms exploring looks them up.
 struct Pointers {
     /// Slot address to target.
@@ -1739,7 +1770,7 @@ fn initial_flags(image: &Image, section: &Section) -> Vec<u8> {
     flags
 }
 
-fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'a Pointers, known_lengths: FxHashMap<u64, usize>, rejected: FxHashSet<u64>) -> Explorer<'a, A> {
+fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], symbols: &'a [(u64, u64)], pointers: &'a Pointers, known_lengths: FxHashMap<u64, usize>, rejected: FxHashSet<u64>) -> Explorer<'a, A> {
     let regions = image
         .sections
         .iter()
@@ -1773,6 +1804,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         pointer_values: &pointers.values,
         known_lengths,
         frames,
+        symbols,
         clock: 0,
         recording: true,
         unbounded: 0,

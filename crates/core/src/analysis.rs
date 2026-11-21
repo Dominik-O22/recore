@@ -512,6 +512,9 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         .collect();
     // A table of trampoline entries is code with a known extent, like a function with a frame.
     let frame_end: FxHashMap<u64, u64> = frames.iter().chain(&image.banking.tables).copied().collect();
+    // A sized symbol says where its function ends too, but code may follow it up to the next
+    // entry that no symbol names. Of symbols at one address, the largest.
+    let symbol_end: FxHashMap<u64, u64> = image.symbol_extents.iter().copied().collect();
 
     drop(_phase);
     let mut discovery = discover::<A>(image, &frames);
@@ -656,7 +659,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             index > 0 && addr < inline_tables[index - 1].1
         };
         let after_call = |f: &Function, control: &Control| {
-            if control.next == f.end && frame_end.contains_key(&f.start) {
+            if control.next == f.end && frame_end.contains_key(&f.start) || symbol_end.get(&f.start) == Some(&control.next) {
                 return After::Ends;
             }
             // Read the bytes themselves: a trap that pads the end of a function has been
@@ -777,16 +780,15 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         // Code in a function's extent that no path from its entry reaches belongs to a
         // different function: it follows a call that never returns, and nothing else marked it
         // as an entry point. Functions with a frame are left alone, since the frame already
-        // gives their extent.
+        // gives their extent, and so is the inside of a sized symbol.
         _phase = phase::scope("unreached splits");
         let splits: Vec<u64> = functions
             .par_iter()
             .filter(|f| !frame_end.contains_key(&f.start) && !image.data_in_code)
             .filter_map(|f| {
                 let reached = walk(f, &noreturn, &program, |_, _| {});
-                (reached.complete && reached.reach_end < f.end)
-                    .then(|| next_function_start::<A>(image, reached.reach_end, f.end))
-                    .flatten()
+                let from = symbol_end.get(&f.start).map_or(reached.reach_end, |&end| end.max(reached.reach_end));
+                (reached.complete && from < f.end).then(|| next_function_start::<A>(image, from, f.end)).flatten()
             })
             .collect();
         let before = discovery.starts.len();
@@ -1093,7 +1095,9 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         });
         let comes_back = !stops && last.is_some_and(|control| matches!(control.flow, Flow::Call(target) if has_return(target)));
         let code_to_end = code_pieces(f.start, f.end, inline_tables).last().is_some_and(|(from, to)| from < to && to == f.end);
-        ((A::RUNS_ON && !stops) || falls_through || comes_back).then_some(f.end).filter(|&end| is_start(end) && code_to_end)
+        // A sized symbol that ends short of the next entry says what lies between is not its code.
+        let symbol_to_end = symbol_end.get(&f.start).is_none_or(|&end| end == f.end);
+        ((A::RUNS_ON && !stops) || falls_through || comes_back).then_some(f.end).filter(|&end| is_start(end) && code_to_end && symbol_to_end)
     };
     Analysis {
         sends,
