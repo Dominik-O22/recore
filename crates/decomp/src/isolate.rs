@@ -517,8 +517,9 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
         session.decompile(entry)
     };
-    // Results of functions decompiled ahead of a caller that are as good as asked for.
-    let mut ready: HashMap<u64, Event> = HashMap::new();
+    // Results of functions decompiled ahead of a caller that are as good as asked for, each with
+    // whether the function's callers had been given then.
+    let mut ready: HashMap<u64, (Event, bool)> = HashMap::new();
 
     let mut out = std::io::stdout().lock();
     let mut send = |event: &Event| -> Result<()> {
@@ -638,9 +639,13 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             }
             Request::Decompile(addr) | Request::Parameters(addr) => addr,
         };
-        if let (Request::Decompile(_), Some(event)) = (&request, ready.remove(&addr)) {
-            send(&event)?;
-            continue;
+        if let (Request::Decompile(_), Some((event, with_callers))) = (&request, ready.remove(&addr)) {
+            // One that came out void before its callers were given may return what they read.
+            let void = matches!(&event, Event::Done { record, .. } if !record.returns_value);
+            if with_callers || !void || !given.contains_key(&addr) {
+                send(&event)?;
+                continue;
+            }
         }
         // A function that ends by jumping to another passes on what that one takes, and with
         // that one unknown it seems to pass on every register. So before a function is
@@ -649,9 +654,9 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         if matches!(request, Request::Parameters(_)) && callees_first {
             tail_chain(&tail_callees, addr, &small, TAIL_DEPTH, &mut jumped_first);
         }
-        // Decompiled for a caller's sake with every callee of its own known, and its own callers
-        // given, a function comes out as it would when asked for, so the result is kept for then.
-        let keep = matches!(request, Request::Parameters(_)) && given.contains_key(&addr) && unknown(addr).iter().all(|callee| jumped_first.contains(callee));
+        // Decompiled for a caller's sake with every callee of its own known, a function comes
+        // out as it would when asked for, so the result is kept for then.
+        let keep = matches!(request, Request::Parameters(_)) && unknown(addr).iter().all(|callee| jumped_first.contains(callee));
         for target in jumped_first {
             settle_return(&mut session, target);
             session.keep_prototypes(!hands_on_registers);
@@ -693,7 +698,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         if keep {
             // The caller only waits for this to finish.
             send(&Event::Callees(Vec::new()))?;
-            ready.insert(addr, event);
+            ready.insert(addr, (event, given.contains_key(&addr)));
         } else {
             send(&event)?;
         }
