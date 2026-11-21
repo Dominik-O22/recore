@@ -37,3 +37,19 @@ __attribute__((noipa)) int call_twice(int (*f)(int)) {
 int init_module(void) {
     return call_probe(&driver, 1) + call_twice(driver.probe);
 }
+
+#ifdef __aarch64__
+// kCFI puts a hash of each function's type before it, as a word of data. These structures are
+// named so that the hash before the function that takes one reads as an `adr` into another
+// function: to an instruction, and off a word.
+struct w3671628;
+struct u0341202;
+
+int kcfi_word(struct w3671628 *p) {
+    return p != 0;
+}
+
+int kcfi_off_word(struct u0341202 *p) {
+    return p == 0;
+}
+#endif
