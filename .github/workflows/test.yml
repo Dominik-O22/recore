@@ -55,11 +55,19 @@ jobs:
       - run: cmake --version && c++ --version
       - run: ${{ matrix.run }}
 
+  # land.sh, which merges into main, on a repository made for it. It needs git and jq, and no
+  # toolchain.
+  landing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./land.test.sh
+
   # Branch protection requires a check named test. It passes only when every job above passed,
   # and runs even when one failed, since a skipped check would count as passing.
   test:
     if: always()
-    needs: check
+    needs: [check, landing]
     runs-on: ubuntu-latest
     steps:
-      - run: test "${{ needs.check.result }}" = success
+      - run: test "${{ needs.check.result }}" = success && test "${{ needs.landing.result }}" = success
