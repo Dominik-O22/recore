@@ -92,11 +92,12 @@ fn struct_target(binary: &mut Binary, text: &str) -> Result<Option<Named>> {
 }
 
 /// Gives the struct `name` the name `new` in `edits`, keeping its recovered tree first if
-/// `recovered` holds one, and says what happened.
-fn name_struct(binary: &mut Binary, edits: &mut Edits, name: &str, recovered: Option<&Recovered>, new: &str) -> Result<String> {
+/// `recovered` holds one, and says what happened. `typed` is whether the decompiler knows a
+/// type called `new`.
+fn name_struct(edits: &mut Edits, name: &str, recovered: Option<&Recovered>, new: &str, typed: bool) -> Result<String> {
     ensure!(!new.is_empty(), "a struct keeps a name; give it another");
     // A type of the engine's, or one declared in C, would be shadowed.
-    if !edits.structs.contains_key(new) && binary.type_layout(new).is_ok() {
+    if !edits.structs.contains_key(new) && typed {
         bail!("the decompiler already has a type `{new}`");
     }
     let mut out = String::new();
@@ -119,6 +120,41 @@ fn name_struct(binary: &mut Binary, edits: &mut Edits, name: &str, recovered: Op
         }
     }
     Ok(out)
+}
+
+/// Makes one renaming in `edits`. Says what it did to a struct or a field, which the caller
+/// cannot tell from `named`; `typed` is as for [`name_struct`].
+fn change(edits: &mut Edits, named: &Named, name: &str, typed: bool) -> Result<Option<String>> {
+    Ok(match named {
+        Named::Address(addr) => {
+            if name.is_empty() {
+                edits.names.remove(addr);
+            } else {
+                edits.names.insert(*addr, name.to_string());
+            }
+            None
+        }
+        Named::Local { function, place, .. } => {
+            let names = edits.locals.entry(*function).or_default();
+            if name.is_empty() {
+                names.remove(place);
+            } else {
+                names.insert(place.clone(), name.to_string());
+            }
+            if names.is_empty() {
+                edits.locals.remove(function);
+            }
+            None
+        }
+        Named::Struct { name: old, recovered } => Some(name_struct(edits, old, recovered.as_ref(), name, typed)?),
+        Named::Field { name: owner, recovered, field } => {
+            if let Some(recovered) = recovered {
+                edits.adopt(recovered);
+            }
+            edits.name_field(owner, field, name)?;
+            Some(if name.is_empty() { format!("{owner}.{field} has its first name again") } else { format!("{owner}.{field} is now {name}") })
+        }
+    })
 }
 
 pub fn rename(binary: &mut Binary, args: Rename) -> Result<String> {
@@ -148,46 +184,13 @@ pub fn rename(binary: &mut Binary, args: Rename) -> Result<String> {
                 }
             },
         };
-        changes.push((named, name.to_string()));
+        let typed = matches!(named, Named::Struct { .. }) && !name.is_empty() && !binary.edits.structs.contains_key(name) && binary.type_layout(name).is_ok();
+        changes.push((named, name.to_string(), typed));
     }
-    // Struct changes depend on each other and may be refused, so all apply to a copy first.
-    let mut edits = binary.edits.clone();
-    let mut said: Vec<Option<String>> = Vec::new();
-    for (named, name) in &changes {
-        said.push(match named {
-            Named::Address(addr) => {
-                if name.is_empty() {
-                    edits.names.remove(addr);
-                } else {
-                    edits.names.insert(*addr, name.clone());
-                }
-                None
-            }
-            Named::Local { function, place, .. } => {
-                let names = edits.locals.entry(*function).or_default();
-                if name.is_empty() {
-                    names.remove(place);
-                } else {
-                    names.insert(place.clone(), name.clone());
-                }
-                if names.is_empty() {
-                    edits.locals.remove(function);
-                }
-                None
-            }
-            Named::Struct { name: old, recovered } => Some(name_struct(binary, &mut edits, old, recovered.as_ref(), name)?),
-            Named::Field { name: owner, recovered, field } => {
-                if let Some(recovered) = recovered {
-                    edits.adopt(recovered);
-                }
-                edits.name_field(owner, field, name)?;
-                Some(if name.is_empty() { format!("{owner}.{field} has its first name again") } else { format!("{owner}.{field} is now {name}") })
-            }
-        });
-    }
-    binary.edit(|saved| *saved = edits)?;
+    // Struct changes depend on each other and may be refused, so none is saved unless all apply.
+    let said = binary.edit(|edits| changes.iter().map(|(named, name, typed)| change(edits, named, name, *typed)).collect::<Result<Vec<_>>>())?;
     let mut out = String::new();
-    for ((named, name), said) in changes.iter().zip(said) {
+    for ((named, name, _), said) in changes.iter().zip(said) {
         match (named, name.as_str(), said) {
             (_, _, Some(said)) => writeln!(out, "{said}")?,
             (Named::Address(addr), "", _) => writeln!(out, "{addr:#x} has the name the analysis gives it again: {}", describe(binary, *addr))?,
@@ -220,6 +223,7 @@ pub fn comment(binary: &mut Binary, args: Comment) -> Result<String> {
         } else {
             edits.comments.insert(addr, text.clone());
         }
+        Ok(())
     })?;
     Ok(if text.is_empty() { format!("comment at {addr:#x} removed\n") } else { format!("comment at {addr:#x} saved; `function`, `disassemble` and `decompile` show it\n") })
 }
@@ -242,6 +246,7 @@ pub fn declare(binary: &mut Binary, args: Declare) -> Result<String> {
                 // Declared again, a struct or prototype replaces what was said before.
                 edits.declarations.retain(|earlier| *earlier != code);
                 edits.declarations.push(code.clone());
+                Ok(())
             })?;
             Ok("declared and saved; the decompiler is starting again with it\n".into())
         }
@@ -250,11 +255,11 @@ pub fn declare(binary: &mut Binary, args: Declare) -> Result<String> {
             ensure!(binary.program.image.section_at(addr).is_some_and(|section| !section.executable), "{addr:#x} is not data; a function gets its type from an `extern` declaration in `code`");
             let kind = kind.trim().to_string();
             if kind.is_empty() {
-                binary.edit(|edits| drop(edits.types.remove(&addr)))?;
+                binary.edit(|edits| Ok(edits.types.remove(&addr)))?;
                 return Ok(format!("{addr:#x} has no declared type any more\n"));
             }
             let layout = binary.type_layout(&kind).with_context(|| format!("the decompiler knows no type `{kind}`; declare it with `code` first"))?;
-            binary.edit(|edits| drop(edits.types.insert(addr, kind.clone())))?;
+            binary.edit(|edits| Ok(edits.types.insert(addr, kind.clone())))?;
             Ok(format!("{addr:#x} is now a {}saved; the decompiler is starting again with it\n", layout.lines().next().map_or_else(String::new, |line| format!("{line}\n"))))
         }
         _ => bail!("`declare` needs either `code`, or `addr` and `type`"),
