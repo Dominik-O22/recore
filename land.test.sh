@@ -116,9 +116,10 @@ echo target/ >.gitignore
 cat >check.sh <<'EOF'
 #!/usr/bin/env bash
 # What a run does is up to the files the change adds: one named `fails`, one that `costs` time
-# unless that was accepted, one that `moves` a count, one that `lowers` the budget and one that
-# `raises` it. Once, the owner of the branch named in $HUB/pushes pushes to it while the run is
-# on, and queues the pull request named in $HUB/queues again.
+# unless that was accepted, one that `moves` a count, one that `loses` a count, which a `Worse:`
+# line may accept, one that `breaks` a binary's analysis, which none accepts, one that `lowers` the
+# budget and one that `raises` it. Once, the owner of the branch named in $HUB/pushes pushes to it
+# while the run is on, and queues the pull request named in $HUB/queues again.
 adds() { [ -n "$(git diff --name-only "$against" HEAD -- "$1")" ]; }
 against="$2"
 git rev-parse HEAD >>"$RUNS"
@@ -141,8 +142,26 @@ if adds costs && [ -z "$RECORE_COST_ACCEPTED" ]; then
   echo "worse than $against: time or memory"
   exit 1
 fi
+if adds breaks; then
+  echo "worse than $against: target/corpus/corpus/recore"
+  exit 1
+fi
+# As check.sh holds the run's losses to the `Worse:` lines: each named with a reason, and no line
+# that names something else.
+lost='' named="$(grep '^Worse:' <<<"$RECORE_WORSE_ACCEPTED" || true)"
+! adds loses || lost="Worse: corpus/recore starts found 10 -> 9 (-1)"
+if [ -n "$lost" ] && [[ "$named" != "$lost "?* || "$named" == *$'\n'* ]]; then
+  echo "worse than $against: not named  $lost"
+  exit 1
+elif [ -z "$lost" ] && [ -n "$named" ]; then
+  echo "worse than $against: not lost   $named"
+  exit 1
+fi
 echo "target/corpus/corpus/recore against base/corpus/corpus/recore"
-if adds moves; then
+if [ -n "$lost" ]; then
+  echo "  worse   starts found                    10 -> 9 (-1)"
+  echo "  accepted   $lost"
+elif adds moves; then
   # A gain and a loss that cancel, which the comparison of signatures prints nothing for.
   echo "  parameter types compared in 10 functions, global types in 10 uses"
 else
@@ -260,6 +279,46 @@ is "the exit status" "$status" 0
 is "both" "$(state "$a")$(state "$b")" MERGEDMERGED
 is "the runs of check.sh" "$(($(runs) - before))" 2
 is "the trains opened" "$(($(trains) - trains_before))" 0
+tried
+
+case="a loss no Worse: line names is turned away"
+change loses && a=$pr
+land "$a"
+is "the exit status" "$status" 1
+is "the change" "$(state "$a")" OPEN
+is "what it was told" "$(grep -c 'not named  Worse: corpus/recore starts found 10 -> 9 (-1)' "$HUB/comment/$a")" 1
+echo CLOSED >"$HUB/pr/$a/state"
+tried
+
+case="a change whose Worse: lines name every loss lands alone, and the others in a train"
+change loses loses "$(printf 'Moves a call.\r\n\r\nWorse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there\r\n')" && a=$pr
+change seventeen && b=$pr
+change eighteen && c=$pr
+before=$(runs) trains_before=$(trains)
+land "$a" "$b" "$c"
+is "the exit status" "$status" 0
+is "all three" "$(state "$a")$(state "$b")$(state "$c")" MERGEDMERGEDMERGED
+is "the trains opened" "$(($(trains) - trains_before))" 1
+# A train with the loss aboard would fail and land each alone, in four runs.
+is "the runs of check.sh" "$(($(runs) - before))" 2
+tried
+
+case="a Worse: line that names a loss the run does not show is turned away"
+change nineteen nineteen "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
+land "$a"
+is "the exit status" "$status" 1
+is "the change" "$(state "$a")" OPEN
+is "what it was told" "$(grep -c 'not lost   Worse: corpus/recore' "$HUB/comment/$a")" 1
+echo CLOSED >"$HUB/pr/$a/state"
+tried
+
+case="a binary that lost its analysis is turned away, whatever its Worse: lines say"
+change breaks breaks "Worse: corpus/recore starts found 10 -> 9 (-1) the truth is wrong there" && a=$pr
+land "$a"
+is "the exit status" "$status" 1
+is "the change" "$(state "$a")" OPEN
+is "what it was told" "$(grep -c 'worse than .*: target/corpus/corpus/recore' "$HUB/comment/$a")" 1
+echo CLOSED >"$HUB/pr/$a/state"
 tried
 
 case="a change check.sh reads nothing of lands without a run"

@@ -23,6 +23,10 @@
 #   - A pull request whose description has a `Budget:` line, or that was queued with
 #     `--accept-cost` (its check then runs with RECORE_COST_ACCEPTED=1), lands alone, so that what
 #     it was let past is not let past for another.
+#   - So does one whose description has `Worse:` lines, which name the losses its check accepts:
+#     the check runs with the description as RECORE_WORSE_ACCEPTED, and fails on a loss no line
+#     names and on a line that names no loss of the run. A train's one run could not say whose
+#     loss it was.
 #
 # A run that lowered bench/budget.json and changed nothing else is committed here, and that commit
 # gets the status without a run of its own: it differs from the commit that passed only in the
@@ -131,7 +135,7 @@ current() {
 rides() {
   local body
   body="$(field "$1" body)"
-  [ -z "${alone[$1]:-}" ] && [ -z "$(sed -n 2p "$queue/$1")" ] && ! grep -Eq '^Budget: .+' <<<"$body"
+  [ -z "${alone[$1]:-}" ] && [ -z "$(sed -n 2p "$queue/$1")" ] && ! grep -Eq '^Budget: .+|^Worse:' <<<"$body"
 }
 
 # at <commit>: the landing checkout at that commit, with nothing left of an earlier run but its
@@ -190,12 +194,13 @@ green() {
 # landing checkout is at, a head that holds main. Fails, and says why in $why, when it did not
 # merge. A train's run also fails when it moved a count.
 settle() {
-  local pr="$1" branch="$2" cost='' log="$logs/$1.log" head dirty grew compared tries=0
+  local pr="$1" branch="$2" cost='' log="$logs/$1.log" head body dirty grew compared passed accepted tries=0
   [[ "$3" != *cost* ]] || cost=1
   head="$(git -C "$tree" rev-parse HEAD)"
   if reads "$head"; then
+    body="$(field "$pr" body)" || need "" "the description of #$pr"
     echo "#$pr: check.sh on ${head:0:12} against ${base:0:12}, its output in $log"
-    if ! (cd "$tree" && RECORE_COST_ACCEPTED="$cost" ./check.sh --against "$base") >"$log" 2>&1; then
+    if ! (cd "$tree" && RECORE_COST_ACCEPTED="$cost" RECORE_WORSE_ACCEPTED="$body" ./check.sh --against "$base") >"$log" 2>&1; then
       why="check.sh failed on ${head:0:12} against ${base:0:12}: $(grep '^worse' "$log" | tail -1 || true) ($log)"
       return 1
     fi
@@ -218,7 +223,11 @@ settle() {
       head="$(git -C "$tree" rev-parse HEAD)"
       why="its branch moved while ${head:0:12} was landing, so queue it again"
       git -C "$tree" push -q origin "HEAD:refs/heads/$branch" 2>/dev/null || return 1
-      gh api --silent "repos/{owner}/{repo}/statuses/$head" -f state=success -f context=check -f description="passed against ${base:0:12}, before the budget it lowered" || return 1
+      # As check.sh says it, with the losses the run accepted.
+      passed="passed against ${base:0:12}"
+      accepted="$(grep -c '^  accepted ' "$log" || true)"
+      [ "$accepted" -eq 0 ] || passed+=", accepting $accepted named loss$([ "$accepted" -eq 1 ] || echo es)"
+      gh api --silent "repos/{owner}/{repo}/statuses/$head" -f state=success -f context=check -f description="$passed, before the budget it lowered" || return 1
     fi
   fi
   green "$pr" "$head" || return 1
