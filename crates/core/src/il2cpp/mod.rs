@@ -64,6 +64,17 @@ pub enum Ty {
     Unknown,
 }
 
+impl Ty {
+    /// How many types this one is built of, itself included.
+    fn nodes(&self) -> usize {
+        match self {
+            Ty::Generic(_, args) => 1 + args.iter().map(Ty::nodes).sum::<usize>(),
+            Ty::Array(inner) | Ty::Pointer(inner) | Ty::ByRef(inner) => 1 + inner.nodes(),
+            _ => 1,
+        }
+    }
+}
+
 /// A field of a type, with where it lies.
 #[derive(Debug, Clone)]
 pub struct Field {
@@ -247,6 +258,10 @@ const HEADER: u32 = 16;
 /// arguments.
 const MAX_ANCESTORS: usize = 64;
 const MAX_NESTING: u32 = 32;
+/// Most types the arguments of one generic type are built of. Real builds stay under a few
+/// dozen. Arguments can share a record, and a damaged file that nests records whose arguments
+/// all are the next one makes a tree 32 times larger with each level.
+const MAX_NODES: usize = 1024;
 
 /// Kinds of usage slot.
 const CLASS: u64 = 1;
@@ -415,7 +430,8 @@ impl<'a> Builder<'a> {
                 let Ty::Def(def) = self.ty_at(self.words.pointer(generic)?, depth + 1) else {
                     return Some(Ty::Unknown);
                 };
-                let args = self.words.pointer(generic + 8).map_or_else(Vec::new, |inst| self.generic_args(inst, depth + 1));
+                let args = self.words.pointer(generic + 8).map_or(Some(Vec::new()), |inst| self.generic_args(inst, depth + 1));
+                let Some(args) = args else { return Some(Ty::Unknown) };
                 Ty::Generic(def, args)
             }
             0x18 => Ty::IntPtr,
@@ -429,12 +445,20 @@ impl<'a> Builder<'a> {
     }
 
     /// The type arguments of the generic instance record at `inst`: a count, then an array.
-    fn generic_args(&self, inst: u64, depth: u32) -> Vec<Ty> {
+    /// `None` for arguments built of more than `MAX_NODES` types.
+    fn generic_args(&self, inst: u64, depth: u32) -> Option<Vec<Ty>> {
         let count = self.words.u32(inst).unwrap_or(0).min(32);
         let Some(argv) = self.words.pointer(inst + 8) else {
-            return Vec::new();
+            return Some(Vec::new());
         };
-        (0..u64::from(count)).map(|index| self.words.entry(argv, index).map_or(Ty::Unknown, |arg| self.ty_at(arg, depth))).collect()
+        let mut nodes = 0;
+        (0..u64::from(count))
+            .map(|index| self.words.entry(argv, index).map_or(Ty::Unknown, |arg| self.ty_at(arg, depth)))
+            .map(|arg| {
+                nodes += arg.nodes();
+                (nodes <= MAX_NODES).then_some(arg)
+            })
+            .collect()
     }
 
     /// The type that type index `index` refers to.
@@ -590,7 +614,8 @@ impl<'a> Builder<'a> {
         let (insts, _) = self.tables.generic_insts?;
         let args = |at: u64| -> Option<Vec<Ty>> {
             let inst = self.words.u32(at)? as i32;
-            (inst >= 0).then(|| self.words.entry(insts, inst as u64).map_or_else(Vec::new, |inst| self.generic_args(inst, 0)))
+            (inst >= 0).then_some(())?;
+            self.words.entry(insts, inst as u64).map_or(Some(Vec::new()), |inst| self.generic_args(inst, 0))
         };
         let owner = match args(spec + 4) {
             Some(class_args) => names.display(&Ty::Generic(method.owner, class_args)),
@@ -801,7 +826,90 @@ impl Il2Cpp {
 
 #[cfg(test)]
 mod tests {
-    use super::render;
+    use super::metadata::{Metadata, TypeDefinition};
+    use super::tables::Tables;
+    use super::{Builder, Ty, Words, render};
+    use crate::image::{Format, Image, Machine, Section};
+
+    /// A type record, a generic class, its instance and its 32 arguments.
+    const LEVEL: u64 = 16 + 16 + 16 + 32 * 8;
+
+    /// A generic class nested `levels` deep, each level's 32 type arguments all the next
+    /// level, and the type record it starts at.
+    fn nested_generics(levels: u64) -> (Image, u64) {
+        const DATA: u64 = 0x10000;
+        let mut bytes = vec![0u8; (LEVEL * (levels + 1) + 16) as usize];
+        let mut put = |addr: u64, value: u64| bytes[(addr - DATA) as usize..][..8].copy_from_slice(&value.to_le_bytes());
+        // The definition every level instantiates, type definition 0.
+        let definition = DATA + LEVEL * (levels + 1);
+        put(definition + 8, 0x12 << 16);
+        for level in 0..=levels {
+            let record = DATA + LEVEL * level;
+            if level == levels {
+                put(record + 8, 0x12 << 16);
+                continue;
+            }
+            let (generic, inst, argv) = (record + 16, record + 32, record + 48);
+            put(record, generic);
+            put(record + 8, 0x15 << 16);
+            put(generic, definition);
+            put(generic + 8, inst);
+            put(inst, 32);
+            put(inst + 8, argv);
+            for arg in 0..32 {
+                put(argv + 8 * arg, record + LEVEL);
+            }
+        }
+        let section = Section { name: ".data".into(), addr: DATA, data: bytes, file_offset: None, executable: false, writable: true };
+        (Image::bare("il2cpp".into(), Format::Elf, Machine::X86_64, 0, vec![section]), DATA)
+    }
+
+    fn metadata() -> Metadata {
+        let definition = TypeDefinition {
+            name: "Box`32".into(),
+            namespace: String::new(),
+            byval: None,
+            declaring: None,
+            parent: None,
+            generic_container: None,
+            flags: 0,
+            field_start: None,
+            method_start: None,
+            vtable_start: None,
+            method_count: 0,
+            field_count: 0,
+            vtable_count: 0,
+            bits: 0,
+        };
+        Metadata {
+            version: 31,
+            types: vec![definition],
+            methods: Vec::new(),
+            parameters: Vec::new(),
+            fields: Vec::new(),
+            vtable_methods: Vec::new(),
+            field_refs: Vec::new(),
+            generic_parameters: Vec::new(),
+            generic_containers: Vec::new(),
+            images: Vec::new(),
+            string_literals: Vec::new(),
+            field_default_values: Vec::new(),
+            default_value_data: Vec::new(),
+        }
+    }
+
+    /// Each level's arguments repeat the next level 32 times: 32 levels are 32^32 types.
+    #[test]
+    fn nested_generic_arguments_are_cut_off() {
+        let metadata = metadata();
+        let (image, root) = nested_generics(32);
+        let tables = Tables { types: (0, 0), field_offsets: None, sizes: None, generic_insts: None, method_specs: None, generic_method_table: None, generic_method_pointers: None };
+        let builder = Builder { words: Words { image: &image, relocated: Default::default() }, metadata: &metadata, tables, modules: Vec::new(), read: Default::default() };
+        // The innermost generic level is read whole; the next, of 32 * 33 types, is cut off.
+        assert_eq!(builder.ty_at(root + 31 * LEVEL, 0), Ty::Generic(0, vec![Ty::Def(0); 32]));
+        assert_eq!(builder.ty_at(root + 30 * LEVEL, 0), Ty::Unknown);
+        assert_eq!(builder.ty_at(root, 0), Ty::Unknown);
+    }
 
     #[test]
     fn generic_arguments_go_to_the_parts_they_belong_to() {
