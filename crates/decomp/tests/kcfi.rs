@@ -43,3 +43,15 @@ fn a_module_of_a_kernel_that_does_not_normalize_is_read_in_the_plain_spelling() 
     let image = recore::Image::load(&module()).unwrap();
     assert_eq!(kcfi::types(&image).map(|(spelling, _)| spelling), Some(Spelling::Plain));
 }
+
+/// `module-unnamed.o` is `module-arm64.o` without `kernel_probe`'s symbol, made with
+/// `llvm-objcopy --strip-symbol=kernel_probe`. Its hash is followed by four ftrace `nop`s, two
+/// of them before the function.
+fn unnamed() -> recore::Image {
+    recore::Image::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/module-unnamed.o")).unwrap()
+}
+
+#[test]
+fn a_hash_names_the_function_after_ftraces_nops_without_a_symbol() {
+    assert!(kcfi::hashes(&unnamed()).contains(&(0xffff_8000_0000_0258, 0x63df_1691)));
+}

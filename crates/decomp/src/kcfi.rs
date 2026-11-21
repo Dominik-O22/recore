@@ -45,13 +45,17 @@ pub fn hashes(image: &Image) -> Vec<(u64, u32)> {
     if !image.kernel_module {
         return Vec::new();
     }
-    let mut entries: Vec<u64> = image.symbol_extents.iter().map(|extent| extent.0).collect();
+    // Where a module has no symbol for a function, the loader finds its start from ftrace's
+    // patch list, or from a pointer to it, which `-fpatchable-function-entry=4,2` puts two of
+    // the `nop`s before.
+    let starts = image.symbol_extents.iter().map(|extent| extent.0).chain(image.relative_targets.iter().map(|target| target.1));
+    let mut entries: Vec<u64> = starts.collect();
     entries.sort_unstable();
     let data = image.marked_data.iter().filter(|(start, end)| end - start == 4);
     data.filter_map(|&(start, end)| {
         let hash = u32::from_le_bytes(image.bytes_from(start)?.get(..4)?.try_into().ok()?);
         let nops = image.bytes_from(end).map_or(0, |code| code.as_chunks::<4>().0.iter().take_while(|&&word| word == NOP).count());
-        // The first symbol from the end of the hash on with only nops before it, or without one
+        // The first start from the end of the hash on with only nops before it, or without one
         // the address the hash ends at.
         let symbol = entries.get(entries.partition_point(|&entry| entry < end)).filter(|&&entry| entry <= end + 4 * nops as u64);
         Some((symbol.copied().unwrap_or(end), hash))
