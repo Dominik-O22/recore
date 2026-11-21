@@ -361,8 +361,10 @@ fn elf(binary_path: &Path, binary: &object::File, debug: &object::File) -> Resul
 
     let slots = import_slots(binary);
     // A kernel module imports the kernel's functions, and objtool's list says which of them never
-    // return where its DWARF cannot: the vendor modules have none.
+    // return where there is no DWARF to say it, as the vendor modules have none. Where there is,
+    // the list has no say, so that DWARF still shows a name the list has wrong.
     let kernel_module = binary.section_by_name(".modinfo").is_some();
+    let listed = kernel_module && debug.section_by_name(".debug_info").is_none_or(|section| section.size() == 0);
     // Both reach imports by a direct call to a PLT stub. On x86-64 the truth resolves only the
     // stubs that recore's link writes for a kernel module; resolving a program's would move the
     // user-space truth.
@@ -389,7 +391,7 @@ fn elf(binary_path: &Path, binary: &object::File, debug: &object::File) -> Resul
         slots: &slots,
         is_noreturn_import: &|name| {
             !is_conditionally_noreturn(name)
-                && (noreturn.declared.contains(name) || is_runtime_noreturn(name) || (kernel_module && recore::noreturn::KERNEL_NAMES.contains(&name)))
+                && (noreturn.declared.contains(name) || is_runtime_noreturn(name) || (listed && recore::noreturn::KERNEL_NAMES.contains(&name)))
         },
         widen_slots: false,
     };
@@ -562,6 +564,16 @@ mod tests {
                 assert_eq!((truth.noreturn_calls.len(), truth.noreturn_imports), (usize::from(noreturn), imports), "{fixture}");
             }
         }
+    }
+
+    #[test]
+    fn dwarf_that_declares_panic_as_returning_overrules_the_kernels_list() {
+        let module = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/fixtures/module-dwarf-arm64.o")).unwrap();
+        let linked = recore::relocatable::link(module);
+        let file = object::File::parse(&*linked).unwrap();
+        let truth = elf(Path::new("module-dwarf-arm64.o"), &file, &file).unwrap();
+        assert!(truth.functions.iter().any(|function| function.name == "checked"));
+        assert_eq!((truth.noreturn_calls.len(), truth.noreturn_imports), (0, Vec::<String>::new()));
     }
 
     #[test]
