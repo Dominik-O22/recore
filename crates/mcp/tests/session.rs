@@ -100,6 +100,22 @@ fn edits_reach_every_view_and_outlive_the_server() {
 }
 
 #[test]
+fn a_saved_edit_the_decompiler_refuses_costs_only_itself() {
+    let edits = edits_dir();
+    let mut client = Client::start_in(&edits);
+    let entry = client.entry();
+    assert!(client.tool("comment", json!({ "addr": entry, "text": "a\u{0}b" })).unwrap_err().contains("NUL"));
+    // An edits file saved before the tool refused one, or written by hand.
+    client.tool("comment", json!({ "addr": entry, "text": "placeholder" })).unwrap();
+    drop(client);
+    let file = std::fs::read_dir(&edits).unwrap().next().unwrap().unwrap().path();
+    std::fs::write(&file, std::fs::read_to_string(&file).unwrap().replace("placeholder", "a\\u0000b")).unwrap();
+
+    let c_text = Client::start_in(&edits).tool("decompile", json!({ "functions": [entry], "timeout": 60.0 })).unwrap();
+    assert!(c_text.contains('{'), "{c_text}");
+}
+
+#[test]
 fn a_variable_keeps_the_name_it_is_given() {
     // `total` of the decompiler's fixture: a loop over a list that sums into one temporary.
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/types.elf");

@@ -246,13 +246,16 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         facts.names.extend(unnamed.filter_map(|f| Some((f.addr, importer.describes(f.addr).filter(|described| !described.name.is_empty())?.name.clone()))));
     }
     let mut importer = importer;
-    session.add_functions(&facts)?;
-    session.add_strings(&analysis)?;
-    session.add_classes(&analysis)?;
-    session.add_objc(&image)?;
+    // From here on a fact the engine refuses is reported and costs only itself, or the facts
+    // after it in the same call: a worker that stopped here would leave every function of the
+    // binary undecompiled.
+    refused("functions", session.add_functions(&facts));
+    refused("strings", session.add_strings(&analysis));
+    refused("classes", session.add_classes(&analysis));
+    refused("Objective-C references", session.add_objc(&image));
     let recores = image.format == Format::Pe || matches!(image.machine, Machine::I8051 | Machine::Thumb | Machine::Arm);
     if options.jump_tables == JumpTables::Recore || (options.jump_tables == JumpTables::Auto && recores) {
-        session.override_jump_tables(&analysis, &facts)?;
+        refused("jump tables", session.override_jump_tables(&analysis, &facts));
     }
 
     // Types from debug information go in before the edits, which have the last word and may
@@ -269,7 +272,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     }
 
     // Named structs go in before declarations, which may mention them.
-    session.set_structs(&edits.structs, &edits.holders)?;
+    refused("structs", session.set_structs(&edits.structs, &edits.holders));
     // Each edit was accepted by a session when it was made. One that no longer is, after a
     // change to an earlier declaration, is reported and costs only itself.
     for declaration in &edits.declarations {
@@ -304,12 +307,12 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
 
     for (&addr, text) in &edits.comments {
         if let Some(function) = comment_owner(&analysis, addr) {
-            session.add_comment(function, addr, text)?;
+            refused(format_args!("comment at {addr:#x}"), session.add_comment(function, addr, text));
         }
     }
     for (&function, names) in &edits.locals {
         for (place, name) in names {
-            session.name_local(function, place, name)?;
+            refused(format_args!("variable {name} of {function:#x}"), session.name_local(function, place, name));
         }
     }
 
@@ -644,6 +647,13 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Reports on stderr that the engine did not take `what`, if `result` says so. Setup goes on.
+fn refused<T>(what: impl std::fmt::Display, result: Result<T>) {
+    if let Err(error) = result {
+        eprintln!("{what}: {error:#}");
+    }
 }
 
 /// The function a comment at `addr` goes to: the one its address is in, by where that starts.
