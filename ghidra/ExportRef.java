@@ -28,8 +28,8 @@ public class ExportRef extends GhidraScript {
 			f.getBody().forEach(r -> ranges.append(ranges.length() > 0 ? "," : "")
 				.append('[').append(r.getMinAddress().getOffset() - shift).append(',')
 				.append(r.getMaxAddress().getOffset() - shift + 1).append(']'));
-			functions.append(String.format("{\"addr\":%d,\"ranges\":[%s],\"noreturn\":%b,\"thunk\":%b}",
-				f.getEntryPoint().getOffset() - shift, ranges, f.hasNoReturn(), f.isThunk()));
+			functions.append(String.format("{\"addr\":%d,\"ranges\":[%s],\"noreturn\":%b,\"thunk\":%b,\"name\":\"%s\"}",
+				f.getEntryPoint().getOffset() - shift, ranges, f.hasNoReturn(), f.isThunk(), f.getName().replace("\\", "\\\\").replace("\"", "\\\"")));
 		}
 
 		StringBuilder callReturn = new StringBuilder();
@@ -50,16 +50,25 @@ public class ExportRef extends GhidraScript {
 						ins.getAddress().getOffset() - shift, targets));
 				}
 			}
-			// A jump given call semantics (a tail call) also has no fallthrough; only real calls count.
-			if (ins.getMnemonicString().startsWith("CALL") && ins.getFlowType().isCall() &&
+			// A jump given call semantics (a tail call) also has no fallthrough. Only an instruction
+			// that is a call before any override counts, on every instruction set.
+			if (ins.getFlowType().isCall() && ins.getPrototype().getFlowType(ins.getInstructionContext()).isCall() &&
 				ins.getFallThrough() == null) {
 				callReturn.append(callReturn.length() > 0 ? "," : "").append(ins.getAddress().getOffset() - shift);
 			}
 		}
 
+		// A relocatable file's addresses are Ghidra's own placement of its sections, which
+		// ghidra/kmod.py maps to recore's by these blocks.
+		StringBuilder blocks = new StringBuilder();
+		for (ghidra.program.model.mem.MemoryBlock block : currentProgram.getMemory().getBlocks()) {
+			blocks.append(blocks.length() > 0 ? "," : "").append(String.format("{\"name\":\"%s\",\"start\":%d,\"size\":%d,\"comment\":\"%s\"}",
+				block.getName(), block.getStart().getOffset(), block.getSize(), block.getComment() == null ? "" : block.getComment().replace("\"", "'")));
+		}
+
 		try (PrintWriter out = new PrintWriter(getScriptArgs()[0])) {
-			out.printf("{\"name\":\"%s\",\"shift\":%d,\"min\":%d,\"instructions\":%d,\"functions\":[%s],\"noreturn_calls\":[%s],\"jump_tables\":[%s]}%n",
-				currentProgram.getName(), shift, min.getOffset(), instructions, functions, callReturn, jumpTables);
+			out.printf("{\"name\":\"%s\",\"shift\":%d,\"min\":%d,\"instructions\":%d,\"functions\":[%s],\"noreturn_calls\":[%s],\"jump_tables\":[%s],\"blocks\":[%s]}%n",
+				currentProgram.getName(), shift, min.getOffset(), instructions, functions, callReturn, jumpTables, blocks);
 		}
 	}
 }
