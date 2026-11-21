@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use recore::edits::Edits;
 use recore::program::{Pattern, matches};
 use recore::structs::{Recovered, Slot, auto_function, field_name};
@@ -81,8 +81,14 @@ fn struct_target(binary: &mut Binary, text: &str) -> Result<Option<Named>> {
     };
     let kept = binary.edits.structs.contains_key(name);
     if !kept && auto_function(name).is_none() {
-        ensure!(field.is_none(), "there is no struct `{name}`");
-        return Ok(None);
+        let Some(field) = field else { return Ok(None) };
+        // The name the C prints a recovered struct as, where it stands for one struct.
+        let recovered = binary.recovered(name).map_err(|_| match binary.type_layout(name) {
+            Ok(layout) if layout.starts_with(&format!("struct {name} has no layout of its own.")) => anyhow!("{layout}Name the field of one of them, as `<struct>.{field}`"),
+            _ => anyhow!("there is no struct `{name}`"),
+        })?;
+        let owner = recovered.structs.first().map(|(owner, _)| owner.clone()).context("a recovered struct has a name")?;
+        return Ok(Some(Named::Field { name: owner, recovered: Some(recovered), field: field.to_string() }));
     }
     let recovered = if kept { None } else { Some(binary.recovered(name)?) };
     Ok(Some(match field {

@@ -297,6 +297,30 @@ fn data_is_told_by_what_its_pointers_reach() {
 }
 
 #[test]
+fn a_struct_printed_under_a_declared_name_answers_to_that_name() {
+    // `poll` at 0x401000 and `reset` at 0x40100c take a `struct device *` that the program
+    // declares and never defines, and read fields through it.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/opaque.elf");
+    let mut client = Client::start_in(&edits_dir());
+    let mut tool = |name: &str, mut arguments: Value| {
+        arguments["path"] = path.into();
+        client.tool(name, arguments)
+    };
+    assert!(tool("decompile", json!({ "functions": ["0x401000"] })).unwrap().contains("if (dev->field_0x10 < limit)"));
+    assert!(tool("structs", json!({ "function": "0x401000" })).unwrap().contains("RDI: S_401000_RDI, printed as device, 3 accesses"));
+    let layout = tool("type", json!({ "name": "device" })).unwrap();
+    assert!(layout.starts_with("struct device has no layout of its own.") && layout.ends_with(":\n  S_401000_RDI, of the function at 0x401000 in RDI\n"), "{layout}");
+    let renamed = tool("rename", json!({ "addr": "device.field_0x10", "name": "capacity" })).unwrap();
+    assert!(renamed.starts_with("S_401000_RDI.field_0x10 is now capacity\n"), "{renamed}");
+    assert!(tool("decompile", json!({ "functions": ["0x401000"] })).unwrap().contains("if (dev->capacity < limit)"));
+
+    // With `reset` decompiled too, two structs print as `device`.
+    tool("decompile", json!({ "functions": ["0x40100c"] })).unwrap();
+    let refused = tool("rename", json!({ "addr": "device.field_0x0", "name": "head" })).unwrap_err();
+    assert!(refused.contains("  S_401000_RDI, of the function at 0x401000 in RDI\n  S_40100c_RDI, of the function at 0x40100c in RDI\n"), "{refused}");
+}
+
+#[test]
 fn a_structure_passed_on_the_stack_reaches_the_call() {
     // `use` passes a 40-byte structure by value with two registers still free, so it goes on the
     // stack: its five fields are arguments of the call, and the callee reads them as parameters.

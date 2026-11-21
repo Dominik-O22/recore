@@ -101,6 +101,9 @@ pub struct ObjectReport {
     pub named: bool,
     /// Reads and writes through it: offset from where its first slot points, and size.
     pub accesses: Vec<(i64, u32)>,
+    /// The name the C prints its struct as, where that is not the struct's own: the struct with
+    /// no layout its parameter is declared to point to.
+    pub label: Option<String>,
 }
 
 /// What struct recovery made of one function's objects, as of its last decompilation.
@@ -459,8 +462,12 @@ impl Registry {
     }
 
     /// The recovered struct `name` stands for in this session, with the one its slot points
-    /// to first and every struct reached from that through fields.
+    /// to first and every struct reached from that through fields. A label stands for the one
+    /// struct printed under it, if only one is and the edits do not keep it.
     pub(crate) fn recovered(&self, name: &str) -> Option<Recovered> {
+        if let [(_, only)] = self.labeled(name).as_slice() {
+            return self.recovered(only.decision.as_deref().ok().filter(|_| !only.named)?);
+        }
         for (&function, last) in &self.last {
             let Some(index) = last.report.objects.iter().position(|object| !object.named && object.decision.as_ref().is_ok_and(|given| given == name)) else { continue };
             let (slot, _) = last.paths[index].clone()?;
@@ -481,6 +488,15 @@ impl Registry {
             return Some(Recovered { function, slot, structs });
         }
         None
+    }
+
+    /// The objects whose structs print as `label`, each with its function, as the last plan for
+    /// each function made them.
+    pub(crate) fn labeled(&self, label: &str) -> Vec<(u64, &ObjectReport)> {
+        let objects = self.last.iter().flat_map(|(&function, last)| last.report.objects.iter().map(move |object| (function, object)));
+        let mut labeled: Vec<(u64, &ObjectReport)> = objects.filter(|(_, object)| object.label.as_deref() == Some(label)).collect();
+        labeled.sort_by_key(|&(function, _)| function);
+        labeled
     }
 
     /// What the last plan for the function at `function` made of its objects.
@@ -576,6 +592,7 @@ fn report(objects: &[Object], choices: &[Choice], decisions: &[Result<String, Re
             decision: decision.clone(),
             named: matches!(choice, Choice::Named(_) | Choice::Typed(_)),
             accesses: object.accesses.iter().map(|access| (access.offset, access.size)).collect(),
+            label: object.label.clone().filter(|_| decision.is_ok()),
         })
         .collect();
     StructReport { objects, warnings: warnings.to_vec() }

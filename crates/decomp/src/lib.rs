@@ -933,12 +933,25 @@ impl Session {
     }
 
     /// Describes a data type the session knows: its size, and the fields of a struct or union
-    /// with their offsets, or the values of an enum.
+    /// with their offsets, or the values of an enum. A struct with no layout lists instead the
+    /// structs recovered for the parameters declared to point to it, which print as its name.
     pub fn type_layout(&mut self, name: &str) -> Result<String> {
-        let name = CString::new(name)?;
+        let text = CString::new(name)?;
         let mut out = std::ptr::null();
-        check(|err, len| unsafe { ffi::rd_type_layout(self.raw.as_ptr(), name.as_ptr(), &mut out, err, len) != 0 })?;
-        Ok(unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned())
+        check(|err, len| unsafe { ffi::rd_type_layout(self.raw.as_ptr(), text.as_ptr(), &mut out, err, len) != 0 })?;
+        let layout = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+        // SAFETY: as in `set_structs`.
+        let labeled = unsafe { self.structs.as_ref() }.labeled(name);
+        if labeled.is_empty() && !layout.starts_with(&format!("struct {name}, 0 bytes,")) {
+            return Ok(layout);
+        }
+        let mut out = format!("struct {name} has no layout of its own. The C prints under its name the struct recovered for each parameter declared to point to it");
+        out += if labeled.is_empty() { "; none is recovered yet. `structs` of a function that takes one names its struct.\n" } else { ":\n" };
+        for (function, object) in labeled {
+            let slots: Vec<String> = object.slots.iter().map(ToString::to_string).collect();
+            out += &format!("  {}, of the function at {function:#x} in {}\n", object.decision.as_deref().unwrap_or_default(), slots.join(", "));
+        }
+        Ok(out)
     }
 
     /// Hands recore's jump tables to the decompiler as overrides. Call before decompiling.
