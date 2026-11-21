@@ -172,6 +172,11 @@ fn address_space() -> Option<u64> {
     pages.checked_mul(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64)
 }
 
+/// The most calls to a function whose code after them is read to see whether they take its
+/// result. Reading each of the tens of thousands of calls some functions have would cost more
+/// than decompiling them.
+const CALLER_SAMPLE: usize = 32;
+
 /// Callees with more code than this, in bytes, are not decompiled ahead of their callers. The few
 /// large functions take most of the time, and leaving them out costs no measurable accuracy.
 const CALLEE_LIMIT: u64 = 4096;
@@ -755,6 +760,9 @@ struct Calls<'a> {
     ranges: Vec<(u64, u64, u64)>,
     /// Indexes into `ranges`, by owner and then by start.
     by_owner: Vec<usize>,
+    /// Indexes into `calls` of the calls that come back, by the function they call: made the first
+    /// time a function's callers are asked for, which most sessions never do.
+    to: std::cell::OnceCell<recore::FxHashMap<u64, Vec<u32>>>,
 }
 
 impl<'a> Calls<'a> {
@@ -764,7 +772,7 @@ impl<'a> Calls<'a> {
         ranges.sort_unstable();
         let mut by_owner: Vec<usize> = (0..ranges.len()).collect();
         by_owner.sort_by_key(|&index| ranges[index].2);
-        Calls { calls: &analysis.calls, ranges, by_owner }
+        Calls { calls: &analysis.calls, ranges, by_owner, to: Default::default() }
     }
 
     /// The calls in range `index`: up to its end, or to where the next range starts.
@@ -786,11 +794,21 @@ impl<'a> Calls<'a> {
         self.ranges_of(entry).flat_map(|index| self.in_range(index)).filter(move |call| call.target != CallTarget::Function(entry))
     }
 
-    /// The calls to the function at `entry` from other functions that come back to the code
-    /// after them.
+    /// Up to [`CALLER_SAMPLE`] of the calls to the function at `entry` from other functions that
+    /// come back to the code after them, spread over all of them.
     fn returning_to_callers(&self, entry: u64) -> Vec<u64> {
+        let to = self.to.get_or_init(|| {
+            let mut to: recore::FxHashMap<u64, Vec<u32>> = recore::FxHashMap::default();
+            for (index, call) in self.calls.iter().enumerate() {
+                if let (CallTarget::Function(target), false, false) = (call.target, call.tail, call.noreturn) {
+                    to.entry(target).or_default().push(index as u32);
+                }
+            }
+            to
+        });
         let own = |at: u64| self.ranges_of(entry).any(|index| (self.ranges[index].0..self.ranges[index].1).contains(&at));
-        self.calls.iter().filter(|call| call.target == CallTarget::Function(entry) && !call.tail && !call.noreturn && !own(call.at)).map(|call| call.at).collect()
+        let calls: Vec<u64> = to.get(&entry).into_iter().flatten().map(|&index| self.calls[index as usize].at).filter(|&at| !own(at)).collect();
+        calls.iter().copied().step_by(calls.len().div_ceil(CALLER_SAMPLE).max(1)).collect()
     }
 
     /// The jumps each function leaves by for good, by entry point.

@@ -1990,10 +1990,13 @@ static bool same_inputs_give_a_constant(const CollectPcode::Op &op) {
 // register, at a write to any of it, at the next call or return, and at a branch, which leaves the
 // call undecided, as do bytes that do not decode and a run of 40 instructions. A read counts where
 // what was read reaches a register, memory, a branch or a call: an address worked out from the
-// register and used for nothing, as a long `NOP` does, is no read.
+// register and used for nothing, as a long `NOP` does, is no read. Nor is a push: compilers push a
+// register to keep the stack aligned for the arguments of the next call as often as to pass it.
 static int4 bytes_read_after(RdSession *session, uint64_t call, const VarnodeData &result) {
   const Translate *translate = session->arch->translate;
   AddrSpace *unique = translate->getUniqueSpace();
+  AddrSpace *stack = session->arch->getStackSpace();
+  const VarnodeData *pointer = stack != nullptr && stack->numSpacebase() > 0 ? &stack->getSpacebase(0) : nullptr;
   uint64_t at = call;
   for (int count = 0; count <= 40; ++count) {
     CollectPcode emit;
@@ -2010,6 +2013,9 @@ static int4 bytes_read_after(RdSession *session, uint64_t call, const VarnodeDat
     // Temporaries of this instruction that hold something of the result, with how many of its bytes.
     map<uintb, int4> holding;
     bool written = false;
+    bool pushes = pointer != nullptr && any_of(emit.ops.begin(), emit.ops.end(), [&](const CollectPcode::Op &op) {
+      return op.has_output && op.output.space == pointer->space && op.output.offset == pointer->offset;
+    });
     for (const CollectPcode::Op &op : emit.ops) {
       int4 read = 0;
       bool reads = false;
@@ -2023,6 +2029,7 @@ static int4 bytes_read_after(RdSession *session, uint64_t call, const VarnodeDat
         }
       }
       if (reads) {
+        if (op.code == CPUI_STORE && pushes) return 0;
         if (!op.has_output || op.output.space != unique) return read;
         holding[op.output.offset] = max(holding[op.output.offset], read);
       }
