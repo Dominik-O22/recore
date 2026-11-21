@@ -2,8 +2,9 @@
 """Adds Android kernel modules to a corpus: the GKI modules of one Android build, or the vendor
 modules of one Pixel release.
 
-Usage: fetch_android_kmod.py <corpus>   corpus-kmod-android or corpus-kmod-android-vendor, or either
-                                        with -holdout; the name picks the build and the half
+Usage: python3 -I fetch_android_kmod.py <corpus>
+       corpus-kmod-android or corpus-kmod-android-vendor, or either with -holdout; the name picks
+       the build and the half
 GKI, build 17002073 of android16-6.12: <corpus>/bin/kmod__<module>.ko is the module as shipped,
 and <corpus>/debug/kmod__<module>.ko.debug the unstripped one with its DWARF decompressed, which
 the build compresses with zstd and recore reads only uncompressed.
@@ -16,7 +17,9 @@ that check.sh never takes a corpus half made. A corpus that has truth/ is left a
 import os, shutil, subprocess, sys, tarfile, urllib.request, zlib
 from pathlib import Path, PurePosixPath
 
-from store import CORPORA
+# `-I` leaves the script's directory off the path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from store import CORPORA  # noqa: E402
 
 GKI = "https://ci.android.com/builds/submitted/17002073/kernel_aarch64/latest/raw"
 # Gitiles makes this archive when asked, so its bytes differ between downloads and cannot be
@@ -29,12 +32,17 @@ def held_out(module):
 
 
 def download(url, pkgs, name):
-    """Downloads `url` once, into a directory of its own in `pkgs`."""
+    """Downloads `url` once, into a directory of its own in `pkgs`. Gitiles sends no length, so
+    a download cut short shows only when the archive is read to its end, which happens before
+    the file gets its name."""
     dest = pkgs / name / Path(url).name
     if not dest.exists():
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(".part")
-        urllib.request.urlretrieve(url, tmp)
+        with urllib.request.urlopen(url, timeout=180) as response, open(tmp, "wb") as out:
+            shutil.copyfileobj(response, out)
+        with tarfile.open(tmp) as tar:
+            tar.getmembers()
         tmp.rename(dest)
     return dest
 
@@ -76,6 +84,7 @@ def main():
     if tuned not in builds:
         sys.exit(f"no Android build for {corpus.name}: name one of {', '.join(builds)}, or either with -holdout")
     if (corpus / "truth").exists():
+        shutil.rmtree(corpus / "work", ignore_errors=True)
         print(f"{corpus} has truth/ already, so it is left as it is")
         return
 
