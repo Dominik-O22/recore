@@ -402,10 +402,12 @@ impl Arch for Arm64 {
     const FUNCTION_ALIGN: u64 = 4;
     const ALIGNMENT_IS_EVIDENCE: bool = false;
 
+    /// No instruction starts off a word, so bytes from there decode to none.
     fn decode<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> + 'a {
-        bytes.as_chunks::<4>().0.iter().zip((addr..).step_by(4)).map(|(chunk, addr)| {
+        let aligned = addr.is_multiple_of(4);
+        bytes.as_chunks::<4>().0.iter().zip((addr..).step_by(4)).map(move |(chunk, addr)| {
             let word = u32::from_le_bytes(*chunk);
-            Decoded { addr, len: 4, insn: Some(Insn { word, addr }) }
+            Decoded { addr, len: 4, insn: aligned.then_some(Insn { word, addr }) }
         })
     }
 
@@ -421,11 +423,18 @@ impl Arch for Arm64 {
         decoder.2 = offset;
     }
 
+    /// Off a word there is no instruction, and the next place one may start is the next word.
     fn decode_next<'d>((bytes, base, offset, insn): &'d mut Self::Decoder<'_>) -> Option<Decoded<&'d Insn>> {
-        let word = u32::from_le_bytes(bytes.get(*offset..*offset + 4)?.try_into().unwrap());
-        *insn = Insn { word, addr: *base + *offset as u64 };
+        let bytes = bytes.get(*offset..*offset + 4)?;
+        let addr = *base + *offset as u64;
+        if !addr.is_multiple_of(4) {
+            let len = 4 - addr % 4;
+            *offset += len as usize;
+            return Some(Decoded { addr, len: len as u8, insn: None });
+        }
+        *insn = Insn { word: u32::from_le_bytes(bytes.try_into().unwrap()), addr };
         *offset += 4;
-        Some(Decoded { addr: insn.addr, len: 4, insn: Some(&*insn) })
+        Some(Decoded { addr, len: 4, insn: Some(&*insn) })
     }
 
     fn flow(insn: &Insn, state: &State, _: &Image) -> Option<Flow> {
@@ -459,6 +468,11 @@ impl Arch for Arm64 {
                 _ => None,
             },
         }
+    }
+
+    /// `adr` forms the address of any byte, but only one on a word can be code.
+    fn code_pointer(_: &Image, target: u64) -> bool {
+        target.is_multiple_of(4)
     }
 
     fn memory_reference(insn: &Insn, state: &State) -> Option<u64> {
@@ -663,6 +677,28 @@ impl Arch for Arm64 {
         }
         stubs
     }
+}
+
+/// `[start, end)` of the data among the code that the file's mapping symbols mark, sorted: from
+/// each `$d` to the next mapping symbol, `$x` for code, or to the end of its section.
+pub(crate) fn marked_data(file: &object::File) -> Vec<(u64, u64)> {
+    use object::{Object, ObjectSection, ObjectSymbol, SectionKind};
+    let text = || file.sections().filter(|section| section.kind() == SectionKind::Text);
+    let mut marks: Vec<(u64, bool)> = file
+        .symbols()
+        .filter_map(|symbol| {
+            let data = match symbol.name().ok()?.split('.').next()? {
+                "$d" => true,
+                "$x" => false,
+                _ => return None,
+            };
+            let section = file.section_by_index(symbol.section_index()?).ok()?;
+            (section.kind() == SectionKind::Text).then_some((symbol.address(), data))
+        })
+        .chain(text().map(|section| (section.address() + section.size(), false)))
+        .collect();
+    marks.sort_unstable();
+    marks.windows(2).filter(|pair| pair[0].1 && pair[0].0 < pair[1].0).map(|pair| (pair[0].0, pair[1].0)).collect()
 }
 
 #[cfg(test)]

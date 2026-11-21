@@ -39,7 +39,8 @@ const FOLLOWS_BREAK: u8 = 1;
 const ASKED_AS_START: u8 = 2;
 /// Something calls the address, takes it, exports it, or points to it from data.
 const REFERENCED: u8 = 4;
-/// The byte is part of a jump table that lies among the code, or of a literal pool.
+/// The byte is part of a jump table that lies among the code, of a literal pool, or of data the
+/// file marks as such.
 const IN_TABLE: u8 = 8;
 
 /// The gap scan works through a section in pages of this many bytes.
@@ -1723,6 +1724,17 @@ impl Pointers {
     }
 }
 
+/// The flags of `section` before anything is decoded: [`IN_TABLE`] on what the file marks as data.
+fn marked_data(image: &Image, section: &Section) -> Vec<u8> {
+    let mut flags = vec![0; section.data.len()];
+    let first = image.marked_data.partition_point(|&(_, end)| end <= section.addr);
+    for &(start, end) in image.marked_data[first..].iter().take_while(|&&(start, _)| start < section.end()) {
+        let (from, to) = (start.max(section.addr) - section.addr, end.min(section.end()) - section.addr);
+        flags[from as usize..to as usize].fill(IN_TABLE);
+    }
+    flags
+}
+
 fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'a Pointers, known_lengths: FxHashMap<u64, usize>, rejected: FxHashSet<u64>) -> Explorer<'a, A> {
     let regions = image
         .sections
@@ -1731,7 +1743,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], pointers: &'
         .map(|section| Region {
             section,
             insn_len: vec![0; section.data.len()],
-            flags: vec![0; section.data.len()],
+            flags: marked_data(image, section),
             changed: vec![0; section.data.len() / PAGE + 1],
             scans: vec![None; section.data.len() / PAGE + 1],
             covered: vec![0; section.data.len() / 64 + 2],
