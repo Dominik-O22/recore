@@ -677,25 +677,29 @@ impl Arch for Arm64 {
 }
 
 /// `[start, end)` of the data among the code that the file's mapping symbols mark, sorted: from
-/// each `$d` to the next mapping symbol, `$x` for code, or to the end of its section.
+/// each `$d` to the next mapping symbol in its section, `$x` for code, or to the section's end.
+/// A `$d` and a `$x` at one address mark no data: LLVM emits both for `.space 0` among code.
 pub(crate) fn marked_data(file: &object::File) -> Vec<(u64, u64)> {
     use object::{Object, ObjectSection, ObjectSymbol, SectionKind};
-    let text = || file.sections().filter(|section| section.kind() == SectionKind::Text);
-    let mut marks: Vec<(u64, bool)> = file
+    // `(section, address, is code)`, so that at one address a `$d` sorts before what closes it.
+    let mut marks: Vec<(usize, u64, bool)> = file
         .symbols()
         .filter_map(|symbol| {
-            let data = match symbol.name().ok()?.split('.').next()? {
-                "$d" => true,
-                "$x" => false,
+            let code = match symbol.name().ok()?.split('.').next()? {
+                "$d" => false,
+                "$x" => true,
                 _ => return None,
             };
-            let section = file.section_by_index(symbol.section_index()?).ok()?;
-            (section.kind() == SectionKind::Text).then_some((symbol.address(), data))
+            let index = symbol.section_index()?;
+            (file.section_by_index(index).ok()?.kind() == SectionKind::Text).then_some((index.0, symbol.address(), code))
         })
-        .chain(text().map(|section| (section.address().saturating_add(section.size()), false)))
+        .chain(file.sections().filter(|section| section.kind() == SectionKind::Text).map(|section| (section.index().0, section.address().saturating_add(section.size()), true)))
         .collect();
     marks.sort_unstable();
-    marks.windows(2).filter(|pair| pair[0].1 && pair[0].0 < pair[1].0).map(|pair| (pair[0].0, pair[1].0)).collect()
+    let mut data: Vec<(u64, u64)> =
+        marks.windows(2).filter(|pair| pair[0].0 == pair[1].0 && !pair[0].2 && pair[0].1 < pair[1].1).map(|pair| (pair[0].1, pair[1].1)).collect();
+    data.sort_unstable();
+    data
 }
 
 #[cfg(test)]
