@@ -78,8 +78,13 @@ enum Command {
         detail: bool,
     },
     /// Scores two analyzer output directories binary by binary and prints each count that moved,
-    /// with the binaries it moved in. Fails when a total got worse or a binary lost its analysis.
+    /// with the binaries it moved in. Fails when a binary lost its analysis, and otherwise with
+    /// exit status 3 when a total got worse, each total printed as a `Worse:` line.
     Compare { base: PathBuf, head: PathBuf },
+    /// Holds the `Worse:` lines of the comparisons of a run, in `found`, to the `Worse:` lines of
+    /// `named`, such as a pull request's description. Fails unless each loss is named with a
+    /// reason, by its count and how far it moved, and each line in `named` names one.
+    Losses { found: String, named: String },
 }
 
 fn binaries(corpus: &Path) -> Result<Vec<PathBuf>> {
@@ -223,17 +228,33 @@ fn score_dir(corpus: &Path, dir: &Path) -> Result<Vec<(String, score::Score)>> {
         .collect())
 }
 
+/// The exit status of a comparison whose only failing is a total that got worse, which a
+/// `Worse:` line may accept. check.sh tells it from a failing no such line accepts.
+const LOSSES_ONLY: i32 = 3;
+
 fn run_compare(corpus: &Path, base: &Path, head: &Path) -> Result<()> {
     let (changes, missing) = compare::compare(&score_dir(corpus, base)?, &score_dir(corpus, head)?);
     println!("{} against {}", head.display(), base.display());
     compare::print(&changes, &missing);
-    let worse = changes.iter().filter(|c| c.worse).count();
-    anyhow::ensure!(
-        worse == 0 && missing.is_empty(),
-        "{} is worse than its base: {worse} counts fell, {} binaries have no analysis",
-        head.display(),
-        missing.len()
-    );
+    let name = |path: &Path| path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let run = format!("{}/{}", name(corpus), name(head));
+    let losses = compare::losses(&changes, &run);
+    losses.iter().for_each(|loss| println!("{loss}"));
+    anyhow::ensure!(missing.is_empty(), "{} is worse than its base: {} binaries have no analysis", head.display(), missing.len());
+    if !losses.is_empty() {
+        eprintln!("{} is worse than its base: {} counts fell", head.display(), losses.len());
+        std::process::exit(LOSSES_ONLY);
+    }
+    Ok(())
+}
+
+/// Prints how each loss in `found` and each `Worse:` line in `named` stands, one line each that
+/// starts with its standing, and fails unless every loss is accepted and every line names one.
+fn run_losses(found: &str, named: &str) -> Result<()> {
+    let judged = compare::judge(found, named);
+    judged.iter().for_each(|(standing, line)| println!("{:9}  {line}", standing.label()));
+    let unaccepted = judged.iter().filter(|(standing, _)| *standing != compare::Standing::Accepted).count();
+    anyhow::ensure!(unaccepted == 0, "{unaccepted} of the losses and the Worse: lines do not match");
     Ok(())
 }
 
@@ -298,6 +319,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Compare { base, head } => run_compare(&cli.corpus, &base, &head),
+        Command::Losses { found, named } => run_losses(&found, &named),
         Command::Score { dirs, detail } => dirs.iter().try_for_each(|dir| run_score(&cli.corpus, dir, detail)),
     }
 }

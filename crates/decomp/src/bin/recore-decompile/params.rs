@@ -489,7 +489,9 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
 
 /// Prints each of [`MEASURES`] that moved from the corpus run in `base_dir` to the one in
 /// `head_dir`, over the functions both decompiled, with the binaries it moved in. Fails when
-/// one got worse.
+/// the decompiler failed on more functions, and otherwise with exit status 3 when a measure got
+/// worse, each printed as a `Worse:` line. The run is named `<corpus>/<run>` after the directory
+/// that holds `debug_dir` and after `head_dir`.
 pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) -> Result<()> {
     let reports = reports(head_dir)?;
     let read = |path: &Path| -> Result<BinaryReport> { serde_json::from_slice(&std::fs::read(path)?).with_context(|| format!("parsing {path:?}")) };
@@ -526,7 +528,7 @@ pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) 
         }
         let better = (head > base) == more_is_better;
         if !better {
-            worse.push(measure);
+            worse.push((measure, base, head));
         }
         println!("  {:<7} {measure:<30} {base} -> {head} ({:+})", if better { "better" } else { "worse" }, head as i64 - base as i64);
         for gained in [true, false] {
@@ -545,11 +547,29 @@ pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) 
         if binaries.iter().all(|b| b.1 == b.2) {
             println!("  no count changed");
         }
-        Ok(())
-    } else {
-        anyhow::bail!("{} is worse than {}: {}", head_dir.display(), base_dir.display(), worse.join(", "))
+        return Ok(());
     }
+    let measures: Vec<&str> = worse.iter().map(|w| w.0).collect();
+    let fails = format!("{} is worse than {}: {}", head_dir.display(), base_dir.display(), measures.join(", "));
+    // A decompiler that fails on more functions is broken, not a knock-on of a right change, and
+    // the functions it failed on drop out of every other count.
+    anyhow::ensure!(!measures.contains(&FAILED), fails);
+    // In the form `recore-corpus compare` prints a loss, which a description's `Worse:` line names.
+    let name = |path: &Path| path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let run = format!("{}/{}", debug_dir.parent().map(name).unwrap_or_default(), name(head_dir));
+    for (measure, base, head) in worse {
+        println!("Worse: {run} {measure} {base} -> {head} ({:+})", head as i64 - base as i64);
+    }
+    eprintln!("{fails}");
+    std::process::exit(LOSSES_ONLY)
 }
+
+/// The measure of functions the decompiler failed or crashed on, which no `Worse:` line accepts.
+const FAILED: &str = MEASURES[2].0;
+
+/// The exit status of a comparison whose only failing is a total that got worse, which a
+/// `Worse:` line may accept. check.sh tells it from a failing no such line accepts.
+const LOSSES_ONLY: i32 = 3;
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,11 @@
 //! Compares two analyzer runs over one corpus binary by binary, so that a change shows every
 //! count it made worse. The rounded percentages `score` prints hide a loss of a few dozen
 //! functions in a corpus of a hundred thousand, and a gain in one binary hides a loss in another.
+//!
+//! A total that got worse is a loss, printed as a `Worse:` line. A pull request's description may
+//! name a loss with that line and a reason, and [`judge`] holds the losses of a run to those lines.
+
+use std::fmt;
 
 use crate::score::Score;
 
@@ -139,6 +144,96 @@ pub fn print(changes: &[Change], missing: &[String]) {
     }
 }
 
+/// A total that got worse in one run of a corpus, as a `Worse:` line names it:
+/// `Worse: <corpus>/<run> <count> <base> -> <head> (<difference>)`, and in a description a
+/// reason after it. `recore-decompile params --against` prints its losses in the same form.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Loss<'a> {
+    /// `<corpus>/<run>`, such as `corpus-thumb/recore-noframes` or `corpus-thumb/signatures`.
+    pub run: &'a str,
+    pub count: &'a str,
+    pub base: u64,
+    pub head: u64,
+}
+
+impl fmt::Display for Loss<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Worse: {} {} {} -> {} ({:+})", self.run, self.count, self.base, self.head, self.difference())
+    }
+}
+
+impl<'a> Loss<'a> {
+    fn difference(&self) -> i128 {
+        i128::from(self.head) - i128::from(self.base)
+    }
+
+    /// The loss a line names and the reason that follows it, or `None` when the line is not in
+    /// the form [`Loss`] prints, or its difference is not that of its totals.
+    fn parse(line: &'a str) -> Option<(Self, &'a str)> {
+        let (run, rest) = line.strip_prefix("Worse: ")?.split_once(' ')?;
+        let (count_base, rest) = rest.split_once(" -> ")?;
+        let (count, base) = count_base.rsplit_once(' ')?;
+        let (head, rest) = rest.split_once(" (")?;
+        let (difference, reason) = rest.split_once(')')?;
+        let loss = Loss { run, count, base: base.parse().ok()?, head: head.parse().ok()? };
+        (difference.parse::<i128>().ok()? == loss.difference()).then_some((loss, reason.trim()))
+    }
+
+    /// Whether a line names this loss: the same count of the same run, moved as far. The totals
+    /// themselves are the base's too, and the base is main when the change lands, which may
+    /// have moved since the line was written.
+    fn names(&self, other: &Loss) -> bool {
+        (self.run, self.count, self.difference()) == (other.run, other.count, other.difference())
+    }
+}
+
+/// The counts of `changes` that got worse, as losses of `run`.
+pub fn losses<'a>(changes: &'a [Change], run: &'a str) -> Vec<Loss<'a>> {
+    changes.iter().filter(|c| c.worse).map(|c| Loss { run, count: c.count, base: c.base, head: c.head }).collect()
+}
+
+/// How a loss of a run, or a `Worse:` line of a description, stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// A loss that a line names, with a reason.
+    Accepted,
+    /// A loss that no line names.
+    NotNamed,
+    /// A line that names a loss the run does not show, or shows by another amount.
+    NotLost,
+    /// A line that starts `Worse:` and is not a loss in the form [`Loss`] prints with a reason
+    /// after it.
+    Unread,
+}
+
+impl Standing {
+    pub fn label(self) -> &'static str {
+        match self {
+            Standing::Accepted => "accepted",
+            Standing::NotNamed => "not named",
+            Standing::NotLost => "not lost",
+            Standing::Unread => "unread",
+        }
+    }
+}
+
+/// Holds the losses a run printed, its `Worse:` lines in `found`, to the `Worse:` lines of
+/// `named`: each loss and each named line, with how it stands. Only lines that start `Worse:`
+/// are read, so `named` can be a pull request's whole description.
+pub fn judge<'a>(found: &'a str, named: &'a str) -> Vec<(Standing, &'a str)> {
+    type Lines<'a> = Vec<(&'a str, Option<Loss<'a>>)>;
+    let worse = |text: &'a str| text.lines().filter(|line| line.starts_with("Worse:"));
+    let lost: Lines = worse(found).map(|line| (line, Loss::parse(line).map(|(loss, _)| loss))).collect();
+    let named: Lines = worse(named).map(|line| (line, Loss::parse(line).filter(|(_, why)| !why.is_empty()).map(|(loss, _)| loss))).collect();
+    let among = |lines: &Lines, loss: &Loss| lines.iter().any(|(_, other)| other.as_ref().is_some_and(|other| other.names(loss)));
+    let losses = lost.iter().map(|(line, loss)| (if loss.as_ref().is_some_and(|loss| among(&named, loss)) { Standing::Accepted } else { Standing::NotNamed }, *line));
+    let lines = named.iter().filter_map(|(line, loss)| match loss {
+        None => Some((Standing::Unread, *line)),
+        Some(loss) => (!among(&lost, loss)).then_some((Standing::NotLost, *line)),
+    });
+    losses.chain(lines).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +302,47 @@ mod tests {
     fn a_binary_without_analysis_at_head_is_missing() {
         let (changes, missing) = compare(&[found("a", 1), found("b", 1)], &[found("a", 1)]);
         assert_eq!((changes, missing), (vec![], vec!["b".to_string()]));
+    }
+
+    #[test]
+    fn a_loss_prints_as_the_line_that_names_it() {
+        let base = [found("a", 10)];
+        let (changes, _) = compare(&base, &[found("a", 9)]);
+        let lines: Vec<String> = losses(&changes, "corpus-thumb/recore").iter().map(Loss::to_string).collect();
+        assert_eq!(lines, ["Worse: corpus-thumb/recore starts found 10 -> 9 (-1)"]);
+        // A count that got better is no loss.
+        assert!(losses(&compare(&base, &[found("a", 11)]).0, "corpus-thumb/recore").is_empty());
+    }
+
+    #[test]
+    fn a_loss_is_accepted_when_a_line_names_it_with_a_reason() {
+        let found = "Worse: corpus-thumb/signatures global types right 812 -> 811 (-1)\n\
+                     Worse: corpus/recore noreturn extra, uncorroborated 40 -> 42 (+2)";
+        let named = "Fixes the returns.\r\n\r\n\
+                     Worse: corpus-thumb/signatures global types right 812 -> 811 (-1) a knock-on of the right return\r\n\
+                     Worse: corpus/recore noreturn extra, uncorroborated 40 -> 42 (+2) the truth misses two\r\n";
+        assert_eq!(judge(found, named).iter().map(|j| j.0).collect::<Vec<_>>(), [Standing::Accepted, Standing::Accepted]);
+    }
+
+    #[test]
+    fn a_line_holds_the_count_and_how_far_it_moved_not_the_base() {
+        let found = "Worse: corpus/recore starts found 100 -> 98 (-2)";
+        // Main moved the base since the line was written, and the change lost as much.
+        assert_eq!(judge(found, "Worse: corpus/recore starts found 103 -> 101 (-2) why"), [(Standing::Accepted, found)]);
+        // Another amount, another run, or another count names a loss the run does not show.
+        for other in ["Worse: corpus/recore starts found 100 -> 99 (-1) why", "Worse: corpus/recore-noframes starts found 100 -> 98 (-2) why", "Worse: corpus/recore mid-func 100 -> 98 (-2) why"] {
+            assert_eq!(judge(found, other), [(Standing::NotNamed, found), (Standing::NotLost, other)]);
+        }
+    }
+
+    #[test]
+    fn a_line_without_a_reason_or_out_of_form_is_unread() {
+        let found = "Worse: corpus/recore starts found 100 -> 98 (-2)";
+        // No reason, a difference that is not the totals', and no difference.
+        for line in [found, "Worse: corpus/recore starts found 100 -> 98 (-1) why", "Worse: corpus/recore starts found 100 -> 98 why", "Worse: whatever got worse"] {
+            assert_eq!(judge(found, line), [(Standing::NotNamed, found), (Standing::Unread, line)]);
+        }
+        // A line that does not start the description's line is no `Worse:` line.
+        assert_eq!(judge("", &format!("  {found} why")), []);
     }
 }
