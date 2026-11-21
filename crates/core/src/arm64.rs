@@ -404,10 +404,10 @@ impl Arch for Arm64 {
 
     /// No instruction starts off a word, so bytes from there decode to none.
     fn decode<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> + 'a {
-        let aligned = addr.is_multiple_of(4);
-        bytes.as_chunks::<4>().0.iter().zip((addr..).step_by(4)).map(move |(chunk, addr)| {
+        let words = if addr.is_multiple_of(4) { bytes.as_chunks::<4>().0 } else { &[] };
+        words.iter().zip((addr..).step_by(4)).map(|(chunk, addr)| {
             let word = u32::from_le_bytes(*chunk);
-            Decoded { addr, len: 4, insn: aligned.then_some(Insn { word, addr }) }
+            Decoded { addr, len: 4, insn: Some(Insn { word, addr }) }
         })
     }
 
@@ -416,25 +416,22 @@ impl Arch for Arm64 {
     type Decoder<'a> = (&'a [u8], u64, usize, Insn);
 
     fn decoder<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> Self::Decoder<'a> {
-        (bytes, addr, 0, Insn { word: 0, addr })
+        let mut decoder = (bytes, addr, 0, Insn { word: 0, addr });
+        Self::seek(&mut decoder, 0);
+        decoder
     }
 
+    /// No instruction starts off a word, so from there the decoder has none to give, as at the
+    /// end of its bytes. From a word it stays on words.
     fn seek(decoder: &mut Self::Decoder<'_>, offset: usize) {
-        decoder.2 = offset;
+        decoder.2 = if (decoder.1 + offset as u64).is_multiple_of(4) { offset } else { decoder.0.len() };
     }
 
-    /// Off a word there is no instruction, and the next place one may start is the next word.
     fn decode_next<'d>((bytes, base, offset, insn): &'d mut Self::Decoder<'_>) -> Option<Decoded<&'d Insn>> {
-        let bytes = bytes.get(*offset..*offset + 4)?;
-        let addr = *base + *offset as u64;
-        if !addr.is_multiple_of(4) {
-            let len = 4 - addr % 4;
-            *offset += len as usize;
-            return Some(Decoded { addr, len: len as u8, insn: None });
-        }
-        *insn = Insn { word: u32::from_le_bytes(bytes.try_into().unwrap()), addr };
+        let word = u32::from_le_bytes(bytes.get(*offset..*offset + 4)?.try_into().unwrap());
+        *insn = Insn { word, addr: *base + *offset as u64 };
         *offset += 4;
-        Some(Decoded { addr, len: 4, insn: Some(&*insn) })
+        Some(Decoded { addr: insn.addr, len: 4, insn: Some(&*insn) })
     }
 
     fn flow(insn: &Insn, state: &State, _: &Image) -> Option<Flow> {
