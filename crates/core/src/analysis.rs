@@ -659,7 +659,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             index > 0 && addr < inline_tables[index - 1].1
         };
         let after_call = |f: &Function, control: &Control| {
-            if control.next == f.end && frame_end.contains_key(&f.start) || symbol_end.get(&f.start) == Some(&control.next) {
+            if (control.next == f.end && frame_end.contains_key(&f.start)) || symbol_end.get(&f.start) == Some(&control.next) {
                 return After::Ends;
             }
             // Read the bytes themselves: a trap that pads the end of a function has been

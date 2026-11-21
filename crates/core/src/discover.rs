@@ -422,8 +422,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
             return;
         }
         *flags |= ASKED_AS_START;
-        let stated = matches!(origin, Origin::Export | Origin::Frame | Origin::Call);
-        if !stated && self.symbol_around(addr).is_some() {
+        if !matches!(origin, Origin::Export | Origin::Frame | Origin::Call) && self.symbol_around(addr).is_some() {
             return;
         }
         // Code that only falls or jumps into the inside of a frame is its function's. In a frame
