@@ -1,8 +1,9 @@
 //! A Linux kernel module, for x86-64 or AArch64, analyzes as if the kernel had loaded it: its
-//! functions where its symbols put them, its calls to the kernel named, and on x86-64 its calls
-//! and jumps through the kernel's thunks read as the returns and indirect calls the kernel
-//! patches them to. On AArch64 the type hash kCFI puts before each function is data, and two of
-//! them read as `adr` into other functions: see module.c.
+//! functions where its symbols put them, and none inside one where no symbol names it, its calls
+//! to the kernel named, and on x86-64 its calls and jumps through the kernel's thunks read as the
+//! returns and indirect calls the kernel patches them to. On AArch64 the type hash kCFI puts
+//! before each function is data, and two of them read as `adr` into other functions: see
+//! module.c.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -28,7 +29,8 @@ fn analyzes_as_loaded(fixture: &str) {
     let mut starts: Vec<u64> = analysis.functions.iter().map(|function| function.addr).collect();
     starts.sort_unstable();
     let kcfi: &[&str] = if fixture == "module-arm64.o" { &["kcfi_word", "kcfi_off_word"] } else { &[] };
-    let mut expected: Vec<u64> = ["remove", "probe", "call_probe", "call_twice", "init_module"].iter().chain(kcfi).map(|name| address(name)).collect();
+    let named = ["remove", "probe", "call_probe", "call_twice", "init_module", "traced", "outer", "inner"];
+    let mut expected: Vec<u64> = named.iter().chain(kcfi).map(|name| address(name)).collect();
     expected.sort_unstable();
     assert_eq!(starts, expected, "{fixture}");
     assert_eq!(image.entry, address("init_module"));

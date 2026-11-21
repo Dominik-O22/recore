@@ -53,3 +53,16 @@ int kcfi_off_word(struct u0341202 *p) {
     return p == 0;
 }
 #endif
+
+// The kernel passes `_THIS_IP_`, the address of a label inside the function, to what traces
+// it. The label starts no function: the function's symbol says where the function ends.
+__attribute__((noipa)) void traced(unsigned long value) {
+    printk("value %lu\n", value);
+    printk("at %lx\n", ({ __label__ here; here: (unsigned long)&&here; }));
+}
+
+// Hand-written code may name an entry inside a routine, whose symbol's size covers it.
+asm(".text\n"
+    ".globl outer\n.type outer, %function\nouter:\n\tnop\n"
+    ".globl inner\n.type inner, %function\ninner:\n\tret\n"
+    ".size inner, . - inner\n.size outer, . - outer\n");
