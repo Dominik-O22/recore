@@ -384,6 +384,7 @@ impl Image {
 /// Imports, relocated pointers, exports and unwind frames of an ELF image.
 #[allow(clippy::type_complexity)]
 fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, String>, Vec<(u64, u64)>, Vec<u64>, Vec<(u64, u64)>) {
+    let sections = SectionFinder::new(sections);
     let mut import_slots = FxHashMap::default();
     let mut relative_targets = Vec::new();
     if let Some(relocations) = file.dynamic_relocations() {
@@ -398,7 +399,7 @@ fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, St
                 }
                 // A REL relocation keeps its addend in the word it relocates.
                 object::RelocationTarget::Absolute if reloc.has_implicit_addend() => {
-                    if let Some(word) = read_word(sections, addr, if file.is_64() { 8 } else { 4 }) {
+                    if let Some(word) = read_word(&sections, addr, if file.is_64() { 8 } else { 4 }) {
                         relative_targets.push((addr, word));
                     }
                 }
@@ -411,7 +412,7 @@ fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, St
     // Packed relative relocations store the target in the relocated word itself.
     if let Some(relr) = file.section_by_name(".relr.dyn").and_then(|s| s.uncompressed_data().ok()) {
         let word = if file.is_64() { 8 } else { 4 };
-        relative_targets.extend(relr_slots(&relr, word).into_iter().filter_map(|slot| Some((slot, read_word(sections, slot, word)?))));
+        relative_targets.extend(relr_slots(&relr, word).into_iter().filter_map(|slot| Some((slot, read_word(&sections, slot, word)?))));
     }
 
     let exports = file
@@ -428,9 +429,35 @@ fn elf_metadata(file: &object::File, sections: &[Section]) -> (FxHashMap<u64, St
     (import_slots, relative_targets, exports, frames)
 }
 
+/// Finds the section that holds each of a loader's addresses, of sections sorted by address.
+/// An address mostly falls in the section of the one before, which is tried first. Others are
+/// searched for, in time that grows with the log of the number of sections, which a damaged
+/// image can make large. Of sections that overlap, as only a damaged image's do, it may find
+/// either.
+pub(crate) struct SectionFinder<'a> {
+    sections: &'a [Section],
+    last: std::cell::Cell<Option<&'a Section>>,
+}
+
+impl<'a> SectionFinder<'a> {
+    pub(crate) fn new(sections: &'a [Section]) -> SectionFinder<'a> {
+        SectionFinder { sections, last: std::cell::Cell::new(None) }
+    }
+
+    pub(crate) fn find(&self, addr: u64) -> Option<&'a Section> {
+        if let Some(last) = self.last.get().filter(|s| s.contains(addr)) {
+            return Some(last);
+        }
+        let index = self.sections.partition_point(|s| s.addr <= addr);
+        let found = self.sections[..index].last().filter(|s| s.contains(addr))?;
+        self.last.set(Some(found));
+        Some(found)
+    }
+}
+
 /// The little-endian word of `size` bytes at `addr`.
-fn read_word(sections: &[Section], addr: u64, size: usize) -> Option<u64> {
-    let section = sections.iter().find(|s| s.contains(addr))?;
+fn read_word(sections: &SectionFinder, addr: u64, size: usize) -> Option<u64> {
+    let section = sections.find(addr)?;
     let bytes = section.data.get((addr - section.addr) as usize..)?.get(..size)?;
     Some(bytes.iter().rev().fold(0, |word, &byte| word << 8 | u64::from(byte)))
 }
@@ -518,6 +545,21 @@ fn has_bti(note: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whichever section held the address before, each address finds its own, and one in a
+    /// gap or past the end finds none.
+    #[test]
+    fn the_section_finder_finds_each_address_in_any_order() {
+        let section = |addr: u64| Section { name: String::new(), addr, data: vec![0; 0x100], file_offset: None, executable: false, writable: false };
+        let sections: Vec<Section> = (1..=1000).map(|n| section(n * 0x1000)).collect();
+        let finder = SectionFinder::new(&sections);
+        for addr in [0x1000, 0x10ff, 0x5_0010, 0x2000, 0x3e_80ff, 0x1080] {
+            assert_eq!(finder.find(addr).map(|s| s.addr), Some(addr & !0xfff));
+        }
+        for addr in [0, 0xfff, 0x1100, 0x5_0100, 0x3e_8100] {
+            assert!(finder.find(addr).is_none());
+        }
+    }
 
     #[test]
     fn packed_relocations_count_words_of_the_image_s_own_size() {

@@ -98,15 +98,22 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// `(selector, implementation)` for each entry of the method list at `list`.
-    fn methods(&self, list: u64) -> Vec<(String, u64)> {
+    /// `(selector, implementation)` for each entry of the method list at `list`, taking each
+    /// from `budget`, the entries left to read in the image.
+    fn methods(&self, list: u64, budget: &mut u64) -> Vec<(String, u64)> {
         /// Entries are three 32-bit offsets, not three pointers.
         const RELATIVE: u32 = 1 << 31;
         /// A relative entry's name leads to the selector itself, not to a slot holding it.
         const DIRECT_SELECTORS: u32 = 1 << 30;
         let (Some(header), Some(count)) = (self.u32(list), self.u32(list + 4)) else { return Vec::new() };
         let size = u64::from(header & 0xFFFC);
-        (0..u64::from(count).min(LONGEST))
+        // A shorter entry overlaps the next, and one of size 0 repeats the first.
+        if size < if header & RELATIVE == 0 { 24 } else { 12 } {
+            return Vec::new();
+        }
+        let count = u64::from(count).min(LONGEST).min(*budget);
+        *budget -= count;
+        (0..count)
             .map(|index| list + 8 + index * size)
             .filter_map(|entry| {
                 if header & RELATIVE == 0 {
@@ -120,8 +127,8 @@ impl<'a> Reader<'a> {
     }
 
     /// The methods of the record at `record`, which keeps its method list `offset` bytes in.
-    fn methods_of(&self, record: Option<u64>, offset: u64) -> Vec<(String, u64)> {
-        record.and_then(|record| self.pointer(record + offset)).filter(|&list| list != 0).map_or_else(Vec::new, |list| self.methods(list))
+    fn methods_of(&self, record: Option<u64>, offset: u64, budget: &mut u64) -> Vec<(String, u64)> {
+        record.and_then(|record| self.pointer(record + offset)).filter(|&list| list != 0).map_or_else(Vec::new, |list| self.methods(list, budget))
     }
 }
 
@@ -145,6 +152,9 @@ pub fn metadata(image: &Image) -> Option<Metadata> {
         return None;
     }
     let reader = Reader { image };
+    // No more entries than fit in the image without overlapping: lists of a damaged one can
+    // claim the same bytes over and over.
+    let mut budget = image.sections.iter().map(|section| section.data.len() as u64).sum::<u64>() / 12;
     let mut classes = Vec::new();
     let mut methods = Vec::new();
     let mut add = |name: String, object: u64, bases: Vec<String>, instance: Vec<(String, u64)>, class: Vec<(String, u64)>| {
@@ -165,13 +175,15 @@ pub fn metadata(image: &Image) -> Option<Metadata> {
             current = next;
         }
         let metaclass = reader.pointer(class).and_then(|metaclass| reader.read_only(metaclass));
-        add(name, class, bases, reader.methods_of(reader.read_only(class), 32), reader.methods_of(metaclass, 32));
+        let instance = reader.methods_of(reader.read_only(class), 32, &mut budget);
+        add(name, class, bases, instance, reader.methods_of(metaclass, 32, &mut budget));
     }
     // A category adds methods to a class, often one from another library. Its record holds
     // its name, the class, and the lists of instance and class methods.
     for (_, category) in reader.pointers("__objc_catlist") {
         let (Some(name), Some(class)) = (reader.pointer(category).and_then(|name| reader.text(name)), reader.class_at(category + 8)) else { continue };
-        add(format!("{class}({name})"), category, Vec::new(), reader.methods_of(Some(category), 16), reader.methods_of(Some(category), 24));
+        let instance = reader.methods_of(Some(category), 16, &mut budget);
+        add(format!("{class}({name})"), category, Vec::new(), instance, reader.methods_of(Some(category), 24, &mut budget));
     }
 
     let selectors: FxHashMap<u64, String> = reader.pointers("__objc_selrefs").filter_map(|(slot, selector)| Some((slot, reader.text(selector)?))).collect();
@@ -461,7 +473,50 @@ pub fn sends<A: Arch>(image: &Image, metadata: &Metadata, swift_methods: &[(u64,
 
 #[cfg(test)]
 mod tests {
-    use super::swift_class_name;
+    use super::{metadata, swift_class_name};
+    use crate::image::{Format, Image, Machine, Section};
+
+    /// An image of `classes` entries in the class list, each the class `Box`, whose method
+    /// list has `header` and `count` and is followed by relative entries for `-[Box area]` to
+    /// the end of its section.
+    fn image(header: u32, count: u32, classes: usize) -> Image {
+        let (list, data, methods) = (0x1000u64, 0x2000u64, 0x2300u64);
+        let mut bytes = vec![0u8; 0x1000];
+        let mut put = |addr: u64, value: &[u8]| bytes[(addr - data) as usize..][..value.len()].copy_from_slice(value);
+        // The class's read-only record, its name and its method list.
+        put(data + 32, &0x2100u64.to_le_bytes());
+        put(0x2100 + 24, &0x2200u64.to_le_bytes());
+        put(0x2100 + 32, &methods.to_le_bytes());
+        put(0x2200, b"Box\0area\0");
+        put(methods, &header.to_le_bytes());
+        put(methods + 4, &count.to_le_bytes());
+        for entry in (methods + 8..data + 0x1000 - 12).step_by(12) {
+            let offset = |from: u64, to: u64| (to.wrapping_sub(from) as i32).to_le_bytes();
+            put(entry, &offset(entry, 0x2204));
+            put(entry + 8, &offset(entry + 8, 0x8000));
+        }
+        let section = |name: &str, addr: u64, data: Vec<u8>| Section { name: name.into(), addr, data, file_offset: None, executable: false, writable: false };
+        let sections = vec![section("__DATA,__objc_classlist", list, data.to_le_bytes().repeat(classes)), section("__DATA,__objc_data", data, bytes)];
+        Image::bare("objc".into(), Format::MachO, Machine::Aarch64, 0, sections)
+    }
+
+    /// Relative entries, with the selector itself where a slot holding it would be.
+    const RELATIVE: u32 = 3 << 30;
+
+    #[test]
+    fn method_lists_read_each_entry() {
+        assert_eq!(metadata(&image(RELATIVE | 12, 1, 1)).unwrap().methods, vec![(0x8000, "-[Box area]".to_string())]);
+    }
+
+    /// The headers of a damaged image can make each list repeat its first entry, or every list
+    /// claim the same entries.
+    #[test]
+    fn method_lists_read_no_more_entries_than_the_image_holds() {
+        assert!(metadata(&image(RELATIVE, u32::MAX, 1)).unwrap().methods.is_empty());
+        let image = image(RELATIVE | 12, u32::MAX, 1000);
+        let bytes: usize = image.sections.iter().map(|section| section.data.len()).sum();
+        assert!(metadata(&image).unwrap().methods.len() <= bytes / 12);
+    }
 
     #[test]
     fn swift_class_names_spell_out_module_and_type() {
