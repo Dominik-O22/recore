@@ -9,7 +9,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rayon::prelude::*;
 
 use crate::arch::{Arch, Flow, TextPointer};
-use crate::discover::{discover, is_function_section};
+use crate::discover::{discover, is_function_section, symbol_holding};
 use crate::image::{Format, Image, Machine};
 use crate::noreturn::is_noreturn_import;
 use crate::phase;
@@ -603,8 +603,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         };
 
         // A chunk that several functions jump to the top of is a function they all tail-call,
-        // not a cold block of one of them, and so is one that opens like a function.
-        // Only jumps to the top of a chunk matter, and most images have no chunks at all.
+        // not a cold block of one of them, and so is one that opens like a function. Not inside a
+        // sized symbol. Only jumps to the top of a chunk matter, and most images have no chunks.
         let mut jumped_to: FxHashMap<u64, FxHashSet<u64>> = chunks.iter().map(|chunk| (chunk.start, FxHashSet::default())).collect();
         if !chunks.is_empty() {
             for function in &functions {
@@ -620,6 +620,7 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
         let tail_called: Vec<u64> = chunks
             .iter()
             .map(|chunk| chunk.start)
+            .filter(|&start| symbol_holding(&symbols, start).is_none())
             .filter(|start| {
                 let sources = jumped_to.get(start).map_or(0, FxHashSet::len);
                 let opens_function = || {

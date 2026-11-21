@@ -170,8 +170,10 @@ pub struct Image {
     /// functions next to each other that unwind alike. What calls or points into such a frame
     /// is a function all the same, and the frame ends a function only where no other starts.
     pub frames_merge: bool,
-    /// `[start, end)` of every function an ELF symbol gives a size, in the order of the symbol
-    /// table. Ranges overlap where hand-written code names an entry inside a routine.
+    /// `[start, end)` of every function of an ELF `.dynsym` with a size, in the order of that
+    /// table: in a linked image its exports, in a kernel module, which recore links into a
+    /// `.dynsym` of its own, the functions of `.symtab`. Ranges overlap where hand-written code
+    /// names an entry inside a routine.
     pub symbol_extents: Vec<(u64, u64)>,
     /// Pointers stored in data by relative relocations, as `(slot address, target)`. Targets in
     /// code are function pointers or, in computed-goto tables, labels.
