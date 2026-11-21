@@ -640,6 +640,12 @@ impl<'a> Importer<'a> {
         }
     }
 
+    /// Keeps the prototypes of the functions at `addrs` from `session`: an edit declares them,
+    /// and an edit has the last word.
+    pub fn declared(&mut self, addrs: impl IntoIterator<Item = u64>) {
+        self.given.extend(addrs);
+    }
+
     /// Gives `session` every global variable with its type.
     pub fn globals(&mut self, session: &mut crate::Session) {
         for (index, global) in self.types.globals.iter().enumerate() {

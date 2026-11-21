@@ -116,6 +116,19 @@ fn a_saved_edit_the_decompiler_refuses_costs_only_itself() {
 }
 
 #[test]
+fn a_declared_prototype_wins_over_the_one_a_kcfi_hash_names() {
+    // A kernel module whose `kernel_probe` has the hash of `int (struct platform_device *)`.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../core/tests/fixtures/module-arm64.o");
+    let mut client = Client::start_in(&edits_dir());
+    let decompile = |client: &mut Client| client.tool("decompile", json!({ "path": path, "functions": ["kernel_probe"], "timeout": 60.0 })).unwrap();
+    let c_text = decompile(&mut client);
+    assert!(c_text.contains("int4 kernel_probe(platform_device *param_1)\n"), "{c_text}");
+    client.tool("declare", json!({ "path": path, "code": "extern int8 kernel_probe(void *device);" })).unwrap();
+    let c_text = decompile(&mut client);
+    assert!(c_text.contains("int8 kernel_probe(void *device)\n"), "{c_text}");
+}
+
+#[test]
 fn a_variable_keeps_the_name_it_is_given() {
     // `total` of the decompiler's fixture: a loop over a list that sums into one temporary.
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/types.elf");
