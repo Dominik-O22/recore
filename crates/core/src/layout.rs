@@ -458,6 +458,7 @@ impl Layout {
             banking,
             compiler: self.compiler,
             instruction_sets: Vec::new(),
+            marked_data: Vec::new(),
             il2cpp: None,
         })
     }

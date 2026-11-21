@@ -402,8 +402,10 @@ impl Arch for Arm64 {
     const FUNCTION_ALIGN: u64 = 4;
     const ALIGNMENT_IS_EVIDENCE: bool = false;
 
+    /// No instruction starts off a word, so bytes from there decode to none.
     fn decode<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> impl Iterator<Item = Decoded<Insn>> + 'a {
-        bytes.as_chunks::<4>().0.iter().zip((addr..).step_by(4)).map(|(chunk, addr)| {
+        let words = if addr.is_multiple_of(4) { bytes.as_chunks::<4>().0 } else { &[] };
+        words.iter().zip((addr..).step_by(4)).map(|(chunk, addr)| {
             let word = u32::from_le_bytes(*chunk);
             Decoded { addr, len: 4, insn: Some(Insn { word, addr }) }
         })
@@ -414,11 +416,15 @@ impl Arch for Arm64 {
     type Decoder<'a> = (&'a [u8], u64, usize, Insn);
 
     fn decoder<'a>(_: &'a Image, bytes: &'a [u8], addr: u64) -> Self::Decoder<'a> {
-        (bytes, addr, 0, Insn { word: 0, addr })
+        let mut decoder = (bytes, addr, 0, Insn { word: 0, addr });
+        Self::seek(&mut decoder, 0);
+        decoder
     }
 
+    /// No instruction starts off a word, so from there the decoder has none to give, as at the
+    /// end of its bytes. From a word it stays on words.
     fn seek(decoder: &mut Self::Decoder<'_>, offset: usize) {
-        decoder.2 = offset;
+        decoder.2 = if (decoder.1 + offset as u64).is_multiple_of(4) { offset } else { decoder.0.len() };
     }
 
     fn decode_next<'d>((bytes, base, offset, insn): &'d mut Self::Decoder<'_>) -> Option<Decoded<&'d Insn>> {
@@ -459,6 +465,11 @@ impl Arch for Arm64 {
                 _ => None,
             },
         }
+    }
+
+    /// `adr` forms the address of any byte, but only one on a word can be code.
+    fn code_pointer(_: &Image, target: u64) -> bool {
+        target.is_multiple_of(4)
     }
 
     fn memory_reference(insn: &Insn, state: &State) -> Option<u64> {
@@ -663,6 +674,28 @@ impl Arch for Arm64 {
         }
         stubs
     }
+}
+
+/// `[start, end)` of the data among the code that the file's mapping symbols mark, sorted: from
+/// each `$d` to the next mapping symbol, `$x` for code, or to the end of its section.
+pub(crate) fn marked_data(file: &object::File) -> Vec<(u64, u64)> {
+    use object::{Object, ObjectSection, ObjectSymbol, SectionKind};
+    let text = || file.sections().filter(|section| section.kind() == SectionKind::Text);
+    let mut marks: Vec<(u64, bool)> = file
+        .symbols()
+        .filter_map(|symbol| {
+            let data = match symbol.name().ok()?.split('.').next()? {
+                "$d" => true,
+                "$x" => false,
+                _ => return None,
+            };
+            let section = file.section_by_index(symbol.section_index()?).ok()?;
+            (section.kind() == SectionKind::Text).then_some((symbol.address(), data))
+        })
+        .chain(text().map(|section| (section.address().saturating_add(section.size()), false)))
+        .collect();
+    marks.sort_unstable();
+    marks.windows(2).filter(|pair| pair[0].1 && pair[0].0 < pair[1].0).map(|pair| (pair[0].0, pair[1].0)).collect()
 }
 
 #[cfg(test)]
