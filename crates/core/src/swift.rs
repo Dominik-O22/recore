@@ -20,6 +20,9 @@ use crate::report::{Field, SwiftType};
 
 /// Most entries read from one list in a descriptor.
 const LONGEST: u64 = 1 << 16;
+/// Most contexts one name is read through, deeper than any program nests its types. A
+/// damaged image can chain any number, and each costs a frame of the stack.
+const DEEPEST: u32 = 64;
 
 /// The kinds of context descriptor, in the low five bits of its flags.
 const MODULE: u32 = 0;
@@ -96,6 +99,8 @@ struct Collector<'a> {
     types: Vec<SwiftType>,
     /// Context descriptor to its qualified name, for the ones looked up so far.
     contexts: FxHashMap<u64, Option<String>>,
+    /// Contexts being named, each inside the next: `context` stops at `DEEPEST`.
+    depth: u32,
     /// Type descriptor to its place in `types`.
     type_index: FxHashMap<u64, usize>,
     /// A vtable's method descriptor, or a protocol's requirement, to what names it apart from
@@ -166,11 +171,25 @@ impl<'a> Collector<'a> {
         if let Some(known) = self.contexts.get(&descriptor) {
             return known.clone();
         }
+        // A chain that deep is damaged. What was named stays in the memo, cut off where the
+        // chain was first entered.
+        if self.depth >= DEEPEST {
+            return None;
+        }
         // Guards against a parent chain that loops.
         self.contexts.insert(descriptor, None);
+        self.depth += 1;
+        let name = self.read_context(descriptor);
+        self.depth -= 1;
+        self.contexts.insert(descriptor, name.clone());
+        name
+    }
+
+    /// `context`, read from the descriptor rather than the memo.
+    fn read_context(&mut self, descriptor: u64) -> Option<String> {
         let kind = self.reader.u32(descriptor)? & 0x1F;
         let own = self.reader.relative(descriptor + 8);
-        let name = match kind {
+        match kind {
             MODULE => self.reader.text(own?),
             // An extension stands for the type it extends.
             EXTENSION => self.type_name(own?),
@@ -182,9 +201,7 @@ impl<'a> Collector<'a> {
                     (_, None) => self.own_name(descriptor),
                 }
             }
-        };
-        self.contexts.insert(descriptor, name.clone());
-        name
+        }
     }
 
     /// The name the type or protocol at `descriptor` is declared under. A type imported from
@@ -205,7 +222,7 @@ impl<'a> Collector<'a> {
     /// The module the context at `descriptor` is declared in, which for a type declared in
     /// an extension is the extension's and not that of the type it extends.
     fn module(&self, mut descriptor: u64) -> Option<String> {
-        for _ in 0..64 {
+        for _ in 0..DEEPEST {
             if self.reader.u32(descriptor)? & 0x1F == MODULE {
                 return self.reader.text(self.reader.relative(descriptor + 8)?);
             }
@@ -564,6 +581,7 @@ fn read(image: &Image, naming: bool) -> Option<Metadata> {
         names: Vec::new(),
         types: Vec::new(),
         contexts: FxHashMap::default(),
+        depth: 0,
         type_index: FxHashMap::default(),
         members: FxHashMap::default(),
         overrides: Vec::new(),
@@ -607,4 +625,39 @@ fn read(image: &Image, naming: bool) -> Option<Metadata> {
     names.sort_by_key(|name| name.0);
     names.dedup_by_key(|name| name.0);
     Some(Metadata { functions, names, types, instance_methods })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEEPEST, MODULE, STRUCT, metadata};
+    use crate::image::{Format, Image, Machine, Section};
+
+    /// A struct nested in 20,000 others, each the parent of the one before, which a damaged
+    /// image can hold: its name is read through the innermost `DEEPEST` of them.
+    #[test]
+    fn a_deep_chain_of_parents_is_cut_off() {
+        const LINKS: u64 = 20_000;
+        const STRIDE: u64 = 32;
+        let (list, descriptors) = (0x1000, 0x2000);
+        let name = descriptors + STRIDE * (LINKS + 1);
+        let mut data = Vec::new();
+        for link in 0..=LINKS {
+            let at = descriptors + STRIDE * link;
+            let kind = if link == LINKS { MODULE } else { STRUCT };
+            // Flags, the parent one stride on, the name, then no accessor and no fields.
+            let mut descriptor = [0u8; STRIDE as usize];
+            descriptor[0..4].copy_from_slice(&kind.to_le_bytes());
+            descriptor[4..8].copy_from_slice(&((STRIDE - 4) as i32).to_le_bytes());
+            descriptor[8..12].copy_from_slice(&((name - (at + 8)) as i32).to_le_bytes());
+            descriptor[16..20].copy_from_slice(&0i32.to_le_bytes());
+            data.extend(descriptor);
+        }
+        data.extend(b"A\0");
+        let section = |name: &str, addr: u64, data: Vec<u8>| Section { name: name.into(), addr, data, file_offset: None, executable: false, writable: false };
+        let entry = ((descriptors - list) as u32).to_le_bytes().to_vec();
+        let sections = vec![section("__TEXT,__swift5_types", list, entry), section("__TEXT,__const", descriptors, data)];
+        let image = Image::bare("deep".into(), Format::MachO, Machine::Aarch64, 0, sections);
+        let types = metadata(&image).unwrap().types;
+        assert_eq!(types[0].name, vec!["A"; DEEPEST as usize].join("."));
+    }
 }
