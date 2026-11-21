@@ -1,7 +1,8 @@
 //! Binaries kept loaded between requests, with the lookups the tools share.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -21,9 +22,9 @@ const KEPT: usize = 8;
 
 /// An analyzed binary and its decompiler process.
 pub struct Binary {
-    /// The binary's path with every link resolved, so that two spellings of it find one binary,
+    /// The device and inode of the binary's file, so that two spellings of it find one binary,
     /// and the file name it was given, which names its edits file.
-    key: (PathBuf, OsString),
+    key: (u64, u64, OsString),
     /// Modification time and size of the file when it was loaded.
     stamp: (SystemTime, u64),
     pub program: Program,
@@ -54,7 +55,7 @@ fn worker(path: &Path, start: bool) -> Worker {
 }
 
 impl Binary {
-    fn load(path: &Path, key: (PathBuf, OsString), stamp: (SystemTime, u64), start_worker: bool) -> Result<Binary> {
+    fn load(path: &Path, key: (u64, u64, OsString), stamp: (SystemTime, u64), start_worker: bool) -> Result<Binary> {
         let start = Instant::now();
         // A child started now reads the analysis kept on disk at the same time as this process.
         // Without one it is started once this process has kept its own, so the binary is
@@ -201,8 +202,7 @@ impl Cache {
         let metadata = std::fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
         // A FIFO would never end, /dev/zero would fill memory, and /dev/stdin is the protocol.
         anyhow::ensure!(metadata.is_file(), "{} is not a regular file", path.display());
-        let resolved = std::fs::canonicalize(path).with_context(|| format!("cannot read {}", path.display()))?;
-        let key = (resolved, path.file_name().unwrap_or_default().to_os_string());
+        let key = (metadata.dev(), metadata.ino(), path.file_name().unwrap_or_default().to_os_string());
         let stamp = (metadata.modified()?, metadata.len());
         let binary = match self.binaries.iter().position(|binary| binary.key == key) {
             Some(index) if self.binaries[index].stamp == stamp => self.binaries.remove(index),
