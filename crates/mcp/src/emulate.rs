@@ -1196,8 +1196,10 @@ options! {
         snapshot: Option<String> = json!({ "type": "string", "description": "A directory holding the memory of a live process, which the run starts from where it holds any: a `snapshot.tsv` of `region START END PERMISSIONS NAME` rows, each region's bytes in `START.bin` with START spelled as the row spells it, and `teb ADDRESS` rows for the threads of a Windows process, the first of which the run is on unless `set` gives FS_OFFSET. `set` and `args` apply on top, and the run keeps its own stack." }),
         #[serde(default)]
         before: Vec<String> = json!({ "type": "array", "items": { "type": "string" }, "description": "Functions to run first, in order and with no arguments, as setup: their writes are not listed and their instructions not counted. For a C runtime whose startup has not run, such as MSVC's `_mtinit`, which sets up the locks and the thread data its string functions need." }),
-        writes: Option<String> = json!({ "type": "string", "description": "A file to write every range of memory the run wrote to, one per line as ADDRESS HEX, where the answer shows the first 16 cut at 64 bytes. For comparing two whole runs." }),
-        entered: Option<String> = json!({ "type": "string", "description": "A file to write the entry of every function the run entered to, one per line, in order of address." }),
+        #[serde(default)]
+        writes: bool = json!({ "type": "boolean", "description": "List every range of memory the run wrote, whole, where the answer otherwise lists the first 16 cut at 64 bytes. For comparing two whole runs." }),
+        #[serde(default)]
+        entered: bool = json!({ "type": "boolean", "description": "List the entry of every function the run entered, in order of address." }),
         timeout: Option<f64> = json!({ "type": "number", "description": "Seconds the run may take before it stops, whatever `steps` allows (default 30)." }),
         #[serde(default)]
         skip: Vec<String> = json!({ "type": "array", "items": { "type": "string" }, "description": "Functions that return as soon as they are entered, as FUNCTION:BYTES with the bytes of arguments each takes off the stack, 0 unless it is stdcall: `0x401230:8`. The result register keeps what it held. For a function the run cannot or need not go through, such as one that draws." }),
@@ -1275,9 +1277,10 @@ fn count(n: usize, noun: &str) -> String {
     format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }
 
-fn hex(bytes: &[u8]) -> String {
-    let shown: Vec<String> = bytes.iter().take(SHOWN).map(|byte| format!("{byte:02x}")).collect();
-    let more = if bytes.len() > SHOWN { format!(" ... ({} bytes)", bytes.len()) } else { String::new() };
+/// The first `shown` of `bytes` in hex, and how many there are when that cuts them.
+fn hex(bytes: &[u8], shown: usize) -> String {
+    let more = if bytes.len() > shown { format!(" ... ({} bytes)", bytes.len()) } else { String::new() };
+    let shown: Vec<String> = bytes.iter().take(shown).map(|byte| format!("{byte:02x}")).collect();
     format!("{}{more}", shown.join(" "))
 }
 
@@ -1477,7 +1480,7 @@ pub fn run(binary: &mut Binary, args: Run) -> Result<String> {
     };
     let mut call = Call {
         entry, snapshot, before, args: args.args.iter().map(arg).collect::<Result<_>>()?, registers: Vec::new(), memory: Vec::new(), read: args.read, dump, steps: args.steps.unwrap_or(DEFAULT_STEPS),
-        skip, ticks: args.ticks, timeout, track_entered: args.entered.is_some(),
+        skip, ticks: args.ticks, timeout, track_entered: args.entered,
     };
     for setting in &args.set {
         let (place, what) = setting.split_once('=').with_context(|| format!("`{setting}` is not REGISTER=number, 0xADDRESS=hex:bytes or SPACE:0xADDRESS=hex:bytes"))?;
@@ -1502,27 +1505,22 @@ pub fn run(binary: &mut Binary, args: Run) -> Result<String> {
         writeln!(out, "{}", value(reading, None))?;
     }
     for (space, addr, bytes) in &outcome.dumps {
-        writeln!(out, "{} at {}: {}", count(bytes.len(), "byte"), place(space, *addr), hex(bytes))?;
+        writeln!(out, "{} at {}: {}", count(bytes.len(), "byte"), place(space, *addr), hex(bytes, SHOWN))?;
     }
     for buffer in &outcome.buffers {
         let state = if buffer.before == buffer.after { "unchanged" } else { "now" };
-        writeln!(out, "argument {}, a buffer at {:#x}, {state}: {}", buffer.arg, buffer.addr, hex(&buffer.after))?;
+        writeln!(out, "argument {}, a buffer at {:#x}, {state}: {}", buffer.arg, buffer.addr, hex(&buffer.after, SHOWN))?;
     }
-    for (space, addr, bytes) in outcome.writes.iter().take(RANGES_SHOWN) {
-        writeln!(out, "wrote {} at {}: {}", count(bytes.len(), "byte"), place(space, *addr), hex(bytes))?;
+    let (ranges, bytes_shown) = if args.writes { (usize::MAX, usize::MAX) } else { (RANGES_SHOWN, SHOWN) };
+    for (space, addr, bytes) in outcome.writes.iter().take(ranges) {
+        writeln!(out, "wrote {} at {}: {}", count(bytes.len(), "byte"), place(space, *addr), hex(bytes, bytes_shown))?;
     }
-    if outcome.writes.len() > RANGES_SHOWN {
-        writeln!(out, "... and {} more ranges", outcome.writes.len() - RANGES_SHOWN)?;
+    if outcome.writes.len() > ranges {
+        writeln!(out, "... and {} more ranges", outcome.writes.len() - ranges)?;
     }
-    if let Some(path) = &args.writes {
-        let lines: String = outcome.writes.iter().map(|(space, addr, bytes)| format!("{} {}\n", place(space, *addr), bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>())).collect();
-        std::fs::write(path, lines).with_context(|| format!("writing the ranges written to {path}"))?;
-        writeln!(out, "every range written, {}, is in {path}", outcome.writes.len())?;
-    }
-    if let Some(path) = &args.entered {
-        let lines: String = outcome.entered.iter().map(|entry| format!("{entry:#x}\n")).collect();
-        std::fs::write(path, lines).with_context(|| format!("writing the functions entered to {path}"))?;
-        writeln!(out, "every function entered, {}, is in {path}", outcome.entered.len())?;
+    if args.entered {
+        let entries: Vec<String> = outcome.entered.iter().map(|&entry| binary.program.label(entry)).collect();
+        writeln!(out, "entered {}: {}", count(entries.len(), "function"), entries.join(", "))?;
     }
     for note in &outcome.notes {
         writeln!(out, "{note}")?;

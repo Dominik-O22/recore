@@ -398,14 +398,17 @@ fn functions_run_before_set_up_the_state_the_function_reads() {
 }
 
 #[test]
-fn a_whole_run_is_written_out_and_steered_to_compare_with_another() {
+fn a_whole_run_is_listed_and_steered_to_compare_with_another() {
     let mut program = Program::new();
-    let (writes, entered) = (program.dir.join("writes"), program.dir.join("entered"));
     let (outer, inner) = (program.addr("outer"), program.addr("inner"));
-    let whole = program.run("outer", json!({ "writes": writes, "entered": entered }));
-    assert_eq!(whole, format!("{outer} returned EAX = 0x9 (9) after 7 instructions\nwrote 4 bytes at 0x402048: 99 00 00 00\nevery range written, 1, is in {}\nevery function entered, 2, is in {}\n", writes.display(), entered.display()));
-    assert_eq!(std::fs::read_to_string(&writes).unwrap(), "0x402048 99000000\n");
-    assert_eq!(std::fs::read_to_string(&entered).unwrap(), format!("{outer}\n{inner}\n"));
+    let whole = program.run("outer", json!({ "writes": true, "entered": true }));
+    assert_eq!(whole, format!("{outer} returned EAX = 0x9 (9) after 7 instructions\nwrote 4 bytes at 0x402048: 99 00 00 00\nentered 2 functions: {outer}, {inner}\n"));
+    // The lists come back in the answer: a run writes no file, whatever path a caller gives.
+    let path = program.dir.join("entered");
+    std::fs::write(&path, "kept\n").unwrap();
+    let refused = program.client.tool("run", json!({ "path": program.path, "function": outer, "entered": path })).unwrap_err();
+    assert!(refused.contains("expected a boolean"), "{refused}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
     // A skipped function returns at once, with its stdcall argument off the stack, and the
     // result register as it was.
     let skipped = program.run("outer", json!({ "skip": [format!("{inner}:4")] }));
