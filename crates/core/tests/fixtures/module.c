@@ -56,6 +56,14 @@ int kcfi_word(struct w3671628 *p) {
 int kcfi_off_word(struct u0341202 *p) {
     return p == 0;
 }
+
+// A function of a type the kernel defines, a platform driver's probe: its hash is in the
+// decompiler's table of the kernel's function types.
+struct platform_device;
+
+int kernel_probe(struct platform_device *pdev) {
+    return pdev == 0 ? -19 : 0;
+}
 #endif
 
 // The kernel passes `_THIS_IP_`, the address of a label inside the function, to what traces

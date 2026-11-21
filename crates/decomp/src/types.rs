@@ -314,6 +314,8 @@ pub struct Writer<'a> {
     first_id: u64,
     /// Types the engine holds already, by the number it knows them by: see [`Writer::known`].
     known: HashMap<TypeId, u64>,
+    /// What structs print as, where not their names: see [`Writer::label`].
+    labels: HashMap<TypeId, String>,
     out: String,
 }
 
@@ -325,7 +327,18 @@ impl<'a> Writer<'a> {
     /// A writer whose types the engine knows by numbers from `first_id` on, to keep them apart
     /// from those of another table given to the same session.
     pub fn numbered_from(types: &'a Types, first_id: u64) -> Writer<'a> {
-        Writer { types, written: vec![false; types.types.len()], pending: Vec::new(), function_types: HashMap::new(), first_id, known: HashMap::new(), out: String::new() }
+        Writer { types, written: vec![false; types.types.len()], pending: Vec::new(), function_types: HashMap::new(), first_id, known: HashMap::new(), labels: HashMap::new(), out: String::new() }
+    }
+
+    /// Says that the struct at `id` prints as `label`. The engine still knows it by its name,
+    /// so two structs can print alike.
+    pub fn label(&mut self, id: TypeId, label: &str) {
+        self.labels.insert(id, label.to_string());
+    }
+
+    /// The `label` attribute of the type at `id`, with a space before it, or nothing.
+    fn label_attribute(&self, id: TypeId) -> String {
+        self.labels.get(&id).map(|label| format!(r#" label="{}""#, escaped(label))).unwrap_or_default()
     }
 
     /// Says that the engine holds the named type at `id` already, by the number `engine_id`:
@@ -378,7 +391,10 @@ impl<'a> Writer<'a> {
             Type::Composite { name, union, size, .. } => {
                 if !std::mem::replace(&mut self.written[id as usize], true) {
                     let meta = if *union { "union" } else { "struct" };
-                    let _ = writeln!(self.out, r#"<type name="{}" id="{}" metatype="{meta}" size="{}" incomplete="true"/>"#, escaped(name), self.ident(id), (*size).max(1));
+                    // One only declared keeps size 0 in the engine too, as `void` has. At size 1
+                    // the engine would print `p + 0xd8` for bytes past a pointer to it, which C
+                    // reads as steps over elements.
+                    let _ = writeln!(self.out, r#"<type name="{}"{} id="{}" metatype="{meta}" size="{size}" incomplete="true"/>"#, escaped(name), self.label_attribute(id), self.ident(id));
                     self.pending.push(id);
                 }
             }
@@ -543,7 +559,7 @@ impl<'a> Writer<'a> {
                 self.define(field.kind);
             }
             let meta = if *union { "union" } else { "struct" };
-            let _ = writeln!(self.out, r#"<type name="{}" id="{}" metatype="{meta}" size="{size}">"#, escaped(name), self.ident(id));
+            let _ = writeln!(self.out, r#"<type name="{}"{} id="{}" metatype="{meta}" size="{size}">"#, escaped(name), self.label_attribute(id), self.ident(id));
             for (index, field) in kept.iter().enumerate() {
                 let offset = if *union { 0 } else { field.offset };
                 match field.bits {
@@ -638,6 +654,12 @@ impl<'a> Importer<'a> {
             Ok(rejected) => rejected.iter().for_each(|entry| eprintln!("debug information: {entry}")),
             Err(error) => eprintln!("debug information: {error}"),
         }
+    }
+
+    /// Keeps the prototypes of the functions at `addrs` from `session`: an edit declares them,
+    /// and an edit has the last word.
+    pub fn declared(&mut self, addrs: impl IntoIterator<Item = u64>) {
+        self.given.extend(addrs);
     }
 
     /// Gives `session` every global variable with its type.
@@ -735,14 +757,16 @@ pub fn debug_file(path: &Path, image: &Image) -> Option<PathBuf> {
 }
 
 /// The types in the debug information of the image at `path`, if it has any that can be read,
-/// or else those of the managed program of an IL2CPP build. Why debug information could not be
-/// read goes to stderr: the decompiler works without. [`DEBUG_VAR`] set to `off` keeps both
-/// out.
+/// or else those of the managed program of an IL2CPP build, or else the prototypes a kernel
+/// module's kCFI hashes name. Why debug information could not be read goes to stderr: the
+/// decompiler works without. [`DEBUG_VAR`] set to `off` keeps all three out.
 pub fn load(path: &Path, image: &Image) -> Option<Types> {
     if std::env::var(DEBUG_VAR).is_ok_and(|setting| setting == "off") {
         return None;
     }
-    let Some(file) = debug_file(path, image) else { return image.il2cpp.as_deref().map(crate::il2cpp::types) };
+    let Some(file) = debug_file(path, image) else {
+        return image.il2cpp.as_deref().map(crate::il2cpp::types).or_else(|| crate::kcfi::types(image).map(|(_, types)| types));
+    };
     let loaded = if file.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("pdb")) {
         crate::pdb::types(&file, image)
     } else {

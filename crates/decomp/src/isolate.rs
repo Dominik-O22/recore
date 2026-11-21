@@ -246,6 +246,17 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         facts.names.extend(unnamed.filter_map(|f| Some((f.addr, importer.describes(f.addr).filter(|described| !described.name.is_empty())?.name.clone()))));
     }
     let mut importer = importer;
+    if let Some(importer) = &mut importer {
+        let declared = declared_functions(&edits.declarations);
+        let named: HashSet<u64> = facts.names.iter().map(|name| name.0).collect();
+        // A function with no name goes by the one the engine gives it, `func_0x` and its address
+        // padded to the width of the space, or on a 64-bit machine to 8 or 12 digits where it can.
+        let size = image.machine.pointer_size() as usize;
+        let digits = |addr: u64| if size == 8 { [8, 12, 16][usize::from(addr >> 32 != 0) + usize::from(addr >> 48 != 0)] } else { 2 * size };
+        let automatic = |name: &str| u64::from_str_radix(name.strip_prefix("func_0x")?, 16).ok().filter(|&addr| name == format!("func_0x{addr:0width$x}", width = digits(addr)));
+        let unnamed = declared.iter().filter_map(|name| automatic(name)).filter(|addr| !named.contains(addr));
+        importer.declared(facts.names.iter().filter(|(_, name)| declared.contains(name.as_str())).map(|name| name.0).chain(unnamed));
+    }
     // From here on a fact the engine refuses is reported and costs only itself, or the facts
     // after it in the same call: a worker that stopped here would leave every function of the
     // binary undecompiled.
@@ -702,6 +713,14 @@ fn edit_in_place(session: &mut Session, analysis: &Analysis, aliases: &HashSet<u
         }
     }
     Ok(true)
+}
+
+/// The names of the functions whose prototypes `declarations` set: those of `extern`
+/// declarations.
+fn declared_functions(declarations: &[String]) -> HashSet<&str> {
+    let statements = declarations.iter().flat_map(|text| text.split(';')).map(str::trim);
+    let heads = statements.filter(|statement| statement.starts_with("extern")).filter_map(|statement| statement.split_once('(').map(|head| head.0));
+    heads.filter_map(|head| head.rsplit(|c: char| !(c.is_alphanumeric() || c == '_')).find(|word| !word.is_empty())).collect()
 }
 
 /// Whether an imported function formats or scans with arguments it is handed as a list, as
