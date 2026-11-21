@@ -15,6 +15,9 @@ moves to the same section and offset in recore's layout.
   kmod.py sample <recore-signatures-dir> <in-dir> <out-dir>
       Keeps of each translated signature report only the functions recore's report has, so that
       `recore-decompile params` scores both decompilers on the same sample.
+  kmod.py diff <bin-dir> <truth-dir> <recore-dir> <ghidra-dir>
+      Lists by kind the function starts and noreturn calls one tool gets right and the other
+      wrong, each kind with a count and an example.
 """
 import bisect
 import json
@@ -23,28 +26,102 @@ import struct
 import sys
 
 SHF_ALLOC = 2
+SHF_EXECINSTR = 4
+SHT_SYMTAB = 2
+SHT_RELA = 4
+SHT_NOBITS = 8
+R_AARCH64_JUMP26 = 282
+R_AARCH64_CALL26 = 283
 BASES = {183: 0xFFFF_8000_0000_0000, 62: 0xFFFF_FFFF_C000_0000}
+
+
+class Module:
+    """A `.ko`'s sections, symbols and relocations, at the addresses recore gives them."""
+
+    def __init__(self, path):
+        self.data = data = open(path, 'rb').read()
+        machine, = struct.unpack_from('<H', data, 18)
+        shoff, = struct.unpack_from('<Q', data, 0x28)
+        shnum, shstrndx = struct.unpack_from('<HH', data, 0x3C)
+        self.headers = [struct.unpack_from('<IIQQQQIIQQ', data, shoff + 64 * i) for i in range(shnum)]
+        names = self.headers[shstrndx][4]
+        self.names = [self.string(names, h[0]) for h in self.headers]
+        self.addrs, self.layout, at = {}, {}, BASES[machine]
+        for index, (_, _, flags, _, _, size, _, _, align, _) in enumerate(self.headers):
+            if not flags & SHF_ALLOC:
+                continue
+            name = self.names[index]
+            if name in self.layout:
+                sys.exit(f'{path}: two allocated sections are named {name}')
+            align = max(align, 1)
+            self.addrs[index] = self.layout[name] = at = (at + align - 1) // align * align
+            at += size
+
+    def string(self, table, offset):
+        return self.data[table + offset:self.data.index(b'\0', table + offset)].decode(errors='replace')
+
+    def symbols(self):
+        """Each symbol as (name, section index, value)."""
+        symtab = next(h for h in self.headers if h[1] == SHT_SYMTAB)
+        strings = self.headers[symtab[6]][4]
+        return [(self.string(strings, name), shndx, value)
+                for name, _, _, shndx, value, _ in struct.iter_unpack('<IBBHQQ', self.data[symtab[4]:symtab[4] + symtab[5]])]
+
+    def relocations(self):
+        """Each relocation of an allocated section as (place, kind, symbol name, target), where
+        the target is None for a symbol the module does not define."""
+        symbols = self.symbols()
+        for header in self.headers:
+            if header[1] != SHT_RELA or header[7] not in self.addrs:
+                continue
+            base = self.addrs[header[7]]
+            for offset, info, addend in struct.iter_unpack('<QQq', self.data[header[4]:header[4] + header[5]]):
+                name, shndx, value = symbols[info >> 32]
+                target = self.addrs[shndx] + value + addend if shndx in self.addrs else None
+                yield base + offset, info & 0xFFFFFFFF, name, target
+
+    def section_of(self, addr):
+        index = max((i for i, a in self.addrs.items() if a <= addr), key=self.addrs.get, default=None)
+        return index if index is not None and addr < self.addrs[index] + self.headers[index][5] else None
+
+    def word(self, addr):
+        index = self.section_of(addr)
+        offset = self.headers[index][4] + addr - self.addrs[index]
+        return struct.unpack_from('<I', self.data, offset)[0]
+
+    def data_in_code(self):
+        """The ranges that `$d` mapping symbols mark as data inside code: clang's kCFI hashes."""
+        marks = {}
+        for name, shndx, value in self.symbols():
+            if shndx in self.addrs and self.headers[shndx][2] & SHF_EXECINSTR and name[:2] in ('$d', '$x') and name[2:3] in ('', '.'):
+                marks.setdefault(shndx, []).append((value, name[:2] == '$d'))
+        ranges = []
+        for shndx, marks in marks.items():
+            marks.sort()
+            for i, (value, is_data) in enumerate(marks):
+                if is_data:
+                    end = next((v for v, d in marks[i + 1:] if not d), self.headers[shndx][5])
+                    ranges.append((self.addrs[shndx] + value, self.addrs[shndx] + end))
+        return sorted(ranges)
+
+    def adr_targets(self, relocated):
+        """Where each `adr` without a relocation points: `_THIS_IP_`, an address in its own code."""
+        targets = set()
+        for index, addr in self.addrs.items():
+            header = self.headers[index]
+            if not header[2] & SHF_EXECINSTR or header[1] == SHT_NOBITS:
+                continue
+            for i, (insn,) in enumerate(struct.iter_unpack('<I', self.data[header[4]:header[4] + header[5] // 4 * 4])):
+                place = addr + 4 * i
+                if insn & 0x9F000000 == 0x10000000 and place not in relocated:
+                    imm = (insn >> 3 & 0x1FFFFC) | (insn >> 29 & 3)
+                    targets.add(place + imm - (imm & 0x100000) * 2)
+        return targets
 
 
 def recore_layout(path):
     """Each allocated section's name and address, as relocatable::link places it."""
-    data = open(path, 'rb').read()
-    machine, = struct.unpack_from('<H', data, 18)
-    shoff, = struct.unpack_from('<Q', data, 0x28)
-    shnum, shstrndx = struct.unpack_from('<HH', data, 0x3C)
-    headers = [struct.unpack_from('<IIQQQQIIQQ', data, shoff + 64 * i) for i in range(shnum)]
-    names = headers[shstrndx][4]
-    layout, at = {}, BASES[machine]
-    for name, _, flags, _, _, size, _, _, align, _ in headers:
-        if not flags & SHF_ALLOC:
-            continue
-        name = data[names + name:data.index(b'\0', names + name)].decode()
-        if name in layout:
-            sys.exit(f'{path}: two allocated sections are named {name}')
-        align = max(align, 1)
-        layout[name] = at = (at + align - 1) // align * align
-        at += size
-    return layout
+    return Module(path).layout
 
 
 def mover(path, blocks, shift):
@@ -132,6 +209,103 @@ def sample(recore_dir, in_dir, out_dir):
         json.dump(report, open(os.path.join(out_dir, file), 'w'))
 
 
+def diff(bin_dir, truth_dir, recore_dir, ghidra_dir):
+    """Sorts each false start and each wrong noreturn call by kind, for the starts and calls
+    where one tool is right and the other wrong."""
+    from collections import Counter, defaultdict
+    counts = defaultdict(Counter)
+    examples = {}
+    for file in sorted(os.listdir(truth_dir)):
+        name = file[:-5]
+        try:
+            ours, theirs = (json.load(open(os.path.join(d, file))) for d in (recore_dir, ghidra_dir))
+        except FileNotFoundError:
+            continue
+        truth = json.load(open(os.path.join(truth_dir, file)))
+        module = Module(os.path.join(bin_dir, name))
+        functions = sorted((f['addr'], f['addr'] + f['size'], f['name']) for f in truth['functions'])
+        starts = [f[0] for f in functions]
+        text = truth['text']
+
+        def where(addr):
+            i = bisect.bisect_right(starts, addr) - 1
+            f = functions[i] if i >= 0 and addr < functions[i][1] else None
+            return f'{name} {addr:#x} ' + (f'{f[2]}+{addr - f[0]:#x}' if f else 'outside every function')
+
+        def note(table, kind, addr):
+            counts[table][kind] += 1
+            examples.setdefault((table, kind), where(addr))
+
+        relocations = list(module.relocations())
+        referrers = defaultdict(set)
+        callees = {}
+        for place, kind, symbol, target in relocations:
+            if target is not None:
+                referrers[target].add(module.names[module.section_of(place)])
+            if kind in (R_AARCH64_CALL26, R_AARCH64_JUMP26):
+                callees[place] = symbol if target is None else target
+        data = module.data_in_code()
+        adrs = module.adr_targets({place for place, _, _, _ in relocations})
+        origin = {f['addr']: f.get('origin', '') for f in ours['functions']}
+
+        def kind_of_start(addr):
+            i = bisect.bisect_right(data, (addr, float('inf'))) - 1
+            if i >= 0 and addr < data[i][1]:
+                return 'a kCFI type hash read as code'
+            sources = referrers.get(addr, ())
+            if '__jump_table' in sources:
+                return 'a jump label target'
+            if addr in adrs:
+                return 'the address an adr takes of its own code (_THIS_IP_)'
+            if any(module.headers[module.section_of(module.layout[s])][2] & SHF_EXECINSTR for s in sources):
+                return 'an address code takes'
+            if sources:
+                return 'an address in ' + ' '.join(sorted(sources))
+            return f'recore origin {origin[addr]}' if addr in origin else 'no reference'
+
+        def callee(call):
+            target = callees.get(call)
+            if target is None:
+                insn = module.word(call)
+                if insn & 0x7C000000 != 0x14000000:
+                    return 'not a branch'
+                imm = insn & 0x3FFFFFF
+                target = call + 4 * (imm - (imm & 0x2000000) * 2)
+            if isinstance(target, str):
+                return target
+            i = bisect.bisect_right(starts, target) - 1
+            return functions[i][2] if i >= 0 and target < functions[i][1] else f'{target:#x}'
+
+        in_text = lambda addr: text[0] <= addr < text[1]
+        true_starts = {a for a in starts if in_text(a)}
+        false = [{f['addr'] for f in tool['functions'] if in_text(f['addr'])} - true_starts for tool in (ours, theirs)]
+        for addr in false[0] - false[1]:
+            note('false starts recore has and Ghidra not', kind_of_start(addr), addr)
+        for addr in false[1] - false[0]:
+            note('false starts Ghidra has and recore not', kind_of_start(addr), addr)
+        found = [{f['addr'] for f in tool['functions']} for tool in (ours, theirs)]
+        for addr in true_starts - found[1]:
+            note('true starts Ghidra misses', f'recore origin {origin.get(addr, "none")}', addr)
+        for addr in true_starts - found[0]:
+            note('true starts recore misses', 'missed', addr)
+        noreturn = set(truth['noreturn_calls'])
+        calls = [{a for a in tool['noreturn_calls'] if in_text(a)} for tool in (ours, theirs)]
+        for addr in calls[0] - calls[1] - noreturn:
+            note('wrong noreturn calls recore has and Ghidra not', callee(addr), addr)
+        for addr in calls[1] - calls[0] - noreturn:
+            note('wrong noreturn calls Ghidra has and recore not', callee(addr), addr)
+        for addr in noreturn - calls[0] - calls[1]:
+            note('noreturn calls both miss', callee(addr), addr)
+        for addr in noreturn & calls[0] - calls[1]:
+            note('noreturn calls Ghidra misses', callee(addr), addr)
+        for addr in noreturn & calls[1] - calls[0]:
+            note('noreturn calls recore misses', callee(addr), addr)
+    for table, kinds in counts.items():
+        print(f'{table}: {sum(kinds.values())}')
+        for kind, count in kinds.most_common(12):
+            print(f'  {count:6}  {kind}  e.g. {examples[(table, kind)]}')
+
+
 if __name__ == '__main__':
     command, args = sys.argv[1], sys.argv[2:]
     if command == 'translate':
@@ -140,5 +314,7 @@ if __name__ == '__main__':
         names(args[0], args[1], set(args[2:]))
     elif command == 'sample':
         sample(*args)
+    elif command == 'diff':
+        diff(*args)
     else:
         sys.exit(__doc__)
