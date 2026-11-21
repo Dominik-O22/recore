@@ -212,6 +212,8 @@ pub fn comment(binary: &mut Binary, args: Comment) -> Result<String> {
     let addr = addr_arg(&args.addr)?;
     ensure!(binary.program.image.section_at(addr).is_some(), "{addr:#x} is not in any section of the file");
     let text = args.text.trim().replace('\n', " ");
+    // A comment reaches the decompiler as a C string, which cannot hold a NUL.
+    ensure!(!text.contains('\0'), "a comment cannot contain a NUL character");
     binary.edit(|edits| {
         if text.is_empty() {
             edits.comments.remove(&addr);
