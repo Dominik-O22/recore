@@ -491,8 +491,9 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
 /// Prints each of [`MEASURES`] that moved from the corpus run in `base_dir` to the one in
 /// `head_dir`, over the functions both decompiled, with the binaries it moved in. Fails when
 /// the decompiler failed on more functions, and otherwise with exit status 3 when a measure got
-/// worse, each printed as a `Worse:` line. The run is named `<corpus>/<run>` after the directory
-/// that holds `debug_dir` and after `head_dir`.
+/// worse, each printed as a `Worse:` line, after a `Left out:` line with how many functions each
+/// run left out for the load. The run is named `<corpus>/<run>` after the directory that holds
+/// `debug_dir` and after `head_dir`.
 pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) -> Result<()> {
     let reports = reports(head_dir)?;
     let read = |path: &Path| -> Result<BinaryReport> { serde_json::from_slice(&std::fs::read(path)?).with_context(|| format!("parsing {path:?}")) };
