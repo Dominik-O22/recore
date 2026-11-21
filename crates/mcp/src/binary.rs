@@ -173,6 +173,8 @@ impl Cache {
     /// The binary at `path`, analyzed now unless it was before and the file has not changed.
     pub fn get(&mut self, path: &Path) -> Result<&mut Binary> {
         let metadata = std::fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
+        // A FIFO would never end, /dev/zero would fill memory, and /dev/stdin is the protocol.
+        anyhow::ensure!(metadata.is_file(), "{} is not a regular file", path.display());
         let stamp = (metadata.modified()?, metadata.len());
         let binary = match self.binaries.iter().position(|binary| binary.path == path) {
             Some(index) if self.binaries[index].stamp == stamp => self.binaries.remove(index),

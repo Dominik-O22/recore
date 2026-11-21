@@ -39,7 +39,13 @@ impl Client {
     }
 
     pub fn send(&mut self, line: &str) {
-        writeln!(self.stdin, "{line}").unwrap();
+        self.send_bytes(line.as_bytes());
+    }
+
+    /// Sends one line that need not be text.
+    pub fn send_bytes(&mut self, line: &[u8]) {
+        self.stdin.write_all(line).unwrap();
+        self.stdin.write_all(b"\n").unwrap();
     }
 
     pub fn receive(&mut self) -> Value {
