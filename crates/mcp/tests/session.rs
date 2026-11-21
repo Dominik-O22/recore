@@ -321,6 +321,25 @@ fn a_struct_printed_under_a_declared_name_answers_to_that_name() {
 }
 
 #[test]
+fn a_struct_kept_by_a_rename_still_answers_to_the_name_it_prints_as() {
+    // The first rename keeps `poll`'s struct in the edits. The next session reads it from them.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/opaque.elf");
+    let edits = edits_dir();
+    let refused = Client::start_in(&edits).tool("rename", json!({ "path": path, "addr": "device.field_0x10", "name": "capacity" })).unwrap_err();
+    assert!(refused.ends_with("none is recovered yet. `structs` of a function that takes one names its struct.\nDecompile a function that takes one, then name `device.field_0x10` again"), "{refused}");
+    let session = || {
+        let mut client = Client::start_in(&edits);
+        client.tool("decompile", json!({ "path": path, "functions": ["0x401000"] })).unwrap();
+        client
+    };
+    session().tool("rename", json!({ "path": path, "addr": "device.field_0x10", "name": "capacity" })).unwrap();
+    let renamed = session().tool("rename", json!({ "path": path, "addr": "device.field_0x8", "name": "level" })).unwrap();
+    assert!(renamed.starts_with("S_401000_RDI.field_0x8 is now level\n"), "{renamed}");
+    let c_text = session().tool("decompile", json!({ "path": path, "functions": ["0x401000"] })).unwrap();
+    assert!(c_text.contains("if (dev->capacity < limit) {\n    dev->level = limit;"), "{c_text}");
+}
+
+#[test]
 fn a_structure_passed_on_the_stack_reaches_the_call() {
     // `use` passes a 40-byte structure by value with two registers still free, so it goes on the
     // stack: its five fields are arguments of the call, and the callee reads them as parameters.

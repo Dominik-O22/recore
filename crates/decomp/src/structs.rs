@@ -463,31 +463,35 @@ impl Registry {
 
     /// The recovered struct `name` stands for in this session, with the one its slot points
     /// to first and every struct reached from that through fields. A label stands for the one
-    /// struct printed under it, if only one is and the edits do not keep it.
+    /// struct printed under it, if only one is, whether the edits keep that struct or not.
     pub(crate) fn recovered(&self, name: &str) -> Option<Recovered> {
-        if let [(_, only)] = self.labeled(name).as_slice() {
-            return self.recovered(only.decision.as_deref().ok().filter(|_| !only.named)?);
+        if let [(function, _)] = self.labeled(name).as_slice() {
+            return self.tree(*function, |object| object.label.as_deref() == Some(name));
         }
-        for (&function, last) in &self.last {
-            let Some(index) = last.report.objects.iter().position(|object| !object.named && object.decision.as_ref().is_ok_and(|given| given == name)) else { continue };
-            let (slot, _) = last.paths[index].clone()?;
-            let root = last.paths.iter().zip(&last.report.objects).find_map(|(path, object)| (path.as_ref() == Some(&(slot.clone(), Vec::new()))).then(|| object.decision.clone().ok()).flatten())?;
-            let mut structs: Vec<(String, Layout)> = Vec::new();
-            let mut queue = vec![root];
-            while let Some(name) = queue.pop() {
-                if structs.iter().any(|(known, _)| *known == name) {
-                    continue;
-                }
-                let (layout, _) = self.defined.get(&name)?;
-                queue.extend(layout.fields().values().rev().filter_map(|field| match &field.ty {
-                    FieldType::Struct(target) => Some(target.clone()),
-                    _ => None,
-                }));
-                structs.push((name, layout.clone()));
+        self.last.keys().find_map(|&function| self.tree(function, |object| !object.named && object.decision.as_ref().is_ok_and(|given| given == name)))
+    }
+
+    /// The struct of the first object `is` picks in the last plan for the function at
+    /// `function`, as [`Registry::recovered`] gives it.
+    fn tree(&self, function: u64, is: impl Fn(&ObjectReport) -> bool) -> Option<Recovered> {
+        let last = self.last.get(&function)?;
+        let index = last.report.objects.iter().position(is)?;
+        let (slot, _) = last.paths[index].clone()?;
+        let root = last.paths.iter().zip(&last.report.objects).find_map(|(path, object)| (path.as_ref() == Some(&(slot.clone(), Vec::new()))).then(|| object.decision.clone().ok()).flatten())?;
+        let mut structs: Vec<(String, Layout)> = Vec::new();
+        let mut queue = vec![root];
+        while let Some(name) = queue.pop() {
+            if structs.iter().any(|(known, _)| *known == name) {
+                continue;
             }
-            return Some(Recovered { function, slot, structs });
+            let (layout, _) = self.defined.get(&name)?;
+            queue.extend(layout.fields().values().rev().filter_map(|field| match &field.ty {
+                FieldType::Struct(target) => Some(target.clone()),
+                _ => None,
+            }));
+            structs.push((name, layout.clone()));
         }
-        None
+        Some(Recovered { function, slot, structs })
     }
 
     /// The objects whose structs print as `label`, each with its function, as the last plan for

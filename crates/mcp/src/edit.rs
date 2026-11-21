@@ -82,13 +82,17 @@ fn struct_target(binary: &mut Binary, text: &str) -> Result<Option<Named>> {
     let kept = binary.edits.structs.contains_key(name);
     if !kept && auto_function(name).is_none() {
         let Some(field) = field else { return Ok(None) };
-        // The name the C prints a recovered struct as, where it stands for one struct.
+        // The name the C prints a struct as, where it stands for one struct: the field is that
+        // struct's, kept by the edits or not.
         let recovered = binary.recovered(name).map_err(|_| match binary.type_layout(name) {
+            // The layout's first line says that no struct is recovered; the others list them.
+            Ok(layout) if layout.starts_with(&format!("struct {name} has no layout of its own.")) && layout.lines().count() == 1 => anyhow!("{layout}Decompile a function that takes one, then name `{name}.{field}` again"),
             Ok(layout) if layout.starts_with(&format!("struct {name} has no layout of its own.")) => anyhow!("{layout}Name the field of one of them, as `<struct>.{field}`"),
             _ => anyhow!("there is no struct `{name}`"),
         })?;
         let owner = recovered.structs.first().map(|(owner, _)| owner.clone()).context("a recovered struct has a name")?;
-        return Ok(Some(Named::Field { name: owner, recovered: Some(recovered), field: field.to_string() }));
+        let recovered = (!binary.edits.structs.contains_key(&owner)).then_some(recovered);
+        return Ok(Some(Named::Field { name: owner, recovered, field: field.to_string() }));
     }
     let recovered = if kept { None } else { Some(binary.recovered(name)?) };
     Ok(Some(match field {
