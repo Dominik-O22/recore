@@ -41,7 +41,7 @@ pub(crate) struct Object {
     /// Members handed to calls: the callee, the slot it takes the member in, and the member's
     /// offset from the base.
     pub passed: Vec<(u64, Slot, i64)>,
-    /// A member has a locked type.
+    /// A member has a locked type that says more than the name of a struct with no layout.
     pub locked: bool,
     /// A member is in global memory.
     pub global: bool,
