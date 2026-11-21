@@ -48,6 +48,9 @@ pub(crate) struct Object {
     /// A member is used as a number: compared with a constant other than null, or added to
     /// the address of a table.
     pub number: bool,
+    /// The struct with no layout that its parameters are declared to point to, which a struct
+    /// recovered for it prints as.
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +67,8 @@ pub(crate) struct Planned {
     pub name: String,
     pub layout: Layout,
     pub array: bool,
+    /// The name it prints as, if not its own: see [`Object::label`].
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +138,8 @@ pub(crate) struct Registry {
     /// Every struct defined in the engine, by name, with the number the engine knows it by.
     /// A name is defined once.
     defined: HashMap<String, (Layout, u64)>,
+    /// The labels of the structs defined with one, by name.
+    labels: HashMap<String, String>,
     /// The structs of the edits, by name.
     named: BTreeMap<String, Layout>,
     /// The structs the edits say functions are passed pointers to: function, slot, name.
@@ -275,15 +282,16 @@ impl Registry {
             }
         }
 
-        let based: Vec<(String, Layout, bool)> = choices
+        let based: Vec<Planned> = choices
             .iter()
             .zip(&names)
-            .filter_map(|(choice, name)| match choice {
-                Choice::Recover(layout, array) => Some((name.clone()?, layout.clone(), *array)),
+            .zip(objects)
+            .filter_map(|((choice, name), object)| match choice {
+                Choice::Recover(layout, array) => Some(Planned { name: name.clone()?, layout: layout.clone(), array: *array, label: object.label.clone() }),
                 _ => None,
             })
             .collect();
-        let recovered: HashSet<String> = based.iter().map(|(name, ..)| name.clone()).collect();
+        let recovered: HashSet<String> = based.iter().map(|planned| planned.name.clone()).collect();
         let rename = |version: u32| {
             let recovered = &recovered;
             move |target: &str| if recovered.contains(target) { versioned(target, version) } else { target.to_string() }
@@ -292,8 +300,8 @@ impl Registry {
         // earlier decompilation of the function with other callee prototypes, make every
         // struct of the plan take the next free version.
         let version = self.version(&based, &rename);
-        let new = !based.is_empty() && based.iter().all(|(name, ..)| !self.defined.contains_key(&versioned(name, version)));
-        let structs: Vec<Planned> = based.iter().map(|(name, layout, array)| Planned { name: versioned(name, version), layout: layout.renamed(rename(version)), array: *array }).collect();
+        let new = !based.is_empty() && based.iter().all(|planned| !self.defined.contains_key(&versioned(&planned.name, version)));
+        let structs: Vec<Planned> = based.into_iter().map(|planned| Planned { name: versioned(&planned.name, version), layout: planned.layout.renamed(rename(version)), ..planned }).collect();
         let decisions: Vec<Result<String, Refusal>> = choices
             .iter()
             .zip(&names)
@@ -372,13 +380,21 @@ impl Registry {
     }
 
     /// The version of the names that `structs` can take: the first under which none of them
-    /// is defined, or all are, with these layouts. Names are finitely many, so one comes.
-    fn version<F: Fn(&str) -> String>(&self, structs: &[(String, Layout, bool)], rename: &impl Fn(u32) -> F) -> u32 {
+    /// is defined, or all are, with these layouts and labels. Names are finitely many, so one
+    /// comes.
+    fn version<F: Fn(&str) -> String>(&self, structs: &[Planned], rename: &impl Fn(u32) -> F) -> u32 {
         if structs.is_empty() {
             return 1;
         }
         for version in 1.. {
-            let defined: Vec<Option<bool>> = structs.iter().map(|(name, layout, _)| self.defined.get(&versioned(name, version)).map(|(defined, _)| defined.same_shape(&layout.renamed(rename(version))))).collect();
+            let defined: Vec<Option<bool>> = structs
+                .iter()
+                .map(|planned| {
+                    let name = versioned(&planned.name, version);
+                    let (defined, _) = self.defined.get(&name)?;
+                    Some(defined.same_shape(&planned.layout.renamed(rename(version))) && self.labels.get(&name) == planned.label.as_ref())
+                })
+                .collect();
             if defined.iter().all(Option::is_none) || defined.iter().all(|defined| *defined == Some(true)) {
                 return version;
             }
@@ -426,7 +442,7 @@ impl Registry {
                     }
                 }
                 Some(_) => return Converge { restart: true, ..Default::default() },
-                None => new.push(Planned { name: name.clone(), layout: layout.clone(), array: false }),
+                None => new.push(Planned { name: name.clone(), layout: layout.clone(), array: false, label: None }),
             }
         }
         for (old, name) in &renamed {
@@ -503,6 +519,13 @@ impl Registry {
         let mut writer = Writer::numbered_from(&table, first_id);
         for (id, engine_id) in known {
             writer.known(id, engine_id);
+        }
+        // Before any is written: one struct's field may announce another.
+        for planned in structs {
+            if let Some(label) = &planned.label {
+                writer.label(ids[&planned.name], label);
+                self.labels.insert(planned.name.clone(), label.clone());
+            }
         }
         for planned in structs {
             writer.named(ids[&planned.name]);
@@ -681,7 +704,14 @@ unsafe fn slot(register: *const c_char, stack: u64) -> Slot {
 unsafe fn evidence(raw: &ffi::RdEvidence) -> Evidence {
     let mut objects: Vec<Object> = unsafe { crate::slice(raw.objects, raw.object_count) }
         .iter()
-        .map(|object| Object { span: (object.low, object.high), locked: object.locked != 0, global: object.global != 0, number: object.number != 0, ..Default::default() })
+        .map(|object| Object {
+            span: (object.low, object.high),
+            locked: object.locked != 0,
+            global: object.global != 0,
+            number: object.number != 0,
+            label: (!object.label.is_null()).then(|| unsafe { CStr::from_ptr(object.label) }.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
         .collect();
     for root in unsafe { crate::slice(raw.roots, raw.root_count) } {
         objects[root.object as usize].roots.push((unsafe { slot(root.register, root.stack) }, root.offset));
@@ -803,7 +833,7 @@ mod tests {
         fields.accesses.push(access(8, 2, FieldType::Uint));
         let plan = plan(vec![fields]);
         assert_eq!(plan.decisions, [Ok("S_401000_RDI".to_string())]);
-        assert_eq!(plan.structs, [Planned { name: "S_401000_RDI".into(), layout: layout(&[(0, 4, FieldType::Int), (8, 4, FieldType::Int)], 12), array: false }]);
+        assert_eq!(plan.structs, [Planned { name: "S_401000_RDI".into(), layout: layout(&[(0, 4, FieldType::Int), (8, 4, FieldType::Int)], 12), array: false, label: None }]);
         assert!(plan.new);
     }
 

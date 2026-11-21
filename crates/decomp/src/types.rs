@@ -314,6 +314,8 @@ pub struct Writer<'a> {
     first_id: u64,
     /// Types the engine holds already, by the number it knows them by: see [`Writer::known`].
     known: HashMap<TypeId, u64>,
+    /// What structs print as, where not their names: see [`Writer::label`].
+    labels: HashMap<TypeId, String>,
     out: String,
 }
 
@@ -325,7 +327,18 @@ impl<'a> Writer<'a> {
     /// A writer whose types the engine knows by numbers from `first_id` on, to keep them apart
     /// from those of another table given to the same session.
     pub fn numbered_from(types: &'a Types, first_id: u64) -> Writer<'a> {
-        Writer { types, written: vec![false; types.types.len()], pending: Vec::new(), function_types: HashMap::new(), first_id, known: HashMap::new(), out: String::new() }
+        Writer { types, written: vec![false; types.types.len()], pending: Vec::new(), function_types: HashMap::new(), first_id, known: HashMap::new(), labels: HashMap::new(), out: String::new() }
+    }
+
+    /// Says that the struct at `id` prints as `label`. The engine still knows it by its name,
+    /// so two structs can print alike.
+    pub fn label(&mut self, id: TypeId, label: &str) {
+        self.labels.insert(id, label.to_string());
+    }
+
+    /// The `label` attribute of the type at `id`, with a space before it, or nothing.
+    fn label_attribute(&self, id: TypeId) -> String {
+        self.labels.get(&id).map(|label| format!(r#" label="{}""#, escaped(label))).unwrap_or_default()
     }
 
     /// Says that the engine holds the named type at `id` already, by the number `engine_id`:
@@ -378,7 +391,7 @@ impl<'a> Writer<'a> {
             Type::Composite { name, union, size, .. } => {
                 if !std::mem::replace(&mut self.written[id as usize], true) {
                     let meta = if *union { "union" } else { "struct" };
-                    let _ = writeln!(self.out, r#"<type name="{}" id="{}" metatype="{meta}" size="{}" incomplete="true"/>"#, escaped(name), self.ident(id), (*size).max(1));
+                    let _ = writeln!(self.out, r#"<type name="{}"{} id="{}" metatype="{meta}" size="{}" incomplete="true"/>"#, escaped(name), self.label_attribute(id), self.ident(id), (*size).max(1));
                     self.pending.push(id);
                 }
             }
@@ -543,7 +556,7 @@ impl<'a> Writer<'a> {
                 self.define(field.kind);
             }
             let meta = if *union { "union" } else { "struct" };
-            let _ = writeln!(self.out, r#"<type name="{}" id="{}" metatype="{meta}" size="{size}">"#, escaped(name), self.ident(id));
+            let _ = writeln!(self.out, r#"<type name="{}"{} id="{}" metatype="{meta}" size="{size}">"#, escaped(name), self.label_attribute(id), self.ident(id));
             for (index, field) in kept.iter().enumerate() {
                 let offset = if *union { 0 } else { field.offset };
                 match field.bits {

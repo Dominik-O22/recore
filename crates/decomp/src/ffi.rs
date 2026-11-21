@@ -57,7 +57,7 @@ pub struct RdDecompiled {
 }
 
 /// One object of [`RdEvidence`]: the lowest and highest offset a member points to, and flags
-/// as [`crate::structs::Object`] has them.
+/// and the label as [`crate::structs::Object`] has them, the label null for none.
 #[repr(C)]
 pub struct RdObject {
     pub low: i64,
@@ -65,6 +65,7 @@ pub struct RdObject {
     pub locked: u8,
     pub global: u8,
     pub number: u8,
+    pub label: *const c_char,
 }
 
 /// A parameter that points to an object: a register by name, or with a null name the stack at
