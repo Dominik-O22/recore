@@ -799,7 +799,9 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             .filter(|f| !frame_end.contains_key(&f.start) && !image.data_in_code)
             .filter_map(|f| {
                 let reached = walk(f, &noreturn, &program, |_, _| {});
-                let from = symbol_end.get(&f.start).map_or(reached.reach_end, |&end| end.max(reached.reach_end));
+                // A function a call started inside a symbol is bounded by that symbol too.
+                let symbol = symbol_end.get(&f.start).copied().or_else(|| symbol_holding(&symbols, f.start).map(|(_, end)| end));
+                let from = symbol.map_or(reached.reach_end, |end| end.max(reached.reach_end));
                 (reached.complete && from < f.end).then(|| next_function_start::<A>(image, from, f.end)).flatten()
             })
             .collect();

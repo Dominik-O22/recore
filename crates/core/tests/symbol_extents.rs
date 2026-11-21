@@ -120,3 +120,33 @@ fn a_call_within_a_symbol_starts_no_function() {
     let (analysis, sub, _) = calls_into_a_symbol(false);
     assert!(function(&analysis, sub).is_none());
 }
+
+/// `user` calls `alt` inside `outer`'s symbol, which starts a function there. `alt` ends in a
+/// call that never returns, and `rest`, which only `outer`'s own branch reaches, follows it.
+/// `rest` is still inside the symbol, so the code no path from `alt` reaches is not split off as
+/// a function: only past the symbol's end may it be.
+#[test]
+fn code_after_a_function_a_call_started_stays_inside_the_symbol() {
+    const TEST_EDI_EDI: [u8; 2] = [0x85, 0xff];
+    const JE_REST: [u8; 2] = [0x74, 12];
+    const MOV_EAX_2_RET: [u8; 6] = [0xb8, 2, 0, 0, 0, RET];
+    const ADD_EAX_ESI: [u8; 2] = [0x01, 0xf0];
+    const JMP_SELF: [u8; 2] = [0xeb, 0xfe];
+
+    let mut code = Code::default();
+    let outer = code.here();
+    // `rest` is where a function would be laid out, 16 bytes in.
+    let (alt, rest, user) = (outer + 10, outer + 16, outer + 24);
+    let spin = user + 8;
+    code.bytes(&TEST_EDI_EDI).bytes(&JE_REST).bytes(&MOV_EAX_2_RET);
+    assert_eq!(code.here(), alt);
+    code.bytes(&[PUSH_RBX]).call(spin);
+    assert_eq!(code.here(), rest);
+    code.bytes(&MOV_EAX_1).bytes(&ADD_EAX_ESI).bytes(&[RET]).symbol(outer, user);
+    code.bytes(&[PUSH_RBX]).call(alt).bytes(&[POP_RBX, RET]).symbol(user, spin);
+    code.bytes(&JMP_SELF).symbol(spin, spin + 2);
+
+    let analysis = code.analyze();
+    assert!(function(&analysis, alt).is_some(), "the call from outside starts a function");
+    assert!(function(&analysis, rest).is_none(), "what follows it inside the symbol is no function");
+}
