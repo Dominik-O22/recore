@@ -269,9 +269,14 @@ fn choose(program: &Program, mut server: Server) -> Vec<u64> {
 /// dynamic loader, the allocator and the C++ runtime each go through every variable when a
 /// process starts: an agent's environment of 54 variables added 4% to a process that answers
 /// from what was kept. The decompiler process `recore-mcp` starts inherits this environment.
+/// `HOME` stays, because the decompiler's language files are kept under it, and the length of
+/// their path moves the decompiler's count. Without it they would go to the shared `/tmp`.
 fn measured(program: &Path, kept: &Path) -> Command {
     let mut command = Command::new(program);
     command.env_clear().env(recore::cache::DIR_VAR, kept).env(recore::edits::DIR_VAR, kept).env("RAYON_NUM_THREADS", "1");
+    if let Some(home) = std::env::var_os("HOME") {
+        command.env("HOME", home);
+    }
     command
 }
 
@@ -392,7 +397,9 @@ mod tests {
         let output = measured(Path::new("/usr/bin/env"), Path::new("/kept")).output().unwrap();
         let mut seen: Vec<String> = String::from_utf8(output.stdout).unwrap().lines().map(str::to_string).collect();
         seen.sort();
-        assert_eq!(seen, ["RAYON_NUM_THREADS=1".to_string(), format!("{}=/kept", recore::cache::DIR_VAR), format!("{}=/kept", recore::edits::DIR_VAR)]);
+        let home = std::env::var("HOME").ok().map(|home| format!("HOME={home}"));
+        let expected: Vec<String> = home.into_iter().chain(["RAYON_NUM_THREADS=1".to_string(), format!("{}=/kept", recore::cache::DIR_VAR), format!("{}=/kept", recore::edits::DIR_VAR)]).collect();
+        assert_eq!(seen, expected);
     }
 
     #[test]
