@@ -2031,6 +2031,10 @@ static int4 bytes_read_after(RdSession *session, uint64_t call, const VarnodeDat
   // Temporaries of an instruction that hold something of the result, with how many of its bytes.
   vector<pair<uintb, int4>> holding;
   for (int count = 0; count <= 40; ++count) {
+    // Code that runs on into another function, past no branch, follows a call that never comes
+    // back, whatever recore's analysis made of the callee. The next function's code says nothing
+    // of the result.
+    if (count > 0 && session->image->entries.count(at) != 0) return 0;
     emit.clear();
     int4 length;
     try {
@@ -2043,9 +2047,6 @@ static int4 bytes_read_after(RdSession *session, uint64_t call, const VarnodeDat
       // SectionSleigh::oneInstruction.
       auto data = session->image->data_after.find(at);
       at += length + (data != session->image->data_after.end() ? data->second : 0);
-      // Another function there means the call never comes back, whatever recore's analysis
-      // made of the callee, and that function's code says nothing of the result.
-      if (session->image->entries.count(at) != 0) return 0;
       continue;
     }
     at += length;

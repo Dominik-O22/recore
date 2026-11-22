@@ -136,5 +136,8 @@ fn the_function_after_a_call_that_never_comes_back_is_no_caller_reading() {
     // function at 0x1005 starts, which reads rax: mov rbx, rax; ret.
     let code = calling(&[0x48, 0x89, 0xc3, 0xc3], &[0xeb, 0xfe]);
     assert!(!one_decompilation_returns(&code, &[0x1005]));
+    // The same with a nop to pad the function at 0x1006.
+    let code = calling(&[0x90, 0x48, 0x89, 0xc3, 0xc3], &[0xeb, 0xfe]);
+    assert!(!one_decompilation_returns(&code, &[0x1006]));
 }
 
