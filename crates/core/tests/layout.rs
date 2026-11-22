@@ -244,3 +244,23 @@ fn a_cortex_m_vector_table_is_where_the_layout_says() {
     let image = load("no-vectors", format!("machine = \"cortex-m\"\nentry = [0x10000000]\nvectors = \"none\"\n{}", region("0x10000000", true)));
     assert_eq!((image.entry, sections(&image)), (0x1000_0000, vec![(0x1000_0000, 0x1000_0026, true)]));
 }
+
+#[test]
+fn a_raw_arm64_kernel_has_its_kcfi_hashes_found() {
+    // arm64's image header, whose magic sits at 0x38. At 0x80040 a function checks the kCFI hash
+    // before x1 and calls it: ldur w16, [x1, #-4]; movk w17, #0x192d; movk w17, #0x77bf, lsl #16;
+    // cmp w16, w17; b.eq +8; brk #0x8221; blr x1; ret. Then the hash, and at 0x80064 a function
+    // nothing calls: mov x0, #1; ret.
+    let mut bytes = vec![0; 0x40];
+    bytes[0x38..0x3c].copy_from_slice(b"ARM\x64");
+    let code = [0xb85f_c030u32, 0x7283_25b1, 0x72ae_f7f1, 0x6b11_021f, 0x5400_0040, 0xd430_4420, 0xd63f_0020, 0xd65f_03c0, 0x77bf_192d, 0xd280_0020, 0xd65f_03c0];
+    bytes.extend(code.iter().flat_map(|word| word.to_le_bytes()));
+    let layout = format!(
+        "machine = \"aarch64\"\nentry = [0x80040]\n\n[[region]]\nfile = \"code.bin\"\noffset = 0\nlength = {:#x}\naddress = 0x80000\nexecutable = true\n",
+        bytes.len()
+    );
+    let image = Image::load(&write("kcfi", &layout, &bytes)).unwrap();
+    assert_eq!(image.marked_data, [(0x80060, 0x80064)]);
+    let functions: Vec<u64> = recore::analyze(&image).functions.iter().map(|function| function.addr).collect();
+    assert!(functions.contains(&0x80064), "{functions:x?}");
+}

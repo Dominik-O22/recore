@@ -313,13 +313,16 @@ mod tests {
         assert_eq!(starts(&image), vec![TEXT, first, second]);
     }
 
-    /// A function that calls through a pointer checks the hash before the target, then the hash
-    /// a function no check expects, then a function that opens with `paciasp`. Nothing calls
-    /// either function, and neither hash marks itself. Last, a function without a hash tests an
-    /// argument before `paciasp`. A section opens with the image header, as a kernel's does.
+    /// A function that calls through a pointer checks the hash before the target, then a function
+    /// that opens with a `nop`, as a patch site does, then the hash a function no check expects,
+    /// then a function that opens with `paciasp`. Nothing calls either function, and neither hash
+    /// marks itself. Then a function without a hash that tests an argument before `paciasp`, one
+    /// without a hash or an entry marker, and an alternative's replacement for the check's first
+    /// word, after which another unchecked hash opens a function. A section opens with the image
+    /// header, as a kernel's does.
     #[test]
     fn kcfi_hashes_are_data_and_start_the_function_after_them() {
-        let (checked, unchecked) = (0x77bf_192du32, 0x5e0f_3a91u32);
+        let (checked, unchecked, after_replacement) = (0x77bf_192du32, 0x5e0f_3a91u32, 0x3c7a_e5d1u32);
         let movk = |base: u32, half: u32| base | (half & 0xFFFF) << 5 | 17;
         let check = [
             0xb85f_c030, // ldur w16, [x1, #-4]
@@ -328,29 +331,52 @@ mod tests {
             0x6b11_021f, // cmp w16, w17
             0x5400_0040, // b.eq +8
             0xd430_4420, // brk #0x8221
+            0xd63f_0020, // blr x1
+            RET,
         ];
-        let (first, second) = (TEXT + 36, TEXT + 48);
-        let rest = [0xd63f_0020 /* blr x1 */, RET, checked, MOV_X0_1, RET, unchecked, PACIASP, MOV_X0_0, AUTIASP, RET];
+        let (first, second, replacement, third) = (TEXT + 36, TEXT + 52, TEXT + 96, TEXT + 104);
+        let functions = [checked, NOP, MOV_X0_1, RET, unchecked, PACIASP, MOV_X0_0, AUTIASP, RET];
         let tests_argument = [0xb400_0081 /* cbz x1, +16 */, PACIASP, MOV_X0_1, AUTIASP, RET];
-        let code: Vec<u32> = check.into_iter().chain(rest).chain(tests_argument).collect();
+        let unmarked = [MOV_X0_1, RET];
+        let replaced = [MOV_X0_0, after_replacement, PACIASP, MOV_X0_0, AUTIASP, RET];
+        let code: Vec<u32> = [&check[..], &functions, &tests_argument, &unmarked, &replaced].concat();
+        // The alternative: the original at the check's first word, the replacement one word long.
+        let mut alternative = Vec::new();
+        alternative.extend((TEXT.wrapping_sub(DATA) as i32).to_le_bytes());
+        alternative.extend((replacement.wrapping_sub(DATA + 4) as i32).to_le_bytes());
+        alternative.extend([0, 0, 4, 4]);
         let kernel = |code: &[u32], header: bool| {
-            let data = code.iter().flat_map(|word| word.to_le_bytes()).collect();
-            let text = Section { name: ".text".into(), addr: TEXT, data, file_offset: None, executable: true, writable: false };
+            let section = |name: &str, addr: u64, data: Vec<u8>, executable: bool| Section { name: name.into(), addr, data, file_offset: None, executable, writable: false };
             let mut head = vec![0; 0x40];
             head[0x38..0x3c].copy_from_slice(if header { &IMAGE_MAGIC } else { b"ELF!" });
-            let head = Section { name: ".head".into(), addr: TABLE, data: head, file_offset: None, executable: false, writable: false };
-            let mut image = Image::bare("vmlinux".into(), Format::Elf, Machine::Aarch64, TEXT, vec![text, head]);
+            let text = section(".text", TEXT, code.iter().flat_map(|word| word.to_le_bytes()).collect(), true);
+            let sections = vec![text, section(".head", TABLE, head, false), section(".altinstructions", DATA, alternative.clone(), false)];
+            let mut image = Image::bare("vmlinux".into(), Format::Elf, Machine::Aarch64, TEXT, sections);
             read(&mut image);
             image
         };
         let image = kernel(&code, true);
-        assert_eq!(image.marked_data, vec![(first - 4, first), (second - 4, second)]);
-        assert_eq!(starts(&image), vec![TEXT, first, second]);
+        assert_eq!(image.replacement_code, vec![(replacement, replacement + 4)]);
+        assert_eq!(image.marked_data, vec![(first - 4, first), (second - 4, second), (third - 4, third)]);
+        assert_eq!(starts(&image), vec![TEXT, first, second, third]);
         // Without a check, or in a file that is no kernel, nothing is taken for a hash.
         let mut unchecked_code = code.clone();
         unchecked_code[5] = NOP;
         assert!(kernel(&unchecked_code, true).marked_data.is_empty());
         assert!(kernel(&code, false).marked_data.is_empty());
+    }
+
+    /// A module marks its hashes with `$d`, and other data too: here an undefined instruction
+    /// that straight-line code runs into, after which no function starts. After the hash, which
+    /// follows a `ret`, ftrace's `nop` comes before the function.
+    #[test]
+    fn a_modules_mark_inside_a_function_starts_nothing() {
+        let (undefined, hash) = (TEXT + 4, TEXT + 16);
+        let code = [MOV_X0_0, 0xe7f0_01f2, MOV_X0_1, RET, 0x5e0f_3a91, NOP, MOV_X0_0, RET];
+        let text = Section { name: ".text".into(), addr: TEXT, data: code.iter().flat_map(|word| word.to_le_bytes()).collect(), file_offset: None, executable: true, writable: false };
+        let mut image = Image::bare("module".into(), Format::Elf, Machine::Aarch64, TEXT, vec![text]);
+        (image.kernel_module, image.marked_data) = (true, vec![(undefined, undefined + 4), (hash, hash + 4)]);
+        assert_eq!(starts(&image), vec![TEXT, hash + 8]);
     }
 
     /// `WARN()` calls a function that returns, then traps, and the kernel goes on after the trap.
