@@ -247,7 +247,7 @@ fn a_function_that_comes_back_from_a_call_into_the_next_one_calls_it() {
 #[test]
 fn archive_prototypes_parse() {
     use recore_decomp::prototypes::Platform;
-    for (target, platform) in [(Target::X86Windows, Platform::Windows), (Target::X86_64Gcc, Platform::Linux), (Target::Aarch64, Platform::MacOs), (Target::Aarch64, Platform::LinuxKernel), (Target::Arm, Platform::LinuxKernel)] {
+    for (target, platform) in [(Target::X86Windows, Platform::Windows), (Target::X86_64Gcc, Platform::Linux), (Target::Aarch64, Platform::MacOs), (Target::Aarch64, Platform::LinuxKernel), (Target::X86_64Gcc, Platform::LinuxKernel)] {
         let mut session = Session::new(&vendored_spec_dir().unwrap(), target, &[Section { addr: 0x1000, data: &[0xc3], readonly: true, code: true }]).unwrap();
         recore_decomp::prototypes::declare(&mut session, target, platform, std::iter::empty()).unwrap();
         let declarations: Vec<(&str, String)> = recore_decomp::prototypes::archive_declarations(target, platform).collect();

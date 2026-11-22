@@ -16,8 +16,9 @@ A kernel built with an older pahole, such as Debian's 6.12, gives its assembly f
 `__arch_copy_from_user`, the prototype `void (void)`, so it is not one of them.
 
 Types are reduced as ghidra/ExportPrototypes.java reduces an archive's: numbers as both tables
-spell them, `long`, `ulong` and `size_t` by name so that the table serves 32-bit kernels,
-pointers to numbers, and every other pointer as `void *`. A function that takes or returns a
+spell them, `long`, `ulong` and `size_t` by name, with `ssize_t` as `long`, pointers to numbers,
+and every other pointer as `void *`. Every other width is a 64-bit kernel's, such as the 8 bytes
+of `phys_addr_t`, so the table does not describe a 32-bit kernel. A function that takes or returns a
 struct by value has no such spelling and is left out. Lines read `- <return> <name>(<params>)`,
 sorted by name.
 
@@ -59,8 +60,9 @@ TRAILER = {INT: (4, 0), ARRAY: (12, 0), STRUCT: (0, 12), UNION: (0, 12), ENUM: (
 QUALIFIERS = (TYPEDEF, CONST, VOLATILE, RESTRICT, TYPE_TAG)
 INT_SIGNED = 1
 
-# Typedefs that are as wide as a pointer whatever they are built from.
-POINTER_SIZED = {"size_t", "ssize_t", "uintptr_t", "intptr_t", "ptrdiff_t"}
+# Typedefs that are as wide as a pointer whatever they are built from, and the name of that width
+# with their sign.
+POINTER_SIZED = {"size_t": "size_t", "uintptr_t": "size_t", "ssize_t": "long", "intptr_t": "long", "ptrdiff_t": "long"}
 RESERVED = {
     "int", "uint", "char", "void", "bool", "float", "double", "long", "short", "unsigned", "signed", "struct", "union", "enum",
     "const", "typedef", "extern", "code", "size_t", "DWORD", "BOOL", "HANDLE", "wstr", "ulong", "string", "this", "class",
@@ -121,7 +123,7 @@ class Btf:
         """The reduced spelling of a type, or None for one passed by value that has none."""
         while self.kind(id) in QUALIFIERS:
             if self.kind(id) == TYPEDEF and self.type_name(id) in POINTER_SIZED:
-                return "size_t"
+                return POINTER_SIZED[self.type_name(id)]
             id = self.types[id][2]
         kind, info, size, trailer, _ = self.types[id]
         if id == 0:
