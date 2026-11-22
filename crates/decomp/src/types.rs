@@ -409,6 +409,16 @@ impl<'a> Writer<'a> {
             }
             Type::Typedef { name, target } => {
                 if !std::mem::replace(&mut self.written[id as usize], true) {
+                    // The engine drops a typedef of a function type, and with it every type that
+                    // names one, as a kernel's `proc_handler` is named: such a typedef is written
+                    // as a function type of its own name.
+                    if let Some(prototype) = self.function_behind(*target) {
+                        self.define_prototype(prototype);
+                        let _ = write!(self.out, r#"<functype name="{}" id="{}""#, escaped(name), self.ident(id));
+                        self.prototype(prototype);
+                        self.out.push_str("</functype>\n");
+                        return;
+                    }
                     self.define(*target);
                     let _ = write!(self.out, r#"<def name="{}" id="{}">"#, escaped(name), self.ident(id));
                     self.reference(*target);
@@ -428,6 +438,19 @@ impl<'a> Writer<'a> {
                 }
             }
         }
+    }
+
+    /// The prototype a function type behind typedefs of it gives, if `id` is one.
+    fn function_behind(&self, mut id: TypeId) -> Option<&'a Prototype> {
+        let types = self.types;
+        for _ in 0..16 {
+            match types.get(id) {
+                Type::Typedef { target, .. } => id = *target,
+                Type::Function(prototype) => return Some(prototype),
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// A word for the type `id` in the name of a function type.
@@ -529,8 +552,9 @@ impl<'a> Writer<'a> {
             // The engine wants fields in order and rejects a struct with one that does not fit;
             // a field that overlaps the one before it, as an empty base class does, is left out.
             // A member with nothing in it, as an empty base class is, holds no data, and the
-            // engine faults on a struct that is all one such member.
-            let mut kept: Vec<&Field> = fields.iter().filter(|field| !field.name.is_empty() && !types.hollow(field.kind, 8)).collect();
+            // engine faults on a struct that is all one such member. A union of the engine holds
+            // no bitfield.
+            let mut kept: Vec<&Field> = fields.iter().filter(|field| !field.name.is_empty() && !types.hollow(field.kind, 8) && !(*union && field.bits.is_some())).collect();
             if !*union {
                 kept.sort_by_key(|field| (field.offset, field.bits.map_or(0, |bits| bits.0)));
             }
