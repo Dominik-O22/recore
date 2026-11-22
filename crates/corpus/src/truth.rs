@@ -34,8 +34,9 @@ pub struct Function {
     /// Compiler-split cold or partial fragment (`foo.cold`, `foo.part.0`), not a real entry point.
     pub fragment: bool,
     pub noreturn: bool,
-    /// PE only: a lone `jmp` to an import or to another function (import thunk, incremental-link
-    /// thunk). Always also `fragment`, so scoring neither demands nor penalises reporting it.
+    /// A lone jump to an import or to another function: a PE import or incremental-link thunk, or
+    /// an entry of the jump table of LLVM's CFI. Always also `fragment`, so scoring neither
+    /// demands nor penalises reporting it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub thunk: bool,
 }
@@ -165,6 +166,13 @@ fn dwarf_noreturn(debug: &object::File) -> Result<NoReturn> {
         }
     }
     Ok(out)
+}
+
+/// Whether a symbol labels an entry of the jump table LLVM's CFI writes, rather than a function:
+/// `f.cfi_jt` the entry for `f` (Linux 5.10), `__typeid_<type>_global_addr` the first entry for
+/// the functions of one type (4.19).
+fn is_jump_table_label(name: &str) -> bool {
+    name.ends_with(".cfi_jt") || (name.starts_with("__typeid_") && name.ends_with("_global_addr"))
 }
 
 fn is_fragment(name: &str) -> bool {
@@ -298,7 +306,18 @@ fn classify(scans: impl Iterator<Item = Scan>, callees: &Callees) -> Classified 
 
 pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
     if recore::layout::is_layout(binary_path) {
-        return if is_elf_of_raw(debug_path) { thumb::extract(binary_path, debug_path) } else { sdcc::extract(binary_path, debug_path) };
+        if !is_elf_of_raw(debug_path) {
+            return sdcc::extract(binary_path, debug_path);
+        }
+        let debug_data = std::fs::read(debug_path).with_context(|| format!("reading {debug_path:?}"))?;
+        let debug = object::File::parse(&*debug_data)?;
+        if debug.architecture() == Architecture::Arm {
+            return thumb::extract(binary_path, debug_path);
+        }
+        // An arm64 kernel's `Image` is its vmlinux's loaded bytes at the same addresses, so it
+        // takes the vmlinux's truth.
+        let name = binary_path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        return Ok(Truth { name, ..elf(binary_path, &debug, &debug)? });
     }
     let binary_data = recore::relocatable::link(std::fs::read(binary_path).with_context(|| format!("reading {binary_path:?}"))?);
     let binary = object::File::parse(&*binary_data)?;
@@ -329,26 +348,43 @@ fn elf(binary_path: &Path, binary: &object::File, debug: &object::File) -> Resul
 
     // A debug file without DWARF (some Go builds) still has a usable symbol table.
     let noreturn = dwarf_noreturn(debug).unwrap_or_default();
+    let kernel_module = binary.section_by_name(".modinfo").is_some();
+    // The kernel itself exports symbols as a module can, and is no module. Its DWARF does not say
+    // that `__stack_chk_fail` never returns, and objtool's list does.
+    let kernel = !kernel_module && binary.section_by_name("__ksymtab").is_some();
+
+    // LLVM's CFI, which defines `__cfi_check` in each module of a 4.19 or 5.10 kernel, has an
+    // indirect call go through a jump table after the functions of `.text`. Only there is a
+    // symbol named as its labels are a label.
+    let cfi_jump_tables = architecture == Architecture::Aarch64
+        && debug.symbols().any(|symbol| symbol.kind() == SymbolKind::Text && symbol.name() == Ok("__cfi_check") && in_exec(symbol.address()));
 
     // Aliases share an address; keep one, preferring a non-fragment name.
     let mut by_addr: BTreeMap<u64, Function> = BTreeMap::new();
+    let mut jump_table_labels: HashMap<u64, String> = HashMap::new();
     for symbol in debug.symbols() {
+        let name = symbol.name().unwrap_or("");
+        // clang gives the `.cold` piece of a kernel function its size but no type.
+        let untyped_piece = symbol.kind() == SymbolKind::Unknown && symbol.size() > 0 && is_fragment(name);
         // Sizeless function symbols are kept: C runtime stubs such as `frame_dummy` are written
         // in assembly without a size, and they are real entry points.
-        if symbol.kind() != SymbolKind::Text || !in_exec(symbol.address()) {
+        if !(symbol.kind() == SymbolKind::Text || untyped_piece) || !in_exec(symbol.address()) {
             continue;
         }
-        let name = symbol.name().unwrap_or("").to_string();
-        if is_mapping_symbol(&name) || recore::relocatable::is_padding(name.as_bytes()) {
+        if is_mapping_symbol(name) || recore::relocatable::is_padding(name.as_bytes()) {
+            continue;
+        }
+        if cfi_jump_tables && is_jump_table_label(name) {
+            jump_table_labels.insert(symbol.address(), name.to_string());
             continue;
         }
         let function = Function {
             addr: symbol.address(),
             size: symbol.size(),
-            fragment: is_fragment(&name),
-            noreturn: noreturn.addrs.contains(&symbol.address()) || noreturn.names.contains(&name),
+            fragment: is_fragment(name),
+            noreturn: noreturn.addrs.contains(&symbol.address()) || noreturn.names.contains(name) || (kernel && recore::noreturn::KERNEL_NAMES.contains(&name)),
             thunk: false,
-            name,
+            name: name.to_string(),
         };
         match by_addr.get(&function.addr) {
             Some(existing) if !existing.fragment && existing.noreturn >= function.noreturn => {}
@@ -357,13 +393,20 @@ fn elf(binary_path: &Path, binary: &object::File, debug: &object::File) -> Resul
             }
         }
     }
+    if cfi_jump_tables {
+        let text = exec_sections.iter().find(|s| s.name() == Ok(".text")).context("no .text section")?;
+        let entries = aarch64::cfi_jump_table(text, by_addr.values().map(|function| (function.addr, function.addr + function.size)));
+        for (addr, size) in entries {
+            let name = jump_table_labels.remove(&addr).unwrap_or_default();
+            by_addr.entry(addr).or_insert(Function { addr, size, name, fragment: true, noreturn: false, thunk: true });
+        }
+    }
     let noreturn_addrs: HashSet<u64> = by_addr.values().filter(|f| f.noreturn).map(|f| f.addr).collect();
 
     let slots = import_slots(binary);
     // A kernel module imports the kernel's functions, and objtool's list says which of them never
     // return where there is no DWARF to say it, as the vendor modules have none. Where there is,
     // the list has no say, so that DWARF still shows a name the list has wrong.
-    let kernel_module = binary.section_by_name(".modinfo").is_some();
     let listed = kernel_module && debug.section_by_name(".debug_info").is_none_or(|section| section.size() == 0);
     // Both reach imports by a direct call to a PLT stub. On x86-64 the truth resolves only the
     // stubs that recore's link writes for a kernel module; resolving a program's would move the
@@ -424,14 +467,16 @@ pub(crate) mod fixture {
     use object::{Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope};
 
     /// An ELF relocatable object of `architecture`, whose sections all sit at 0, with `code` in
-    /// `.text` and each symbol in it as `(name, address, size)`: a function, or a mapping symbol
-    /// where the name starts with `$`. `sections` adds sections of other data by name.
+    /// `.text` and each symbol in it as `(name, address, size)`: a function, or a symbol without
+    /// a type where the name starts with `$`, as a mapping symbol's does, or ends with `.cold`, as
+    /// clang leaves the cold piece of a kernel function. `sections` adds sections of other data by
+    /// name.
     pub fn elf(architecture: Architecture, code: &[u8], symbols: &[(&str, u64, u64)], sections: &[(&str, &[u8])]) -> Vec<u8> {
         let mut object = Object::new(BinaryFormat::Elf, architecture, Endianness::Little);
         let text = object.section_id(StandardSection::Text);
         object.append_section_data(text, code, 4);
         for &(name, value, size) in symbols {
-            let kind = if name.starts_with('$') { SymbolKind::Label } else { SymbolKind::Text };
+            let kind = if name.starts_with('$') || name.ends_with(".cold") { SymbolKind::Label } else { SymbolKind::Text };
             let symbol = Symbol { name: name.into(), value, size, kind, scope: SymbolScope::Compilation, weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None };
             object.add_symbol(symbol);
         }
@@ -574,6 +619,43 @@ mod tests {
         let truth = elf(Path::new("module-dwarf-arm64.o"), &file, &file).unwrap();
         assert!(truth.functions.iter().any(|function| function.name == "checked"));
         assert_eq!((truth.noreturn_calls.len(), truth.noreturn_imports), (0, Vec::<String>::new()));
+    }
+
+    #[test]
+    fn where_llvm_cfi_checks_calls_each_branch_outside_a_function_is_a_thunk_and_its_label_no_function() {
+        // `ret`, then the jump table: `b` back to it, labelled the first entry of a type, then
+        // `bti c` and `b` back to it, then a `nop`.
+        let code: Vec<u8> = [0xd65f_03c0u32, 0x17ff_ffff, 0xd503_245f, 0x17ff_fffd, 0xd503_201f].iter().flat_map(|word| word.to_le_bytes()).collect();
+        let label = "__typeid__ZTSFvvE_global_addr";
+        let functions = |entry: &str| {
+            let bytes = fixture::elf(Architecture::Aarch64, &code, &[(entry, 0, 4), (label, 4, 1)], &[]);
+            let file = object::File::parse(&*bytes).unwrap();
+            elf(Path::new("t"), &file, &file).unwrap().functions.into_iter().map(|f| (f.addr, f.size, f.name, f.thunk)).collect::<Vec<_>>()
+        };
+        let thunk = |addr, size, name: &str| (addr, size, name.to_string(), true);
+        assert_eq!(functions("__cfi_check"), [(0, 4, "__cfi_check".into(), false), thunk(4, 4, label), thunk(8, 8, "")]);
+        // Without `__cfi_check` nothing says the name is a label, so its symbol is a function.
+        assert_eq!(functions("f"), [(0, 4, "f".into(), false), (4, 1, label.to_string(), false)]);
+    }
+
+    #[test]
+    fn an_untyped_cold_piece_with_a_size_is_a_fragment() {
+        let bytes = fixture::elf(Architecture::X86_64, &[0xc3, 0xc3], &[("f", 0, 1), ("f.cold", 1, 1), ("$x", 1, 0)], &[]);
+        let file = object::File::parse(&*bytes).unwrap();
+        let functions: Vec<_> = elf(Path::new("t"), &file, &file).unwrap().functions.into_iter().map(|f| (f.addr, f.fragment)).collect();
+        assert_eq!(functions, [(0, false), (1, true)]);
+    }
+
+    #[test]
+    fn in_the_kernel_a_call_to_stack_chk_fail_never_returns_and_in_a_program_it_returns() {
+        // `__stack_chk_fail` at 0 is a `ret`; at 1 `call 0; ret`.
+        let code = [0xc3, 0xe8, 0xfa, 0xff, 0xff, 0xff, 0xc3];
+        let symbols = [("__stack_chk_fail", 0, 1), ("f", 1, 6)];
+        for (sections, calls) in [(&[("__ksymtab", &[0u8; 4][..])][..], vec![1]), (&[], vec![])] {
+            let bytes = fixture::elf(Architecture::X86_64, &code, &symbols, sections);
+            let file = object::File::parse(&*bytes).unwrap();
+            assert_eq!(elf(Path::new("t"), &file, &file).unwrap().noreturn_calls, calls, "{sections:?}");
+        }
     }
 
     #[test]

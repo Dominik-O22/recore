@@ -410,9 +410,10 @@ fn ftrace_start(sections: &[Section], data: &[u8], entry: u64) -> u64 {
 }
 
 /// Whether a function symbol names the padding the Linux kernel puts before each function, for
-/// the code it patches in at run time, and not a function.
+/// the code it patches in at run time, and not a function. LLVM's CFI of a 4.19 or 5.10 kernel
+/// gives each module two real functions with the same prefix.
 pub fn is_padding(name: &[u8]) -> bool {
-    name.starts_with(b"__pfx_") || name.starts_with(b"__cfi_")
+    name.starts_with(b"__pfx_") || name.starts_with(b"__cfi_") && !matches!(name, b"__cfi_check" | b"__cfi_check_fail")
 }
 
 /// The bytes the kernel writes over the call or jump to `name` whose 32-bit displacement is at
