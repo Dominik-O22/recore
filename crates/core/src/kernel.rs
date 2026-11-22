@@ -52,10 +52,11 @@ fn section<'a>(image: &'a Image, name: &str) -> Option<&'a Section> {
 /// The slots of `__jump_table` that hold a jump label's instruction or where it jumps. The
 /// layout holds when the table is whole entries and both of those are pointers into code in each.
 fn jump_labels(image: &Image) -> Option<HashSet<u64>> {
-    let table = section(image, "__jump_table").map(|s| s.addr..s.end())?;
+    // Whole entries first: an entry's two slots then lie inside the table, whatever its address.
+    let table = section(image, "__jump_table").filter(|s| (s.data.len() as u64).is_multiple_of(JUMP_ENTRY)).map(|s| s.addr..s.end())?;
     let into_code: HashSet<u64> = image.relative_targets.iter().filter(|&&(slot, target)| table.contains(&slot) && image.is_code(target)).map(|&(slot, _)| slot).collect();
     let labels: HashSet<u64> = table.clone().step_by(JUMP_ENTRY as usize).flat_map(|entry| [entry, entry + 8]).collect();
-    ((table.end - table.start).is_multiple_of(JUMP_ENTRY) && labels.is_subset(&into_code)).then_some(labels)
+    labels.is_subset(&into_code).then_some(labels)
 }
 
 /// Where the offset the tables store at `place`, 32 bits from that place, points.
@@ -174,6 +175,11 @@ mod tests {
         // A section of that name whose entries are not of this layout keeps its pointers.
         let pointers = vec![(TABLE, TEXT), (TABLE + 8, DATA), (TABLE + 16, TEXT + 12)];
         assert_eq!(module(&code, "__jump_table", vec![0; 24], pointers.clone()).relative_targets, pointers);
+        // So does one that is not whole entries, at the last address there is.
+        let section = Section { name: "__jump_table".into(), addr: u64::MAX - 1, data: vec![0], file_offset: None, executable: false, writable: true };
+        let mut image = Image::bare("module".into(), Format::Elf, Machine::Aarch64, 0, vec![section]);
+        read(&mut image);
+        assert!(image.relative_targets.is_empty());
     }
 
     /// The replacement for the first function's two words sits after it, and the function after
