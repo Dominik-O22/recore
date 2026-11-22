@@ -40,8 +40,9 @@ const BUGFLAG_WARNING: u16 = 1;
 
 /// Reads the tables an ELF or raw `image` has into what the analysis reads: drops the pointers
 /// `__jump_table` relocates from `relative_targets`, and sets `replacement_code` and
-/// `resuming_traps`. A table whose layout the reader cannot establish is left unread. Where no
-/// mapping symbol marks data among arm64 code, the kCFI hashes become `marked_data`.
+/// `resuming_traps`. A table whose layout the reader cannot establish is left unread. It says
+/// whether an arm64 image is a kernel's, `kernel_image`, and where no mapping symbol marks data
+/// among such a kernel's code, the kCFI hashes become `marked_data`.
 pub(crate) fn read(image: &mut Image) {
     if !matches!(image.machine, Machine::Aarch64 | Machine::X86_64) {
         return;
@@ -138,8 +139,8 @@ fn warnings(image: &Image) -> Vec<u64> {
 const IMAGE_MAGIC: [u8; 4] = *b"ARMd";
 
 /// Whether `image` is an arm64 Linux kernel's, whose `.head.text`, and the raw `Image` made from
-/// it, open with the image header. Only a kernel has kCFI hashes that nothing marks, and only it
-/// pays to look for them.
+/// it, open with the image header. Only a kernel has kCFI hashes that nothing marks, so only it
+/// pays to look for them, and only in it does a `nop` after a hash open a function.
 fn is_kernel(image: &Image) -> bool {
     image.sections.iter().any(|section| section.data.get(0x38..0x3c) == Some(&IMAGE_MAGIC[..]))
 }
