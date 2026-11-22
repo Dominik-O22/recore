@@ -12,10 +12,11 @@ from compression import zstd
 from pathlib import Path
 
 BLOCK = 4096
-# The manifest and partitions of the phones read here are a few MB and at most a few hundred.
+# The phones read here have manifests of a few MB, and the partitions read are at most 100 MB.
 MAX_MANIFEST = 64 << 20
 MAX_PARTITION = 2 << 30
 REPLACE, ZERO, DISCARD = 0, 6, 7
+# REPLACE_BZ, REPLACE_XZ and ZSTD.
 DECOMPRESSORS = {1: bz2.BZ2Decompressor, 8: lzma.LZMADecompressor, 14: zstd.ZstdDecompressor}
 
 
