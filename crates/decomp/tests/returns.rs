@@ -141,7 +141,6 @@ fn the_function_after_a_call_that_never_comes_back_is_no_caller_reading() {
     assert!(!one_decompilation_returns(&code, &[0x1006]));
 }
 
-
 /// Raw code at 0x1000 with a function at 0x1100 that never returns, `b .` on arm64 and `jmp $`
 /// on x86-64, and whether the function at 0x1000 returns a value. `declare` names the callee
 /// and gives its prototype.
