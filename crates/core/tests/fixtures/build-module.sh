@@ -14,3 +14,4 @@ gcc -c -O2 -fno-pic -mcmodel=kernel -mno-red-zone -fcf-protection=branch -pg -mf
 clang --target=aarch64-linux-gnu -c -O2 -fno-pic -mgeneral-regs-only -fpatchable-function-entry=4,2 \
   -mbranch-protection=pac-ret -fsanitize=kcfi -fno-asynchronous-unwind-tables module.c -o module-arm64.o
 llvm-objcopy --wildcard --strip-symbol='$d*' --strip-symbol='$x*' module-arm64.o module-arm64-unmarked.o
+clang --target=aarch64-linux-gnu -c -O2 -g -fno-pic -fno-asynchronous-unwind-tables module-dwarf.c -o module-dwarf-arm64.o

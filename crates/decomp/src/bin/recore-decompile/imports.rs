@@ -1,11 +1,12 @@
-//! Measurements of where the decompiler's types come from: the prototype tables for imports, and
-//! debug information.
+//! Measurements of where the decompiler's types come from: the prototype tables for imports, the
+//! kCFI hashes of kernel modules, and debug information.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
 use recore::report::CallTarget;
+use recore_decomp::kcfi::{self, Spelling};
 use recore_decomp::prototypes;
 
 /// Prints, over every binary in `bin_dir`, the share of call sites of imported functions whose
@@ -39,6 +40,41 @@ pub fn coverage(bin_dir: &Path, list: usize) -> Result<()> {
     uncovered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     for (name, sites) in uncovered.iter().take(list) {
         println!("  {sites:7} {name}");
+    }
+    Ok(())
+}
+
+/// Prints, over the kernel modules in `bin_dir`, how many functions have a kCFI hash before them
+/// and how many take a prototype from it, and how many modules hash in each spelling.
+pub fn kcfi(bin_dir: &Path) -> Result<()> {
+    let mut binaries: Vec<std::path::PathBuf> = std::fs::read_dir(bin_dir)?.map(|entry| Ok(entry?.path())).collect::<Result<_>>()?;
+    binaries.sort();
+    let (mut functions, mut hashed, mut typed) = (0, 0, 0);
+    let mut spellings: BTreeMap<&str, usize> = BTreeMap::new();
+    for binary in binaries {
+        let Ok(image) = recore::Image::load(&binary) else { continue };
+        if !image.kernel_module {
+            continue;
+        }
+        let analysis = recore::analyze(&image);
+        let hashes: HashSet<u64> = kcfi::hashes(&image).into_iter().map(|(addr, _)| addr).collect();
+        let read = kcfi::types(&image);
+        let described: HashSet<u64> = read.iter().flat_map(|(_, types)| types.functions.iter().map(|function| function.addr)).collect();
+        for function in analysis.functions.iter().filter(|function| function.fragment_of.is_none()) {
+            functions += 1;
+            hashed += usize::from(hashes.contains(&function.addr));
+            typed += usize::from(described.contains(&function.addr));
+        }
+        let spelling = match read {
+            Some((Spelling::Normalized, _)) => "normalized",
+            Some((Spelling::Plain, _)) => "plain",
+            None => "none found",
+        };
+        *spellings.entry(spelling).or_default() += 1;
+    }
+    println!("{functions} functions, {hashed} with a kCFI hash, {typed} with a prototype from it");
+    for (spelling, modules) in spellings {
+        println!("{spelling:10} {modules} modules");
     }
     Ok(())
 }

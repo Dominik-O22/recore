@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use recore::Image;
 use recore::edits::{Edits, EditsFile, Stamp};
 use recore::program::Program;
-use recore_decomp::isolate::{FunctionRecord, Options, Worker};
+use recore_decomp::isolate::{FunctionRecord, Options, Worker, returning_callers};
 use recore::structs::Recovered;
 use recore_decomp::{Flow, Instruction, Local, StructReport};
 
@@ -138,30 +138,44 @@ impl Binary {
         self.worker.register(name, QUICK).map_err(anyhow::Error::msg)
     }
 
+    /// Gives the decompiler process the calls to the function at `addr`, from this binary's
+    /// index of them, before it decompiles the function: see [`Worker::callers`].
+    fn give_callers(&mut self, addr: u64) {
+        let program = &self.program;
+        self.worker.callers(addr, || returning_callers(program, addr));
+    }
+
     /// The data flow of the function at `addr`, which costs one decompilation.
     pub fn flow(&mut self, addr: u64, timeout: Duration) -> Result<Flow> {
+        self.give_callers(addr);
         self.worker.flow(addr, timeout).map_err(anyhow::Error::msg)
     }
 
     /// The C of the function at `addr` with the address of its instruction before each line.
     pub fn addressed(&mut self, addr: u64, timeout: Duration) -> Result<String> {
+        self.give_callers(addr);
         self.worker.addressed(addr, timeout).map_err(anyhow::Error::msg)
     }
 
     /// The variables of the function at `addr`, which costs one decompilation.
     pub fn locals(&mut self, addr: u64, timeout: Duration) -> Result<Vec<Local>> {
+        self.give_callers(addr);
         self.worker.locals(addr, timeout).map_err(anyhow::Error::msg)
     }
 
     /// The struct the decompiler recovered under the name `name` and those it points to. Its
     /// function is decompiled first if the decompiler process has not.
     pub fn recovered(&mut self, name: &str) -> Result<Recovered> {
+        if let Some(function) = recore::structs::auto_function(name) {
+            self.give_callers(function);
+        }
         self.worker.recovered(name, QUICK).map_err(anyhow::Error::msg)
     }
 
     /// What struct recovery made of the objects the function at `addr` reaches through its
     /// pointers, which costs one decompilation.
     pub fn structs(&mut self, addr: u64, timeout: Duration) -> Result<StructReport> {
+        self.give_callers(addr);
         self.worker.structs(addr, timeout).map_err(anyhow::Error::msg)
     }
 
@@ -178,6 +192,7 @@ impl Binary {
     /// Decompiles the function at `addr` in the child process. A crash or a function that runs
     /// past `timeout` costs that child and is reported in the record.
     pub fn decompile(&mut self, addr: u64, timeout: Duration) -> (FunctionRecord, Option<String>) {
+        self.give_callers(addr);
         self.worker.decompile(addr, timeout)
     }
 }

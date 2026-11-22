@@ -15,6 +15,7 @@ mod ffi;
 pub mod flow;
 pub mod il2cpp;
 pub mod isolate;
+pub mod kcfi;
 mod mangled;
 pub mod pdb;
 pub mod prototypes;
@@ -757,6 +758,26 @@ impl Session {
         unsafe { ffi::rd_returns_like(self.raw.as_ptr(), function, callee, import.into(), err.as_mut_ptr(), err.len()) != 0 }
     }
 
+    /// Gives `calls`, calls to `function` from other functions that come back, for its next
+    /// decompilation. If its own code shows no value returned, as that of one that ends by
+    /// calling a function of no known prototype does, and the code after one of them reads the
+    /// register a result comes back in before anything writes it, that decompilation takes it
+    /// as returning as many bytes as the widest such read, or the whole register where the
+    /// register also passes an argument, and no more than its own code holds of it. Not where
+    /// the function leaves that register as it found it: a caller that knows so goes on using
+    /// its own value. The session reads each function's callers once.
+    pub fn callers(&mut self, function: u64, calls: &[u64]) {
+        unsafe { ffi::rd_callers(self.raw.as_ptr(), function, calls.as_ptr(), calls.len()) }
+    }
+
+    /// Whether the code after one of `calls`, calls to `function` given as for
+    /// [`Session::callers`], reads the register a result comes back in, without decompiling
+    /// `function`. Its next decompilation does not read them again.
+    pub fn callers_read(&mut self, function: u64, calls: &[u64]) -> bool {
+        self.callers(function, calls);
+        unsafe { ffi::rd_callers_read(self.raw.as_ptr(), function) != 0 }
+    }
+
     /// With `keep`, every later [`Session::decompile`] prints each line of C after the address of
     /// the instruction the line came from, in a column, where it came from one.
     pub fn keep_addresses(&mut self, keep: bool) {
@@ -932,12 +953,25 @@ impl Session {
     }
 
     /// Describes a data type the session knows: its size, and the fields of a struct or union
-    /// with their offsets, or the values of an enum.
+    /// with their offsets, or the values of an enum. A struct with no layout lists instead the
+    /// structs recovered for the parameters declared to point to it, which print as its name.
     pub fn type_layout(&mut self, name: &str) -> Result<String> {
-        let name = CString::new(name)?;
+        let text = CString::new(name)?;
         let mut out = std::ptr::null();
-        check(|err, len| unsafe { ffi::rd_type_layout(self.raw.as_ptr(), name.as_ptr(), &mut out, err, len) != 0 })?;
-        Ok(unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned())
+        check(|err, len| unsafe { ffi::rd_type_layout(self.raw.as_ptr(), text.as_ptr(), &mut out, err, len) != 0 })?;
+        let layout = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+        // SAFETY: as in `set_structs`.
+        let labeled = unsafe { self.structs.as_ref() }.labeled(name);
+        if labeled.is_empty() && !layout.starts_with(&format!("struct {name}, 0 bytes,")) {
+            return Ok(layout);
+        }
+        let mut out = format!("struct {name} has no layout of its own. The C prints under its name the struct recovered for each parameter declared to point to it");
+        out += if labeled.is_empty() { "; none is recovered yet. `structs` of a function that takes one names its struct.\n" } else { ":\n" };
+        for (function, object) in labeled {
+            let slots: Vec<String> = object.slots.iter().map(ToString::to_string).collect();
+            out += &format!("  {}, of the function at {function:#x} in {}\n", object.decision.as_deref().unwrap_or_default(), slots.join(", "));
+        }
+        Ok(out)
     }
 
     /// Hands recore's jump tables to the decompiler as overrides. Call before decompiling.

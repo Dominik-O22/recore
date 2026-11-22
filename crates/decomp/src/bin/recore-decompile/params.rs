@@ -2,7 +2,7 @@
 //! what its parameters, its return and the globals it uses are, with the debug info of each
 //! binary.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -410,55 +410,69 @@ pub fn compare(out_dir: &Path, debug_dir: &Path, jobs: usize, list: usize) -> Re
     Ok(())
 }
 
-/// The counts [`against`] holds a run to, each with whether more of it is better.
-const MEASURES: [(&str, bool); 8] = [
-    ("parameter counts right", true),
-    ("returns a value or not right", true),
-    ("failed or crashed", false),
-    ("parameter types right", true),
-    ("return types right", true),
+/// The counts [`against`] holds a run to, each with whether more of it is better and what it is
+/// counted in: a function, or a function's use of a global.
+const MEASURES: [(&str, bool, &str); 8] = [
+    ("parameter counts right", true, "function"),
+    ("returns a value or not right", true, "function"),
+    ("failed or crashed", false, "function"),
+    ("parameter types right", true, "function"),
+    ("return types right", true, "function"),
     // What keeps typing every untyped value a pointer from passing for better types.
-    ("parameters wrongly called a pointer", false),
-    ("global types right", true),
-    ("globals wrongly called a pointer", false),
+    ("parameters wrongly called a pointer", false, "function"),
+    ("global types right", true, "use of a global"),
+    ("globals wrongly called a pointer", false, "use of a global"),
 ];
 
-/// One binary's [`MEASURES`] in a run, over the functions that both runs decompiled.
-type Counts = [usize; 8];
+/// A measure's count in one function in the base and in the head, or in one use of a global.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Unit {
+    function: u64,
+    base: usize,
+    head: usize,
+}
 
-/// A binary's name, its [`MEASURES`] in the base and in the head, and what [`counted`] compared.
-type Compared = (String, Counts, Counts, [usize; 4]);
+/// One binary's [`MEASURES`], each unit by unit, over the functions that both runs decompiled.
+/// A total is the sum of its units.
+type Units = [Vec<Unit>; 8];
+
+/// A binary's name, its [`MEASURES`], and what [`counted`] compared.
+type Compared = (String, Units, [usize; 4]);
 
 /// The [`MEASURES`] of `base` and of `head`, two runs of the same functions of one binary, and
 /// how many functions have their parameters' types scored in both, how many uses of a global,
-/// and how many functions each run left out for coming after a lost worker.
-fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &Typed) -> (Counts, Counts, [usize; 4]) {
+/// and how many functions each run left out of every count for the load: those that reached
+/// the time limit, and those that came after a worker lost a child.
+fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &Typed) -> (Units, [usize; 4]) {
     // Neither a function that timed out nor one decompiled after a timeout lost its worker the
     // parameters it had kept: either depends on the load, not on the change.
     let compared = |r: &FunctionRecord| r.status == Status::Ok && !r.after_failure;
     let ok = |report: &BinaryReport| -> BTreeMap<u64, (usize, bool)> { report.functions.iter().filter(|r| compared(r)).map(|r| (r.addr, (r.params, r.returns_value))).collect() };
     let (base_ok, head_ok) = (ok(base), ok(head));
+    let mut units = Units::default();
     // Over every function: a decompiler that starts to fail drops functions from the ones both
     // runs finished. A timeout depends on the load and is left out.
-    let failed = |report: &BinaryReport| report.functions.iter().filter(|r| matches!(r.status, Status::Error | Status::Crash)).count();
-    let (mut base_counts, mut head_counts) = ([0, 0, failed(base), 0, 0, 0, 0, 0], [0, 0, failed(head), 0, 0, 0, 0, 0]);
+    let failed = |report: &BinaryReport| -> BTreeSet<u64> { report.functions.iter().filter(|r| matches!(r.status, Status::Error | Status::Crash)).map(|r| r.addr).collect() };
+    let (base_failed, head_failed) = (failed(base), failed(head));
+    for &function in base_failed.union(&head_failed) {
+        units[2].push(Unit { function, base: usize::from(base_failed.contains(&function)), head: usize::from(head_failed.contains(&function)) });
+    }
     // Types count where both runs have them scored: a function whose parameter count one run
     // got wrong has no parameters scored in that run, and a build from before shapes were
     // recorded has none scored at all. Its wrong pointers would otherwise read as new ones.
     let scored = |report: &BinaryReport| -> BTreeMap<u64, Shapes> { report.functions.iter().filter(|r| compared(r)).map(|r| (r.addr, typed.score(r, &mut BTreeMap::new()))).collect() };
     let (base_scored, head_scored) = (scored(base), scored(head));
     let mut typed_in_both = 0;
-    for (addr, base_shapes) in &base_scored {
-        let Some(head_shapes) = head_scored.get(addr) else { continue };
-        typed_in_both += usize::from(base_shapes.params > 0 && head_shapes.params > 0);
-        for (counts, shapes) in [(&mut base_counts, base_shapes), (&mut head_counts, head_shapes)] {
-            if base_shapes.params > 0 && head_shapes.params > 0 {
-                counts[3] += shapes.params_matched;
-                counts[5] += shapes.pointers_claimed - shapes.pointers_matched;
-            }
-            if base_shapes.returns > 0 && head_shapes.returns > 0 {
-                counts[4] += shapes.returns_matched;
-            }
+    for (&function, base_shapes) in &base_scored {
+        let Some(head_shapes) = head_scored.get(&function) else { continue };
+        if base_shapes.params > 0 && head_shapes.params > 0 {
+            typed_in_both += 1;
+            units[3].push(Unit { function, base: base_shapes.params_matched, head: head_shapes.params_matched });
+            let wrong_pointers = |shapes: &Shapes| shapes.pointers_claimed - shapes.pointers_matched;
+            units[5].push(Unit { function, base: wrong_pointers(base_shapes), head: wrong_pointers(head_shapes) });
+        }
+        if base_shapes.returns > 0 && head_shapes.returns > 0 {
+            units[4].push(Unit { function, base: base_shapes.returns_matched, head: head_shapes.returns_matched });
         }
     }
     // A global counts where both runs have the function use it: one a run no longer reads, or
@@ -469,27 +483,69 @@ fn counted(base: &BinaryReport, head: &BinaryReport, debug: &DebugInfo, typed: &
     for (&(function, addr), &base_shape) in &base_uses {
         let (Some(&head_shape), Some(_)) = (head_uses.get(&(function, addr)), typed.global(addr, base_shape)) else { continue };
         globals_in_both += 1;
-        for (counts, found) in [(&mut base_counts, base_shape), (&mut head_counts, head_shape)] {
-            let matched = typed.global(addr, found).is_some_and(|(_, matched)| matched);
-            counts[6] += usize::from(matched);
-            counts[7] += usize::from(found.kind == Kind::Pointer && !matched);
-        }
+        let matched = |found: Shape| typed.global(addr, found).is_some_and(|(_, matched)| matched);
+        let wrong_pointer = |found: Shape| found.kind == Kind::Pointer && !matched(found);
+        units[6].push(Unit { function, base: usize::from(matched(base_shape)), head: usize::from(matched(head_shape)) });
+        units[7].push(Unit { function, base: usize::from(wrong_pointer(base_shape)), head: usize::from(wrong_pointer(head_shape)) });
     }
-    for (addr, expected) in &debug.functions {
+    for (&function, expected) in &debug.functions {
         // A function that timed out in one run says nothing about the other.
-        let (Some(&base_found), Some(&head_found)) = (base_ok.get(addr), head_ok.get(addr)) else { continue };
-        for (counts, (params, returns_value)) in [(&mut base_counts, base_found), (&mut head_counts, head_found)] {
-            counts[0] += usize::from(!expected.variadic && params == expected.params);
-            counts[1] += usize::from(expected.returns_value == Some(returns_value));
+        let (Some(&(base_params, base_returns)), Some(&(head_params, head_returns))) = (base_ok.get(&function), head_ok.get(&function)) else { continue };
+        let params = |params: usize| usize::from(!expected.variadic && params == expected.params);
+        let returns = |returns_value: bool| usize::from(expected.returns_value == Some(returns_value));
+        units[0].push(Unit { function, base: params(base_params), head: params(head_params) });
+        units[1].push(Unit { function, base: returns(base_returns), head: returns(head_returns) });
+    }
+    let left_out = |report: &BinaryReport| report.functions.iter().filter(|r| r.status == Status::Timeout || (r.after_failure && r.status == Status::Ok)).count();
+    (units, [typed_in_both, globals_in_both, left_out(base), left_out(head)])
+}
+
+/// How the measure `index` of [`MEASURES`] moved over `binaries`: its total in the base and in
+/// the head, and the lines that say so, none where no unit moved. Besides the total and the
+/// binaries it moved in, they say in how many units it got better and in how many worse, with
+/// the first of those that got worse, so that a gain elsewhere in the same binary hides no loss.
+fn moved(binaries: &[Compared], index: usize) -> (usize, usize, Vec<String>) {
+    let (measure, more_is_better, unit) = MEASURES[index];
+    let totals = |units: &[Unit]| units.iter().fold((0, 0), |(base, head), unit| (base + unit.base, head + unit.head));
+    let per_binary: Vec<(&str, usize, usize)> = binaries.iter().map(|(name, units, _)| (name.as_str(), totals(&units[index]))).map(|(name, (base, head))| (name, base, head)).collect();
+    let (base, head) = per_binary.iter().fold((0, 0), |(base, head), &(_, b, h)| (base + b, head + h));
+    let changed: Vec<(&str, &Unit)> = binaries.iter().flat_map(|(name, units, _)| units[index].iter().filter(|unit| unit.base != unit.head).map(move |unit| (name.as_str(), unit))).collect();
+    if changed.is_empty() {
+        return (base, head, Vec::new());
+    }
+    let (better, worse): (Vec<_>, Vec<_>) = changed.into_iter().partition(|(_, unit)| (unit.head > unit.base) == more_is_better);
+    let label = if base == head {
+        "even"
+    } else if (head > base) == more_is_better {
+        "better"
+    } else {
+        "worse"
+    };
+    let mut lines = vec![format!("  {label:<7} {measure:<30} {base} -> {head} ({:+})", head as i64 - base as i64)];
+    for gained in [true, false] {
+        let moved: Vec<(&str, usize)> = per_binary.iter().filter(|&&(_, b, h)| (h > b) == gained && h != b).map(|&(name, b, h)| (name, h.abs_diff(b))).collect();
+        if !moved.is_empty() {
+            let total: usize = moved.iter().map(|m| m.1).sum();
+            let list: Vec<String> = moved.iter().take(8).map(|(name, count)| format!("{name} {count}")).collect();
+            lines.push(format!("            {} {total} in {} binaries ({})", if gained { "gained" } else { "lost  " }, moved.len(), list.join(", ")));
         }
     }
-    let left_out = |report: &BinaryReport| report.functions.iter().filter(|r| r.after_failure).count();
-    (base_counts, head_counts, [typed_in_both, globals_in_both, left_out(base), left_out(head)])
+    let mut named: Vec<String> = worse.iter().take(8).map(|(name, unit)| format!("{name} {:#x}", unit.function)).collect();
+    if worse.len() > named.len() {
+        named.push("...".into());
+    }
+    let named = if named.is_empty() { String::new() } else { format!(" ({})", named.join(", ")) };
+    lines.push(format!("            by {unit}: {} better, {} worse{named}", better.len(), worse.len()));
+    (base, head, lines)
 }
 
 /// Prints each of [`MEASURES`] that moved from the corpus run in `base_dir` to the one in
-/// `head_dir`, over the functions both decompiled, with the binaries it moved in. Fails when
-/// one got worse.
+/// `head_dir`, over the functions both decompiled, with the binaries it moved in and how many
+/// functions it got better and worse in, as [`moved`] words it. Fails when
+/// the decompiler failed on more functions, and otherwise with exit status 3 when a measure got
+/// worse, each printed as a `Worse:` line, after a `Left out:` line with how many functions each
+/// run left out for the load. The run is named `<corpus>/<run>` after the directory that holds
+/// `debug_dir` and after `head_dir`.
 pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) -> Result<()> {
     let reports = reports(head_dir)?;
     let read = |path: &Path| -> Result<BinaryReport> { serde_json::from_slice(&std::fs::read(path)?).with_context(|| format!("parsing {path:?}")) };
@@ -500,8 +556,8 @@ pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) 
         if !base_path.exists() || !debug_path.exists() {
             return Ok(None);
         }
-        let (base, head_counts, typed_in_both) = counted(&read(&base_path)?, &head, &DebugInfo::load(&debug_path)?, &Typed::load(&debug_path)?);
-        Ok(Some((head.name, base, head_counts, typed_in_both)))
+        let (units, both) = counted(&read(&base_path)?, &head, &DebugInfo::load(&debug_path)?, &Typed::load(&debug_path)?);
+        Ok(Some((head.name, units, both)))
     })
     .into_iter()
     .collect::<Result<Vec<_>>>()?
@@ -510,51 +566,67 @@ pub fn against(base_dir: &Path, head_dir: &Path, debug_dir: &Path, jobs: usize) 
     .collect();
     binaries.sort_by(|a, b| a.0.cmp(&b.0));
     // A base from before shapes were recorded has none, and then no type count can move.
-    let both = |index: usize| binaries.iter().map(|binary| binary.3[index]).sum::<usize>();
+    let both = |index: usize| binaries.iter().map(|binary| binary.2[index]).sum::<usize>();
     println!("  parameter types compared in {} functions, global types in {} uses", both(0), both(1));
     // A head that makes a callee fail every time leaves the rest of its shard out of the
-    // comparison, so many more left out here than in the base can hide what changed.
+    // comparison, and a slower one more functions at the time limit, so many more left out here
+    // than in the base can hide what changed.
+    let left_out = format!("for a timeout or after a lost worker, {} in the base and {} here", both(2), both(3));
     if both(2) + both(3) > 0 {
-        println!("  left out for coming after a worker lost a child to a timeout or a crash: {} in the base, {} here", both(2), both(3));
+        println!("  left out {left_out}");
     }
 
     let mut worse = Vec::new();
-    for (index, (measure, more_is_better)) in MEASURES.into_iter().enumerate() {
-        let (base, head): (usize, usize) = (binaries.iter().map(|b| b.1[index]).sum(), binaries.iter().map(|b| b.2[index]).sum());
-        if base == head {
-            continue;
+    for (index, &(measure, more_is_better, _)) in MEASURES.iter().enumerate() {
+        let (base, head, lines) = moved(&binaries, index);
+        for line in lines {
+            println!("{line}");
         }
-        let better = (head > base) == more_is_better;
-        if !better {
-            worse.push(measure);
-        }
-        println!("  {:<7} {measure:<30} {base} -> {head} ({:+})", if better { "better" } else { "worse" }, head as i64 - base as i64);
-        for gained in [true, false] {
-            let moved: Vec<(&str, usize)> = binaries.iter().filter_map(|(name, b, h, _)| {
-                let (b, h) = (b[index], h[index]);
-                ((h > b) == gained && h != b).then(|| (name.as_str(), h.abs_diff(b)))
-            }).collect();
-            if !moved.is_empty() {
-                let total: usize = moved.iter().map(|m| m.1).sum();
-                let list: Vec<String> = moved.iter().take(8).map(|(name, count)| format!("{name} {count}")).collect();
-                println!("            {} {total} in {} binaries ({})", if gained { "gained" } else { "lost  " }, moved.len(), list.join(", "));
-            }
+        if base != head && (head > base) != more_is_better {
+            worse.push((measure, base, head));
         }
     }
     if worse.is_empty() {
-        if binaries.iter().all(|b| b.1 == b.2) {
+        if binaries.iter().all(|(_, units, _)| units.iter().flatten().all(|unit| unit.base == unit.head)) {
             println!("  no count changed");
         }
-        Ok(())
-    } else {
-        anyhow::bail!("{} is worse than {}: {}", head_dir.display(), base_dir.display(), worse.join(", "))
+        return Ok(());
     }
+    let measures: Vec<&str> = worse.iter().map(|w| w.0).collect();
+    let fails = format!("{} is worse than {}: {}", head_dir.display(), base_dir.display(), measures.join(", "));
+    // A decompiler that fails on more functions is broken, not a knock-on of a right change, and
+    // the functions it failed on drop out of every other count.
+    anyhow::ensure!(!measures.contains(&FAILED), fails);
+    // In the form `recore-corpus compare` prints a loss, which a line of bench/accepted-losses.txt names.
+    let name = |path: &Path| path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let run = format!("{}/{}", debug_dir.parent().map(name).unwrap_or_default(), name(head_dir));
+    // Beside each loss, so that whoever accepts one sees whether timeouts are behind it. It is
+    // no gate: under load it moves by itself.
+    println!("Left out: {run} {left_out}");
+    for (measure, base, head) in worse {
+        println!("Worse: {run} {measure} {base} -> {head} ({:+})", head as i64 - base as i64);
+    }
+    eprintln!("{fails}");
+    std::process::exit(LOSSES_ONLY)
 }
+
+/// The measure of functions the decompiler failed or crashed on, which no `Worse:` line accepts.
+const FAILED: &str = MEASURES[2].0;
+
+/// The exit status of a comparison whose only failing is a total that got worse, which a
+/// `Worse:` line may accept. check.sh tells it from a failing no such line accepts.
+const LOSSES_ONLY: i32 = 3;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use recore_decomp::dwarf::Function;
+
+    /// Each measure's total in the base and in the head, and the rest of what [`counted`] says.
+    fn totals((units, both): (Units, [usize; 4])) -> ([usize; 8], [usize; 8], [usize; 4]) {
+        let total = |count: fn(&Unit) -> usize| units.each_ref().map(|units| units.iter().map(count).sum());
+        (total(|unit| unit.base), total(|unit| unit.head), both)
+    }
 
     fn run(records: &[(u64, Status, usize, bool)]) -> BinaryReport {
         let functions = records.iter().map(|&(addr, status, params, returns_value)| FunctionRecord { status, params, returns_value, ..FunctionRecord::failed(addr, status, String::new(), 0.0) }).collect();
@@ -569,19 +641,32 @@ mod tests {
         // 0x10 now reads as returning a value, and 0x20 timed out.
         let head = run(&[(0x10, Status::Ok, 1, true), (0x20, Status::Timeout, 0, false), (0x30, Status::Ok, 0, false)]);
         let typed = Typed::default();
-        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0]));
+        assert_eq!(totals(counted(&base, &head, &debug, &typed)), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 1]));
         // A function that fails drops out of the comparison, and counts as failed.
         let head = run(&[(0x10, Status::Error, 0, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, false)]);
-        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 1, 1, 0, 0, 0, 0, 0], [0, 0, 0, 0]));
+        assert_eq!(totals(counted(&base, &head, &debug, &typed)), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 1, 1, 0, 0, 0, 0, 0], [0, 0, 0, 0]));
         // 0x10 lost a parameter after its worker lost a child, which is the load's doing.
         let mut head = run(&[(0x10, Status::Ok, 0, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, true)]);
         head.functions[0].after_failure = true;
-        assert_eq!(counted(&base, &head, &debug, &typed), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 1, 0, 0, 0, 0, 0, 0], [0, 0, 0, 1]));
+        assert_eq!(totals(counted(&base, &head, &debug, &typed)), ([2, 1, 0, 0, 0, 0, 0, 0], [2, 1, 0, 0, 0, 0, 0, 0], [0, 0, 0, 1]));
         // A function that fails after a lost child still fails: a head that crashes everywhere
         // marks every function after its first crash.
         let mut head = run(&[(0x10, Status::Crash, 0, false), (0x20, Status::Ok, 2, true), (0x30, Status::Ok, 0, false)]);
         head.functions[0].after_failure = true;
-        assert_eq!(counted(&base, &head, &debug, &typed).1[2], 1);
+        assert_eq!(totals(counted(&base, &head, &debug, &typed)).1[2], 1);
+    }
+
+    #[test]
+    fn a_function_made_wrong_shows_beside_one_made_right_in_the_same_binary() {
+        let function = |returns_value| Function { params: 0, variadic: false, returns_value: Some(returns_value), c: true };
+        let debug = DebugInfo { functions: BTreeMap::from([(0x10, function(false)), (0x20, function(true))]), symbols: BTreeMap::new() };
+        // Both are void in the base and return a value in the head: 0x20 is now right, 0x10 wrong.
+        let base = run(&[(0x10, Status::Ok, 0, false), (0x20, Status::Ok, 0, false)]);
+        let head = run(&[(0x10, Status::Ok, 0, true), (0x20, Status::Ok, 0, true)]);
+        let (units, both) = counted(&base, &head, &debug, &Typed::default());
+        let (base_total, head_total, lines) = moved(&[("b".into(), units, both)], 1);
+        assert_eq!((base_total, head_total), (1, 1));
+        assert_eq!(lines, ["  even    returns a value or not right   1 -> 1 (+0)", "            by function: 1 better, 1 worse (b 0x10)"]);
     }
 
     #[test]
@@ -617,9 +702,9 @@ mod tests {
         // A build that records no shapes has no type scored, so the head's wrong pointer is no
         // loss. Its records here have no parameters either, which is what the first count says.
         let head = run([&[pointer], &[number]]);
-        assert_eq!(counted(&run([&[], &[]]), &head, &debug, &typed), ([0, 2, 0, 0, 0, 0, 0, 0], [2, 2, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0]));
+        assert_eq!(totals(counted(&run([&[], &[]]), &head, &debug, &typed)), ([0, 2, 0, 0, 0, 0, 0, 0], [2, 2, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0]));
         // Against a run that had both right, it is one: a type lost and a pointer wrongly called.
-        assert_eq!(counted(&run([&[number], &[number]]), &head, &debug, &typed), ([2, 2, 0, 2, 0, 0, 0, 0], [2, 2, 0, 1, 0, 1, 0, 0], [2, 0, 0, 0]));
+        assert_eq!(totals(counted(&run([&[number], &[number]]), &head, &debug, &typed)), ([2, 2, 0, 2, 0, 0, 0, 0], [2, 2, 0, 1, 0, 1, 0, 0], [2, 0, 0, 0]));
     }
 
     #[test]
@@ -634,12 +719,12 @@ mod tests {
         assert_eq!(misses, BTreeMap::from([("global: a pointer of 8 as a number of 8".to_string(), 1)]));
         let debug = DebugInfo { functions: BTreeMap::new(), symbols: BTreeMap::new() };
         // A build that lists no globals has none to compare, so the head's miss is no loss.
-        assert_eq!(counted(&run(&[]), &head, &debug, &typed), ([0; 8], [0; 8], [0, 0, 0, 0]));
+        assert_eq!(totals(counted(&run(&[]), &head, &debug, &typed)), ([0; 8], [0; 8], [0, 0, 0, 0]));
         // Against a run that had the pointer right and did not use the number, it is one.
-        assert_eq!(counted(&run(&[(0x100, shape(Kind::Pointer, 8))]), &head, &debug, &typed), ([0, 0, 0, 0, 0, 0, 1, 0], [0; 8], [0, 1, 0, 0]));
+        assert_eq!(totals(counted(&run(&[(0x100, shape(Kind::Pointer, 8))]), &head, &debug, &typed)), ([0, 0, 0, 0, 0, 0, 1, 0], [0; 8], [0, 1, 0, 0]));
         // Calling the number a pointer is no better type, and counts against the run.
         let pointers = run(&[(0x100, shape(Kind::Pointer, 8)), (0x200, shape(Kind::Pointer, 4))]);
-        assert_eq!(counted(&head, &pointers, &debug, &typed), ([0, 0, 0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 0, 1, 1], [0, 2, 0, 0]));
+        assert_eq!(totals(counted(&head, &pointers, &debug, &typed)), ([0, 0, 0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 0, 1, 1], [0, 2, 0, 0]));
     }
 
     #[test]

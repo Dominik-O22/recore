@@ -7,6 +7,15 @@
 # with recore built at <ref>, and `recore-corpus compare` prints each count that moved, with
 # the binaries it moved in. It fails when a total got worse.
 #
+# Each total that got worse is a loss, printed as a line such as
+# `Worse: corpus-thumb/signatures global types right 812 -> 811 (-1)`. A change accepts a loss by
+# adding that line, with a reason after it, to bench/accepted-losses.txt: the lines the file holds
+# in the working tree and did not at the merge base of <ref> and HEAD. A line accepts a loss of its
+# run and count up to the size it names. A loss no added line names fails the run, and so does an
+# added line out of that form, and a line of the base's file the change took out or edited. A line
+# whose loss did not happen only prints. No line accepts a binary that lost its analysis or a
+# decompiler that fails on more functions.
+#
 # Where a corpus has DWARF, the decompiler's signatures are scored too: a fixed sample of each
 # binary's functions, each one's parameter count, whether it returns a value, and what its
 # parameters, its return and the globals it uses are (a number, a float or a pointer, and its
@@ -126,7 +135,20 @@ signatures() {
     # Made again if this checkout samples differently.
     once "$base_out/signatures" "${sample[*]}" base_signatures "$in" "${sample[@]}"
     echo "$out/signatures against $base_out/signatures"
-    "$build/recore-decompile" params "$out/signatures" "$in/debug" --against "$base_out/signatures" || worse+=("$out/signatures")
+    compared "$out/signatures" "$build/recore-decompile" params "$out/signatures" "$in/debug" --against "$base_out/signatures"
+  fi
+}
+# compared <dir> <command>...: prints what the comparison of <dir> with the base's says. Exit
+# status 3 says that all it found wrong is totals that got worse, each on a `Worse:` line, which go
+# to $losses for a line of bench/accepted-losses.txt to name, with the `Left out:` line of a comparison of signatures.
+# Any other failure is worse whatever that file says.
+compared() {
+  local dir="$1" output status=0
+  shift
+  output="$("$@")" || status=$?
+  echo "$output"
+  if [ "$status" -ne 0 ] && { [ "$status" -ne 3 ] || ! grep -E '^(Worse|Left out): ' <<<"$output" >>"$losses"; }; then
+    worse+=("$dir")
   fi
 }
 base_signatures() {
@@ -142,6 +164,9 @@ SIGNATURE_SAMPLE=100
 CORES="$(lscpu -p=core 2>/dev/null | awk '!/^#/' | sort -u | wc -l || true)"
 [ "$CORES" -gt 1 ] || CORES="$(nproc)"
 worse=()
+losses=target/corpus/losses
+mkdir -p target/corpus
+: >"$losses"
 # Every corpus in the store that has truth, so a new corpus is scored without a change here.
 for in in "$corpora"/*/; do
   in="${in%/}" corpus="$(basename "$in")"
@@ -168,7 +193,7 @@ for in in "$corpora"/*/; do
   "$build/recore-corpus" --corpus "$in" score "${dirs[@]}" "$@"
   if [ -n "$against" ]; then
     for dir in "${dirs[@]}"; do
-      "$build/recore-corpus" --corpus "$in" compare "$base_out/${dir##*/}" "$dir" || worse+=("$dir")
+      compared "$dir" "$build/recore-corpus" --corpus "$in" compare "$base_out/${dir##*/}" "$dir"
     done
   fi
   # The decompiler's signatures against the debug files: the parameter count of every so many
@@ -179,6 +204,32 @@ for in in "$corpora"/*/; do
     signatures "$in"
   fi
 done
+# Every loss, and whether a line the change added to the record names it. The record is read from
+# the working tree, so that a line can be tried before it is committed, and held to the one at the
+# merge base: lines main added since the branch left it are not this change's.
+accepted=0
+if [ -n "$against" ]; then
+  record=bench/accepted-losses.txt
+  # Through a link the lines would sit in a file the diff of the record does not show.
+  if [ -L "$record" ] || { [ -e "$record" ] && [ ! -f "$record" ]; }; then
+    worse+=("$record is no regular file")
+  fi
+  # Without a merge base `git show :path` would read the index, and every line would look old.
+  from="$(git merge-base "$against" HEAD)" || from=
+  [ -n "$from" ] || worse+=("$against and HEAD share no commit, so the lines this change added to $record cannot be told")
+  git show "${from:-HEAD}:$record" >target/corpus/accepted-losses.base 2>/dev/null || : >target/corpus/accepted-losses.base
+  [ -e "$record" ] || record=/dev/null
+  if ! judged="$("$build/recore-corpus" losses "$losses" target/corpus/accepted-losses.base "$record")"; then
+    mapfile -t unmatched < <(grep -E '^(not named|unread|removed) ' <<<"$judged" || true)
+    worse+=("${unmatched[@]:-losses that recore-corpus could not hold to bench/accepted-losses.txt}")
+    ! grep -q '^not named ' <<<"$judged" || echo "to accept a loss, add its line with the reason after it to bench/accepted-losses.txt" >&2
+  fi
+  if [ -n "$judged" ]; then
+    echo "losses:"
+    sed 's/^/  /' <<<"$judged"
+  fi
+  accepted="$(grep -c '^accepted ' <<<"$judged" || true)"
+fi
 # The ratchet and the cost measure the build that ships, which a --quick run does not build.
 if [ -z "$quick" ] && ! "$build/recore-bench" ratchet; then
   worse+=("bench/budget.json")
@@ -187,15 +238,19 @@ if [ -z "$quick" ] && [ -n "$against" ] && ! "$build/recore-bench" cost --base "
   worse+=("time or memory")
 fi
 if [ ${#worse[@]} -gt 0 ]; then
-  echo "worse${against:+ than $against}: ${worse[*]}" >&2
+  echo "worse${against:+ than $against}: $(printf '%s; ' "${worse[@]}" | sed 's/; $//')" >&2
   exit 1
 fi
-# `main` takes a commit only with this status, so it says that this run passed on that commit. A
-# budget this run lowered is left to commit, and the commit then needs a run of its own.
+# `main` takes a commit only with this status, so it says that this run passed on that commit, and
+# how many losses it passed with. A budget this run lowered is left to commit, and land.sh then
+# gives the commit this line as its status.
+passed="passed against ${against:0:12}"
+[ "$accepted" -eq 0 ] || passed+=", accepting $accepted named loss$([ "$accepted" -eq 1 ] || echo es)"
+[ -z "$against" ] || echo "$passed"
 if [ -n "$quick" ]; then
   echo "no check status: a --quick run leaves out the ratchet and the cost, so run without it last" >&2
 elif [ -z "$against" ] || [ -n "$uncommitted$(git status --porcelain)" ] || [ "$head" != "$(git rev-parse HEAD)" ]; then
   echo "no check status: that takes --against, on a commit with nothing left to commit" >&2
-elif ! gh api --silent "repos/{owner}/{repo}/statuses/$head" -f state=success -f context=check -f description="passed against ${against:0:12}"; then
+elif ! gh api --silent "repos/{owner}/{repo}/statuses/$head" -f state=success -f context=check -f description="$passed"; then
   echo "no check status: GitHub has to know $head, so push before the run" >&2
 fi

@@ -116,6 +116,31 @@ fn a_saved_edit_the_decompiler_refuses_costs_only_itself() {
 }
 
 #[test]
+fn a_declared_prototype_wins_over_the_one_a_kcfi_hash_names() {
+    // A kernel module whose `kernel_probe` has the hash of `int (struct platform_device *)`.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../core/tests/fixtures/module-arm64.o");
+    let mut client = Client::start_in(&edits_dir());
+    let decompile = |client: &mut Client| client.tool("decompile", json!({ "path": path, "functions": ["kernel_probe"], "timeout": 60.0 })).unwrap();
+    let c_text = decompile(&mut client);
+    assert!(c_text.contains("int4 kernel_probe(platform_device *param_1)\n"), "{c_text}");
+    client.tool("declare", json!({ "path": path, "code": "extern int8 kernel_probe(void *device);" })).unwrap();
+    let c_text = decompile(&mut client);
+    assert!(c_text.contains("int8 kernel_probe(void *device)\n"), "{c_text}");
+}
+
+#[test]
+fn a_declaration_under_a_functions_automatic_name_wins_over_its_hash() {
+    // `module-arm64.o` without `kernel_probe`'s symbol, so the function goes by its address.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/module-unnamed.o");
+    let mut client = Client::start_in(&edits_dir());
+    let decompile = |client: &mut Client| client.tool("decompile", json!({ "path": path, "functions": ["0xffff800000000258"], "timeout": 60.0 })).unwrap();
+    assert!(decompile(&mut client).contains("int4 func_0xffff800000000258(platform_device *param_1)\n"));
+    client.tool("declare", json!({ "path": path, "code": "extern int8 func_0xffff800000000258(void *device);" })).unwrap();
+    let c_text = decompile(&mut client);
+    assert!(c_text.contains("int8 func_0xffff800000000258(void *device)\n"), "{c_text}");
+}
+
+#[test]
 fn a_variable_keeps_the_name_it_is_given() {
     // `total` of the decompiler's fixture: a loop over a list that sums into one temporary.
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/types.elf");
@@ -269,6 +294,49 @@ fn data_is_told_by_what_its_pointers_reach() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/tables.elf");
     let record = Client::start().tool("addr", json!({ "path": path, "addr": "0x3d60" })).unwrap();
     assert_eq!(record, "address 0x3d60, file offset 0x2d60, in .data.rel.ro: .data.rel.ro holding {\"twice\", function 0x11b0, 0x8, \"Return the value doubled.\", ...}\n");
+}
+
+#[test]
+fn a_struct_printed_under_a_declared_name_answers_to_that_name() {
+    // `poll` at 0x401000 and `reset` at 0x40100c take a `struct device *` that the program
+    // declares and never defines, and read fields through it.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/opaque.elf");
+    let mut client = Client::start_in(&edits_dir());
+    let mut tool = |name: &str, mut arguments: Value| {
+        arguments["path"] = path.into();
+        client.tool(name, arguments)
+    };
+    assert!(tool("decompile", json!({ "functions": ["0x401000"] })).unwrap().contains("if (dev->field_0x10 < limit)"));
+    assert!(tool("structs", json!({ "function": "0x401000" })).unwrap().contains("RDI: S_401000_RDI, printed as device, 3 accesses"));
+    let layout = tool("type", json!({ "name": "device" })).unwrap();
+    assert!(layout.starts_with("struct device has no layout of its own.") && layout.ends_with(":\n  S_401000_RDI, of the function at 0x401000 in RDI\n"), "{layout}");
+    let renamed = tool("rename", json!({ "addr": "device.field_0x10", "name": "capacity" })).unwrap();
+    assert!(renamed.starts_with("S_401000_RDI.field_0x10 is now capacity\n"), "{renamed}");
+    assert!(tool("decompile", json!({ "functions": ["0x401000"] })).unwrap().contains("if (dev->capacity < limit)"));
+
+    // With `reset` decompiled too, two structs print as `device`.
+    tool("decompile", json!({ "functions": ["0x40100c"] })).unwrap();
+    let refused = tool("rename", json!({ "addr": "device.field_0x0", "name": "head" })).unwrap_err();
+    assert!(refused.contains("  S_401000_RDI, of the function at 0x401000 in RDI\n  S_40100c_RDI, of the function at 0x40100c in RDI\n"), "{refused}");
+}
+
+#[test]
+fn a_struct_kept_by_a_rename_still_answers_to_the_name_it_prints_as() {
+    // The first rename keeps `poll`'s struct in the edits. The next session reads it from them.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../decomp/tests/data/opaque.elf");
+    let edits = edits_dir();
+    let refused = Client::start_in(&edits).tool("rename", json!({ "path": path, "addr": "device.field_0x10", "name": "capacity" })).unwrap_err();
+    assert!(refused.ends_with("none is recovered yet. `structs` of a function that takes one names its struct.\nDecompile a function that takes one, then name `device.field_0x10` again"), "{refused}");
+    let session = || {
+        let mut client = Client::start_in(&edits);
+        client.tool("decompile", json!({ "path": path, "functions": ["0x401000"] })).unwrap();
+        client
+    };
+    session().tool("rename", json!({ "path": path, "addr": "device.field_0x10", "name": "capacity" })).unwrap();
+    let renamed = session().tool("rename", json!({ "path": path, "addr": "device.field_0x8", "name": "level" })).unwrap();
+    assert!(renamed.starts_with("S_401000_RDI.field_0x8 is now level\n"), "{renamed}");
+    let c_text = session().tool("decompile", json!({ "path": path, "functions": ["0x401000"] })).unwrap();
+    assert!(c_text.contains("if (dev->capacity < limit) {\n    dev->level = limit;"), "{c_text}");
 }
 
 #[test]

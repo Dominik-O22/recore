@@ -4,7 +4,7 @@
     "again": 68496939,
     "setup": 830085595,
     "decompile": 2449617002,
-    "lookups": 472924363,
+    "lookups": 464377604,
     "dataflow": 2052034969,
     "diff": 1941958795
   },
@@ -23,7 +23,7 @@
     "setup": 489961811,
     "decompile": 2449898507,
     "lookups": 103126821,
-    "dataflow": 4194553492,
+    "dataflow": 3017840654,
     "diff": 280469992
   },
   "corpus-arm64/bin/deb__gzip__gzip": {
@@ -58,7 +58,7 @@
     "again": 889250516,
     "setup": 2311582137,
     "decompile": 1300696048,
-    "lookups": 418998905,
+    "lookups": 410709256,
     "dataflow": 2137127992,
     "diff": 5482040297
   },
@@ -112,7 +112,7 @@
     "again": 847196439,
     "setup": 2731337123,
     "decompile": 5066217008,
-    "lookups": 408473107,
+    "lookups": 402827375,
     "dataflow": 2621689100,
     "diff": 5288846811
   },
@@ -140,7 +140,7 @@
     "setup": 225743260,
     "decompile": 2343958482,
     "lookups": 72601734,
-    "dataflow": 2026323226,
+    "dataflow": 1964882161,
     "diff": 29656821
   },
   "corpus-armhf/bin/deb__openssh-client__ssh-agent": {
@@ -157,7 +157,7 @@
     "again": 50458135,
     "setup": 328522411,
     "decompile": 1034084891,
-    "lookups": 73832457,
+    "lookups": 72786758,
     "dataflow": 3459085534,
     "diff": 304420432
   },
@@ -266,7 +266,7 @@
     "setup": 402929424,
     "decompile": 1120169514,
     "lookups": 76802483,
-    "dataflow": 2752912936,
+    "dataflow": 1082244353,
     "diff": 95878714
   },
   "corpus-pe32/bin/php83__php_opcache.dll": {
@@ -284,7 +284,7 @@
     "setup": 1352875696,
     "decompile": 772247427,
     "lookups": 809497567,
-    "dataflow": 1200733310,
+    "dataflow": 1046169616,
     "diff": 1390990766
   },
   "corpus/bin/binutils__strip": {
@@ -297,11 +297,11 @@
     "diff": 43451821
   },
   "corpus/bin/deb__cmake__ctest": {
-    "analysis": 4426641818,
+    "analysis": 4466764952,
     "again": 74167436,
     "setup": 966501178,
     "decompile": 1655982028,
-    "lookups": 453218735,
+    "lookups": 444321048,
     "dataflow": 7712338775,
     "diff": 6221475023
   },
@@ -320,7 +320,7 @@
     "setup": 411745665,
     "decompile": 1693717882,
     "lookups": 60823615,
-    "dataflow": 9275553287,
+    "dataflow": 7770443625,
     "diff": 10537677
   },
   "corpus/bin/fd__fd": {
