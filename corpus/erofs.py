@@ -12,7 +12,9 @@ MAGIC = 0xE0F5E1E2
 # Larger than any file read here: modules are at most a few MB, directories a few KB.
 MAX_FILE = 256 << 20
 MAX_DEPTH = 32
-INCOMPAT_ZERO_PADDING, INCOMPAT_48BIT = 0x1, 0x80
+INCOMPAT_ZERO_PADDING = 0x1
+# The version bit and the three of the data layout (EROFS_I_ALL).
+I_FORMAT_BITS = 0xF
 PLAIN, HEAD1, NONHEAD, HEAD2 = 0, 1, 2, 3
 FLAT_PLAIN, COMPRESSED_FULL, FLAT_INLINE, COMPRESSED_COMPACT = 0, 1, 2, 3
 ADVISE_COMPACTED_2B, ADVISE_BIG_PCLUSTER_1, ADVISE_BIG_PCLUSTER_2 = 0x1, 0x2, 0x4
@@ -53,6 +55,9 @@ class Image:
         if self.incompat & ~0x7F:
             raise ValueError(f"incompatible features {self.incompat:#x}")
         self.zero_padding = bool(self.incompat & INCOMPAT_ZERO_PADDING)
+        extra_devices, = struct.unpack_from("<H", sb, 86)
+        if extra_devices:
+            raise ValueError(f"{extra_devices} extra devices")
 
     def read(self, offset, n):
         if n == 0:
@@ -66,6 +71,8 @@ class Image:
         iloc = self.meta * self.blksz + nid * 32
         h = self.read(iloc, 32)
         fmt, xcount, mode = struct.unpack_from("<HHH", h, 0)
+        if fmt & ~I_FORMAT_BITS:
+            raise ValueError(f"inode {nid}: i_format {fmt:#x}")
         if fmt & 1:
             h = self.read(iloc, 64)
             size, = struct.unpack_from("<Q", h, 8)
@@ -84,6 +91,8 @@ class Image:
             return self.read(ino["u"] * self.blksz, size)
         if layout == FLAT_INLINE:
             full = size // self.blksz * self.blksz
+            if ino["end"] % self.blksz + size - full > self.blksz:
+                raise ValueError(f"inode {ino['nid']}: its inline tail crosses a block")
             return self.read(ino["u"] * self.blksz, full) + self.read(ino["end"], size - full)
         if layout in (COMPRESSED_FULL, COMPRESSED_COMPACT):
             return Compressed(self, ino).data()
@@ -114,8 +123,10 @@ class Image:
         seen = set()
 
         def walk(directory, path, depth):
-            if directory["nid"] in seen or depth > MAX_DEPTH:
-                raise ValueError(f"directory {directory['nid']} at {path or '/'} is reached twice or too deep")
+            if directory["nid"] in seen:
+                raise ValueError(f"directory {directory['nid']} at {path or '/'} is reached twice")
+            if depth > MAX_DEPTH:
+                raise ValueError(f"directory {directory['nid']} at {path} is deeper than {MAX_DEPTH}")
             seen.add(directory["nid"])
             for name, nid in self.entries(directory):
                 ino = self.inode(nid)

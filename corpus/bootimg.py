@@ -6,7 +6,7 @@ in binary. A ramdisk is an LZ4 stream of the legacy format holding cpio "newc" a
 image gives is checked against it, and a ramdisk inflates to at most MAX_RAMDISK, or raises
 ValueError. The format is AOSP's system/tools/mkbootimg.
 """
-import ctypes, stat, struct
+import ctypes, re, stat, struct
 
 from erofs import LZ4
 
@@ -45,6 +45,9 @@ def cpio(data):
             if data[pos:].strip(b"\0"):
                 raise ValueError(f"no cpio header at {pos}")
             return
+        # int(x, 16) alone would take a sign, spaces or `_`, and a negative size loops.
+        if not re.fullmatch(rb"[0-9a-fA-F]{104}", data[pos + 6:pos + 110]):
+            raise ValueError(f"a cpio header at {pos} with a field of other than eight hex digits")
         fields = [int(data[pos + 6 + 8 * k:pos + 14 + 8 * k], 16) for k in range(13)]
         mode, filesize, namesize = fields[1], fields[6], fields[11]
         name_at = pos + 110
@@ -71,14 +74,14 @@ def ramdisk_files(f, suffix=""):
 
     h = read(0, 2128)
     magic, version, page = struct.unpack_from("<8sII", h, 0)
-    if magic != b"VNDRBOOT" or version not in (3, 4) or page not in (2048, 4096, 16384):
+    if magic != b"VNDRBOOT" or version not in (3, 4) or page not in (2048, 4096, 8192, 16384):
         raise ValueError(f"not a vendor_boot image of version 3 or 4: {magic} {version} {page}")
     ramdisk_size, = struct.unpack_from("<I", h, 24)
     header_size, = struct.unpack_from("<I", h, 2096)
     start = -(-header_size // page) * page
     section = read(start, ramdisk_size)
     if version == 3:
-        ramdisks = [section]
+        ramdisks = [(0, ramdisk_size)]
     else:
         dtb_size, = struct.unpack_from("<I", h, 2100)
         table_size, entries, entry_size = struct.unpack_from("<III", h, 2112)
@@ -91,8 +94,9 @@ def ramdisk_files(f, suffix=""):
             size, offset = struct.unpack_from("<II", table, k * entry_size)
             if offset + size > ramdisk_size:
                 raise ValueError(f"ramdisk {k} runs past the ramdisk section")
-            ramdisks.append(section[offset:offset + size])
-    for ramdisk in ramdisks:
-        for path, mode, data in cpio(lz4_legacy(ramdisk)):
+            ramdisks.append((offset, size))
+    # Entries may overlap, so each ramdisk is cut from the section only when it is read.
+    for offset, size in ramdisks:
+        for path, mode, data in cpio(lz4_legacy(section[offset:offset + size])):
             if stat.S_ISREG(mode) and path.endswith(suffix):
                 yield path, data

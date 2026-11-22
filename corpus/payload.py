@@ -7,7 +7,7 @@ the payload before it is read, a blob is decompressed only to the size its exten
 blob's sha256 and each partition's sha256 must match the manifest, and a partition gets its name
 only once it matched. The format is system/update_engine/update_metadata.proto of AOSP.
 """
-import bz2, hashlib, lzma, re, struct, zipfile
+import bz2, functools, hashlib, lzma, re, struct, zipfile
 from compression import zstd
 from pathlib import Path
 
@@ -17,7 +17,7 @@ MAX_MANIFEST = 64 << 20
 MAX_PARTITION = 2 << 30
 REPLACE, ZERO, DISCARD = 0, 6, 7
 # REPLACE_BZ, REPLACE_XZ and ZSTD.
-DECOMPRESSORS = {1: bz2.BZ2Decompressor, 8: lzma.LZMADecompressor, 14: zstd.ZstdDecompressor}
+DECOMPRESSORS = {1: bz2.BZ2Decompressor, 8: functools.partial(lzma.LZMADecompressor, lzma.FORMAT_XZ), 14: zstd.ZstdDecompressor}
 
 
 def varint(b, i):
@@ -165,16 +165,20 @@ def extract(zpath, outdir, names):
             if psize > MAX_PARTITION:
                 raise ValueError(f"{name}: {psize} bytes")
             part = outdir / f"{name}.img.part"
-            with open(part, "wb") as out:
-                out.truncate(psize)
-                for op in ops:
-                    operation(payload, op, psize, out)
-            h = hashlib.sha256()
-            with open(part, "rb") as i:
-                while chunk := i.read(1 << 24):
-                    h.update(chunk)
-            if h.digest() != info.get(2):
-                raise ValueError(f"{name}: the partition's hash does not match the manifest")
+            try:
+                with open(part, "wb") as out:
+                    out.truncate(psize)
+                    for op in ops:
+                        operation(payload, op, psize, out)
+                h = hashlib.sha256()
+                with open(part, "rb") as i:
+                    while chunk := i.read(1 << 24):
+                        h.update(chunk)
+                if h.digest() != info.get(2):
+                    raise ValueError(f"{name}: the partition's hash does not match the manifest")
+            except BaseException:
+                part.unlink(missing_ok=True)
+                raise
             written[name] = part.rename(outdir / f"{name}.img")
     if missing := set(names) - written.keys():
         raise ValueError(f"no partition {sorted(missing)} in the payload")

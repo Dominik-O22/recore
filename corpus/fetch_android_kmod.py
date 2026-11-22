@@ -17,18 +17,18 @@ module as `llvm-strip --strip-unneeded` leaves it, with the symbols its relocati
 need and the `$x` and `$d` mapping symbols, so that recore finds the rest itself.
 PHONES, the modules that MediaTek, Qualcomm and Unisoc built for a phone, read out of its full
 OTA by payload.py, erofs.py and bootimg.py: as OLDER, as shipped and stripped. Only the two
-partitions they come from are kept in pkgs/, not the OTA. `python3 -I test_android_readers.py`
+partitions they come from are kept in pkgs/, not the OTA. Those readers need Python 3.14, for
+zstd, and liblz4, and only a phone's corpora import them. `python3 -I test_android_readers.py`
 tests the three readers on images made in the test.
 A module is held out when the CRC-32 of its name is 0 modulo 3, the same rule for every build.
 The downloads are kept in the tuned corpus's pkgs/, and the corpus's truth/ is written last, so
 that check.sh never takes a corpus half made. A corpus that has truth/ is left as it is.
 """
-import functools, hashlib, os, re, shutil, subprocess, sys, tarfile, urllib.request, zlib
+import functools, hashlib, importlib, itertools, os, re, shutil, subprocess, sys, tarfile, urllib.request, zlib
 from pathlib import Path, PurePosixPath
 
 # `-I` leaves the script's directory off the path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import bootimg, erofs, payload  # noqa: E402
 from store import CORPORA  # noqa: E402
 
 GKI = "https://ci.android.com/builds/submitted/17002073/kernel_aarch64/latest/raw"
@@ -69,26 +69,38 @@ PHONES = {
     ),
 }
 PARTITIONS = ("vendor_boot", "vendor_dlkm")
-GKI_SIGNATURE = b"~Module signature appended~\n"
+# The end of every signed module, whatever key signed it.
+SIGNED = b"~Module signature appended~\n"
+# Bytes of .ko files read from one phone's partitions, copies included, which phone() holds in
+# memory. duchamp's come to 87 MB, houji's to 167 MB and serenity's to 52 MB.
+MAX_PHONE_MODULES = 1 << 30
 
 
 def held_out(module):
     return zlib.crc32(module.encode()) % 3 == 0
 
 
-def download(url, pkgs, name):
-    """Downloads `url` once, into a directory of its own in `pkgs`. A download cut short gets no
-    name: it is held to the length the server sent, and an archive, for which Gitiles sends none,
+def download(url, pkgs, name, sha256=None):
+    """Downloads `url` once, into a directory of its own in `pkgs`, and says how large it is
+    first. A download cut short or, given `sha256`, with other bytes gets no name: it is held to
+    the length the server sent and the hash, and an archive, for which Gitiles sends no length,
     is read to its end."""
     dest = pkgs / name / Path(url).name
     if not dest.exists():
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(".part")
+        h = hashlib.sha256()
         with urllib.request.urlopen(url, timeout=180) as response, open(tmp, "wb") as out:
-            shutil.copyfileobj(response, out)
             length = response.headers.get("Content-Length")
+            print(f"downloading {url}, {'size unknown' if length is None else f'{int(length) / 1e9:.1f} GB'}", flush=True)
+            while chunk := response.read(1 << 20):
+                h.update(chunk)
+                out.write(chunk)
         if length is not None and tmp.stat().st_size != int(length):
             sys.exit(f"{url}: got {tmp.stat().st_size} of {length} bytes")
+        if sha256 is not None and h.hexdigest() != sha256:
+            tmp.unlink()
+            sys.exit(f"{url}: sha256 {h.hexdigest()}, not {sha256}")
         if dest.name.endswith(".tar.gz"):
             with tarfile.open(tmp) as tar:
                 tar.getmembers()
@@ -138,35 +150,40 @@ def older(name, pkgs):
     return modules(download(OLDER[name], pkgs, name), ".")
 
 
+def readers():
+    """payload, erofs and bootimg, which need Python 3.14, for zstd, and liblz4."""
+    try:
+        return [importlib.import_module(m) for m in ("payload", "erofs", "bootimg")]
+    except (ImportError, OSError) as e:
+        sys.exit(f"a phone's corpora need Python 3.14, for compression.zstd, and liblz4: {e}")
+
+
 def phone(name, pkgs):
     """Maps module name to the bytes of each module of the phone `name` of PHONES that its chip's
-    maker built: every .ko file in vendor_dlkm and in vendor_boot's ramdisks but those that end in
-    the signature of a GKI module, which the GKI corpus holds. system_dlkm, which holds only GKI
-    modules, is not read, so a module of the vendor's own that has a GKI namesake, such as
-    MediaTek's and Unisoc's zram.ko, is kept. Of copies with one name, vendor_dlkm's is kept."""
+    maker built: every .ko file in vendor_dlkm and in vendor_boot's ramdisks but a signed one,
+    as GKI's are, which the GKI corpus holds. On these three phones no module there is signed,
+    so it is leaving out system_dlkm, which holds the GKI modules, that decides the set:
+    a module of the vendor's own that has a GKI namesake, such as MediaTek's and Unisoc's
+    zram.ko, is kept. Of copies with one name, vendor_dlkm's is kept."""
+    payload, erofs, bootimg = readers()
     url, sha256 = PHONES[name]
     images = pkgs / name
     if not all((images / f"{p}.img").exists() for p in PARTITIONS):
-        ota = download(url, pkgs, f"{name}-ota")
-        h = hashlib.sha256()
-        with open(ota, "rb") as f:
-            while chunk := f.read(1 << 24):
-                h.update(chunk)
-        if h.hexdigest() != sha256:
-            sys.exit(f"{url}: sha256 {h.hexdigest()}, not {sha256}")
+        print(f"{name}: of the full OTA only {' and '.join(PARTITIONS)} are kept, in {images}")
+        ota = download(url, pkgs, f"{name}-ota", sha256)
         payload.extract(ota, images, PARTITIONS)
         shutil.rmtree(ota.parent)
-    with open(images / "vendor_dlkm.img", "rb") as f:
-        files = list(erofs.Image(f).files(".ko"))
-    with open(images / "vendor_boot.img", "rb") as f:
-        files += list(bootimg.ramdisk_files(f, ".ko"))
-    found = {}
-    for path, data in files:
-        module = PurePosixPath(path).stem
-        if not re.fullmatch(r"\w[\w.+-]*", module):
-            sys.exit(f"{name}: a module named {module!r}")
-        if not data.endswith(GKI_SIGNATURE):
-            found.setdefault(module, data)
+    found, total = {}, 0
+    with open(images / "vendor_dlkm.img", "rb") as dlkm, open(images / "vendor_boot.img", "rb") as boot:
+        for path, data in itertools.chain(erofs.Image(dlkm).files(".ko"), bootimg.ramdisk_files(boot, ".ko")):
+            total += len(data)
+            if total > MAX_PHONE_MODULES:
+                sys.exit(f"{name}: more than {MAX_PHONE_MODULES} bytes of modules")
+            module = PurePosixPath(path).stem
+            if not re.fullmatch(r"\w[\w.+-]*", module, re.ASCII):
+                sys.exit(f"{name}: a module named {module!r}")
+            if not data.endswith(SIGNED):
+                found.setdefault(module, data)
     return found
 
 
