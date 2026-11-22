@@ -70,6 +70,15 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   that register's trial active, so the function returns a value in the same decompilation.
   Upstream has no way to take what the callers show. Marked with `recore:` comments.
 
+- `cpp/funcdata_varnode.cc`, `Funcdata::onlyOpUse`: a value that reaches one of the function's
+  returns is still taken for what it returns when a call that never returns, to a function
+  with no declared prototype, also reads it. Upstream counts any call that reads the value
+  against it. A stack canary check is the case: the function sets its result before the
+  check, and the check's failing branch calls `__stack_chk_fail`, which takes nothing, but
+  without a prototype the engine takes the result register for its argument, and the function
+  came out `void`. A call to a function declared to take the value still counts, so a value
+  set up for `exit` is not returned. Marked with a `recore:` comment.
+
 - `cpp/coreaction.cc`, `ActionDeadCode::markConsumedParameters`: of a call to a variadic
   function, only the fixed parameters are taken as consumed whole. An argument past them is
   consumed as an argument of a call without a prototype is, up to its highest bit that can be

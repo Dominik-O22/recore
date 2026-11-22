@@ -1933,6 +1933,13 @@ bool Funcdata::onlyOpUse(const Varnode *invn,const PcodeOp *opmatch,const ParamT
       case CPUI_CALL:
       case CPUI_CALLIND:
 	if (checkCallDoubleUse(opmatch,op,vn,curFlags,trial)) continue;
+	// recore: a call that never returns and has no declared prototype does not veto a value
+	// that also reaches a return. Its inputs are a guess, and a stack canary check's call to
+	// __stack_chk_fail sees the result register the function set before the check.
+	if (opmatch->code() == CPUI_RETURN) {
+	  const FuncCallSpecs *fc = getCallSpecs(op);
+	  if (fc->isNoReturn() && !fc->isInputLocked()) continue;
+	}
 	res = false;
 	break;
       case CPUI_INDIRECT:
