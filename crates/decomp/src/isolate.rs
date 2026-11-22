@@ -680,8 +680,9 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         session.keep_prototypes(callees_first || (jumped_to.contains(&addr) && !hands_on_registers));
         let start = Instant::now();
         prepare(&mut session, &mut importer, &edits, addr, true);
-        // Reading the callers costs more than what it changes in a function decompiled only for
-        // the parameters it takes, whose result no one sees.
+        // A function decompiled only for the parameters it takes, whose result no one sees, is
+        // not given its callers here: reading them costs more than what it changes. Where the
+        // session was given them before, it still takes what they read.
         let result = if matches!(request, Request::Decompile(_)) || keep { decompile(&mut session, &given, addr) } else { session.decompile(addr) };
         known.insert(addr);
         let ms = start.elapsed().as_secs_f64() * 1e3;

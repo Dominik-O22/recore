@@ -763,7 +763,9 @@ impl Session {
     /// calling a function of no known prototype does, and the code after one of them reads the
     /// register a result comes back in before anything writes it, that decompilation takes it
     /// as returning as many bytes as the widest such read, or the whole register where the
-    /// register also passes an argument. The session reads each function's callers once.
+    /// register also passes an argument, and no more than its own code holds of it. Not where
+    /// the function leaves that register as it found it: a caller that knows so goes on using
+    /// its own value. The session reads each function's callers once.
     pub fn callers(&mut self, function: u64, calls: &[u64]) {
         unsafe { ffi::rd_callers(self.raw.as_ptr(), function, calls.as_ptr(), calls.len()) }
     }

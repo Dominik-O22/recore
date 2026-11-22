@@ -2172,9 +2172,9 @@ static bool leaves_as_found(Funcdata &fd, ParamActive &active, int4 index) {
 }
 
 // Called where the engine found no value returned in the code of `fd`. If a caller reads the
-// result register after a call to it, makes that register the output, as wide as the widest read
-// or the part of it the function's code holds, whichever is narrower, or the whole register where
-// it also passes an argument. It marks the register's trial in `active` and says it did. Where no
+// result register after a call to it, makes that register the output: as wide as the widest read,
+// or the whole register where it also passes an argument, and no wider than the part of it the
+// function's code holds. It marks the register's trial in `active` and says it did. Where no
 // return could pass the value, it sets the output of the prototype instead.
 static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamActive &active) {
   Architecture *arch = session->arch;

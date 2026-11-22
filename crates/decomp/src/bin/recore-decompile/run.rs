@@ -1,9 +1,10 @@
 //! The parent side of a corpus run: plans shards, supervises child processes, writes reports.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,8 @@ struct Binary {
     fragments: usize,
     /// Shards not yet finished; the reports are written when it reaches zero.
     pending: usize,
+    /// The calls to each of `functions`, read once for all its shards: see [`callers_of`].
+    callers: Arc<Callers>,
     records: Vec<FunctionRecord>,
     c_text: Vec<(u64, String)>,
 }
@@ -61,15 +64,19 @@ pub fn corpus(config: &Config) -> Result<()> {
     paths.sort();
     let start = Instant::now();
 
-    // The parent analyzes each binary only to learn which functions exist. Each child repeats
-    // the analysis, which costs far less than shipping the result to it would save.
+    // The parent analyzes each binary only to learn which functions exist and the calls to
+    // them. Each child repeats the analysis, which costs far less than shipping the result to it
+    // would save.
     let planned: Mutex<Vec<Binary>> = Mutex::new(Vec::new());
     let functions_of = |path: &PathBuf| match &config.sample {
         Some((count, debug_dir)) => sampled(path, *count, debug_dir),
         None => plan(path),
     };
     for_each(&paths, config.jobs, |path| match functions_of(path) {
-        Ok(binary) => planned.lock().unwrap().push(binary),
+        Ok(mut binary) => {
+            binary.callers = Arc::new(callers_of(path, &binary.functions));
+            planned.lock().unwrap().push(binary);
+        }
         Err(error) => eprintln!("{}: skipped: {error:#}", path.display()),
     });
     let mut binaries = planned.into_inner().unwrap();
@@ -89,8 +96,11 @@ pub fn corpus(config: &Config) -> Result<()> {
     let fragments: usize = binaries.iter().map(|b| b.lock().unwrap().fragments).sum();
     let finished: Mutex<Vec<(String, Vec<FunctionRecord>)>> = Mutex::new(Vec::new());
     for_each(&shards, config.jobs, |(index, addrs)| {
-        let path = binaries[*index].lock().unwrap().path.clone();
-        let (records, c_text) = run_shard(&config.worker, config.timeout, &path, addrs);
+        let (path, callers) = {
+            let binary = binaries[*index].lock().unwrap();
+            (binary.path.clone(), binary.callers.clone())
+        };
+        let (records, c_text) = run_shard(&config.worker, config.timeout, &path, addrs, &callers);
         let mut binary = binaries[*index].lock().unwrap();
         binary.records.extend(records);
         binary.c_text.extend(c_text);
@@ -119,6 +129,7 @@ fn plan(path: &Path) -> Result<Binary> {
         functions: functions.iter().map(|f| f.addr).collect(),
         fragments: fragments.len(),
         pending: 0,
+        callers: Arc::default(),
         records: Vec::new(),
         c_text: Vec::new(),
     })
@@ -138,11 +149,12 @@ fn sampled(path: &Path, count: usize, debug_dir: &Path) -> Result<Binary> {
     anyhow::ensure!(!listed.is_empty(), "its debug file lists no function");
     let taken = count.min(listed.len());
     let functions = (0..taken).map(|index| listed[index * listed.len() / taken]).collect();
-    Ok(Binary { name, path: path.to_path_buf(), functions, fragments: 0, pending: 0, records: Vec::new(), c_text: Vec::new() })
+    Ok(Binary { name, path: path.to_path_buf(), functions, fragments: 0, pending: 0, callers: Arc::default(), records: Vec::new(), c_text: Vec::new() })
 }
 
 /// Writes the reports of a binary whose shards are all done, and returns its records.
 fn finish(config: &Config, binary: &mut Binary) -> Result<Vec<FunctionRecord>> {
+    binary.callers = Arc::default();
     let mut functions = std::mem::take(&mut binary.records);
     functions.sort_by_key(|r| r.addr);
     let report = BinaryReport { name: binary.name.clone(), fragments_skipped: binary.fragments, functions };
@@ -158,9 +170,22 @@ fn finish(config: &Config, binary: &mut Binary) -> Result<Vec<FunctionRecord>> {
     Ok(report.functions)
 }
 
-/// Decompiles `addrs` in a worker process. A worker that dies or stalls costs only the function
-/// it was working on: that one is recorded as crashed or timed out.
-pub fn run_shard(options: &Options, timeout: Duration, binary: &Path, addrs: &[u64]) -> (Vec<FunctionRecord>, Vec<(u64, String)>) {
+/// The calls to each function, as [`returning_callers`] picks them.
+type Callers = HashMap<u64, Vec<u64>>;
+
+/// The calls to each of `functions` of the binary at `path`, from the analysis the worker keeps
+/// on disk. A binary that does not load has none, and fails in the worker.
+fn callers_of(path: &Path, functions: &[u64]) -> Callers {
+    let Ok(image) = recore::Image::load(path) else { return Callers::new() };
+    let analysis = recore::cache::analyze(path, &image);
+    let program = Program::new(image, analysis);
+    functions.iter().map(|&addr| (addr, returning_callers(&program, addr))).collect()
+}
+
+/// Decompiles `addrs` in a worker process, each given its calls from `callers`. A worker that
+/// dies or stalls costs only the function it was working on: that one is recorded as crashed or
+/// timed out.
+pub fn run_shard(options: &Options, timeout: Duration, binary: &Path, addrs: &[u64], callers: &Callers) -> (Vec<FunctionRecord>, Vec<(u64, String)>) {
     let command = || {
         // Without the path of this program no child starts, and each function reports that.
         let mut command = Command::new(std::env::current_exe().unwrap_or_default());
@@ -168,13 +193,9 @@ pub fn run_shard(options: &Options, timeout: Duration, binary: &Path, addrs: &[u
         command
     };
     let mut worker = Worker::new(command, binary, options);
-    // The calls to each function, from the analysis the worker keeps on disk. A binary that does
-    // not load decompiles without them and fails in the worker.
-    if let Ok(image) = recore::Image::load(binary) {
-        let analysis = recore::cache::analyze(binary, &image);
-        let program = Program::new(image, analysis);
-        for &addr in addrs {
-            worker.callers(addr, || returning_callers(&program, addr));
+    for &addr in addrs {
+        if let Some(calls) = callers.get(&addr) {
+            worker.callers(addr, || calls.clone());
         }
     }
     let mut records = Vec::new();
@@ -245,9 +266,10 @@ pub fn functions(binary: &Path, wanted: &[String], all: bool, jobs: usize, timeo
         vec![wanted.iter().map(resolve).collect::<Result<_>>()?]
     };
 
+    let callers = callers_of(binary, &shards.concat());
     let results: Mutex<Vec<(FunctionRecord, Option<String>)>> = Mutex::new(Vec::new());
     for_each(&shards, jobs, |addrs| {
-        let (records, mut texts) = run_shard(&worker, timeout, binary, addrs);
+        let (records, mut texts) = run_shard(&worker, timeout, binary, addrs, &callers);
         let with_text = records.into_iter().map(|record| {
             let text = texts.iter().position(|text| text.0 == record.addr).map(|index| texts.swap_remove(index).1);
             (record, text)
