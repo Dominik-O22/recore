@@ -8,8 +8,8 @@
 //! library archive (glibc and what Linux programs commonly link) and `data/macos.protos` from
 //! the macOS archive. `ghidra/ExportPrototypes.java` writes those files. A kernel module's
 //! imports are the Linux kernel's exports instead, which `data/kernel.protos` describes, made
-//! from the kernel's BTF by `data/kernel_protos.py`. A C++ import that none of them lists takes
-//! the parameters its mangled name gives.
+//! from kernels' BTF and older kernels' headers by `data/kernel_protos.py`. A C++ import that
+//! none of them lists takes the parameters its mangled name gives.
 
 use std::collections::HashSet;
 

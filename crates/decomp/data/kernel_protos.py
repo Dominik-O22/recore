@@ -1,6 +1,6 @@
 """Writes kernel.protos: the prototypes of the functions Linux kernels export to their modules.
 
-    python3 -I kernel_protos.py <kernel> <exports> [<kernel> <exports> ...] > kernel.protos
+    python3 -I kernel_protos.py <kernel> <exports> [<kernel> <exports> ...] [--headers <file>] > kernel.protos
 
 Each kernel is a raw `Image` or a `vmlinux`, both of which carry the kernel's BTF. Its exports
 are a `vmlinux.symvers`, or a `System.map` or `nm vmlinux` listing, whose `__ksymtab_` symbols
@@ -11,6 +11,24 @@ from these, newest first:
    https://ci.android.com/builds/submitted/17002073/kernel_aarch64/latest/raw/<name>.
 2. The Pixel 9's android14-6.1 kernel of 25Q1: `Image.lz4`, decompressed, and `System.map` from
    https://android.googlesource.com/device/google/caimito-kernels/6.1/+archive/refs/heads/main/25Q1-12919773.tar.gz.
+3. The Pixel 7's android13-5.10 kernel: `Image.lz4`, decompressed, and `System.map` from the
+   archive corpus/fetch_android_kmod.py fetches for `pantah`. It gives the names the newer two
+   dropped or renamed, such as `printk`, which 5.15 made `_printk`.
+
+An old module's call to a function whose prototype changed takes the newest kernel's line. Of the
+4,244 names the 5.10 kernel shares with the newer two, 95 differ in their parameter count or in
+whether they return a value.
+
+The newer two build mac80211, cfg80211, bluetooth and usbnet as modules, so their images export
+none of those names, and the 5.10 line is the only one a 6.x module's call to them gets. Against
+the DWARF of the modules that import them, 9 of the 354 (module, name) pairs that take a line the
+5.10 kernel added differ, all 9 among the 193 of Debian's 6.12 arm64 modules: 8 mac80211 and
+cfg80211 names that 6.x gave more parameters, six a `link_id`, such as `ieee80211_nullfunc_get`,
+one a channel context, and `cfg80211_port_authorized` two.
+
+Kernels before 5.2 carry no BTF. `--headers kernel_headers.txt` adds, after every kernel, the
+lines of that file, written by hand from the headers of the Pixel 5's 4.19 and the Pixel 2's 4.4
+in this table's spelling, each under the header it came from.
 
 A kernel built with an older pahole, such as Debian's 6.12, gives its assembly functions, such as
 `__arch_copy_from_user`, the prototype `void (void)`, so it is not one of them.
@@ -45,7 +63,8 @@ Both tables spell `_Bool` as `bool`, `char` as `char`, any other integer by its 
 such as `uint4` for `unsigned int`, an enum as the integer it is stored in, and a float by its
 width.
 
-Both tables are made from Linux kernels, and Linux is licensed under the GPL-2.0.
+Both tables are made from Linux kernels, their BTF and their headers, and Linux is licensed under
+the GPL-2.0.
 """
 
 import collections
@@ -461,15 +480,27 @@ def kcfi_main(args):
         print(f"{hash:08x} {spelling} {line}")
 
 
+def written(path):
+    """The lines of a file of prototypes written by hand, by name."""
+    with open(path) as file:
+        lines = [line.rstrip("\n") for line in file if line.startswith("- ")]
+    return {line.split("(")[0].rsplit(" ", 1)[-1].lstrip("*"): line for line in lines}
+
+
 def main():
     if sys.argv[1:2] == ["--kcfi"]:
         return kcfi_main(sys.argv[2:])
+    args, headers = sys.argv[1:], None
+    if args[-2:-1] == ["--headers"]:
+        args, headers = args[:-2], args[-1]
     lines = {}
-    for kernel, exported in zip(sys.argv[1::2], sys.argv[2::2]):
+    for kernel, exported in zip(args[::2], args[1::2]):
         with open(kernel, "rb") as file:
             btf = Btf(find_btf(file.read()))
         for name, line in table(btf, exports(exported)).items():
             lines.setdefault(name, line)
+    for name, line in (written(headers) if headers else {}).items():
+        lines.setdefault(name, line)
     for name in sorted(lines):
         print(lines[name])
 
