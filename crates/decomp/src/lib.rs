@@ -748,7 +748,8 @@ impl Session {
     /// States that `function` returns what `callee` returns, because it ends by jumping to it.
     /// `callee` is a function this session has decompiled, or an import, by its slot, whose
     /// prototype is declared. Says whether the callee returns a value; if it does, `function`
-    /// is from now on decompiled as returning one too.
+    /// is from now on decompiled as returning one too. Not where the callers given with
+    /// [`Session::callers`] write the result register after their calls before they read it.
     pub fn returns_like(&mut self, function: u64, callee: recore::report::CallTarget) -> bool {
         let (callee, import) = match callee {
             recore::report::CallTarget::Function(entry) => (entry, false),
@@ -765,7 +766,10 @@ impl Session {
     /// as returning as many bytes as the widest such read, or the whole register where the
     /// register also passes an argument, and no more than its own code holds of it. Not where
     /// the function leaves that register as it found it: a caller that knows so goes on using
-    /// its own value. The session reads each function's callers once.
+    /// its own value. The other way, a function that returns only what a call it makes returned,
+    /// as `return g();` and a void function's last `g();` both compile, returns nothing where no
+    /// caller reads the register and one writes it first. The session reads each function's
+    /// callers once.
     pub fn callers(&mut self, function: u64, calls: &[u64]) {
         unsafe { ffi::rd_callers(self.raw.as_ptr(), function, calls.as_ptr(), calls.len()) }
     }
@@ -776,6 +780,15 @@ impl Session {
     pub fn callers_read(&mut self, function: u64, calls: &[u64]) -> bool {
         self.callers(function, calls);
         unsafe { ffi::rd_callers_read(self.raw.as_ptr(), function) != 0 }
+    }
+
+    /// Whether the last decompilation of `function` returned only what a call returned and the
+    /// code after each of `calls` that says writes the result register before it reads it, so
+    /// that its next decompilation, given them, returns nothing. Reads them as
+    /// [`Session::callers_read`] does.
+    pub fn callers_overwrite(&mut self, function: u64, calls: &[u64]) -> bool {
+        self.callers(function, calls);
+        unsafe { ffi::rd_callers_overwrite(self.raw.as_ptr(), function) != 0 }
     }
 
     /// With `keep`, every later [`Session::decompile`] prints each line of C after the address of

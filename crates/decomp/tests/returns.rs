@@ -141,3 +141,136 @@ fn the_function_after_a_call_that_never_comes_back_is_no_caller_reading() {
     assert!(!one_decompilation_returns(&code, &[0x1006]));
 }
 
+
+/// A session on `code`, raw code for `target` at 0x1000, with the slot of the import `import` at
+/// 0x1100 and a stub of it at 0x10f0. The C library archive says the import returns a value.
+fn importing_session(target: Target, import: &str, code: &[u8]) -> Session {
+    use recore_decomp::prototypes::{self, Platform};
+    let mut code = code.to_vec();
+    code.resize(0x108, 0);
+    let mut session = Session::new(&vendored_spec_dir().unwrap(), target, &[Section { addr: 0x1000, data: &code, readonly: true, code: true }]).unwrap();
+    session.add_import(0x1100, import, false).unwrap();
+    prototypes::declare(&mut session, target, Platform::Linux, [import].into_iter()).unwrap();
+    session.alias_import(0x10f0, 0x1100).unwrap();
+    session
+}
+
+/// Whether one decompilation of the function at 0x1010 of an [`importing_session`] returns a
+/// value, given the call at 0x1000 as its caller. With `tail`, the function ends by jumping to
+/// the import, which the worker says before it decompiles a function.
+fn passing_on_returns(target: Target, import: &str, code: &[u8], tail: bool) -> bool {
+    let mut session = importing_session(target, import, code);
+    session.callers(0x1010, &[0x1000]);
+    if tail {
+        session.returns_like(0x1010, recore::report::CallTarget::Import(0x1100));
+    }
+    let function = session.decompile(0x1010).unwrap();
+    println!("{}", function.c_text);
+    function.returns_value
+}
+
+/// AArch64 code at 0x1000 that calls 0x1010 and runs on into `after`, with `callee` at 0x1010.
+fn aarch64_calling(after: &[u32], callee: &[u32]) -> Vec<u8> {
+    // bl 0x1010
+    let mut words = vec![0x9400_0004];
+    words.extend(after);
+    words.resize(4, 0xd503_201f);
+    words.extend(callee);
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+/// bl 0x10f0, from 0x1010: a call to the import's stub.
+const BL_IMPORT: u32 = 0x9400_0038;
+const RET: u32 = 0xd65f_03c0;
+
+#[test]
+fn a_function_that_passes_on_a_calls_result_returns_nothing_where_its_callers_overwrite_it() {
+    // `close` returns an int, which AArch64 passes in w0 and the function's return in all of x0.
+    let passes_on = [BL_IMPORT, RET];
+    let returns = |after: &[u32]| passing_on_returns(Target::Aarch64, "close", &aarch64_calling(after, &passes_on), false);
+    // mov w0, #0; ret
+    assert!(!returns(&[0x5280_0000, RET]));
+    // add w0, w0, #1; ret
+    assert!(returns(&[0x1100_0400, RET]));
+    // ret: the caller passes the result on, which says nothing.
+    assert!(returns(&[RET]));
+}
+
+#[test]
+fn a_function_that_jumps_to_one_that_returns_a_value_returns_nothing_where_its_callers_overwrite_it() {
+    // jmp [rip+0xea], to lseek through its slot at 0x1100.
+    let jumps = [0xff, 0x25, 0xea, 0x00, 0x00, 0x00];
+    // xor eax, eax; ret
+    assert!(!passing_on_returns(Target::X86_64Gcc, "lseek", &calling(&[0x31, 0xc0, 0xc3], &jumps), true));
+    // add eax, 1; ret
+    assert!(passing_on_returns(Target::X86_64Gcc, "lseek", &calling(&[0x83, 0xc0, 0x01, 0xc3], &jumps), true));
+}
+
+#[test]
+fn a_declared_result_stands_whatever_the_callers_do() {
+    // jmp [rip+0xea], to lseek, with a caller that sets eax after the call: xor eax, eax; ret.
+    let code = calling(&[0x31, 0xc0, 0xc3], &[0xff, 0x25, 0xea, 0x00, 0x00, 0x00]);
+    let mut session = importing_session(Target::X86_64Gcc, "lseek", &code);
+    session.name_function(0x1010, "jumper").unwrap();
+    // Settled as returning what lseek returns before the callers are known, then declared.
+    assert!(session.returns_like(0x1010, recore::report::CallTarget::Import(0x1100)));
+    session.declare("extern int8 jumper(void);").unwrap();
+    session.callers(0x1010, &[0x1000]);
+    session.returns_like(0x1010, recore::report::CallTarget::Import(0x1100));
+    let function = session.decompile(0x1010).unwrap();
+    assert!(function.returns_value, "{}", function.c_text);
+}
+
+#[test]
+fn a_value_of_a_functions_own_is_returned_whatever_its_callers_do() {
+    // bl close; mov w0, #1; ret, with a caller that sets w0: mov w0, #0; ret.
+    let own = [BL_IMPORT, 0x5280_0020, RET];
+    assert!(passing_on_returns(Target::Aarch64, "close", &aarch64_calling(&[0x5280_0000, RET], &own), false));
+}
+
+/// A worker on raw x86-64 code where the function at 0x1010 jumps to the one at 0x1020, which
+/// returns 1, and the one at 0x1000 calls it and sets eax after: call 0x1010; xor eax, eax; ret.
+/// The function at 0x1008 calls 0x1020, which makes that a function of its own.
+fn jumping_worker(name: &str) -> (Worker, Program) {
+    let mut code = vec![0xe8, 0x0b, 0x00, 0x00, 0x00, 0x31, 0xc0, 0xc3];
+    // call 0x1020; ret
+    code.extend([0xe8, 0x13, 0x00, 0x00, 0x00, 0xc3]);
+    code.resize(0x10, 0xcc);
+    // jmp 0x1020
+    code.extend([0xe9, 0x0b, 0x00, 0x00, 0x00]);
+    code.resize(0x20, 0xcc);
+    // mov eax, 1; ret
+    code.extend([0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3]);
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("code.bin"), &code).unwrap();
+    let layout = format!("machine = \"x86-64\"\nentry = [0x1000, 0x1008]\n[[region]]\nfile = \"code.bin\"\noffset = 0\nlength = {}\naddress = 0x1000\nexecutable = true\n", code.len());
+    std::fs::write(dir.join("image.toml"), layout).unwrap();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_recore-decompile"));
+        command.arg("worker");
+        command
+    };
+    let worker = Worker::new(command, &dir.join("image.toml"), &Options::default());
+    (worker, Program::load(&dir.join("image.toml")).unwrap())
+}
+
+#[test]
+fn a_function_that_jumps_to_one_that_returns_a_value_returns_nothing_where_its_caller_overwrites_it() {
+    let (mut worker, program) = jumping_worker("jumps-overwritten");
+    assert_eq!(returning_callers(&program, 0x1010), [0x1000]);
+    worker.callers(0x1010, || returning_callers(&program, 0x1010));
+    let (record, c_text) = worker.decompile(0x1010, Duration::from_secs(60));
+    assert!(!record.returns_value, "{}", c_text.unwrap_or_default());
+}
+
+#[test]
+fn a_result_kept_from_before_the_callers_were_given_takes_what_they_overwrite() {
+    let (mut worker, program) = jumping_worker("jumps-kept");
+    // Decompiled ahead of its caller, the function at 0x1010 returns what 0x1020 returns.
+    let (record, _) = worker.decompile(0x1000, Duration::from_secs(60));
+    assert_eq!(record.status, Status::Ok, "{:?}", record.message);
+    worker.callers(0x1010, || returning_callers(&program, 0x1010));
+    let (record, c_text) = worker.decompile(0x1010, Duration::from_secs(60));
+    assert!(!record.returns_value, "{}", c_text.unwrap_or_default());
+}

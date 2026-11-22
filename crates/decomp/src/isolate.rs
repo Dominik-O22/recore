@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use recore::edits::Edits;
 use recore::structs::{Recovered, auto_function};
 
-use crate::{Converged, Decompiled, Facts, Flow, Instruction, Local, Session, Shape, StructReport, Style};
+use crate::{Converged, Facts, Flow, Instruction, Local, Session, Shape, StructReport, Style};
 
 /// Where switch targets come from.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -195,7 +195,8 @@ pub const CALLER_SAMPLE: usize = 32;
 /// Up to [`CALLER_SAMPLE`] of the calls to the function at `entry` that come back to the code
 /// after them, from other functions, picked at even steps through all the calls to it. Given to a
 /// [`Worker`] with [`Worker::callers`], they let the decompiler take the function as returning
-/// a value where its own code shows none and the code after one of them reads the result.
+/// a value where its own code shows none and the code after one of them reads the result, and
+/// as returning nothing where it only passes on a call's result and none reads it.
 pub fn returning_callers(program: &Program, entry: u64) -> Vec<u64> {
     let body = program.body(entry);
     let calls = program.call_indices_to(entry);
@@ -510,8 +511,13 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     };
     // A function that ends by jumping to another returns what that one returns, which the engine
     // does not see. Said before every decompilation, so that what a function returns does not
-    // depend on which tool asked first.
-    let settle_return = |session: &mut Session, entry: u64| {
+    // depend on which tool asked first. Where the function's own code cannot say whether it
+    // returns a value, the calls to it the parent gave may: `calls`, for a decompilation whose
+    // result is shown.
+    let settle_return = |session: &mut Session, entry: u64, calls: Option<&Vec<u64>>| {
+        if let Some(calls) = calls {
+            session.callers(entry, calls);
+        }
         for &callee in tail_callees.get(&entry).into_iter().flatten() {
             if session.returns_like(entry, callee) {
                 break;
@@ -520,14 +526,6 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     };
     // The calls to each function the parent gave with Request::Callers.
     let mut given: HashMap<u64, Vec<u64>> = HashMap::new();
-    // A function whose own code shows no value returned may still return one that a caller
-    // reads, which only the callers show. The session reads them only for such a function.
-    let decompile = |session: &mut Session, given: &HashMap<u64, Vec<u64>>, entry: u64| -> Result<Decompiled> {
-        if let Some(calls) = given.get(&entry) {
-            session.callers(entry, calls);
-        }
-        session.decompile(entry)
-    };
     // Results of functions decompiled ahead of a caller that are as good as asked for, each with
     // whether the function's callers had been given then.
     let mut ready: HashMap<u64, (Event, bool)> = HashMap::new();
@@ -576,27 +574,27 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Flow(addr) => {
-                settle_return(&mut session, addr);
+                settle_return(&mut session, addr, given.get(&addr));
                 prepare(&mut session, &mut importer, &edits, addr, true);
                 session.keep_flow(true);
-                let flow = decompile(&mut session, &given, addr).map(|function| function.flow.unwrap_or_default());
+                let flow = session.decompile(addr).map(|function| function.flow.unwrap_or_default());
                 session.keep_flow(false);
                 send(&Event::Flow(flow.map_err(|error| error.to_string())))?;
                 continue;
             }
             Request::Addressed(addr) => {
-                settle_return(&mut session, addr);
+                settle_return(&mut session, addr, given.get(&addr));
                 prepare(&mut session, &mut importer, &edits, addr, true);
                 session.keep_addresses(true);
-                let c_text = decompile(&mut session, &given, addr).map(|function| function.c_text);
+                let c_text = session.decompile(addr).map(|function| function.c_text);
                 session.keep_addresses(false);
                 send(&text(c_text))?;
                 continue;
             }
             Request::Locals(addr) => {
-                settle_return(&mut session, addr);
+                settle_return(&mut session, addr, given.get(&addr));
                 prepare(&mut session, &mut importer, &edits, addr, true);
-                send(&Event::Locals(decompile(&mut session, &given, addr).map(|function| function.locals).map_err(|error| error.to_string())))?;
+                send(&Event::Locals(session.decompile(addr).map(|function| function.locals).map_err(|error| error.to_string())))?;
                 continue;
             }
             Request::Recovered(ref name) => {
@@ -604,9 +602,9 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                     Some(found) => Some(found),
                     None => match auto_function(name) {
                         Some(function) => {
-                            settle_return(&mut session, function);
+                            settle_return(&mut session, function, given.get(&function));
                             prepare(&mut session, &mut importer, &edits, function, true);
-                            let _ = decompile(&mut session, &given, function);
+                            let _ = session.decompile(function);
                             session.recovered(name)
                         }
                         None => None,
@@ -616,9 +614,9 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 continue;
             }
             Request::Structs(addr) => {
-                settle_return(&mut session, addr);
+                settle_return(&mut session, addr, given.get(&addr));
                 prepare(&mut session, &mut importer, &edits, addr, true);
-                let report = decompile(&mut session, &given, addr).map_err(|error| error.to_string()).map(|_| session.structs_of(addr).unwrap_or_default());
+                let report = session.decompile(addr).map_err(|error| error.to_string()).map(|_| session.structs_of(addr).unwrap_or_default());
                 send(&Event::Structs(report))?;
                 continue;
             }
@@ -651,9 +649,11 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             Request::Decompile(addr) | Request::Parameters(addr) => addr,
         };
         if let (Request::Decompile(_), Some((event, with_callers))) = (&request, ready.remove(&addr)) {
-            // One that came out void before its callers were given returns a value if they read it.
+            // One that came out void before its callers were given returns a value if they read
+            // it, and one that passed on a call's result returns nothing if they overwrite it.
             let void = matches!(&event, Event::Done { record, .. } if !record.returns_value);
-            if with_callers || !void || !given.get(&addr).is_some_and(|calls| session.callers_read(addr, calls)) {
+            let overturned = |session: &mut Session, calls: &Vec<u64>| if void { session.callers_read(addr, calls) } else { session.callers_overwrite(addr, calls) };
+            if with_callers || !given.get(&addr).is_some_and(|calls| overturned(&mut session, calls)) {
                 send(&event)?;
                 continue;
             }
@@ -669,21 +669,22 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         // out as it would when asked for, so the result is kept for then.
         let keep = matches!(request, Request::Parameters(_)) && unknown(addr).iter().all(|callee| jumped_first.contains(callee));
         for target in jumped_first {
-            settle_return(&mut session, target);
+            settle_return(&mut session, target, None);
             session.keep_prototypes(!hands_on_registers);
             prepare(&mut session, &mut importer, &edits, target, false);
             // A failure here only leaves the caller as well off as it was.
             let _ = session.decompile(target);
             known.insert(target);
         }
-        settle_return(&mut session, addr);
-        session.keep_prototypes(callees_first || (jumped_to.contains(&addr) && !hands_on_registers));
-        let start = Instant::now();
-        prepare(&mut session, &mut importer, &edits, addr, true);
         // A function decompiled only for the parameters it takes, whose result no one sees, is
         // not given its callers here: reading them costs more than what it changes. Where the
         // session was given them before, it still takes what they read.
-        let result = if matches!(request, Request::Decompile(_)) || keep { decompile(&mut session, &given, addr) } else { session.decompile(addr) };
+        let shown = matches!(request, Request::Decompile(_)) || keep;
+        settle_return(&mut session, addr, given.get(&addr).filter(|_| shown));
+        session.keep_prototypes(callees_first || (jumped_to.contains(&addr) && !hands_on_registers));
+        let start = Instant::now();
+        prepare(&mut session, &mut importer, &edits, addr, true);
+        let result = session.decompile(addr);
         known.insert(addr);
         let ms = start.elapsed().as_secs_f64() * 1e3;
         let event = match result {
@@ -1021,8 +1022,9 @@ impl Worker {
     /// [`returning_callers`] picks them, for every later decompilation of it that is shown: one
     /// asked for, and one ahead of a caller that is kept for when it is. `calls` runs the first
     /// time a function is given. A function whose own code shows no value returned is then
-    /// taken as returning one where the code after one of these calls reads the result.
-    /// Without them it stays as its own code has it.
+    /// taken as returning one where the code after one of these calls reads the result, and one
+    /// that only passes on a call's result as returning nothing where none reads it and one
+    /// writes it first. Without them it stays as its own code has it.
     pub fn callers(&mut self, function: u64, calls: impl FnOnce() -> Vec<u64>) {
         self.callers.entry(function).or_insert_with(calls);
     }

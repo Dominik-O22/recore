@@ -2023,8 +2023,8 @@ int4 ActionReturnRecovery::apply(Funcdata &data)
 
     if (active->isFullyChecked()) {
       data.getFuncProto().deriveOutputMap(active);
-      // recore: see Architecture::returnsNoValue
-      if (active->getNumUsed() == 0 && data.getArch()->returnsNoValue(data,*active))
+      // recore: see Architecture::reviseOutput
+      if (data.getArch()->reviseOutput(data,*active))
 	data.getFuncProto().deriveOutputMap(active);
       iterend = data.endOp(CPUI_RETURN);
       for(iter=data.beginOp(CPUI_RETURN);iter!=iterend;++iter) {

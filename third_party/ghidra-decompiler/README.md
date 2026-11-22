@@ -63,12 +63,15 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   pointers it is passed structs before any unlocked varnode is typed. Marked with `recore:`
   comments.
 
-- `cpp/architecture.hh` and `cpp/coreaction.cc`, `Architecture::returnsNoValue`: a virtual
-  method that `ActionReturnRecovery` calls when none of the trials at a function's returns
-  turned out to be its output, and that answers no in the engine. `crates/decomp` reads the
-  code after the function's calls there and, where a caller reads the result register, marks
-  that register's trial active, so the function returns a value in the same decompilation.
-  Upstream has no way to take what the callers show. Marked with `recore:` comments.
+- `cpp/architecture.hh` and `cpp/coreaction.cc`, `Architecture::reviseOutput`: a virtual
+  method that `ActionReturnRecovery` calls once it has taken a function's output from the
+  trials at its returns, and that changes nothing in the engine. `crates/decomp` reads the code
+  after the function's calls there. Where none of the trials turned out to be the output and a
+  caller reads the result register, it marks that register's trial active, so the function
+  returns a value in the same decompilation. Where the output only passes on what a call
+  returned and the callers overwrite the register, it marks the trial as of no use, so the
+  function returns nothing. Upstream has no way to take what the callers show. Marked with
+  `recore:` comments.
 
 - `cpp/type.hh` and `cpp/type.cc`, `TypeFactory::setFieldName`: names a field of a struct the
   session already holds. Upstream builds a struct whole and never changes it; `crates/decomp`

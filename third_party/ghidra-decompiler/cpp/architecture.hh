@@ -253,10 +253,10 @@ public:
   /// recore: called when data-type recovery starts on a function, after the main loop has
   /// settled its SSA and before any unlocked varnode has a type.
   virtual void startTypes(Funcdata &data) {}
-  /// recore: called by ActionReturnRecovery when no trial at the function's returns turned out
-  /// to be its output. It may mark trials of \e active as active, which then make the output,
-  /// and says whether it did.
-  virtual bool returnsNoValue(Funcdata &data,ParamActive &active) { return false; }
+  /// recore: called by ActionReturnRecovery once it has taken the function's output from the
+  /// trials at its returns. It may mark trials of \e active as active, or as of no use, which
+  /// then make the output, and says whether it did.
+  virtual bool reviseOutput(Funcdata &data,ParamActive &active) { return false; }
   string getScopeDelimiter(void) const { return print->getScopeDelimiter(); }	///< Get the character string separating scope names
 #ifdef OPACTION_DEBUG
   void setDebugStream(ostream *s) { debugstream = s; }	///< Establish the debug console stream

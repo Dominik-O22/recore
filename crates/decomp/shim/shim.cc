@@ -552,11 +552,11 @@ class SectionArchitecture : public SleighArchitecture {
     if (start_types) start_types(data);
   }
 
-  // What the session does when a function's own code shows no value returned: see
-  // `returns_what_callers_read`.
-  std::function<bool(Funcdata &, ParamActive &)> returns_no_value;
-  bool returnsNoValue(Funcdata &data, ParamActive &active) override {
-    return returns_no_value && returns_no_value(data, active);
+  // What the session does once the engine has taken a function's output from its returns: see
+  // `returns_what_callers_read` and `returns_nothing_callers_read`.
+  std::function<bool(Funcdata &, ParamActive &)> revise_output;
+  bool reviseOutput(Funcdata &data, ParamActive &active) override {
+    return revise_output && revise_output(data, active);
   }
 };
 
@@ -616,6 +616,8 @@ struct RdSession {
   map<uint64_t, ParameterPieces> outputs;
   // Functions whose result rd_returns_like settled, until they are next decompiled.
   set<uint64_t> returns_like;
+  // Functions whose result is locked as rd_returns_like locked it, which only it may undo.
+  set<uint64_t> settled;
   // The function rd_callers named and the calls to it it gave, for its next decompilation.
   pair<uint64_t, vector<uint64_t>> callers;
   // How many bytes of the result register the callers of each function read, of those whose
@@ -623,6 +625,9 @@ struct RdSession {
   map<uint64_t, int4> read_by_callers;
   // Whether the function being decompiled returns what its callers read, not what its code shows.
   bool result_from_callers = false;
+  // Functions whose last decompilation returned only what a call returned, in the low end of the
+  // result register: see `returns_nothing_callers_read`.
+  set<uint64_t> passed_on;
   // The registers rd_keep_registers named for each function.
   map<uint64_t, vector<VarnodeData>> kept_registers;
   // recore's side of struct recovery, which plans the structs: see rd_set_struct_hooks.
@@ -1399,6 +1404,10 @@ extern "C" {
 
 static void recover_structs(RdSession *session, Funcdata &fd);
 static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamActive &active);
+static bool returns_nothing_callers_read(RdSession *session, Funcdata &fd, ParamActive &active);
+static bool callers_overwrite(RdSession *session, uint64_t function, const Address &at, int4 size);
+static bool result_register(Architecture *arch, VarnodeData &result, bool &whole);
+static bool low_end(const Address &at, int4 size, const VarnodeData &result);
 
 // `spec_dir` holds the .ldefs/.pspec/.cspec/.sla files. The first session fixes it for the
 // whole process, because the engine caches its language list in static storage.
@@ -1422,7 +1431,9 @@ RdSession *rd_session_new(const char *spec_dir, const char *language, const RdSe
     session->arch = new SectionArchitecture(session->image, &session->messages);
     session->arch->init(session->store);
     session->arch->start_types = [session](Funcdata &fd) { recover_structs(session, fd); };
-    session->arch->returns_no_value = [session](Funcdata &fd, ParamActive &active) { return returns_what_callers_read(session, fd, active); };
+    session->arch->revise_output = [session](Funcdata &fd, ParamActive &active) {
+      return active.getNumUsed() == 0 ? returns_what_callers_read(session, fd, active) : returns_nothing_callers_read(session, fd, active);
+    };
     // Use the contents of read-only memory as constants, as Ghidra does by default. This is
     // what turns a call through a pointer table into a call to a known function.
     session->arch->readonlypropagate = true;
@@ -1676,6 +1687,8 @@ int rd_declare(RdSession *session, const char *declaration, char *err, size_t er
   return guarded(err, errlen, [&] {
     istringstream text(declaration);
     parse_C(session->arch, text);
+    // A declared function's result is the declaration's from now on, whichever it names.
+    session->settled.clear();
   });
 }
 
@@ -1764,7 +1777,10 @@ int rd_set_storage(RdSession *session, uint64_t addr, const char *storage, char 
     for (string place; getline(arguments, place, ',');) proto.setParam(count++, "", stored_in(arch, place));
     proto.setInputLock(true);
     // With `?` what is known of the result stays as it is.
-    if (result != "?") proto.setOutputLock(true);
+    if (result != "?") {
+      proto.setOutputLock(true);
+      session->settled.erase(addr);
+    }
     proto.setModelLock(true);
   });
 }
@@ -1857,6 +1873,7 @@ int rd_returns_nothing(RdSession *session, uint64_t addr, char *err, size_t errl
     bool model_locked = proto.isModelLocked();
     proto.setOutputLock(true);
     proto.setModelLock(model_locked);
+    session->settled.erase(addr);
   });
 }
 
@@ -1923,7 +1940,8 @@ int rd_override_return(RdSession *session, uint64_t function, uint64_t jump, cha
 // does when it ends by jumping there: the engine sees a call followed by a return and does not
 // connect the two. `callee` must have been decompiled by this session, or be an import with a
 // declared prototype if `import_slot` is set, in which case `callee` is the slot. Answers 1 if
-// the callee returns a value, which `function` then returns too, and 0 if it does not.
+// the callee returns a value, which `function` then returns too, and 0 if it does not or if the
+// callers rd_callers gave overwrite the result: see returns_nothing_callers_read.
 int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int import_slot, char *err,
                     size_t errlen) {
   bool returns = false;
@@ -1944,14 +1962,23 @@ int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int 
       if (session->function(callee)->getFuncProto().getInjectId() >= 0) return;
       piece = found->second;
     }
-    Funcdata *fd = session->function(function);
-    if (fd->getFuncProto().isOutputLocked()) return;  // the caller or an edit has said what it returns
-    bool model_locked = fd->getFuncProto().isModelLocked();
-    fd->getFuncProto().setOutput(piece);
-    fd->getFuncProto().setOutputLock(true);
+    FuncProto &proto = session->function(function)->getFuncProto();
+    bool settled = session->settled.count(function) != 0;
+    if (proto.isOutputLocked() && !settled) return;  // the caller or an edit has said what it returns
+    bool model_locked = proto.isModelLocked();
+    // As for a call and then a return: see returns_nothing_callers_read.
+    if (callers_overwrite(session, function, piece.addr, piece.type->getSize())) {
+      proto.setOutputLock(false);
+      proto.setModelLock(model_locked);
+      session->settled.erase(function);
+      return;
+    }
+    proto.setOutput(piece);
+    proto.setOutputLock(true);
     // Locking the output locks the calling convention with it, which is still to be recovered.
-    fd->getFuncProto().setModelLock(model_locked);
+    proto.setModelLock(model_locked);
     session->returns_like.insert(function);
+    session->settled.insert(function);
     returns = true;
   });
   return ok && returns;
@@ -2015,13 +2042,17 @@ static bool gives_a_constant(const CollectPcode &emit, const CollectPcode::Op &o
   }
 }
 
+// What `bytes_read_after` says of code that writes the result register before it reads it.
+static const int4 OVERWRITTEN = -1;
+
 // How many of the low bytes of `result` the code after the call at `call` reads of what the call
-// left there, or 0. It follows the code on from the call and stops at the first read of the
-// register, at a write to any of it, at the next call or return, and at a branch, which leaves the
-// call undecided, as do bytes that do not decode and a run of 40 instructions. A read counts where
-// what was read reaches a register, memory, a branch or a call: an address worked out from the
-// register and used for nothing, as a long `NOP` does, is no read. Nor is a push: compilers push a
-// register to keep the stack aligned for the arguments of the next call as often as to pass it.
+// left there, OVERWRITTEN where it writes any of them first, or 0. It follows the code on from the
+// call and stops at the first read of the register, at a write to any of it, at the next call or
+// return, and at a branch, which leaves the call undecided, as do bytes that do not decode and a
+// run of 40 instructions. A read counts where what was read reaches a register, memory, a branch
+// or a call: an address worked out from the register and used for nothing, as a long `NOP` does,
+// is no read. Nor is a push: compilers push a register to keep the stack aligned for the
+// arguments of the next call as often as to pass it.
 static int4 bytes_read_after(RdSession *session, uint64_t call, const VarnodeData &result, CollectPcode &emit) {
   const Translate *translate = session->arch->translate;
   AddrSpace *unique = translate->getUniqueSpace();
@@ -2088,15 +2119,16 @@ static int4 bytes_read_after(RdSession *session, uint64_t call, const VarnodeDat
           break;
       }
     }
-    if (written) return 0;
+    if (written) return OVERWRITTEN;
   }
   return 0;
 }
 
 // How many low bytes of `result`, the register the default convention returns an integer in, the
 // callers of the function at `function` read after their calls to it, as `bytes_read_after`
-// decides it for the calls rd_callers gave: 0 if none reads it, or none were given. Reading stops
-// once a caller reads `enough`. Each function's callers are read once a session.
+// decides it for the calls rd_callers gave. OVERWRITTEN where none reads it and one writes it
+// first, and 0 where no call says, or none were given. Reading stops once a caller reads
+// `enough`. Each function's callers are read once a session.
 static int4 bytes_callers_read(RdSession *session, uint64_t function, const VarnodeData &result, int4 enough) {
   auto known = session->read_by_callers.find(function);
   if (known != session->read_by_callers.end()) return known->second;
@@ -2106,8 +2138,13 @@ static int4 bytes_callers_read(RdSession *session, uint64_t function, const Varn
   session->image->current = ~(uint64_t)0;
   CollectPcode emit;
   int4 bytes = 0;
-  for (size_t i = 0; i < session->callers.second.size() && bytes < enough; ++i)
-    bytes = max(bytes, bytes_read_after(session, session->callers.second[i], result, emit));
+  bool overwritten = false;
+  for (size_t i = 0; i < session->callers.second.size() && bytes < enough; ++i) {
+    int4 read = bytes_read_after(session, session->callers.second[i], result, emit);
+    overwritten |= read == OVERWRITTEN;
+    bytes = max(bytes, read);
+  }
+  if (bytes == 0 && overwritten) bytes = OVERWRITTEN;
   session->image->current = current;
   session->read_by_callers[function] = bytes;
   return bytes;
@@ -2127,6 +2164,12 @@ static bool result_register(Architecture *arch, VarnodeData &result, bool &whole
   result = {storage[0].addr.getSpace(), storage[0].addr.getOffset(), (uint4)integer.outtype->getSize()};
   whole = arch->defaultfp->possibleInputParam(storage[0].addr, result.size);
   return true;
+}
+
+// Whether `size` bytes at `at` are the low end of the register `result`.
+static bool low_end(const Address &at, int4 size, const VarnodeData &result) {
+  if (at.getSpace() != result.space) return false;
+  return result.space->isBigEndian() ? at.getOffset() + size == result.offset + result.size : at.getOffset() == result.offset;
 }
 
 // Whether `vn` is, on every path, what the storage at `low` of `size` bytes held as the function
@@ -2184,11 +2227,7 @@ static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamAct
   bool big = result.space->isBigEndian();
   // The trial that holds the low end of the register, if the function's code touches it.
   int4 index = 0;
-  for (; index < active.getNumTrials(); ++index) {
-    const ParamTrial &trial(active.getTrial(index));
-    const Address &at = trial.getAddress();
-    if (at.getSpace() == result.space && (big ? at.getOffset() + trial.getSize() == result.offset + result.size : at.getOffset() == result.offset)) break;
-  }
+  while (index < active.getNumTrials() && !low_end(active.getTrial(index).getAddress(), active.getTrial(index).getSize(), result)) ++index;
   bool returns = any_of(fd.beginOp(CPUI_RETURN), fd.endOp(CPUI_RETURN), [](PcodeOp *op) { return !op->isDead() && op->getHaltType() == 0; });
   // A function that leaves the register as it found it returns nothing there, whatever a caller
   // does with it after the call: a compiler that sees the callee knows that, and keeps using its
@@ -2196,7 +2235,7 @@ static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamAct
   // that argument unchanged, as memcpy does, for one that returns nothing.
   if (returns && leaves_as_found(fd, active, index)) return false;
   int4 bytes = bytes_callers_read(session, session->offset(fd.getAddress()), result, whole ? 1 : (int4)result.size);
-  if (bytes == 0) return false;
+  if (bytes <= 0) return false;
   if (whole) bytes = result.size;
   Address low(result.space, big ? result.offset + result.size - bytes : result.offset);
   session->result_from_callers = true;
@@ -2245,6 +2284,69 @@ static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamAct
   return true;
 }
 
+// Whether `vn` is, on every path, what a call returned, passed on through copies, merges,
+// extensions and the low end of a wider register. The low end is all that is followed, so a
+// call that returns fewer bytes than its register holds passes on what it returned.
+static bool call_result(const Varnode *vn, set<const Varnode *> &seen) {
+  if (!seen.insert(vn).second) return true;
+  if (!vn->isWritten()) return false;
+  const PcodeOp *op = vn->getDef();
+  switch (op->code()) {
+    case CPUI_CALL:
+    case CPUI_CALLIND:
+      return true;
+    case CPUI_COPY:
+    case CPUI_INT_ZEXT:
+    case CPUI_INT_SEXT:
+      return call_result(op->getIn(0), seen);
+    case CPUI_SUBPIECE:
+      return op->getIn(1)->getOffset() == 0 && call_result(op->getIn(0), seen);
+    case CPUI_PIECE:
+      return call_result(op->getIn(1), seen);
+    case CPUI_MULTIEQUAL:
+      for (int4 i = 0; i < op->numInput(); ++i)
+        if (!call_result(op->getIn(i), seen)) return false;
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Whether the callers of the function at `function` write the result register after their calls
+// before they read it, as `bytes_callers_read` decides, where `at` of `size` bytes is the low end
+// of that register.
+static bool callers_overwrite(RdSession *session, uint64_t function, const Address &at, int4 size) {
+  VarnodeData result;
+  bool whole;
+  return result_register(session->arch, result, whole) && low_end(at, size, result) &&
+         bytes_callers_read(session, function, result, whole ? 1 : (int4)result.size) == OVERWRITTEN;
+}
+
+// Called where the engine found a value returned. `return g();` and a void function's last
+// `g();` compile alike, so a function whose every return passes on what a call returned, and
+// nothing else, returns nothing where its callers overwrite the result register: see
+// `callers_overwrite`. It marks every trial in `active` as no use and says it did.
+static bool returns_nothing_callers_read(RdSession *session, Funcdata &fd, ParamActive &active) {
+  if (active.getNumUsed() != 1) return false;
+  int4 index = 0;
+  while (!active.getTrial(index).isUsed()) ++index;
+  const ParamTrial &trial(active.getTrial(index));
+  set<const Varnode *> seen;
+  bool returns = false;
+  for (auto op = fd.beginOp(CPUI_RETURN); op != fd.endOp(CPUI_RETURN); ++op) {
+    if ((*op)->isDead() || (*op)->getHaltType() != 0) continue;
+    if (trial.getSlot() >= (*op)->numInput() || !call_result((*op)->getIn(trial.getSlot()), seen)) return false;
+    returns = true;
+  }
+  uint64_t function = session->offset(fd.getAddress());
+  VarnodeData result;
+  bool whole;
+  if (returns && result_register(session->arch, result, whole) && low_end(trial.getAddress(), trial.getSize(), result)) session->passed_on.insert(function);
+  if (!returns || !callers_overwrite(session, function, trial.getAddress(), trial.getSize())) return false;
+  for (int4 i = 0; i < active.getNumTrials(); ++i) active.getTrial(i).markNoUse();
+  return true;
+}
+
 // Gives the calls to the function at `function` from other functions that come back, `count` of
 // them at `calls`, for its next decompilation: if its own code shows no value returned and the
 // code after one of them reads the result register, it returns what that reads.
@@ -2262,6 +2364,20 @@ int rd_callers_read(RdSession *session, uint64_t function) {
     read = result_register(session->arch, result, whole) && bytes_callers_read(session, function, result, whole ? 1 : (int4)result.size) > 0;
   });
   return read;
+}
+
+// Whether the last decompilation of the function at `function` returned only what a call
+// returned and the code after the calls rd_callers gave for it overwrites the result register,
+// without decompiling it. Its next decompilation does not read them again.
+int rd_callers_overwrite(RdSession *session, uint64_t function) {
+  bool overwrite = false;
+  guarded(nullptr, 0, [&] {
+    VarnodeData result;
+    bool whole;
+    overwrite = session->passed_on.count(function) != 0 && result_register(session->arch, result, whole) &&
+                bytes_callers_read(session, function, result, whole ? 1 : (int4)result.size) == OVERWRITTEN;
+  });
+  return overwrite;
 }
 
 // With `keep` set, the parameters recovered by each successful rd_decompile are locked into the
@@ -3076,6 +3192,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
   bool spills = false;
   bool inlined = false;
   session->result_from_callers = false;
+  session->passed_on.erase(addr);
   bool ok = guarded(err, errlen, [&] {
     fd = session->function(addr);
     declared = fd->getFuncProto().isInputLocked() && session->kept.count(addr) == 0;
@@ -3239,6 +3356,12 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     out->jump_table_count = session->jump_addrs.size();
     out->jump_targets = session->jump_targets.data();
     session->outputs.erase(addr);
+    VarnodeData result;
+    bool whole;
+    // A result rd_returns_like settled is what the callee returned.
+    if (session->returns_like.count(addr) != 0 && proto.getOutputType()->getMetatype() != TYPE_VOID && result_register(arch, result, whole) &&
+        low_end(proto.getOutput()->getAddress(), proto.getOutput()->getSize(), result))
+      session->passed_on.insert(addr);
     // The size of a result only its callers show is a guess where a register also passes an
     // argument, so it stays this decompilation's: other functions find what they make of the
     // call themselves, and one that jumps here is told nothing of it.
@@ -3289,6 +3412,7 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     // register of its first argument, a result kept without the parameters costs every call
     // that argument.
     fd->getFuncProto().setOutputLock(false);
+    session->settled.erase(addr);
   }
   // A result only the callers show is this decompilation's.
   if (fd != nullptr && session->result_from_callers) fd->getFuncProto().setOutputLock(false);
