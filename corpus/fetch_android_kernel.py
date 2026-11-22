@@ -4,19 +4,24 @@ raw Image a boot partition holds.
 
 Usage: python3 -I fetch_android_kernel.py <corpus>
        corpus-kernel-android, corpus-kernel-android-stripped, corpus-kernel-android-image or
-       corpus-kernel-android-raw, or any with -holdout
+       corpus-kernel-android-raw, or any with -holdout; or the same with -5.10 after
+       corpus-kernel-android, and no -holdout
 The tuned corpora hold GKI build 17002073 of android16-6.12, whose modules fetch_android_kmod.py
 takes. A kernel cannot be split as a set of modules is, so the held-out corpora hold another one,
-GKI build 16969351 of android15-6.6.
+GKI build 16969351 of android15-6.6. The -5.10 corpora are a second tuned kernel, GKI build
+16924933 of android12-5.10: built with clang's CFI before kCFI, it reaches each function whose
+address is taken through a stub in a jump table, which the 6.12 and 6.6 kernels have none of.
+No held-out kernel answers for it.
 <corpus>/bin/vmlinux is the kernel as built, with its symbols and DWARF, and in -stripped the same
 after `llvm-strip --strip-all`. In -image, bin/Image.toml is the layout of image/Image, which is
 vmlinux's loaded bytes as `objcopy -O binary` writes them: a region for each segment it loads.
 In -raw, bin/Image is that Image by itself, which recore places by the kernel's own symbol table.
 The debug file is vmlinux with its DWARF decompressed, which recore reads only so. The Image
 holds vmlinux's bytes at vmlinux's addresses, so vmlinux is its debug file too.
-The downloads are kept in the pkgs/ of corpus-kernel-android, and the held-out kernel's in that
-of corpus-kernel-android-holdout, so that no tuned corpus holds the held-out kernel. The large files
-are hard links to them, and the corpus's truth/ is written last. A corpus that has truth/ is left as it is.
+The downloads are kept in the pkgs/ of corpus-kernel-android, the 5.10 kernel's in that of
+corpus-kernel-android-5.10, and the held-out kernel's in that of corpus-kernel-android-holdout, so
+that no tuned corpus holds the held-out kernel. The large files are hard links to them, and the
+corpus's truth/ is written last. A corpus that has truth/ is left as it is.
 """
 import os, struct, subprocess, sys
 from pathlib import Path
@@ -27,8 +32,10 @@ from fetch_android_kmod import download, fresh, write_truth  # noqa: E402
 from store import CORPORA  # noqa: E402
 
 CI = "https://ci.android.com/builds/submitted/{build}/kernel_aarch64/latest/raw/{file}"
-# The build of the tuned corpora, and the one of the held out.
-BUILDS = {False: "17002073", True: "16969351"}
+# The build of each tuned kernel, by what follows corpus-kernel-android in its corpora's names, and
+# the one of the held out.
+TUNED = {"": "17002073", "-5.10": "16924933"}
+HELD_OUT = "16969351"
 PT_LOAD, PF_X, PF_W = 1, 1, 2
 
 
@@ -54,14 +61,16 @@ def layout(vmlinux):
 def main():
     corpus = CORPORA / sys.argv[1]
     held_out = corpus.name.endswith("-holdout")
-    form = corpus.name.removesuffix("-holdout").removeprefix("corpus-kernel-android")
+    name = corpus.name.removesuffix("-holdout").removeprefix("corpus-kernel-android")
+    kernel = "-5.10" if name.startswith("-5.10") and not held_out else ""
+    form = name.removeprefix(kernel)
     if form not in ("", "-stripped", "-image", "-raw"):
-        sys.exit(f"no Android kernel for {corpus.name}: name corpus-kernel-android, its -stripped, -image or -raw, or any with -holdout")
+        sys.exit(f"no Android kernel for {corpus.name}: name corpus-kernel-android or corpus-kernel-android-5.10, its -stripped, -image or -raw, or the first's with -holdout")
     if not fresh(corpus, "bin", "debug", *["image"] * (form == "-image")):
         return
 
-    build = BUILDS[held_out]
-    pkgs = CORPORA / ("corpus-kernel-android-holdout" if held_out else "corpus-kernel-android") / "pkgs"
+    build = HELD_OUT if held_out else TUNED[kernel]
+    pkgs = CORPORA / ("corpus-kernel-android-holdout" if held_out else f"corpus-kernel-android{kernel}") / "pkgs"
     vmlinux = download(CI.format(build=build, file="vmlinux"), pkgs, f"gki-{build}-vmlinux")
     debug = pkgs / f"gki-{build}-debug" / "vmlinux.debug"
     if not debug.exists():
