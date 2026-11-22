@@ -1,7 +1,12 @@
 //! Compares two analyzer runs over one corpus binary by binary, so that a change shows every
 //! count it made worse. The rounded percentages `score` prints hide a loss of a few dozen
 //! functions in a corpus of a hundred thousand, and a gain in one binary hides a loss in another.
+//!
+//! A total that got worse is a loss, printed as a `Worse:` line. A change may accept a loss by
+//! adding that line with a reason to `bench/accepted-losses.txt`, and [`crate::losses::judge`]
+//! holds the losses of a run to the lines it added.
 
+use crate::losses::Loss;
 use crate::score::Score;
 
 /// Which way a count improves.
@@ -139,6 +144,11 @@ pub fn print(changes: &[Change], missing: &[String]) {
     }
 }
 
+/// The counts of `changes` that got worse, as losses of `run`.
+pub fn losses<'a>(changes: &'a [Change], run: &'a str) -> Vec<Loss<'a>> {
+    changes.iter().filter(|c| c.worse).map(|c| Loss { run, count: c.count, base: c.base, head: c.head }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +217,15 @@ mod tests {
     fn a_binary_without_analysis_at_head_is_missing() {
         let (changes, missing) = compare(&[found("a", 1), found("b", 1)], &[found("a", 1)]);
         assert_eq!((changes, missing), (vec![], vec!["b".to_string()]));
+    }
+
+    #[test]
+    fn a_loss_prints_as_the_line_that_names_it() {
+        let base = [found("a", 10)];
+        let (changes, _) = compare(&base, &[found("a", 9)]);
+        let lines: Vec<String> = losses(&changes, "corpus-thumb/recore").iter().map(Loss::to_string).collect();
+        assert_eq!(lines, ["Worse: corpus-thumb/recore starts found 10 -> 9 (-1)"]);
+        // A count that got better is no loss.
+        assert!(losses(&compare(&base, &[found("a", 11)]).0, "corpus-thumb/recore").is_empty());
     }
 }

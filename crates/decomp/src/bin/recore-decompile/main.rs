@@ -127,7 +127,8 @@ enum Command {
         out_dir: PathBuf,
         debug_dir: PathBuf,
         /// Another `corpus` run of the same functions, by the build to compare with. Prints each
-        /// count that moved over the functions both runs decompiled, and fails when one fell.
+        /// count that moved over the functions both runs decompiled. Fails when more functions
+        /// failed, and otherwise with exit status 3 when a count fell, each on a `Worse:` line.
         #[arg(long)]
         against: Option<PathBuf>,
         #[arg(long, default_value_t = std::thread::available_parallelism().map_or(1, usize::from))]
@@ -177,6 +178,9 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         list: usize,
     },
+    /// Prints how many functions of the kernel modules in a directory have a kCFI hash before
+    /// them, how many take a prototype from it, and how many modules hash in each spelling.
+    Kcfi { bin_dir: PathBuf },
     /// Reads a binary's debug information and gives its types to a decompiler session, printing
     /// what was found and how long each step took, and how long a child takes to be ready with
     /// the debug information and without.
@@ -216,6 +220,7 @@ fn main() -> Result<()> {
         }
         Command::Noise { out_dir, list } => noise::report(&out_dir, list.as_deref()),
         Command::Imports { bin_dir, list } => imports::coverage(&bin_dir, list),
+        Command::Kcfi { bin_dir } => imports::kcfi(&bin_dir),
         Command::DebugInfo { binary } => imports::debug_info(&binary),
         Command::Worker { binary, options } => isolate::serve(&binary, &options),
     }

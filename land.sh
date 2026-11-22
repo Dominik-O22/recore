@@ -23,6 +23,10 @@
 #   - A pull request whose description has a `Budget:` line, or that was queued with
 #     `--accept-cost` (its check then runs with RECORE_COST_ACCEPTED=1), lands alone, so that what
 #     it was let past is not let past for another.
+#   - So does one that changes bench/accepted-losses.txt, whose added lines name the losses its
+#     check accepts: a train's one run could not say whose loss it was. Its head pins the lines,
+#     and the merge commit's message holds each loss the run accepted as the run measured it, with
+#     the reason of its line.
 #
 # A run that lowered bench/budget.json and changed nothing else is committed here, and that commit
 # gets the status without a run of its own: it differs from the commit that passed only in the
@@ -97,16 +101,28 @@ declare -A heads=() alone=()
 
 # finish <pr> <landed|turned away> <why>: leaves the answer for the run that queued it and takes
 # it off the queue, unless it was queued again meanwhile: that is the next pass's. A pull request
-# that was turned away is told why, which is what wakes its owner.
+# that was turned away is told why, which is what wakes its owner. A comment GitHub does not take
+# leaves the answer to say why, and the queue goes on.
 finish() {
   echo "#$1 $2: $3"
   echo "$2: $3" >"$answers/$1"
   if [ "$(sed -n 1p "$queue/$1" 2>/dev/null)" = "${heads[$1]}" ]; then
     rm -f "$queue/$1"
   fi
-  if [ "$2" != landed ]; then
-    gh pr comment "$1" --body "\`land.sh\` did not land this: $3" >/dev/null
+  if [ "$2" != landed ] && ! gh pr comment "$1" --body "\`land.sh\` did not land this: $3" >/dev/null; then
+    echo "#$1: GitHub took no comment that says why" >&2
   fi
+}
+
+# quoted <text>: a line of a run's output, which can hold lines a change wrote into
+# bench/accepted-losses.txt, as a comment quotes it: cut short, since a comment holds 65,536
+# characters at most, and in a code span, so that an @mention in it notifies no one. A backtick or
+# a control character, such as a carriage return that GitHub reads as a line break, would end the
+# span.
+quoted() {
+  local text="${1//[[:cntrl:]\`]/}"
+  [ ${#text} -le 2000 ] || text="${text:0:2000}..."
+  [ -z "$text" ] || printf '`%s`' "$text"
 }
 
 # current <pr>: whether it is still open at the head that was queued. If not, that is its answer.
@@ -131,7 +147,8 @@ current() {
 rides() {
   local body
   body="$(field "$1" body)"
-  [ -z "${alone[$1]:-}" ] && [ -z "$(sed -n 2p "$queue/$1")" ] && ! grep -Eq '^Budget: .+' <<<"$body"
+  [ -z "${alone[$1]:-}" ] && [ -z "$(sed -n 2p "$queue/$1")" ] && ! grep -Eq '^Budget: .+' <<<"$body" &&
+    git diff --quiet "$base...${heads[$1]}" -- bench/accepted-losses.txt
 }
 
 # at <commit>: the landing checkout at that commit, with nothing left of an earlier run but its
@@ -190,13 +207,13 @@ green() {
 # landing checkout is at, a head that holds main. Fails, and says why in $why, when it did not
 # merge. A train's run also fails when it moved a count.
 settle() {
-  local pr="$1" branch="$2" cost='' log="$logs/$1.log" head dirty grew compared tries=0
+  local pr="$1" branch="$2" cost='' log="$logs/$1.log" head dirty grew compared passed accepted='' message='' title tries=0
   [[ "$3" != *cost* ]] || cost=1
   head="$(git -C "$tree" rev-parse HEAD)"
   if reads "$head"; then
     echo "#$pr: check.sh on ${head:0:12} against ${base:0:12}, its output in $log"
     if ! (cd "$tree" && RECORE_COST_ACCEPTED="$cost" ./check.sh --against "$base") >"$log" 2>&1; then
-      why="check.sh failed on ${head:0:12} against ${base:0:12}: $(grep '^worse' "$log" | tail -1 || true) ($log)"
+      why="check.sh failed on ${head:0:12} against ${base:0:12}: $(quoted "$(grep '^worse' "$log" | tail -1 || true)") ($log)"
       return 1
     fi
     # Every comparison check.sh makes is headed `<this run> against <the base's>`, and says
@@ -205,6 +222,14 @@ settle() {
     if [ -n "${4:-}" ] && { [ "$compared" -eq 0 ] || [ "$compared" != "$(grep -c '^  no count changed' "$log" || true)" ]; }; then
       why="the run moved a count ($log)"
       return 1
+    fi
+    # Each loss the run accepted, with the reason of the line that did and what its run left out,
+    # for the merge commit's message.
+    accepted="$(awk '/^  accepted / { print substr($0, 14); on = 1; next } on && /^             [^ ]/ { print "  " substr($0, 14); next } { on = 0 }' "$log")"
+    if [ -n "$accepted" ]; then
+      title="$(field "$pr" title)"
+      need "$title" "the title of #$pr"
+      message="$title"$'\n\n'"Losses accepted by the run of check.sh on ${head:0:12} against ${base:0:12}:"$'\n'"$accepted"
     fi
     dirty="$(git -C "$tree" status --porcelain)"
     if [ -n "$dirty" ]; then
@@ -218,12 +243,14 @@ settle() {
       head="$(git -C "$tree" rev-parse HEAD)"
       why="its branch moved while ${head:0:12} was landing, so queue it again"
       git -C "$tree" push -q origin "HEAD:refs/heads/$branch" 2>/dev/null || return 1
-      gh api --silent "repos/{owner}/{repo}/statuses/$head" -f state=success -f context=check -f description="passed against ${base:0:12}, before the budget it lowered" || return 1
+      # As check.sh would have left it, with the losses the run accepted.
+      passed="$(grep '^passed against ' "$log" | tail -1)"
+      gh api --silent "repos/{owner}/{repo}/statuses/$head" -f state=success -f context=check -f description="$passed, before the budget it lowered" || return 1
     fi
   fi
   green "$pr" "$head" || return 1
   # GitHub can take a few seconds after the last check to call a pull request mergeable.
-  until gh pr merge "$pr" --merge --match-head-commit "$head" >"$logs/$pr.merge" 2>&1; do
+  until gh pr merge "$pr" --merge --match-head-commit "$head" ${message:+--body "$message"} >"$logs/$pr.merge" 2>&1; do
     # An attempt that merged it and then lost its answer is not one to make again.
     [ "$(field "$pr" state || true)" != MERGED ] || break
     tries=$((tries + 1))
@@ -275,7 +302,7 @@ train() {
   url="$(gh pr create --head "$train_branch" --base main --title "Land $(printf '#%s ' "${aboard[@]}" | sed 's/ $//; s/ /, /g')" --body "A train from \`land.sh\`: these pull requests merged together onto main at ${base:0:12}, with one run of \`check.sh\` for all of them. Merging it merges them.")" || return 0
   if ! settle "${url##*/}" "$train_branch" "" train; then
     echo "train #${url##*/}: $why, so its members land one at a time"
-    gh pr close "${url##*/}" --delete-branch --comment "$why, so its members land one at a time." >/dev/null
+    gh pr close "${url##*/}" --delete-branch --comment "$why, so its members land one at a time." >/dev/null || true
     return 0
   fi
   git push -q origin --delete "$train_branch" 2>/dev/null || true
