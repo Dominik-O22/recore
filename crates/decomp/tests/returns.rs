@@ -141,3 +141,58 @@ fn the_function_after_a_call_that_never_comes_back_is_no_caller_reading() {
     assert!(!one_decompilation_returns(&code, &[0x1006]));
 }
 
+
+/// Raw code at 0x1000 with a function at 0x1100 that never returns, `b .` on arm64 and `jmp $`
+/// on x86-64, and whether the function at 0x1000 returns a value. `declare` names the callee
+/// and gives its prototype.
+fn returns_before_a_call_that_never_comes_back(target: Target, function: &[u8], declare: Option<(&str, &str)>) -> bool {
+    let mut code = function.to_vec();
+    code.resize(0x100, 0);
+    code.extend(match target {
+        Target::Aarch64 => &[0x00, 0x00, 0x00, 0x14][..],
+        _ => &[0xeb, 0xfe][..],
+    });
+    let mut session = Session::new(&vendored_spec_dir().unwrap(), target, &[Section { addr: 0x1000, data: &code, readonly: true, code: true }]).unwrap();
+    if let Some((name, prototype)) = declare {
+        session.name_function(0x1100, name).unwrap();
+        session.add_function(0x1100, true).unwrap();
+        session.declare(prototype).unwrap();
+    } else {
+        session.add_function(0x1100, true).unwrap();
+    }
+    let function = session.decompile(0x1000).unwrap();
+    println!("{}", function.c_text);
+    function.returns_value
+}
+
+fn arm64(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+#[test]
+fn a_value_loaded_before_the_stack_canary_check_is_returned_on_arm64() {
+    // The failing branch of the check calls a function that never returns and takes nothing,
+    // which the engine cannot tell from one that takes x0: ldrsw x0, [x1]; ldr x8, [x2];
+    // ldr x9, [x3]; cmp x8, x9; b.ne 0x1018; ret; bl 0x1100.
+    let code = arm64(&[0xb980_0020, 0xf940_0048, 0xf940_0069, 0xeb09_011f, 0x5400_0041, 0xd65f_03c0, 0x9400_003a]);
+    assert!(returns_before_a_call_that_never_comes_back(Target::Aarch64, &code, None));
+}
+
+#[test]
+fn a_value_loaded_before_the_stack_canary_check_is_returned_on_x86_64() {
+    // Only a float is returned in a register that also passes an argument: movsd xmm0, [rsi];
+    // mov rcx, [rdx]; cmp rcx, [rdi]; jne 0x100d; ret; call 0x1100.
+    let code = [0xf2, 0x0f, 0x10, 0x06, 0x48, 0x8b, 0x0a, 0x48, 0x3b, 0x0f, 0x75, 0x01, 0xc3, 0xe8, 0xee, 0x00, 0x00, 0x00];
+    assert!(returns_before_a_call_that_never_comes_back(Target::X86_64Gcc, &code, None));
+}
+
+#[test]
+fn a_value_passed_to_a_call_that_never_comes_back_is_not_returned() {
+    // ldr w0, [x1]; cbnz w2, 0x100c; ret; bl 0x1100: what x0 holds at the return is the
+    // argument of `exit` on the other path.
+    let code = arm64(&[0xb940_0020, 0x3500_0042, 0xd65f_03c0, 0x9400_003d]);
+    assert!(!returns_before_a_call_that_never_comes_back(Target::Aarch64, &code, Some(("exit", "extern void exit(int4 status);"))));
+    // A variadic function counts as declared, though the engine still looks for the arguments
+    // past `fmt`.
+    assert!(!returns_before_a_call_that_never_comes_back(Target::Aarch64, &code, Some(("panic", "extern void panic(char *fmt, ...);"))));
+}
