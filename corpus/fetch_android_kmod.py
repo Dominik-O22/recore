@@ -105,6 +105,14 @@ def download(url, pkgs, name, sha256=None):
             with tarfile.open(tmp) as tar:
                 tar.getmembers()
         tmp.rename(dest)
+    elif sha256 is not None:
+        # A file an earlier version of this script named before it checked it.
+        h = hashlib.sha256()
+        with open(dest, "rb") as data:
+            while chunk := data.read(1 << 20):
+                h.update(chunk)
+        if h.hexdigest() != sha256:
+            sys.exit(f"{dest}: sha256 {h.hexdigest()}, not {sha256}: delete it to fetch it again")
     return dest
 
 
