@@ -412,6 +412,22 @@ fn is_dispatch_base(adr: Insn, image: &Image) -> bool {
     false
 }
 
+/// Whether the code at `target`, a little before the instruction at `at` that forms its address,
+/// runs on into that instruction with no branch but calls: then the address is the code's own
+/// position, as the Linux kernel's `_THIS_IP_` takes, and no function's.
+fn runs_into(target: u64, at: u64, image: &Image) -> bool {
+    /// The most bytes back such a label lies.
+    const REACH: u64 = 128;
+    if target > at || at - target > REACH {
+        return false;
+    }
+    let Some(bytes) = image.bytes_from(target).and_then(|bytes| bytes.get(..(at - target) as usize)) else { return false };
+    bytes.as_chunks::<4>().0.iter().all(|&word| {
+        let insn = Insn { word: u32::from_le_bytes(word), addr: 0 };
+        matches!(Arm64::flow(&insn, &State::default(), image), None | Some(Flow::Call(_) | Flow::CallIndirect(_)))
+    })
+}
+
 pub struct Arm64;
 
 impl Arch for Arm64 {
@@ -476,14 +492,15 @@ impl Arch for Arm64 {
     }
 
     fn address_taken(insn: &Insn, state: &State, image: &Image) -> Option<u64> {
-        match insn.pc_relative() {
-            Some((false, address)) => (!is_dispatch_base(*insn, image)).then_some(address),
-            Some((true, _)) => None,
+        let address = match insn.pc_relative() {
+            Some((false, address)) if !is_dispatch_base(*insn, image) => address,
+            Some(_) => return None,
             None => match (insn.add_immediate(), state.registers[insn.rn()]) {
-                (Some(immediate), Value::Page(page)) => Some(page + immediate),
-                _ => None,
+                (Some(immediate), Value::Page(page)) => page + immediate,
+                _ => return None,
             },
-        }
+        };
+        (!runs_into(address, insn.addr, image)).then_some(address)
     }
 
     /// `adr` forms the address of any byte, but only one on a word can be code.
@@ -761,6 +778,18 @@ mod tests {
             0x1000_0040, 0xD61F_0020, 0xD65F_03C0,
         ];
         assert_eq!(starts(&words, &[0x4030, 0x404c, 0x4068]), [0x4000, 0x4030, 0x404c, 0x4068, 0x4070]);
+    }
+
+    #[test]
+    fn the_address_of_code_that_runs_on_into_the_taker_starts_no_function() {
+        let words = [
+            // 0x4000, as clang builds `_THIS_IP_`: stp x29, x30, [sp, #-16]!; bl 0x4020;
+            // mov w1, #7; adrp x0, 0x4000; add x0, x0, #8; bl 0x4024; ldp x29, x30, [sp], #16; ret.
+            0xA9BF_7BFD, 0x9400_0007, 0x5280_00E1, 0x9000_0000, 0x9100_2000, 0x9400_0004, 0xA8C1_7BFD, 0xD65F_03C0,
+            // 0x4020 and 0x4024: ret.
+            0xD65F_03C0, 0xD65F_03C0,
+        ];
+        assert_eq!(starts(&words, &[]), [0x4000, 0x4020, 0x4024]);
     }
 
     /// The entry points recore finds in `words` of code at 0x4000, entered there and at `exports`.
