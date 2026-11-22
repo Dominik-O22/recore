@@ -1519,6 +1519,10 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// function before it, such as switch cases behind an unresolved indirect jump.
     fn fill_gaps(&mut self, decoders: &mut Decoders<'a, A>) -> bool {
         let mut found = false;
+        // A function starts right after its kCFI hash, even at a `nop` the kernel patches. Not in
+        // a module, where ftrace's `nop`s may come between the two. Asked once here, since every
+        // byte of padding the scan steps over would ask.
+        let padding_opens_after_hash = !self.image.kernel_module && !self.image.marked_data.is_empty();
         for index in 0..self.regions.len() {
             let section = self.regions[index].section;
             let mut offset = 0;
@@ -1585,9 +1589,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         let before_table = || {
                             !A::LITERAL_POOLS && self.regions[index].flags.get((scanned_to - section.addr) as usize).is_some_and(|flags| flags & (IN_TABLE | MARKED_DATA) == IN_TABLE)
                         };
-                        // A function starts right after its kCFI hash, even at a `nop` the kernel
-                        // patches. Not in a module, where ftrace's `nop`s may come between the two.
-                        let opens_after_hash = || !self.image.kernel_module && self.hash_before(index, decoded.addr);
+                        let opens_after_hash = || padding_opens_after_hash && self.hash_before(index, decoded.addr);
                         if (A::is_padding(insn) && !opens_after_hash()) || before_table() {
                             skipped_padding = true;
                             continue;
