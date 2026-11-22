@@ -418,7 +418,7 @@ fn is_dispatch_base(adr: Insn, image: &Image) -> bool {
 fn runs_into(target: u64, at: u64, image: &Image) -> bool {
     /// The most bytes back such a label lies.
     const REACH: u64 = 128;
-    if target > at || at - target > REACH {
+    if target >= at || at - target > REACH {
         return false;
     }
     let Some(bytes) = image.bytes_from(target).and_then(|bytes| bytes.get(..(at - target) as usize)) else { return false };
@@ -491,21 +491,25 @@ impl Arch for Arm64 {
         }
     }
 
-    fn address_taken(insn: &Insn, state: &State, image: &Image) -> Option<u64> {
-        let address = match insn.pc_relative() {
-            Some((false, address)) if !is_dispatch_base(*insn, image) => address,
-            Some(_) => return None,
+    fn address_taken(insn: &Insn, state: &State, _: &Image) -> Option<u64> {
+        match insn.pc_relative() {
+            Some((false, address)) => Some(address),
+            Some((true, _)) => None,
             None => match (insn.add_immediate(), state.registers[insn.rn()]) {
-                (Some(immediate), Value::Page(page)) => page + immediate,
-                _ => return None,
+                (Some(immediate), Value::Page(page)) => Some(page + immediate),
+                _ => None,
             },
-        };
-        (!runs_into(address, insn.addr, image)).then_some(address)
+        }
     }
 
     /// `adr` forms the address of any byte, but only one on a word can be code.
     fn code_pointer(_: &Image, target: u64) -> bool {
         target.is_multiple_of(4)
+    }
+
+    /// A jump table's base, or the code's own position.
+    fn takes_label(insn: &Insn, target: u64, image: &Image) -> bool {
+        matches!(insn.pc_relative(), Some((false, _))) && is_dispatch_base(*insn, image) || runs_into(target, insn.addr, image)
     }
 
     fn memory_reference(insn: &Insn, state: &State) -> Option<u64> {
@@ -777,7 +781,10 @@ mod tests {
             // adr x0, 0x4070; br x1; ret.
             0x1000_0040, 0xD61F_0020, 0xD65F_03C0,
         ];
-        assert_eq!(starts(&words, &[0x4030, 0x404c, 0x4068]), [0x4000, 0x4030, 0x404c, 0x4068, 0x4070]);
+        let analysis = analyze(&words, &[0x4030, 0x404c, 0x4068]);
+        assert_eq!(starts(&analysis), [0x4000, 0x4030, 0x404c, 0x4068, 0x4070]);
+        // Each base is still an address its `adr` takes.
+        assert_eq!(references(&analysis), [(0x4008, 0x4018), (0x4034, 0x4034), (0x4058, 0x4050), (0x4068, 0x4070)]);
     }
 
     #[test]
@@ -789,16 +796,27 @@ mod tests {
             // 0x4020 and 0x4024: ret.
             0xD65F_03C0, 0xD65F_03C0,
         ];
-        assert_eq!(starts(&words, &[]), [0x4000, 0x4020, 0x4024]);
+        let analysis = analyze(&words, &[]);
+        assert_eq!(starts(&analysis), [0x4000, 0x4020, 0x4024]);
+        assert_eq!(references(&analysis), [(0x4010, 0x4008)]);
     }
 
-    /// The entry points recore finds in `words` of code at 0x4000, entered there and at `exports`.
-    fn starts(words: &[u32], exports: &[u64]) -> Vec<u64> {
+    /// recore's analysis of `words` of code at 0x4000, entered there and at `exports`.
+    fn analyze(words: &[u32], exports: &[u64]) -> crate::report::Analysis {
         let data = words.iter().flat_map(|word| word.to_le_bytes()).collect();
         let text = crate::image::Section { name: ".text".into(), addr: 0x4000, data, file_offset: None, executable: true, writable: false };
         let mut image = Image::bare(String::new(), crate::image::Format::Elf, crate::image::Machine::Aarch64, 0x4000, vec![text]);
         image.exports.extend(exports);
-        crate::analyze(&image).functions.iter().map(|function| function.addr).collect()
+        crate::analyze(&image)
+    }
+
+    fn starts(analysis: &crate::report::Analysis) -> Vec<u64> {
+        analysis.functions.iter().map(|function| function.addr).collect()
+    }
+
+    /// `(instruction, address)` of each address the code takes.
+    fn references(analysis: &crate::report::Analysis) -> Vec<(u64, u64)> {
+        analysis.data_refs.iter().map(|reference| (reference.from, reference.to)).collect()
     }
 
     #[test]
