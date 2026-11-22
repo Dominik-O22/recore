@@ -898,12 +898,27 @@ static bool constant_address(const Varnode *vn, uint64_t &addr, int depth = 0) {
   }
 }
 
-// What a format takes after it: for each argument, whether it is a floating-point number.
-// Empty for text that is no format, and for one whose conversions cannot be read. A printf
-// format takes an argument for each `*`, where a scanf format, which `scans` says it is,
-// reads and stores nothing for a conversion marked with one.
-static vector<bool> format_arguments(const string &format, bool scans) {
-  vector<bool> floats;
+// The size of what an integer conversion of a printf format takes, by its length modifier: an
+// `int` for none, as the default promotions widen a `char` or a `short` to one, and for `c`, and
+// otherwise the type the modifier names. Zero for a modifier that names none.
+static int4 integer_argument_size(const string &length, char conversion, const TypeFactory *types, int4 word) {
+  if (length.empty() || length == "h" || length == "hh" || conversion == 'c' || conversion == 'C') return types->getSizeOfInt();
+  if (length == "l") return types->getSizeOfLong();
+  if (length == "ll" || length == "q" || length == "L" || length == "j" || length == "I64") return 8;
+  if (length == "z" || length == "t" || length == "I") return word;
+  if (length == "I32") return 4;
+  return 0;
+}
+
+// What a format takes after it, the type of each argument. That is a double for a
+// floating-point conversion, a word for a string or a pointer, and an integer as wide as the
+// conversion's type for the rest: each travels in a whole register or stack slot, but the callee
+// reads only that many bytes of it. Empty for text that is no format, and for one whose
+// conversions cannot be read. A printf format takes an `int` for each `*`, where a scanf format,
+// which `scans` says it is, reads and stores nothing for a conversion marked with one.
+static vector<Datatype *> format_arguments(const string &format, bool scans, TypeFactory *types, int4 word) {
+  vector<Datatype *> arguments;
+  Datatype *pointer = types->getBase(word, TYPE_UNKNOWN);
   for (size_t i = 0; i < format.size(); ++i) {
     if (format[i] != '%') continue;
     size_t j = i + 1;
@@ -916,6 +931,7 @@ static vector<bool> format_arguments(const string &format, bool scans) {
     for (; j < format.size() && (isdigit((unsigned char)format[j]) || format[j] == '*' || format[j] == '.'); ++j)
       stars += format[j] == '*';
     // Length: hh h l ll z j t L, and Microsoft's I, I32, I64 and w.
+    size_t length = j;
     if (format.compare(j, 3, "I64") == 0 || format.compare(j, 3, "I32") == 0) j += 3;
     while (j < format.size() && strchr("hlzjtLIwq", format[j]) != nullptr) ++j;
     if (j >= format.size()) return {};
@@ -928,14 +944,26 @@ static vector<bool> format_arguments(const string &format, bool scans) {
     }
     if (scans) {
       // Every argument of a scan is a pointer, whatever it points to.
-      if (stars == 0) floats.push_back(false);
+      if (stars == 0) arguments.push_back(pointer);
     } else {
-      floats.insert(floats.end(), stars, false);
-      floats.push_back(strchr("eEfFgGaA", format[j]) != nullptr);
+      arguments.insert(arguments.end(), stars, types->getBase(types->getSizeOfInt(), TYPE_UNKNOWN));
+      if (strchr("eEfFgGaA", format[j]) != nullptr) {
+        arguments.push_back(types->getBase(8, TYPE_FLOAT));
+      } else if (strchr("sSpn", format[j]) != nullptr) {
+        arguments.push_back(pointer);
+      } else {
+        int4 size = integer_argument_size(format.substr(length, j - length), format[j], types, word);
+        arguments.push_back(size != 0 ? types->getBase(size, TYPE_UNKNOWN) : pointer);
+      }
     }
     i = j;
   }
-  return floats;
+  return arguments;
+}
+
+// Whether a format takes a floating-point number, which travels in a register of its own.
+static bool takes_float(const vector<Datatype *> &arguments) {
+  return any_of(arguments.begin(), arguments.end(), [](Datatype *type) { return type->getMetatype() == TYPE_FLOAT; });
 }
 
 // Gives each call that passes a printf format to a function taking a variable number of
@@ -970,13 +998,13 @@ static bool follow_formats(RdSession *session, Funcdata *fd) {
       }
       const uint1 *end = (const uint1 *)memchr(bytes, 0, sizeof(bytes));
       if (end == nullptr) continue;
-      vector<bool> floats = format_arguments(string((const char *)bytes, end - bytes), call->getName().find("scanf") != string::npos);
-      if (floats.empty()) continue;
+      vector<Datatype *> arguments = format_arguments(string((const char *)bytes, end - bytes), call->getName().find("scanf") != string::npos, arch->types, word);
+      if (arguments.empty()) continue;
       // The first argument that is a format settles it, whatever the later ones are. A
       // floating-point argument travels in a register of its own, and a call of unknown
       // prototype may list it before the format: with one in play, where the format stands
       // does not say how many parameters come before it, and the call is left as it is.
-      if (at + floats.size() == (size_t)passed || floats.size() > most || count(floats.begin(), floats.end(), true) > 0) break;
+      if (at + arguments.size() == (size_t)passed || arguments.size() > most || takes_float(arguments)) break;
       size_t fixed = at - 1;
       PrototypePieces pieces;
       pieces.model = arch->getModel(call->getModelName());
@@ -986,8 +1014,7 @@ static bool follow_formats(RdSession *session, Funcdata *fd) {
       // again collect whatever else the registers around it hold.
       pieces.firstVarArgSlot = -1;
       pieces.intypes.assign(fixed + 1, arch->types->getBase(word, TYPE_UNKNOWN));
-      for (bool is_float : floats)
-        pieces.intypes.push_back(is_float ? arch->types->getBase(8, TYPE_FLOAT) : arch->types->getBase(word, TYPE_UNKNOWN));
+      pieces.intypes.insert(pieces.intypes.end(), arguments.begin(), arguments.end());
       pieces.innames.assign(pieces.intypes.size(), "");
       FuncProto *proto = new FuncProto();
       proto->setInternal(pieces.model, arch->types->getTypeVoid());
@@ -2328,10 +2355,10 @@ int rd_format_call(RdSession *session, uint64_t function, uint64_t call, uint64_
     const uint1 *end = (const uint1 *)memchr(bytes, 0, sizeof(bytes));
     if (end == nullptr) return;
     string text((const char *)bytes, end - bytes);
-    vector<bool> floats = format_arguments(text, target->getName().find("scanf") != string::npos);
+    vector<Datatype *> arguments = format_arguments(text, target->getName().find("scanf") != string::npos, arch->types, word);
     // recore: text without a `%` asks for nothing more, as firmware's linked `printf` is
     // called with it. Other text that asks for nothing is no format the parser read.
-    if ((floats.empty() && text.find('%') != string::npos) || floats.size() > 12) return;
+    if ((arguments.empty() && text.find('%') != string::npos) || arguments.size() > 12) return;
 
     const FuncProto &declared = target->getFuncProto();
     PrototypePieces pieces;
@@ -2341,8 +2368,7 @@ int rd_format_call(RdSession *session, uint64_t function, uint64_t call, uint64_
     pieces.firstVarArgSlot = -1;
     for (size_t i = 0; i <= position; ++i)
       pieces.intypes.push_back(import != 0 ? declared.getParam(i)->getType() : arch->types->getBase(word, TYPE_UNKNOWN));
-    for (bool is_float : floats)
-      pieces.intypes.push_back(is_float ? arch->types->getBase(8, TYPE_FLOAT) : arch->types->getBase(word, TYPE_UNKNOWN));
+    pieces.intypes.insert(pieces.intypes.end(), arguments.begin(), arguments.end());
     pieces.innames.assign(pieces.intypes.size(), "");
     FuncProto *proto = new FuncProto();
     proto->setInternal(pieces.model, arch->types->getTypeVoid());
