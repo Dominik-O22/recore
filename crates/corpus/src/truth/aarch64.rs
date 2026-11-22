@@ -97,6 +97,36 @@ pub fn data_ranges(binary: &object::File, debug: &object::File) -> Vec<(u64, u64
     ranges
 }
 
+/// The entries of the jump tables of LLVM's CFI in `section`, as `(address, size)`: each word
+/// outside every one of `functions`, given as `[start, end)`, that is a `b`, or a `bti c` and a
+/// `b` where the build has BTI.
+pub fn cfi_jump_table(section: &object::Section, functions: impl Iterator<Item = (u64, u64)>) -> Vec<(u64, u64)> {
+    let Ok(data) = section.data() else { return Vec::new() };
+    let words: Vec<u32> = data.as_chunks::<4>().0.iter().map(|word| u32::from_le_bytes(*word)).collect();
+    let index = |addr: u64| usize::try_from(addr.saturating_sub(section.address()) / 4).unwrap_or(usize::MAX).min(words.len());
+    let mut covered = vec![false; words.len()];
+    for (start, end) in functions {
+        covered[index(start)..index(end.next_multiple_of(4)).max(index(start))].fill(true);
+    }
+    let is_branch = |at: usize| words.get(at).is_some_and(|word| word & 0xfc00_0000 == 0x1400_0000);
+    let mut entries = Vec::new();
+    let mut at = 0;
+    while at < words.len() {
+        let size = if covered[at] {
+            0
+        } else if words[at] == BTI_C && is_branch(at + 1) {
+            2
+        } else {
+            usize::from(is_branch(at))
+        };
+        if size > 0 {
+            entries.push((section.address() + 4 * at as u64, 4 * size as u64));
+        }
+        at += size.max(1);
+    }
+    entries
+}
+
 /// What a register holds while following an `adrp`/`ldr` pair to an indirect call.
 #[derive(Clone, Copy)]
 enum Known {
