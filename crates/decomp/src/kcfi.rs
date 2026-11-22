@@ -90,6 +90,16 @@ fn lookup(hash: u32, spelling: Spelling) -> Option<&'static str> {
 /// of them, and that spelling. `None` for any other image, and for one none of whose hashes is
 /// found.
 pub fn types(image: &Image) -> Option<(Spelling, Types)> {
+    // The table holds 64-bit kernels' types.
+    let mut types = Types::new(8);
+    let spelling = add(image, &mut types)?;
+    Some((spelling, types))
+}
+
+/// Adds to `types` the prototypes the kCFI hashes of `image` name for the functions `types` has
+/// none for, and says in which spelling. A struct a prototype names by a name `types` has is
+/// that struct, so a kernel's own BTF gives it its layout.
+pub fn add(image: &Image, types: &mut Types) -> Option<Spelling> {
     let hashes = hashes(image);
     let found = |spelling| -> Vec<(u64, &'static str)> { hashes.iter().filter_map(|&(addr, hash)| Some((addr, lookup(hash, spelling)?))).collect() };
     let (normalized, plain) = (found(Spelling::Normalized), found(Spelling::Plain));
@@ -97,25 +107,25 @@ pub fn types(image: &Image) -> Option<(Spelling, Types)> {
     if found.is_empty() {
         return None;
     }
-    // The table holds 64-bit kernels' types.
-    let mut reader = Reader { types: Types::new(8), spelled: HashMap::new() };
+    let described = |addr: u64| types.functions.binary_search_by_key(&addr, |function| function.addr).is_ok();
+    let found: Vec<(u64, &str)> = found.into_iter().filter(|&(addr, _)| !described(addr)).collect();
+    let mut reader = Reader { types, spelled: HashMap::new() };
     for (addr, text) in found {
         if let Some(prototype) = reader.prototype(text) {
             reader.types.functions.push(Function { addr, name: String::new(), prototype });
         }
     }
-    let mut types = reader.types;
-    types.finish();
-    Some((spelling, types))
+    reader.types.finish();
+    Some(spelling)
 }
 
 /// Builds the types the table's prototypes spell, each spelling once.
-struct Reader {
-    types: Types,
+struct Reader<'a> {
+    types: &'a mut Types,
     spelled: HashMap<&'static str, TypeId>,
 }
 
-impl Reader {
+impl Reader<'_> {
     /// `<return> (<params>)`, with `(void)` for none and `...` last for a variadic function.
     fn prototype(&mut self, text: &'static str) -> Option<TypeId> {
         let (returns, params) = text.strip_suffix(')')?.split_once(" (")?;

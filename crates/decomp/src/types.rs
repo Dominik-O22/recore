@@ -409,6 +409,16 @@ impl<'a> Writer<'a> {
             }
             Type::Typedef { name, target } => {
                 if !std::mem::replace(&mut self.written[id as usize], true) {
+                    // The engine drops a typedef of a function type, and with it every type that
+                    // names one, as a kernel's `proc_handler` is named: such a typedef is written
+                    // as a function type of its own name.
+                    if let Some(prototype) = self.function_behind(*target) {
+                        self.define_prototype(prototype);
+                        let _ = write!(self.out, r#"<functype name="{}" id="{}""#, escaped(name), self.ident(id));
+                        self.prototype(prototype);
+                        self.out.push_str("</functype>\n");
+                        return;
+                    }
                     self.define(*target);
                     let _ = write!(self.out, r#"<def name="{}" id="{}">"#, escaped(name), self.ident(id));
                     self.reference(*target);
@@ -428,6 +438,19 @@ impl<'a> Writer<'a> {
                 }
             }
         }
+    }
+
+    /// The prototype a function type behind typedefs of it gives, if `id` is one.
+    fn function_behind(&self, mut id: TypeId) -> Option<&'a Prototype> {
+        let types = self.types;
+        for _ in 0..16 {
+            match types.get(id) {
+                Type::Typedef { target, .. } => id = *target,
+                Type::Function(prototype) => return Some(prototype),
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// A word for the type `id` in the name of a function type.
@@ -529,8 +552,9 @@ impl<'a> Writer<'a> {
             // The engine wants fields in order and rejects a struct with one that does not fit;
             // a field that overlaps the one before it, as an empty base class does, is left out.
             // A member with nothing in it, as an empty base class is, holds no data, and the
-            // engine faults on a struct that is all one such member.
-            let mut kept: Vec<&Field> = fields.iter().filter(|field| !field.name.is_empty() && !types.hollow(field.kind, 8)).collect();
+            // engine faults on a struct that is all one such member. A union of the engine holds
+            // no bitfield.
+            let mut kept: Vec<&Field> = fields.iter().filter(|field| !field.name.is_empty() && !types.hollow(field.kind, 8) && !(*union && field.bits.is_some())).collect();
             if !*union {
                 kept.sort_by_key(|field| (field.offset, field.bits.map_or(0, |bits| bits.0)));
             }
@@ -757,15 +781,15 @@ pub fn debug_file(path: &Path, image: &Image) -> Option<PathBuf> {
 }
 
 /// The types in the debug information of the image at `path`, if it has any that can be read,
-/// or else those of the managed program of an IL2CPP build, or else the prototypes an arm64
-/// kernel's or module's kCFI hashes name. Why debug information could not be read goes to stderr: the
-/// decompiler works without. [`DEBUG_VAR`] set to `off` keeps all three out.
+/// or else those of the managed program of an IL2CPP build, or else those of a Linux kernel:
+/// see [`kernel`]. Why debug information could not be read goes to stderr: the decompiler works
+/// without. [`DEBUG_VAR`] set to `off` keeps them all out.
 pub fn load(path: &Path, image: &Image) -> Option<Types> {
     if std::env::var(DEBUG_VAR).is_ok_and(|setting| setting == "off") {
         return None;
     }
     let Some(file) = debug_file(path, image) else {
-        return image.il2cpp.as_deref().map(crate::il2cpp::types).or_else(|| crate::kcfi::types(image).map(|(_, types)| types));
+        return image.il2cpp.as_deref().map(crate::il2cpp::types).or_else(|| kernel(image));
     };
     let loaded = if file.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("pdb")) {
         crate::pdb::types(&file, image)
@@ -773,4 +797,14 @@ pub fn load(path: &Path, image: &Image) -> Option<Types> {
         crate::dwarf::types(&file, image.machine)
     };
     loaded.map_err(|error| eprintln!("debug information in {file:?}: {error:#}")).ok()
+}
+
+/// The types a kernel's own BTF describes, with the prototypes of the functions its symbols name,
+/// and for the functions BTF has none for, the prototypes their kCFI hashes name; or for an arm64
+/// kernel or module without BTF, the latter alone. BTF wins where both give one: it is this
+/// build's, and names the parameters, where a hash names only a shape every kernel shares.
+fn kernel(image: &Image) -> Option<Types> {
+    let Some(mut types) = crate::btf::types(image) else { return crate::kcfi::types(image).map(|(_, types)| types) };
+    crate::kcfi::add(image, &mut types);
+    Some(types)
 }

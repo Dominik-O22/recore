@@ -41,6 +41,9 @@ pub struct Binary {
     /// Started when the binary is loaded, so it sets up while the first queries are answered,
     /// or by the first request, for a tool run from the shell that may make none.
     worker: Worker,
+    /// The objects of a kernel image that hold functions, and the struct each is, read from its
+    /// BTF when first asked for.
+    objects: std::cell::OnceCell<recore_decomp::btf::Objects>,
 }
 
 /// The decompiler process for the binary at `path`, started now or by its first request.
@@ -79,7 +82,7 @@ impl Binary {
         let program = Program::new(image, analysis);
         // What loading freed would otherwise be held while queries are answered.
         recore_decomp::give_back_freed_memory();
-        Ok(Binary { key, stamp, program, edits, edits_file, edits_stamp, found_names, analysis_ms, worker })
+        Ok(Binary { key, stamp, program, edits, edits_file, edits_stamp, found_names, analysis_ms, worker, objects: std::cell::OnceCell::new() })
     }
 
     /// Changes the binary's edits as saved now, which may hold edits another process saved since
@@ -116,6 +119,13 @@ impl Binary {
         }
         self.edits.apply(&mut self.program.analysis);
         self.worker.update(&self.edits, QUICK);
+    }
+
+    /// The objects of a kernel image that hold functions, each with the struct its functions'
+    /// prototypes say it is: see [`recore_decomp::btf::objects`]. None for any other image.
+    pub fn objects(&self) -> &recore_decomp::btf::Objects {
+        let image = &self.program.image;
+        self.objects.get_or_init(|| recore_decomp::btf::types(image).map(|types| recore_decomp::btf::objects(image, &types)).unwrap_or_default())
     }
 
     /// Where this binary's edits are saved.

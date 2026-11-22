@@ -647,3 +647,23 @@ fn sessions_on_several_threads_parse_c_at_once() {
         }
     });
 }
+
+/// A typedef of a function type, as a kernel's `proc_handler` is, and a struct that points to
+/// one, which the engine takes whole.
+#[test]
+fn a_struct_takes_a_pointer_to_a_typedef_of_a_function_type() {
+    use recore_decomp::types::{Base, Field, Named, Prototype, Type, Types, Writer};
+    let mut types = Types::new(8);
+    let int = types.add(Type::Base { base: Base::Int, size: 4 });
+    let function = types.add(Type::Function(Prototype { returns: int, params: vec![("a".into(), int)], variadic: false, convention: None }));
+    let handler = types.named(Named::Typedef, "handler_t", 0).0;
+    types.set_target(handler, function);
+    let pointer = types.add(Type::Pointer(handler));
+    let holder = types.named(Named::Struct, "holder", 8).0;
+    types.set_fields(holder, vec![Field { name: "handle".into(), offset: 0, kind: pointer, bits: None }]);
+    let mut writer = Writer::new(&types);
+    writer.named(holder);
+    let mut session = session(&[0xc3]);
+    assert_eq!(session.add_types(&writer.take().unwrap()).unwrap(), Vec::<String>::new());
+    assert!(session.type_layout("holder").unwrap().contains("handle"), "{}", session.type_layout("holder").unwrap());
+}
