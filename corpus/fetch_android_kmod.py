@@ -50,15 +50,18 @@ def held_out(module):
 
 
 def download(url, pkgs, name):
-    """Downloads `url` once, into a directory of its own in `pkgs`. Gitiles sends no length, so
-    a download of an archive cut short shows only when it is read to its end, which happens
-    before the file gets its name."""
+    """Downloads `url` once, into a directory of its own in `pkgs`. A download cut short gets no
+    name: it is held to the length the server sent, and an archive, for which Gitiles sends none,
+    is read to its end."""
     dest = pkgs / name / Path(url).name
     if not dest.exists():
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(".part")
         with urllib.request.urlopen(url, timeout=180) as response, open(tmp, "wb") as out:
             shutil.copyfileobj(response, out)
+            length = response.headers.get("Content-Length")
+        if length is not None and tmp.stat().st_size != int(length):
+            sys.exit(f"{url}: got {tmp.stat().st_size} of {length} bytes")
         if dest.name.endswith(".tar.gz"):
             with tarfile.open(tmp) as tar:
                 tar.getmembers()

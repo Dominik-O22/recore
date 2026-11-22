@@ -353,6 +353,12 @@ fn elf(binary_path: &Path, binary: &object::File, debug: &object::File) -> Resul
     // that `__stack_chk_fail` never returns, and objtool's list does.
     let kernel = !kernel_module && binary.section_by_name("__ksymtab").is_some();
 
+    // LLVM's CFI, which defines `__cfi_check` in each module of a 4.19 or 5.10 kernel, has an
+    // indirect call go through a jump table after the functions of `.text`. Only there is a
+    // symbol named as its labels are a label.
+    let cfi_jump_tables = architecture == Architecture::Aarch64
+        && debug.symbols().any(|symbol| symbol.kind() == SymbolKind::Text && symbol.name() == Ok("__cfi_check") && in_exec(symbol.address()));
+
     // Aliases share an address; keep one, preferring a non-fragment name.
     let mut by_addr: BTreeMap<u64, Function> = BTreeMap::new();
     let mut jump_table_labels: HashMap<u64, String> = HashMap::new();
@@ -368,7 +374,7 @@ fn elf(binary_path: &Path, binary: &object::File, debug: &object::File) -> Resul
         if is_mapping_symbol(name) || recore::relocatable::is_padding(name.as_bytes()) {
             continue;
         }
-        if is_jump_table_label(name) {
+        if cfi_jump_tables && is_jump_table_label(name) {
             jump_table_labels.insert(symbol.address(), name.to_string());
             continue;
         }
@@ -387,9 +393,7 @@ fn elf(binary_path: &Path, binary: &object::File, debug: &object::File) -> Resul
             }
         }
     }
-    // LLVM's CFI, which defines `__cfi_check` in each module of a 4.19 or 5.10 kernel, has an
-    // indirect call go through a jump table after the functions of `.text`.
-    if architecture == Architecture::Aarch64 && by_addr.values().any(|function| function.name == "__cfi_check") {
+    if cfi_jump_tables {
         let text = exec_sections.iter().find(|s| s.name() == Ok(".text")).context("no .text section")?;
         let entries = aarch64::cfi_jump_table(text, by_addr.values().map(|function| (function.addr, function.addr + function.size)));
         for (addr, size) in entries {
@@ -630,7 +634,8 @@ mod tests {
         };
         let thunk = |addr, size, name: &str| (addr, size, name.to_string(), true);
         assert_eq!(functions("__cfi_check"), [(0, 4, "__cfi_check".into(), false), thunk(4, 4, label), thunk(8, 8, "")]);
-        assert_eq!(functions("f"), [(0, 4, "f".into(), false)]);
+        // Without `__cfi_check` nothing says the name is a label, so its symbol is a function.
+        assert_eq!(functions("f"), [(0, 4, "f".into(), false), (4, 1, label.to_string(), false)]);
     }
 
     #[test]

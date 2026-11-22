@@ -13,8 +13,9 @@ after `llvm-strip --strip-all`. In -image, bin/Image.toml is the layout of image
 vmlinux's loaded bytes as `objcopy -O binary` writes them: a region for each segment it loads.
 The debug file is vmlinux with its DWARF decompressed, which recore reads only so. The Image
 holds vmlinux's bytes at vmlinux's addresses, so vmlinux is its debug file too.
-The downloads are kept in the pkgs/ of corpus-kernel-android, the large files are hard links to
-them, and the corpus's truth/ is written last. A corpus that has truth/ is left as it is.
+The downloads are kept in the pkgs/ of corpus-kernel-android, and the held-out kernel's in that
+of corpus-kernel-android-holdout, so that no tuned corpus holds a held-out file. The large files
+are hard links to them, and the corpus's truth/ is written last. A corpus that has truth/ is left as it is.
 """
 import os, struct, subprocess, sys
 from pathlib import Path
@@ -59,7 +60,7 @@ def main():
         return
 
     build = BUILDS[held_out]
-    pkgs = CORPORA / "corpus-kernel-android" / "pkgs"
+    pkgs = CORPORA / ("corpus-kernel-android-holdout" if held_out else "corpus-kernel-android") / "pkgs"
     vmlinux = download(CI.format(build=build, file="vmlinux"), pkgs, f"gki-{build}-vmlinux")
     debug = pkgs / f"gki-{build}-debug" / "vmlinux.debug"
     if not debug.exists():
