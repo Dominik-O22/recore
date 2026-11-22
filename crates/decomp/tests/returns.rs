@@ -33,11 +33,29 @@ fn returns_value(name: &str, code: &[u8]) -> bool {
 /// The code at 0x1000 calls the function at 0x1010, which ends by calling through a pointer and
 /// so shows no value returned: `call [rdi]; ret`. `after` is the code after the call.
 fn called(after: &[u8]) -> Vec<u8> {
+    calling(after, &[0xff, 0x17, 0xc3])
+}
+
+/// The code at 0x1000 calls `callee`, at 0x1010, and runs on into `after`.
+fn calling(after: &[u8], callee: &[u8]) -> Vec<u8> {
     let mut code = vec![0xe8, 0x0b, 0x00, 0x00, 0x00];
     code.extend(after);
     code.resize(0x10, 0xcc);
-    code.extend([0xff, 0x17, 0xc3]);
+    code.extend(callee);
     code
+}
+
+/// Whether one decompilation of the function at 0x1010 of `code`, raw x86-64 code at 0x1000,
+/// returns a value, given the call at 0x1000 as its caller and the functions at `entries`.
+fn one_decompilation_returns(code: &[u8], entries: &[u64]) -> bool {
+    let mut session = Session::new(&vendored_spec_dir().unwrap(), Target::X86_64Gcc, &[Section { addr: 0x1000, data: code, readonly: true, code: true }]).unwrap();
+    for &entry in entries {
+        session.add_function(entry, false).unwrap();
+    }
+    session.callers(0x1010, &[0x1000]);
+    let function = session.decompile(0x1010).unwrap();
+    println!("{}", function.c_text);
+    function.returns_value
 }
 
 #[test]
@@ -86,3 +104,37 @@ fn a_function_does_not_vouch_for_itself() {
     code.extend([0x85, 0xff, 0x74, 0x09, 0xff, 0xcf, 0xe8, 0xf5, 0xff, 0xff, 0xff, 0x89, 0x06, 0xc3]);
     assert!(!returns_value("only-itself", &code));
 }
+
+#[test]
+fn a_function_that_leaves_the_register_as_it_found_it_returns_nothing_whatever_a_caller_reads() {
+    // The caller reads eax: add eax, 1; ret. Compilers that see the callee know it leaves eax
+    // alone and keep using their own value.
+    let after = [0x83, 0xc0, 0x01, 0xc3];
+    // mov [rdi], rsi; ret: the callee never names rax.
+    assert!(!one_decompilation_returns(&calling(&after, &[0x48, 0x89, 0x37, 0xc3]), &[]));
+    // mov [rdi], rax; ret: it reads rax and never writes it.
+    assert!(!one_decompilation_returns(&calling(&after, &[0x48, 0x89, 0x07, 0xc3]), &[]));
+}
+
+#[test]
+fn a_caller_that_pushes_the_register_reads_nothing() {
+    // push rax; call [rbx]; pop rcx; ret: the push keeps the stack aligned for the next call.
+    assert!(!one_decompilation_returns(&called(&[0x50, 0xff, 0x13, 0x59, 0xc3]), &[]));
+}
+
+#[test]
+fn a_caller_that_sets_every_bit_or_none_reads_nothing() {
+    // or eax, -1; ret
+    assert!(!one_decompilation_returns(&called(&[0x83, 0xc8, 0xff, 0xc3]), &[]));
+    // and eax, 0; ret
+    assert!(!one_decompilation_returns(&called(&[0x83, 0xe0, 0x00, 0xc3]), &[]));
+}
+
+#[test]
+fn the_function_after_a_call_that_never_comes_back_is_no_caller_reading() {
+    // The function at 0x1010 loops forever: jmp $. Right after the call to it at 0x1000 the
+    // function at 0x1005 starts, which reads rax: mov rbx, rax; ret.
+    let code = calling(&[0x48, 0x89, 0xc3, 0xc3], &[0xeb, 0xfe]);
+    assert!(!one_decompilation_returns(&code, &[0x1005]));
+}
+

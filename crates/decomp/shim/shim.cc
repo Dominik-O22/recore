@@ -1986,9 +1986,13 @@ static int4 low_bytes(const VarnodeData &reg, const VarnodeData &vn) {
   return (int4)(min(vn.offset + vn.size, reg.offset + reg.size) - reg.offset);
 }
 
-// Operations whose result is the same whatever value their two inputs share, as `XOR EAX,EAX`
-// clears EAX without reading it.
-static bool same_inputs_give_a_constant(const CollectPcode &emit, const CollectPcode::Op &op) {
+// Operations whose result does not depend on what the register holds: those whose two inputs are
+// the same, as `XOR EAX,EAX` clears EAX without reading it, and those with a constant input that
+// settles the result, as `OR EAX,-1` and `AND EAX,0`.
+static bool gives_a_constant(const CollectPcode &emit, const CollectPcode::Op &op) {
+  if (op.count != 2) return false;
+  const VarnodeData &a = emit.inputs[op.first], &b = emit.inputs[op.first + 1];
+  auto is = [](const VarnodeData &vn, uintb value) { return vn.space->getType() == IPTR_CONSTANT && vn.offset == (value & calc_mask(vn.size)); };
   switch (op.code) {
     case CPUI_INT_XOR:
     case CPUI_INT_SUB:
@@ -2000,7 +2004,12 @@ static bool same_inputs_give_a_constant(const CollectPcode &emit, const CollectP
     case CPUI_INT_EQUAL:
     case CPUI_INT_NOTEQUAL:
     case CPUI_BOOL_XOR:
-      return op.count == 2 && emit.inputs[op.first] == emit.inputs[op.first + 1];
+      return a == b;
+    case CPUI_INT_OR:
+      return is(a, ~(uintb)0) || is(b, ~(uintb)0);
+    case CPUI_INT_AND:
+    case CPUI_INT_MULT:
+      return is(a, 0) || is(b, 0);
     default:
       return false;
   }
@@ -2034,6 +2043,9 @@ static int4 bytes_read_after(RdSession *session, uint64_t call, const VarnodeDat
       // SectionSleigh::oneInstruction.
       auto data = session->image->data_after.find(at);
       at += length + (data != session->image->data_after.end() ? data->second : 0);
+      // Another function there means the call never comes back, whatever recore's analysis
+      // made of the callee, and that function's code says nothing of the result.
+      if (session->image->entries.count(at) != 0) return 0;
       continue;
     }
     at += length;
@@ -2045,7 +2057,7 @@ static int4 bytes_read_after(RdSession *session, uint64_t call, const VarnodeDat
     for (const CollectPcode::Op &op : emit.ops) {
       int4 read = 0;
       bool reads = false;
-      if (!same_inputs_give_a_constant(emit, op)) {
+      if (!gives_a_constant(emit, op)) {
         for (size_t i = op.first; i < op.first + op.count; ++i) {
           const VarnodeData &input = emit.inputs[i];
           int4 direct = written ? 0 : low_bytes(result, input);
@@ -2116,23 +2128,78 @@ static bool result_register(Architecture *arch, VarnodeData &result, bool &whole
   return true;
 }
 
+// Whether `vn` is, on every path, what the storage at `low` of `size` bytes held as the function
+// was entered, passed on through copies, merges and the low end of a wider register.
+static bool entry_value(const Varnode *vn, const Address &low, int4 size, set<const Varnode *> &seen) {
+  if (!seen.insert(vn).second) return true;
+  if (vn->isInput()) {
+    if (vn->getSpace() != low.getSpace() || vn->getSize() < size) return false;
+    return (low.isBigEndian() ? vn->getOffset() + vn->getSize() - size : vn->getOffset()) == low.getOffset();
+  }
+  if (!vn->isWritten()) return false;
+  const PcodeOp *op = vn->getDef();
+  switch (op->code()) {
+    case CPUI_COPY:
+    case CPUI_INDIRECT:
+      return entry_value(op->getIn(0), low, size, seen);
+    case CPUI_SUBPIECE:
+      return op->getIn(1)->getOffset() == 0 && entry_value(op->getIn(0), low, size, seen);
+    case CPUI_MULTIEQUAL:
+      for (int4 i = 0; i < op->numInput(); ++i)
+        if (!entry_value(op->getIn(i), low, size, seen)) return false;
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Whether each return of `fd` leaves the register of the trial `index` of `active` as the function
+// found it. With no trial the function's code never names the register, and only a call changes it.
+static bool leaves_as_found(Funcdata &fd, ParamActive &active, int4 index) {
+  if (index == active.getNumTrials()) {
+    for (int4 i = 0; i < fd.numCalls(); ++i)
+      if (!fd.getCallSpecs(i)->getOp()->isDead()) return false;
+    return true;
+  }
+  const ParamTrial &trial(active.getTrial(index));
+  set<const Varnode *> seen;
+  for (auto op = fd.beginOp(CPUI_RETURN); op != fd.endOp(CPUI_RETURN); ++op) {
+    if ((*op)->isDead() || (*op)->getHaltType() != 0) continue;
+    if (trial.getSlot() >= (*op)->numInput() || !entry_value((*op)->getIn(trial.getSlot()), trial.getAddress(), trial.getSize(), seen)) return false;
+  }
+  return true;
+}
+
 // Called where the engine found no value returned in the code of `fd`. If a caller reads the
-// result register after a call to it, makes that register the output, as wide as the widest
-// read, or the whole register where it also passes an argument. It marks the register's trial
-// in `active` and says it did. Where no return could pass the value, it sets the output of the
-// prototype instead.
+// result register after a call to it, makes that register the output, as wide as the widest read
+// or the part of it the function's code holds, whichever is narrower, or the whole register where
+// it also passes an argument. It marks the register's trial in `active` and says it did. Where no
+// return could pass the value, it sets the output of the prototype instead.
 static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamActive &active) {
   Architecture *arch = session->arch;
   VarnodeData result;
   bool whole;
   if (!result_register(arch, result, whole)) return false;
+  bool big = result.space->isBigEndian();
+  // The trial that holds the low end of the register, if the function's code touches it.
+  int4 index = 0;
+  for (; index < active.getNumTrials(); ++index) {
+    const ParamTrial &trial(active.getTrial(index));
+    const Address &at = trial.getAddress();
+    if (at.getSpace() == result.space && (big ? at.getOffset() + trial.getSize() == result.offset + result.size : at.getOffset() == result.offset)) break;
+  }
+  bool returns = any_of(fd.beginOp(CPUI_RETURN), fd.endOp(CPUI_RETURN), [](PcodeOp *op) { return !op->isDead() && op->getHaltType() == 0; });
+  // A function that leaves the register as it found it returns nothing there, whatever a caller
+  // does with it after the call: a compiler that sees the callee knows that, and keeps using its
+  // own value. Where the register also passes an argument, this takes a function that returns
+  // that argument unchanged, as memcpy does, for one that returns nothing.
+  if (returns && leaves_as_found(fd, active, index)) return false;
   int4 bytes = bytes_callers_read(session, session->offset(fd.getAddress()), result, whole ? 1 : (int4)result.size);
   if (bytes == 0) return false;
   if (whole) bytes = result.size;
-  bool big = result.space->isBigEndian();
   Address low(result.space, big ? result.offset + result.size - bytes : result.offset);
   session->result_from_callers = true;
-  if (none_of(fd.beginOp(CPUI_RETURN), fd.endOp(CPUI_RETURN), [](PcodeOp *op) { return !op->isDead() && op->getHaltType() == 0; })) {
+  if (!returns) {
     // No return to pass the value, as where the flow ran into bytes that do not decode. The
     // prototype says what the callers show, until the decompilation ends: see rd_decompile.
     ParameterPieces piece;
@@ -2146,13 +2213,6 @@ static bool returns_what_callers_read(RdSession *session, Funcdata &fd, ParamAct
     // Locking the output locks the calling convention with it, which is still to be recovered.
     fd.getFuncProto().setModelLock(model_locked);
     return false;
-  }
-  // The trial that holds the low end of the register, if the function's code touches it.
-  int4 index = 0;
-  for (; index < active.getNumTrials(); ++index) {
-    const ParamTrial &trial(active.getTrial(index));
-    const Address &at = trial.getAddress();
-    if (at.getSpace() == result.space && (big ? at.getOffset() + trial.getSize() == result.offset + result.size : at.getOffset() == result.offset)) break;
   }
   if (index == active.getNumTrials()) {
     // Code that never names the register, as `call [rdi]; ret` does, has no trial of it. Each
@@ -3241,3 +3301,4 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
 }
 
 }  // extern "C"
+
