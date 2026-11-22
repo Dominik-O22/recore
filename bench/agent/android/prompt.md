@@ -7,8 +7,8 @@ The tool is the binary `{DIR}/bin/recore-mcp`. Run `recore-mcp --help` first, an
 Before every recore-mcp call, set `RECORE_EDITS_DIR={DIR}/edits` in the environment.
 
 The targets in `task/` are from Android phone kernels, GKI builds for arm64:
-- `Image` is a Linux 5.15 kernel as a boot partition holds it: the raw image, with no ELF header and no section table.
-- `gzvm.ko`, `zram.ko` and `rfkill.ko` are three modules of a Linux 6.1 kernel, stripped of every symbol they can do without.
+- `Image` is an Android phone's Linux kernel as a boot partition holds it: the raw image, with no ELF header and no section table.
+- `gzvm.ko`, `zram.ko` and `rfkill.ko` are three modules of another Android kernel, stripped of every symbol they can do without.
 
 Addresses are as recore shows them.
 

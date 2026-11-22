@@ -33,7 +33,9 @@ fi
 cd "$dir"
 date +%s.%N > work/agent.start
 # No settings, plugins, CLAUDE.md or memory of the user's: the prompt is all the session is told.
+# And no web: these modules' source is public, and the key asks what this build does.
 CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 claude -p "$(cat prompt.md)" --model "$model" --strict-mcp-config --setting-sources project \
+  --disallowedTools WebFetch WebSearch \
   --dangerously-skip-permissions --output-format stream-json --verbose > work/run.jsonl
 date +%s.%N > work/agent.end
 python3 -I "$here/../stats.py" "$dir"

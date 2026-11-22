@@ -60,7 +60,7 @@ bench/agent/android/run.sh claude-haiku-5-5 ~/agent-runs/haiku-android
 KEY=bench/agent/android/key.md bench/agent/judge.py ~/agent-runs/haiku-android
 ```
 
-- **`fetch.py`** downloads the builds by pinned URL and sha256, strips the modules, and keeps vmlinux, System.map and the modules with DWARF apart from what a session gets. `run.sh` puts only the four inputs in the session's folder, and `run.sh <model> <dir> --setup` lays the folder out without starting a session.
+- **`fetch.py`** downloads the builds by pinned URL and sha256, about 0.57 GB on a first run, 0.5 GB of it the `vmlinux` that only the key's derivations read, strips the modules, and keeps vmlinux, System.map and the modules with DWARF apart from what a session gets. `run.sh` puts only the four inputs in the session's folder, and `run.sh <model> <dir> --setup` lays the folder out without starting a session.
 - **`derive.sh`**, **`callers.py`** and **`words.py`** write what the key's derivations read: disassembly of the debug files, direct callers of a kernel function, and entries of the kernel's tables.
 - The `Image` tasks need recore to name the image from its kallsyms. A recore that cannot loads it as unnamed code, and those tasks are then out of reach.
 

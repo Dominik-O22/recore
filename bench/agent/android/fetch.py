@@ -36,14 +36,20 @@ def download(pkgs: Path, build: str, file: str) -> Path:
         part = path.with_name(file + ".part")
         with urllib.request.urlopen(CI.format(build=build, file=file), timeout=600) as response, open(part, "wb") as out:
             shutil.copyfileobj(response, out)
+        # A download that is not the pinned file gets no name, so the next run fetches it again.
+        check(part, build, file)
         part.rename(path)
+    check(path, build, file)
+    return path
+
+
+def check(path: Path, build: str, file: str) -> None:
     digest = hashlib.sha256()
     with open(path, "rb") as data:
         while chunk := data.read(1 << 20):
             digest.update(chunk)
     if digest.hexdigest() != PINS[build, file]:
         sys.exit(f"{path}: sha256 is not the pinned {PINS[build, file]}")
-    return path
 
 
 def place(source: Path, target: Path) -> None:
