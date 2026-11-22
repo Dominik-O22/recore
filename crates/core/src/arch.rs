@@ -201,6 +201,12 @@ pub trait Arch: 'static {
         true
     }
 
+    /// Whether `target`, an address in the code that `insn` takes, is a place in the code around
+    /// `insn` and no function's entry. Discovery keeps the reference and starts no function there.
+    fn takes_label(_insn: &Self::Insn, _target: u64, _image: &Image) -> bool {
+        false
+    }
+
     /// Data that `insn` reads at an offset from a base register whose value is tracked, as
     /// `(base, address)`. When the base is the image base this is how a table is reached, which
     /// tells where the table before it ends. Never treated as code.

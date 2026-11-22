@@ -583,7 +583,9 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     }
                     if let Some(target) = taken.filter(|_| !speculative) {
                         if in_code {
-                            self.add_start(target, Origin::AddressTaken, None);
+                            if !A::takes_label(insn, target, self.image) {
+                                self.add_start(target, Origin::AddressTaken, None);
+                            }
                         } else {
                             self.data_refs.push(target);
                         }
