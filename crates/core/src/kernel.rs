@@ -51,7 +51,8 @@ pub(crate) fn read(image: &mut Image) {
     }
     if image.machine == Machine::Aarch64 {
         image.replacement_code = replacements(image);
-        if image.marked_data.is_empty() && is_kernel(image) {
+        image.kernel_image = is_kernel(image);
+        if image.kernel_image && image.marked_data.is_empty() {
             image.marked_data = kcfi_hashes(image);
         }
     }
@@ -377,6 +378,20 @@ mod tests {
         let mut image = Image::bare("module".into(), Format::Elf, Machine::Aarch64, TEXT, vec![text]);
         (image.kernel_module, image.marked_data) = (true, vec![(undefined, undefined + 4), (hash, hash + 4)]);
         assert_eq!(starts(&image), vec![TEXT, hash + 8]);
+    }
+
+    /// Outside a kernel a marked word is not a hash for sure: here a literal, with the `nop` after
+    /// it that aligns the next function, which starts past that `nop`.
+    #[test]
+    fn a_literal_before_padding_starts_nothing_at_the_padding() {
+        // ldr w0, the literal; ret; the literal; nop; mov x0, #1; ret.
+        let code = [0x1800_0040, RET, 0x0000_002a, NOP, MOV_X0_1, RET];
+        let text = Section { name: ".text".into(), addr: TEXT, data: code.iter().flat_map(|word| word.to_le_bytes()).collect(), file_offset: None, executable: true, writable: false };
+        let mut image = Image::bare("program".into(), Format::Elf, Machine::Aarch64, TEXT, vec![text]);
+        image.marked_data = vec![(TEXT + 8, TEXT + 12)];
+        assert_eq!(starts(&image), vec![TEXT, TEXT + 16]);
+        image.kernel_image = true;
+        assert_eq!(starts(&image), vec![TEXT, TEXT + 12]);
     }
 
     /// `WARN()` calls a function that returns, then traps, and the kernel goes on after the trap.

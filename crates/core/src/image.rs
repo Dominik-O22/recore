@@ -194,6 +194,9 @@ pub struct Image {
     /// A Linux kernel module, which has a `.modinfo` section: its imports are the kernel's
     /// functions, so a name such as `panic` is the kernel's and never returns.
     pub kernel_module: bool,
+    /// An arm64 Linux kernel itself, as a `vmlinux` or a raw `Image`: its first code opens with
+    /// the image header (see [`crate::kernel`]).
+    pub kernel_image: bool,
     /// Where the code of a 32-bit ARM image changes instruction set, as `(address, set)` sorted
     /// by address: each holds up to the next. What comes before the first is in its set. Empty
     /// for every other machine.
@@ -240,6 +243,7 @@ impl Image {
             banking: Banking::default(),
             compiler: None,
             kernel_module: false,
+            kernel_image: false,
             instruction_sets: Vec::new(),
             marked_data: Vec::new(),
             replacement_code: Vec::new(),
@@ -350,6 +354,7 @@ impl Image {
             name,
             entry: file.entry(),
             kernel_module: file.section_by_name(".modinfo").is_some(),
+            kernel_image: false,
             sections,
             import_slots,
             exports,

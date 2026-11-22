@@ -459,6 +459,7 @@ impl Layout {
             banking,
             compiler: self.compiler,
             kernel_module: false,
+            kernel_image: false,
             instruction_sets: Vec::new(),
             marked_data: Vec::new(),
             replacement_code: Vec::new(),

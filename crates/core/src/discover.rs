@@ -1519,10 +1519,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// function before it, such as switch cases behind an unresolved indirect jump.
     fn fill_gaps(&mut self, decoders: &mut Decoders<'a, A>) -> bool {
         let mut found = false;
-        // A function starts right after its kCFI hash, even at a `nop` the kernel patches. Not in
-        // a module, where ftrace's `nop`s may come between the two. Asked once here, since every
-        // byte of padding the scan steps over would ask.
-        let padding_opens_after_hash = !self.image.kernel_module && !self.image.marked_data.is_empty();
+        // In a kernel's image a function starts right after its kCFI hash, even at a `nop` the
+        // kernel patches. Elsewhere a marked word before a `nop` may be a literal before padding,
+        // and a module can be built with ftrace's `nop`s between the two, as this crate's module
+        // fixture is. Asked once here, since every byte of padding the scan steps over would ask.
+        let padding_opens_after_hash = self.image.kernel_image && !self.image.marked_data.is_empty();
         for index in 0..self.regions.len() {
             let section = self.regions[index].section;
             let mut offset = 0;
