@@ -757,15 +757,15 @@ pub fn debug_file(path: &Path, image: &Image) -> Option<PathBuf> {
 }
 
 /// The types in the debug information of the image at `path`, if it has any that can be read,
-/// or else those of the managed program of an IL2CPP build, or else the prototypes an arm64
-/// kernel's or module's kCFI hashes name. Why debug information could not be read goes to stderr: the
-/// decompiler works without. [`DEBUG_VAR`] set to `off` keeps all three out.
+/// or else those of the managed program of an IL2CPP build, or else those of a Linux kernel:
+/// see [`kernel`]. Why debug information could not be read goes to stderr: the decompiler works
+/// without. [`DEBUG_VAR`] set to `off` keeps them all out.
 pub fn load(path: &Path, image: &Image) -> Option<Types> {
     if std::env::var(DEBUG_VAR).is_ok_and(|setting| setting == "off") {
         return None;
     }
     let Some(file) = debug_file(path, image) else {
-        return image.il2cpp.as_deref().map(crate::il2cpp::types).or_else(|| crate::kcfi::types(image).map(|(_, types)| types));
+        return image.il2cpp.as_deref().map(crate::il2cpp::types).or_else(|| kernel(image));
     };
     let loaded = if file.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("pdb")) {
         crate::pdb::types(&file, image)
@@ -773,4 +773,14 @@ pub fn load(path: &Path, image: &Image) -> Option<Types> {
         crate::dwarf::types(&file, image.machine)
     };
     loaded.map_err(|error| eprintln!("debug information in {file:?}: {error:#}")).ok()
+}
+
+/// The types a kernel's own BTF describes, with the prototypes of the functions its symbols name,
+/// and for the functions BTF has none for, the prototypes their kCFI hashes name; or for an arm64
+/// kernel or module without BTF, the latter alone. BTF wins where both give one: it is this
+/// build's, and names the parameters, where a hash names only a shape every kernel shares.
+fn kernel(image: &Image) -> Option<Types> {
+    let Some(mut types) = crate::btf::types(image) else { return crate::kcfi::types(image).map(|(_, types)| types) };
+    crate::kcfi::add(image, &mut types);
+    Some(types)
 }

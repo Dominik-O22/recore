@@ -533,15 +533,16 @@ const KERNEL_READ_ONLY: (&str, &str) = ("__start_rodata", "__end_rodata");
 /// What the kernel writes while it boots and protects afterwards, among its `.rodata`.
 const KERNEL_RO_AFTER_INIT: (&str, &str) = ("__start_ro_after_init", "__end_ro_after_init");
 
-/// The tables [`crate::kernel`] reads, and the unwind tables that Android's 6.1 and 6.12 keep for
-/// the code that patches their shadow call stack, by the symbols that bound each and the section
-/// an ELF file keeps it in.
-const KERNEL_TABLES: [(&str, &str, &str); 5] = [
+/// The tables [`crate::kernel`] reads, the unwind tables that Android's 6.1 and 6.12 keep for
+/// the code that patches their shadow call stack, and the kernel's BTF, which the decompiler
+/// reads, by the symbols that bound each and the section an ELF file keeps it in.
+const KERNEL_TABLES: [(&str, &str, &str); 6] = [
     ("__alt_instructions", "__alt_instructions_end", ".altinstructions"),
     ("__start___bug_table", "__stop___bug_table", "__bug_table"),
     ("__start___jump_table", "__stop___jump_table", "__jump_table"),
     ("__eh_frame_start", "__eh_frame_end", ".eh_frame"),
     ("__pi___eh_frame_start", "__pi___eh_frame_end", ".eh_frame"),
+    ("__start_BTF", "__stop_BTF", ".BTF"),
 ];
 
 /// The symbols of an arm64 Linux kernel's raw `Image`, which [`crate::kernel::is_raw_image`]

@@ -9,6 +9,7 @@
 //! Results can depend on what a session decompiled earlier, because the globals a function
 //! refers to become symbols that later functions see.
 
+pub mod btf;
 pub mod dwarf;
 pub mod facts;
 mod ffi;
