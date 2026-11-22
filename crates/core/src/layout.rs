@@ -545,7 +545,9 @@ const KERNEL_TABLES: [(&str, &str, &str); 4] = [
 /// function. Where it has no kallsyms that holds together, it loads at 0, all code, unnamed.
 pub(crate) fn kernel(name: String, data: Vec<u8>) -> Result<Image> {
     // The symbols start at `_text`, the image's first byte.
+    let phase = crate::phase::scope("load/kallsyms");
     let mut symbols = crate::kallsyms::read(&data).filter(|symbols| symbols[0].addr.checked_add(data.len() as u64).is_some()).unwrap_or_default();
+    drop(phase);
     // A mapping symbol, such as `$x` or `$d` with the prefix of the kernel's code that runs at its
     // physical address, `__pi_`, names no function.
     symbols.retain(|symbol| !symbol.name.contains('$'));
@@ -553,9 +555,10 @@ pub(crate) fn kernel(name: String, data: Vec<u8>) -> Result<Image> {
     let end = base + data.len() as u64;
     // The image's size, which takes in what the kernel zeroes past the end of the file.
     let size = data.get(0x10..0x18).map_or(0, |bytes| u64::from_le_bytes(bytes.try_into().unwrap()));
-    let sections = match symbols.is_empty() {
-        true => vec![Section { name: ".text".into(), addr: 0, data, file_offset: Some(0), executable: true, writable: false }],
-        false => kernel_sections(&data, base, &symbols),
+    let sections = if symbols.is_empty() {
+        vec![Section { name: ".text".into(), addr: 0, data, file_offset: Some(0), executable: true, writable: false }]
+    } else {
+        kernel_sections(&data, base, &symbols)
     };
     let layout = Layout { machine: Machine::Aarch64, entry: vec![base], vectors: None, region: Vec::new(), banking: None, names: None, compiler: None };
     let mut image = layout.image(name, sections, None)?;
