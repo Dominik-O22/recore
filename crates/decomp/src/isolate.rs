@@ -17,13 +17,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use recore::image::{Format, Machine};
+use recore::program::Program;
 use recore::report::{Analysis, CallSite, CallTarget};
 use serde::{Deserialize, Serialize};
 
 use recore::edits::Edits;
 use recore::structs::{Recovered, auto_function};
 
-use crate::{Converged, Facts, Flow, Instruction, Local, Session, Shape, StructReport, Style};
+use crate::{Converged, Decompiled, Facts, Flow, Instruction, Local, Session, Shape, StructReport, Style};
 
 /// Where switch targets come from.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -163,6 +164,20 @@ enum Request {
     Recovered(String),
     /// Decompile the function for what struct recovery made of its objects.
     Structs(u64),
+    /// Calls to the function from other functions that come back, as [`returning_callers`]
+    /// picks them, for each later decompilation of it. Not answered.
+    Callers(u64, Vec<u64>),
+}
+
+impl Request {
+    /// The function the request decompiles, if it decompiles one.
+    fn function(&self) -> Option<u64> {
+        match self {
+            Request::Decompile(addr) | Request::Parameters(addr) | Request::Flow(addr) | Request::Locals(addr) | Request::Addressed(addr) | Request::Structs(addr) => Some(*addr),
+            Request::Recovered(name) => auto_function(name),
+            _ => None,
+        }
+    }
 }
 
 /// The bytes of address space this process holds, where the system says.
@@ -170,6 +185,27 @@ fn address_space() -> Option<u64> {
     // The first number in `statm` is the size of the address space, in pages.
     let pages = std::fs::read_to_string("/proc/self/statm").ok()?.split_whitespace().next()?.parse::<u64>().ok()?;
     pages.checked_mul(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64)
+}
+
+/// The most calls to a function whose code after them is read to see whether they take its
+/// result. Reading each of the tens of thousands of calls some functions have would cost more
+/// than decompiling them.
+pub const CALLER_SAMPLE: usize = 32;
+
+/// Up to [`CALLER_SAMPLE`] of the calls to the function at `entry` that come back to the code
+/// after them, from other functions, picked at even steps through all the calls to it. Given to a
+/// [`Worker`] with [`Worker::callers`], they let the decompiler take the function as returning
+/// a value where its own code shows none and the code after one of them reads the result.
+pub fn returning_callers(program: &Program, entry: u64) -> Vec<u64> {
+    let body = program.body(entry);
+    let calls = program.call_indices_to(entry);
+    calls
+        .iter()
+        .step_by(calls.len().div_ceil(CALLER_SAMPLE).max(1))
+        .map(|&index| &program.analysis.calls[index])
+        .filter(|call| !call.tail && !call.noreturn && !body.iter().any(|&(start, end)| (start..end).contains(&call.at)))
+        .map(|call| call.at)
+        .collect()
 }
 
 /// Callees with more code than this, in bytes, are not decompiled ahead of their callers. The few
@@ -482,8 +518,19 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             }
         }
     };
-    // Results of functions decompiled ahead of a caller that are as good as asked for.
-    let mut ready: HashMap<u64, Event> = HashMap::new();
+    // The calls to each function the parent gave with Request::Callers.
+    let mut given: HashMap<u64, Vec<u64>> = HashMap::new();
+    // A function whose own code shows no value returned may still return one that a caller
+    // reads, which only the callers show. The session reads them only for such a function.
+    let decompile = |session: &mut Session, given: &HashMap<u64, Vec<u64>>, entry: u64| -> Result<Decompiled> {
+        if let Some(calls) = given.get(&entry) {
+            session.callers(entry, calls);
+        }
+        session.decompile(entry)
+    };
+    // Results of functions decompiled ahead of a caller that are as good as asked for, each with
+    // whether the function's callers had been given then.
+    let mut ready: HashMap<u64, (Event, bool)> = HashMap::new();
 
     let mut out = std::io::stdout().lock();
     let mut send = |event: &Event| -> Result<()> {
@@ -532,7 +579,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 settle_return(&mut session, addr);
                 prepare(&mut session, &mut importer, &edits, addr, true);
                 session.keep_flow(true);
-                let flow = session.decompile(addr).map(|function| function.flow.unwrap_or_default());
+                let flow = decompile(&mut session, &given, addr).map(|function| function.flow.unwrap_or_default());
                 session.keep_flow(false);
                 send(&Event::Flow(flow.map_err(|error| error.to_string())))?;
                 continue;
@@ -541,7 +588,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 settle_return(&mut session, addr);
                 prepare(&mut session, &mut importer, &edits, addr, true);
                 session.keep_addresses(true);
-                let c_text = session.decompile(addr).map(|function| function.c_text);
+                let c_text = decompile(&mut session, &given, addr).map(|function| function.c_text);
                 session.keep_addresses(false);
                 send(&text(c_text))?;
                 continue;
@@ -549,7 +596,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             Request::Locals(addr) => {
                 settle_return(&mut session, addr);
                 prepare(&mut session, &mut importer, &edits, addr, true);
-                send(&Event::Locals(session.decompile(addr).map(|function| function.locals).map_err(|error| error.to_string())))?;
+                send(&Event::Locals(decompile(&mut session, &given, addr).map(|function| function.locals).map_err(|error| error.to_string())))?;
                 continue;
             }
             Request::Recovered(ref name) => {
@@ -559,7 +606,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                         Some(function) => {
                             settle_return(&mut session, function);
                             prepare(&mut session, &mut importer, &edits, function, true);
-                            let _ = session.decompile(function);
+                            let _ = decompile(&mut session, &given, function);
                             session.recovered(name)
                         }
                         None => None,
@@ -571,7 +618,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             Request::Structs(addr) => {
                 settle_return(&mut session, addr);
                 prepare(&mut session, &mut importer, &edits, addr, true);
-                let report = session.decompile(addr).map_err(|error| error.to_string()).map(|_| session.structs_of(addr).unwrap_or_default());
+                let report = decompile(&mut session, &given, addr).map_err(|error| error.to_string()).map(|_| session.structs_of(addr).unwrap_or_default());
                 send(&Event::Structs(report))?;
                 continue;
             }
@@ -597,11 +644,19 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
                 send(&Event::Edited(done))?;
                 continue;
             }
+            Request::Callers(function, calls) => {
+                given.insert(function, calls);
+                continue;
+            }
             Request::Decompile(addr) | Request::Parameters(addr) => addr,
         };
-        if let (Request::Decompile(_), Some(event)) = (&request, ready.remove(&addr)) {
-            send(&event)?;
-            continue;
+        if let (Request::Decompile(_), Some((event, with_callers))) = (&request, ready.remove(&addr)) {
+            // One that came out void before its callers were given returns a value if they read it.
+            let void = matches!(&event, Event::Done { record, .. } if !record.returns_value);
+            if with_callers || !void || !given.get(&addr).is_some_and(|calls| session.callers_read(addr, calls)) {
+                send(&event)?;
+                continue;
+            }
         }
         // A function that ends by jumping to another passes on what that one takes, and with
         // that one unknown it seems to pass on every register. So before a function is
@@ -625,7 +680,10 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         session.keep_prototypes(callees_first || (jumped_to.contains(&addr) && !hands_on_registers));
         let start = Instant::now();
         prepare(&mut session, &mut importer, &edits, addr, true);
-        let result = session.decompile(addr);
+        // A function decompiled only for the parameters it takes, whose result no one sees, is
+        // not given its callers here: reading them costs more than what it changes. Where the
+        // session was given them before, it still takes what they read.
+        let result = if matches!(request, Request::Decompile(_)) || keep { decompile(&mut session, &given, addr) } else { session.decompile(addr) };
         known.insert(addr);
         let ms = start.elapsed().as_secs_f64() * 1e3;
         let event = match result {
@@ -652,7 +710,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         if keep {
             // The caller only waits for this to finish.
             send(&Event::Callees(Vec::new()))?;
-            ready.insert(addr, event);
+            ready.insert(addr, (event, given.contains_key(&addr)));
         } else {
             send(&event)?;
         }
@@ -817,6 +875,8 @@ struct Process {
     stderr: Option<JoinHandle<String>>,
     /// The child has reported that its session is set up.
     ready: bool,
+    /// The functions whose callers the child was given.
+    told: HashSet<u64>,
 }
 
 /// How a request went wrong, with the child gone.
@@ -847,7 +907,7 @@ impl Process {
             let _ = stderr.read_to_string(&mut text);
             text
         });
-        Ok(Process { child, stdin, events, stderr: Some(drain), ready: false })
+        Ok(Process { child, stdin, events, stderr: Some(drain), ready: false, told: HashSet::new() })
     }
 
     /// Waits for the child to finish setting up.
@@ -868,12 +928,20 @@ impl Process {
         }
     }
 
-    /// Sends one request and waits up to `timeout` for the answer. Setup still under way does
-    /// not count towards `timeout`.
-    fn ask(&mut self, request: Request, timeout: Duration) -> Result<Event, Failure> {
+    /// Sends one request and waits up to `timeout` for the answer, with the calls to the function
+    /// it decompiles first if `callers` has them and the child was not given them yet. Setup
+    /// still under way does not count towards `timeout`.
+    fn ask(&mut self, request: Request, callers: &HashMap<u64, Vec<u64>>, timeout: Duration) -> Result<Event, Failure> {
         self.wait_ready()?;
+        let mut lines = String::new();
+        if let Some((&function, calls)) = request.function().and_then(|function| callers.get_key_value(&function))
+            && self.told.insert(function)
+        {
+            lines = serde_json::to_string(&Request::Callers(function, calls.clone())).expect("plain data") + "\n";
+        }
+        lines += &serde_json::to_string(&request).expect("plain data");
         // A failed write means the child is gone, which the receive below reports.
-        let _ = writeln!(self.stdin, "{}", serde_json::to_string(&request).expect("plain data")).and_then(|()| self.stdin.flush());
+        let _ = writeln!(self.stdin, "{lines}").and_then(|()| self.stdin.flush());
         match self.events.recv_timeout(timeout) {
             Ok(Event::Ready) | Err(RecvTimeoutError::Disconnected) => Err(Failure { status: Status::Crash, message: self.end(false) }),
             Ok(event) => Ok(event),
@@ -923,6 +991,8 @@ pub struct Worker {
     avoid: HashSet<u64>,
     /// Whether a child has been lost to a timeout or a crash.
     lost: bool,
+    /// The calls to each function given with [`Worker::callers`].
+    callers: HashMap<u64, Vec<u64>>,
 }
 
 impl Worker {
@@ -944,7 +1014,17 @@ impl Worker {
             command.arg(&binary).arg(&json);
             command
         };
-        Worker { command: Box::new(command), options: options.clone(), process: None, avoid: HashSet::new(), lost: false }
+        Worker { command: Box::new(command), options: options.clone(), process: None, avoid: HashSet::new(), lost: false, callers: HashMap::new() }
+    }
+
+    /// Gives the calls to `function` from other functions that come back, as
+    /// [`returning_callers`] picks them, for every later decompilation of it that is shown: one
+    /// asked for, and one ahead of a caller that is kept for when it is. `calls` runs the first
+    /// time a function is given. A function whose own code shows no value returned is then
+    /// taken as returning one where the code after one of these calls reads the result.
+    /// Without them it stays as its own code has it.
+    pub fn callers(&mut self, function: u64, calls: impl FnOnce() -> Vec<u64>) {
+        self.callers.entry(function).or_insert_with(calls);
     }
 
     /// Decompiles one function. If the child dies or exceeds `timeout`, the record says so.
@@ -1129,8 +1209,9 @@ impl Worker {
 
     /// Asks the child, starting one if the last one is gone.
     fn ask(&mut self, request: Request, timeout: Duration) -> Result<Event, Failure> {
-        let process = self.process()?;
-        let result = process.ask(request, timeout);
+        self.process()?;
+        let process = self.process.as_mut().expect("started above");
+        let result = process.ask(request, &self.callers, timeout);
         // Only a child that had set up held any parameters to lose.
         let held = process.ready;
         if result.is_err() {

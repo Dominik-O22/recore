@@ -1,7 +1,7 @@
 # Ghidra decompiler engine (vendored)
 
 The C++ decompiler from Ghidra, built as a static library by `build.rs` and used by
-`crates/decomp`. Seven source files, two language files and the SLEIGH sources of the 8051 language are modified, and one compiler spec is added, see below.
+`crates/decomp`. Source files, two language files and the SLEIGH sources of the 8051 language are modified, and one compiler spec is added, see below.
 
 Source: `Ghidra/Features/Decompiler/src/decompile/` of the
 [Ghidra repository](https://github.com/NationalSecurityAgency/ghidra) at commit `918d44ebc2` (12.3 DEV).
@@ -62,6 +62,13 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   recovery starts. `crates/decomp` reads the function's settled SSA there and gives the
   pointers it is passed structs before any unlocked varnode is typed. Marked with `recore:`
   comments.
+
+- `cpp/architecture.hh` and `cpp/coreaction.cc`, `Architecture::returnsNoValue`: a virtual
+  method that `ActionReturnRecovery` calls when none of the trials at a function's returns
+  turned out to be its output, and that answers no in the engine. `crates/decomp` reads the
+  code after the function's calls there and, where a caller reads the result register, marks
+  that register's trial active, so the function returns a value in the same decompilation.
+  Upstream has no way to take what the callers show. Marked with `recore:` comments.
 
 - `cpp/type.hh` and `cpp/type.cc`, `TypeFactory::setFieldName`: names a field of a struct the
   session already holds. Upstream builds a struct whole and never changes it; `crates/decomp`

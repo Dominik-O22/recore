@@ -758,6 +758,26 @@ impl Session {
         unsafe { ffi::rd_returns_like(self.raw.as_ptr(), function, callee, import.into(), err.as_mut_ptr(), err.len()) != 0 }
     }
 
+    /// Gives `calls`, calls to `function` from other functions that come back, for its next
+    /// decompilation. If its own code shows no value returned, as that of one that ends by
+    /// calling a function of no known prototype does, and the code after one of them reads the
+    /// register a result comes back in before anything writes it, that decompilation takes it
+    /// as returning as many bytes as the widest such read, or the whole register where the
+    /// register also passes an argument, and no more than its own code holds of it. Not where
+    /// the function leaves that register as it found it: a caller that knows so goes on using
+    /// its own value. The session reads each function's callers once.
+    pub fn callers(&mut self, function: u64, calls: &[u64]) {
+        unsafe { ffi::rd_callers(self.raw.as_ptr(), function, calls.as_ptr(), calls.len()) }
+    }
+
+    /// Whether the code after one of `calls`, calls to `function` given as for
+    /// [`Session::callers`], reads the register a result comes back in, without decompiling
+    /// `function`. Its next decompilation does not read them again.
+    pub fn callers_read(&mut self, function: u64, calls: &[u64]) -> bool {
+        self.callers(function, calls);
+        unsafe { ffi::rd_callers_read(self.raw.as_ptr(), function) != 0 }
+    }
+
     /// With `keep`, every later [`Session::decompile`] prints each line of C after the address of
     /// the instruction the line came from, in a column, where it came from one.
     pub fn keep_addresses(&mut self, keep: bool) {
