@@ -783,13 +783,13 @@ impl Session {
         unsafe { ffi::rd_callers_read(self.raw.as_ptr(), function) != 0 }
     }
 
-    /// Whether the last decompilation of `function` returned only what a call returned and the
-    /// code after each of `calls` that says writes the result register before it reads it, so
-    /// that its next decompilation, given them, returns nothing. Reads them as
-    /// [`Session::callers_read`] does.
-    pub fn callers_overwrite(&mut self, function: u64, calls: &[u64]) -> bool {
+    /// Whether the code after each of `calls` that says writes the result register before it
+    /// reads it, and with `passed_on` also whether the last decompilation of `function` returned
+    /// only what a call returned, so that its next decompilation, given them, returns nothing.
+    /// Reads them as [`Session::callers_read`] does.
+    pub fn callers_overwrite(&mut self, function: u64, calls: &[u64], passed_on: bool) -> bool {
         self.callers(function, calls);
-        unsafe { ffi::rd_callers_overwrite(self.raw.as_ptr(), function) != 0 }
+        unsafe { ffi::rd_callers_overwrite(self.raw.as_ptr(), function, passed_on.into()) != 0 }
     }
 
     /// With `keep`, every later [`Session::decompile`] prints each line of C after the address of

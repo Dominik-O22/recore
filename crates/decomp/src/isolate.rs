@@ -515,14 +515,19 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
     // returns a value, the calls to it the parent gave may: `calls`, for a decompilation whose
     // result is shown.
     let settle_return = |session: &mut Session, entry: u64, calls: Option<&Vec<u64>>| {
-        if let Some(calls) = calls {
-            session.callers(entry, calls);
-        }
-        let Some(callees) = tail_callees.get(&entry) else { return };
-        // One that also returns by itself passes on more than what its callees return.
-        let pieces = analysis.functions.binary_search_by_key(&entry, |function| function.addr).ok().into_iter().chain(fragments_of.get(&entry).into_iter().flatten().copied());
-        let body: Vec<(u64, u64)> = pieces.flat_map(|index| analysis.functions[index].ranges.iter().copied()).collect();
-        let jumps_only = !recore::cfg::cfg(&image, &analysis, &body).blocks.iter().any(|block| block.exit == Some(recore::cfg::Exit::Return));
+        let Some(callees) = tail_callees.get(&entry) else {
+            if let Some(calls) = calls {
+                session.callers(entry, calls);
+            }
+            return;
+        };
+        // One that also returns by itself passes on more than what its callees return. Its
+        // graph is read only where the callers would overturn the result.
+        let jumps_only = calls.is_some_and(|calls| session.callers_overwrite(entry, calls, false)) && {
+            let pieces = analysis.functions.binary_search_by_key(&entry, |function| function.addr).ok().into_iter().chain(fragments_of.get(&entry).into_iter().flatten().copied());
+            let body: Vec<(u64, u64)> = pieces.flat_map(|index| analysis.functions[index].ranges.iter().copied()).collect();
+            !recore::cfg::cfg(&image, &analysis, &body).blocks.iter().any(|block| block.exit == Some(recore::cfg::Exit::Return))
+        };
         for &callee in callees {
             if session.returns_like(entry, callee, jumps_only) {
                 break;
@@ -657,7 +662,7 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
             // One that came out void before its callers were given returns a value if they read
             // it, and one that passed on a call's result returns nothing if they overwrite it.
             let void = matches!(&event, Event::Done { record, .. } if !record.returns_value);
-            let overturned = |session: &mut Session, calls: &Vec<u64>| if void { session.callers_read(addr, calls) } else { session.callers_overwrite(addr, calls) };
+            let overturned = |session: &mut Session, calls: &Vec<u64>| if void { session.callers_read(addr, calls) } else { session.callers_overwrite(addr, calls, true) };
             if with_callers || !given.get(&addr).is_some_and(|calls| overturned(&mut session, calls)) {
                 send(&event)?;
                 continue;

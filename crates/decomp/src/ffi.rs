@@ -213,7 +213,7 @@ unsafe extern "C" {
     pub fn rd_returns_like(session: *mut RdSession, function: u64, callee: u64, import_slot: i32, jumps_only: i32, err: *mut c_char, errlen: usize) -> i32;
     pub fn rd_callers(session: *mut RdSession, function: u64, calls: *const u64, count: usize);
     pub fn rd_callers_read(session: *mut RdSession, function: u64) -> i32;
-    pub fn rd_callers_overwrite(session: *mut RdSession, function: u64) -> i32;
+    pub fn rd_callers_overwrite(session: *mut RdSession, function: u64, passed_on: i32) -> i32;
     pub fn rd_set_flow(session: *mut RdSession, on: i32);
     pub fn rd_set_addresses(session: *mut RdSession, on: i32);
     pub fn rd_name_local(session: *mut RdSession, function: u64, place: *const c_char, name: *const c_char);

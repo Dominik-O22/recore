@@ -618,9 +618,6 @@ struct RdSession {
   set<uint64_t> returns_like;
   // Functions whose result is locked as rd_returns_like locked it, which only it may undo.
   set<uint64_t> settled;
-  // Of `returns_like`, those whose only way out is to jump to the callee, until they are next
-  // decompiled.
-  set<uint64_t> passes_on_settled;
   // The function rd_callers named and the calls to it it gave, for its next decompilation.
   pair<uint64_t, vector<uint64_t>> callers;
   // How many bytes of the result register the callers of each function read, of those whose
@@ -628,8 +625,8 @@ struct RdSession {
   map<uint64_t, int4> read_by_callers;
   // Whether the function being decompiled returns what its callers read, not what its code shows.
   bool result_from_callers = false;
-  // Functions whose last decompilation returned only what a call returned, in the low end of the
-  // result register: see `returns_nothing_callers_read`.
+  // Functions whose last decompilation the engine found returning only what a call returned, in
+  // the low end of the result register: see `returns_nothing_callers_read`.
   set<uint64_t> passed_on;
   // The registers rd_keep_registers named for each function.
   map<uint64_t, vector<VarnodeData>> kept_registers;
@@ -1982,7 +1979,6 @@ int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int 
     // Locking the output locks the calling convention with it, which is still to be recovered.
     proto.setModelLock(model_locked);
     session->returns_like.insert(function);
-    if (jumps_only) session->passes_on_settled.insert(function);
     session->settled.insert(function);
     returns = true;
   });
@@ -2371,15 +2367,17 @@ int rd_callers_read(RdSession *session, uint64_t function) {
   return read;
 }
 
-// Whether the last decompilation of the function at `function` returned only what a call
-// returned and the code after the calls rd_callers gave for it overwrites the result register,
-// without decompiling it. Its next decompilation does not read them again.
-int rd_callers_overwrite(RdSession *session, uint64_t function) {
+// Whether the code after the calls rd_callers gave for the function at `function` overwrites the
+// result register, without decompiling it. With `passed_on`, only where its last decompilation
+// may have returned only what a call returned: the engine found that, or rd_returns_like holds
+// its result. Its next decompilation does not read them again.
+int rd_callers_overwrite(RdSession *session, uint64_t function, int passed_on) {
   bool overwrite = false;
   guarded(nullptr, 0, [&] {
     VarnodeData result;
     bool whole;
-    overwrite = session->passed_on.count(function) != 0 && result_register(session->arch, result, whole) &&
+    bool may_pass_on = session->passed_on.count(function) != 0 || session->settled.count(function) != 0;
+    overwrite = (!passed_on || may_pass_on) && result_register(session->arch, result, whole) &&
                 bytes_callers_read(session, function, result, whole ? 1 : (int4)result.size) == OVERWRITTEN;
   });
   return overwrite;
@@ -3361,12 +3359,6 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     out->jump_table_count = session->jump_addrs.size();
     out->jump_targets = session->jump_targets.data();
     session->outputs.erase(addr);
-    VarnodeData result;
-    bool whole;
-    // A result rd_returns_like settled where the function only jumps out is what the callee returned.
-    if (session->passes_on_settled.erase(addr) != 0 && proto.getOutputType()->getMetatype() != TYPE_VOID && result_register(arch, result, whole) &&
-        low_end(proto.getOutput()->getAddress(), proto.getOutput()->getSize(), result))
-      session->passed_on.insert(addr);
     // The size of a result only its callers show is a guess where a register also passes an
     // argument, so it stays this decompilation's: other functions find what they make of the
     // call themselves, and one that jumps here is told nothing of it.
