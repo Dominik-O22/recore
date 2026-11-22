@@ -26,7 +26,7 @@ whether they return a value.
 GKI's modules add 416 names and change 5 lines the 5.10 kernel gave, such as `can_put_echo_skb`,
 which gained a frame length. GKI builds no mac80211 or cfg80211 and the Pixel 9's modules have no
 BTF, so the 5.10 line is still the only one a 6.x module's call to those gets. Against the DWARF
-of the modules that import them, 9 of the 169 (module, name) pairs of Debian's 6.12 arm64 modules
+of the modules that import them, 9 of the 130 (module, name) pairs of Debian's 6.12 arm64 modules
 that take a line only the 5.10 kernel gives differ: 8 mac80211 and cfg80211 names that 6.x gave
 more parameters, six a `link_id`, such as `ieee80211_nullfunc_get`, one a channel context, and
 `cfg80211_port_authorized` two.
@@ -115,10 +115,19 @@ class Btf:
         while at < end:
             name_off, info, size_or_type = struct.unpack_from("<III", blob, at)
             kind, vlen = (info >> 24) & 0x1F, info & 0xFFFF
+            # A kind this reader does not know has a trailer of a size it does not know either,
+            # and every type after it would be read from the wrong place.
+            if not INT <= kind <= ENUM64:
+                raise ValueError(f"BTF kind {kind} is newer than this reader")
             fixed, member = TRAILER.get(kind, (0, 0))
             trailer = blob[at + 12 : at + 12 + fixed + member * vlen]
             self.types.append((kind, info, size_or_type, trailer, name_off))
             at += 12 + fixed + member * vlen
+        if at != end:
+            raise ValueError("the BTF's types do not end where its header says")
+        # Split BTF names no base. Read on another kernel's, its ids point at other types.
+        if any(kind == FUNC and (proto >= len(self.types) or self.types[proto][0] != FUNC_PROTO) for kind, _, proto, _, _ in self.types[self.first :]):
+            raise ValueError("a function's type is no prototype: this BTF is split from another base")
 
     def name(self, offset):
         return self.strings[offset : self.strings.index(b"\0", offset)].decode()
