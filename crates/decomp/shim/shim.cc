@@ -599,6 +599,7 @@ struct RdSession {
   bool result_in_first_argument = false;  // see rd_result_in_first_argument
   bool stack_aggregates = false;  // see rd_stack_aggregates
   bool pushes_scratch_register = false;  // see rd_pushes_scratch_register
+  bool variadic_on_stack = false;  // see rd_variadic_on_stack
   bool want_flow = false;
   bool want_addresses = false;
   set<uint64_t> kept;  // functions whose prototype this session locked
@@ -915,8 +916,9 @@ static int4 integer_argument_size(const string &length, char conversion, const T
 // conversion's type for the rest: each travels in a whole register or stack slot, but the callee
 // reads only that many bytes of it. Empty for text that is no format, and for one whose
 // conversions cannot be read. A printf format takes an `int` for each `*`, where a scanf format,
-// which `scans` says it is, reads and stores nothing for a conversion marked with one.
-static vector<Datatype *> format_arguments(const string &format, bool scans, TypeFactory *types, int4 word) {
+// which `scans` says it is, reads and stores nothing for a conversion marked with one. With
+// `words`, every integer is a word: see rd_variadic_on_stack.
+static vector<Datatype *> format_arguments(const string &format, bool scans, bool words, TypeFactory *types, int4 word) {
   vector<Datatype *> arguments;
   Datatype *pointer = types->getBase(word, TYPE_UNKNOWN);
   for (size_t i = 0; i < format.size(); ++i) {
@@ -946,13 +948,13 @@ static vector<Datatype *> format_arguments(const string &format, bool scans, Typ
       // Every argument of a scan is a pointer, whatever it points to.
       if (stars == 0) arguments.push_back(pointer);
     } else {
-      arguments.insert(arguments.end(), stars, types->getBase(types->getSizeOfInt(), TYPE_UNKNOWN));
+      arguments.insert(arguments.end(), stars, words ? pointer : types->getBase(types->getSizeOfInt(), TYPE_UNKNOWN));
       if (strchr("eEfFgGaA", format[j]) != nullptr) {
         arguments.push_back(types->getBase(8, TYPE_FLOAT));
       } else if (strchr("sSpn", format[j]) != nullptr) {
         arguments.push_back(pointer);
       } else {
-        int4 size = integer_argument_size(format.substr(length, j - length), format[j], types, word);
+        int4 size = words ? 0 : integer_argument_size(format.substr(length, j - length), format[j], types, word);
         arguments.push_back(size != 0 ? types->getBase(size, TYPE_UNKNOWN) : pointer);
       }
     }
@@ -998,7 +1000,7 @@ static bool follow_formats(RdSession *session, Funcdata *fd) {
       }
       const uint1 *end = (const uint1 *)memchr(bytes, 0, sizeof(bytes));
       if (end == nullptr) continue;
-      vector<Datatype *> arguments = format_arguments(string((const char *)bytes, end - bytes), call->getName().find("scanf") != string::npos, arch->types, word);
+      vector<Datatype *> arguments = format_arguments(string((const char *)bytes, end - bytes), call->getName().find("scanf") != string::npos, session->variadic_on_stack, arch->types, word);
       if (arguments.empty()) continue;
       // The first argument that is a format settles it, whatever the later ones are. A
       // floating-point argument travels in a register of its own, and a call of unknown
@@ -2303,6 +2305,12 @@ void rd_stack_aggregates(RdSession *session, int on) { session->stack_aggregates
 // 32-bit ARM: see `pushed_for_alignment`.
 void rd_pushes_scratch_register(RdSession *session, int on) { session->pushes_scratch_register = on != 0; }
 
+// Says that the convention passes the arguments after a variadic function's fixed parameters on
+// the stack, as Apple's arm64 one does. The engine still looks for them in registers, which hold
+// whatever was last put there, so the integers a format asks for stay a word wide: read as an
+// `int` at one call, a stale register is split from its other uses.
+void rd_variadic_on_stack(RdSession *session, int on) { session->variadic_on_stack = on != 0; }
+
 // Puts a note on an instruction of `function`. The C of the function prints it as a comment
 // where that instruction's code is, if the instruction has any left after simplification.
 int rd_add_comment(RdSession *session, uint64_t function, uint64_t addr, const char *text, char *err,
@@ -2355,7 +2363,7 @@ int rd_format_call(RdSession *session, uint64_t function, uint64_t call, uint64_
     const uint1 *end = (const uint1 *)memchr(bytes, 0, sizeof(bytes));
     if (end == nullptr) return;
     string text((const char *)bytes, end - bytes);
-    vector<Datatype *> arguments = format_arguments(text, target->getName().find("scanf") != string::npos, arch->types, word);
+    vector<Datatype *> arguments = format_arguments(text, target->getName().find("scanf") != string::npos, session->variadic_on_stack, arch->types, word);
     // recore: text without a `%` asks for nothing more, as firmware's linked `printf` is
     // called with it. Other text that asks for nothing is no format the parser read.
     if ((arguments.empty() && text.find('%') != string::npos) || arguments.size() > 12) return;

@@ -490,6 +490,10 @@ impl Session {
         let sections: Vec<Section> = loaded.iter().map(|l| Section { addr: l.addr, data: &l.data, readonly: l.constant, code: l.code }).collect();
         let session_target = Target::of(image);
         let mut session = Session::new(&vendored_spec_dir()?, session_target, &sections)?;
+        // Apple's arm64 convention passes variadic arguments on the stack, where the engine does
+        // not look for them.
+        let variadic_on_stack = image.format == Format::MachO && image.machine == Machine::Aarch64;
+        unsafe { ffi::rd_variadic_on_stack(session.raw.as_ptr(), variadic_on_stack.into()) };
         // Banked code: every bank shows the code all banks share, which the image holds once,
         // as bank 0, and a trampoline entry stands for the function it reaches.
         let banking = &image.banking;

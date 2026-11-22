@@ -17,6 +17,7 @@
 //!
 //! The int travels to `printk` in a whole register, whose upper half the caller never set.
 
+use recore::image::{Format, Machine};
 use recore::report::CallTarget;
 use recore_decomp::{Decompiled, Section, Session, Target, vendored_spec_dir};
 
@@ -30,8 +31,9 @@ fn decompile(target: Target, code: &[u8], g: u64, printk: u64, prepare: impl FnO
     session.decompile(0x1000).unwrap()
 }
 
-#[test]
-fn an_int_passed_through_dots_keeps_its_width() {
+/// The arm64 program: `g` at 0x1070, the call to `printk` at 0x1068, `printk` at 0x1078 and the
+/// format at 0x107c.
+fn arm64() -> Vec<u8> {
     #[rustfmt::skip]
     let words: [u32; 31] = [
         0xa9bd7bfd, 0x910003fd, 0xa90153f3, 0xa9025bf5, 0xaa0003f5, 0xaa0103f6, // stp x29, x30, [sp, #-48]!; ...; mov x21, x0; mov x22, x1
@@ -46,7 +48,12 @@ fn an_int_passed_through_dots_keeps_its_width() {
     ];
     let mut code: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
     code.extend(b"%s: failed: %d\n\0");
-    let function = decompile(Target::Aarch64, &code, 0x1070, 0x1078, |session| session.declare("extern int4 printk(char *fmt, ...);").unwrap());
+    code
+}
+
+#[test]
+fn an_int_passed_through_dots_keeps_its_width() {
+    let function = decompile(Target::Aarch64, &arm64(), 0x1070, 0x1078, |session| session.declare("extern int4 printk(char *fmt, ...);").unwrap());
     assert!(function.c_text.contains("printk(\"%s: failed: %d\\n\""), "{}", function.c_text);
     assert_eq!(function.return_shape.size, 4, "{}", function.c_text);
 }
@@ -75,4 +82,25 @@ fn an_int_a_format_asks_for_keeps_its_width() {
     });
     assert_eq!(function.param_count(), 2, "{}", function.c_text);
     assert_eq!(function.return_shape.size, 4, "{}", function.c_text);
+}
+
+/// Apple's arm64 convention passes variadic arguments on the stack, where recore does not read
+/// them yet. On a Mach-O image the registers a format's arguments are taken from hold no
+/// argument, so each integer stays a word wide there, as before formats gave them their widths.
+#[test]
+fn a_format_on_apple_arm64_leaves_its_integers_a_word_wide() {
+    let returned = |format: Format| {
+        let text = recore::image::Section { name: "__text".into(), addr: 0x1000, data: arm64(), file_offset: None, executable: true, writable: false };
+        let mut session = Session::load(&recore::Image::bare("test".into(), format, Machine::Aarch64, 0x1000, vec![text])).unwrap();
+        session.name_function(0x1070, "g").unwrap();
+        session.name_function(0x1078, "printk").unwrap();
+        session.takes_variable_arguments(0x1078);
+        session.format_call(0x1000, 0x1068, CallTarget::Function(0x1078), 0, 0x107c).unwrap();
+        let function = session.decompile(0x1000).unwrap();
+        (function.return_shape.size, function.c_text)
+    };
+    let (elf, c_text) = returned(Format::Elf);
+    assert_eq!(elf, 4, "{c_text}");
+    let (mach_o, c_text) = returned(Format::MachO);
+    assert_eq!(mach_o, 8, "{c_text}");
 }
