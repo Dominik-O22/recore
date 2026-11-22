@@ -269,8 +269,10 @@ impl Image {
     /// Parses the ELF, PE or Mach-O executable in `data`, which needs no file around it: `load`
     /// reads one with this, and the fuzzer (fuzz/) feeds it bytes.
     pub fn parse(name: String, data: Vec<u8>) -> Result<Image> {
-        if crate::kernel::is_raw_image(&data) {
-            return crate::layout::kernel(name, data);
+        if crate::kernel::is_raw_image(&data)
+            && let Some(symbols) = crate::layout::kallsyms(&data)
+        {
+            return crate::layout::kernel(name, data, symbols);
         }
         if crate::macho::is_macho(&data) {
             return crate::macho::load(name, &data);
@@ -516,13 +518,16 @@ fn read_word(sections: &SectionFinder, addr: u64, size: usize) -> Option<u64> {
     Some(bytes.iter().rev().fold(0, |word, &byte| word << 8 | u64::from(byte)))
 }
 
-/// What a file is that wraps or compresses what recore reads, as a kernel's `Image` comes from a
-/// phone, and what to do with it, by the bytes it opens with.
+/// What a file is that recore reads no executable in, as a kernel's `Image` comes from a phone,
+/// wrapped, compressed or with nothing that says where it loads, and what to do with it.
 fn wrapped(data: &[u8]) -> Option<String> {
     const COMPRESSED: [(&[u8], &str); 6] =
         [(b"\x1f\x8b", "gzip"), (b"\x02\x21\x4c\x18", "LZ4"), (b"\x04\x22\x4d\x18", "LZ4"), (b"\x28\xb5\x2f\xfd", "Zstandard"), (b"\xfd7zXZ\x00", "XZ"), (b"BZh", "bzip2")];
     if data.starts_with(b"ANDROID!") {
         return Some("an Android boot image: take the kernel out of it, as `unpack_bootimg` from AOSP's mkbootimg does, decompress it if it is compressed, and load the raw `Image`".into());
+    }
+    if crate::kernel::is_raw_image(data) {
+        return Some("an arm64 Linux kernel `Image` with no kallsyms that holds together and no EFI stub: load it with a layout file, which says where it loads".into());
     }
     let (_, compression) = COMPRESSED.iter().find(|(magic, _)| data.starts_with(magic))?;
     Some(format!("compressed with {compression}: decompress it and load what it holds"))

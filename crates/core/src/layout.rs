@@ -526,43 +526,48 @@ pub fn load(path: &Path) -> Result<Image> {
 /// the trampolines and the identity-mapped code that 6.12 keeps among its read-only data.
 const KERNEL_CODE: [(&str, &str); 3] = [("_text", "_etext"), ("_sinittext", "_einittext"), ("__exittext_begin", "__exittext_end")];
 
-/// The pairs of symbols that bound the data a kernel writes: its data, and what it writes while it
-/// boots.
-const KERNEL_DATA: [(&str, &str); 2] = [("_sdata", "_edata"), ("__initdata_begin", "__initdata_end")];
+/// The data a kernel only reads, `.rodata`, by the symbols that bound it. All other data is
+/// taken as written, since a wrong constant is worse than a missed one.
+const KERNEL_READ_ONLY: (&str, &str) = ("__start_rodata", "__end_rodata");
 
-/// The tables [`crate::kernel`] reads, and the unwind tables that 6.x keeps for the code that
-/// patches its shadow call stack, by the symbols that bound each and the section an ELF file
-/// keeps it in.
-const KERNEL_TABLES: [(&str, &str, &str); 4] = [
+/// What the kernel writes while it boots and protects afterwards, among its `.rodata`.
+const KERNEL_RO_AFTER_INIT: (&str, &str) = ("__start_ro_after_init", "__end_ro_after_init");
+
+/// The tables [`crate::kernel`] reads, and the unwind tables that Android's 6.1 and 6.12 keep for
+/// the code that patches their shadow call stack, by the symbols that bound each and the section
+/// an ELF file keeps it in.
+const KERNEL_TABLES: [(&str, &str, &str); 5] = [
     ("__alt_instructions", "__alt_instructions_end", ".altinstructions"),
     ("__start___bug_table", "__stop___bug_table", "__bug_table"),
     ("__start___jump_table", "__stop___jump_table", "__jump_table"),
+    ("__eh_frame_start", "__eh_frame_end", ".eh_frame"),
     ("__pi___eh_frame_start", "__pi___eh_frame_end", ".eh_frame"),
 ];
 
-/// Loads an arm64 Linux kernel's raw `Image`, which [`crate::kernel::is_raw_image`] tells, with no
-/// layout. Its kallsyms says where it loads, which of it is code, and the name and start of each
-/// function. Where it has no kallsyms that holds together, it loads at 0, all code, unnamed.
-pub(crate) fn kernel(name: String, data: Vec<u8>) -> Result<Image> {
-    // The symbols start at `_text`, the image's first byte.
-    let phase = crate::phase::scope("load/kallsyms");
-    let mut symbols = crate::kallsyms::read(&data).filter(|symbols| symbols[0].addr.checked_add(data.len() as u64).is_some()).unwrap_or_default();
-    drop(phase);
+/// The symbols of an arm64 Linux kernel's raw `Image`, which [`crate::kernel::is_raw_image`]
+/// tells, from its kallsyms, but for mapping symbols. None where it has no kallsyms that holds
+/// together, and the file is read as any other: by the PE header of its EFI stub, if it has one.
+pub(crate) fn kallsyms(data: &[u8]) -> Option<Vec<Symbol>> {
+    let _phase = crate::phase::scope("load/kallsyms");
+    let mut symbols = crate::kallsyms::read(data)?;
     // A mapping symbol, such as `$x` or `$d` with the prefix of the kernel's code that runs at its
     // physical address, `__pi_`, names no function.
     symbols.retain(|symbol| !symbol.name.contains('$'));
-    let base = symbols.first().map_or(0, |symbol| symbol.addr);
+    Some(symbols)
+}
+
+/// Loads an arm64 Linux kernel's raw `Image` with no layout, by its kallsyms `symbols`, which
+/// say where it loads, which of it is code, and the name and start of each function.
+pub(crate) fn kernel(name: String, data: Vec<u8>, symbols: Vec<Symbol>) -> Result<Image> {
+    // The symbols start at `_text`, the image's first byte, and the image ends below 2^64.
+    let base = symbols[0].addr;
     let end = base + data.len() as u64;
     // The image's size, which takes in what the kernel zeroes past the end of the file.
     let size = data.get(0x10..0x18).map_or(0, |bytes| u64::from_le_bytes(bytes.try_into().unwrap()));
-    let sections = if symbols.is_empty() {
-        vec![Section { name: ".text".into(), addr: 0, data, file_offset: Some(0), executable: true, writable: false }]
-    } else {
-        kernel_sections(&data, base, &symbols)
-    };
+    let sections = kernel_sections(&data, base, &symbols);
     let layout = Layout { machine: Machine::Aarch64, entry: vec![base], vectors: None, region: Vec::new(), banking: None, names: None, compiler: None };
     let mut image = layout.image(name, sections, None)?;
-    if let Some(stop) = base.checked_add(size).filter(|&stop| stop > end && !symbols.is_empty()) {
+    if let Some(stop) = base.checked_add(size).filter(|&stop| stop > end) {
         image.zero_filled = vec![(end, stop)];
     }
     if let Some(frames) = image.sections.iter().find(|section| section.name == ".eh_frame") {
@@ -578,7 +583,7 @@ pub(crate) fn kernel(name: String, data: Vec<u8>) -> Result<Image> {
 }
 
 /// The sections of a kernel's image that loads at `base`, cut where its `symbols` say its code,
-/// the data it writes and the tables [`crate::kernel`] reads start and end.
+/// the data it only reads and the tables [`crate::kernel`] reads start and end.
 fn kernel_sections(data: &[u8], base: u64, symbols: &[Symbol]) -> Vec<Section> {
     let mut at: FxHashMap<&str, u64> = FxHashMap::default();
     for symbol in symbols {
@@ -590,11 +595,11 @@ fn kernel_sections(data: &[u8], base: u64, symbols: &[Symbol]) -> Vec<Section> {
         range((&symbol.name, &format!("__{stem}_text_end")))
     });
     let code: Vec<(u64, u64)> = KERNEL_CODE.into_iter().filter_map(range).chain(marked).collect();
-    let written: Vec<(u64, u64)> = KERNEL_DATA.into_iter().filter_map(range).collect();
+    let (read_only, after_init) = (range(KERNEL_READ_ONLY), range(KERNEL_RO_AFTER_INIT));
     let tables: Vec<((u64, u64), &str)> = KERNEL_TABLES.into_iter().filter_map(|(start, stop, name)| Some((range((start, stop))?, name))).collect();
 
     let end = base + data.len() as u64;
-    let bounds = code.iter().chain(&written).chain(tables.iter().map(|(range, _)| range)).flat_map(|&(start, stop)| [start, stop]);
+    let bounds = code.iter().chain(&read_only).chain(&after_init).chain(tables.iter().map(|(range, _)| range)).flat_map(|&(start, stop)| [start, stop]);
     let mut cuts: Vec<u64> = [base, end].into_iter().chain(bounds).map(|addr| addr.clamp(base, end)).collect();
     cuts.sort_unstable();
     cuts.dedup();
@@ -604,7 +609,7 @@ fn kernel_sections(data: &[u8], base: u64, symbols: &[Symbol]) -> Vec<Section> {
         let (from, to) = (pair[0], pair[1]);
         let holds = |&(start, stop): &(u64, u64)| start <= from && from < stop;
         let executable = code.iter().any(holds);
-        let writable = !executable && written.iter().any(holds);
+        let writable = !executable && !(read_only.as_ref().is_some_and(holds) && !after_init.as_ref().is_some_and(holds));
         let kind = if executable { ".text" } else if writable { ".data" } else { ".rodata" };
         let name = tables.iter().find(|(range, _)| holds(range)).map_or(kind, |&(_, name)| name);
         match pieces.last_mut() {
@@ -626,7 +631,7 @@ mod tests {
     use super::*;
 
     /// A kernel's raw image: the header, two functions and kallsyms, which say where it loads,
-    /// what is code and data, and what the functions and a global are called.
+    /// what is code, what is data it only reads, and what the functions and a global are called.
     #[test]
     fn a_kernel_image_loads_where_its_kallsyms_say() {
         use crate::kallsyms::tests::{Order, kallsyms};
@@ -639,6 +644,9 @@ mod tests {
             (TEXT + 0x100, "D__start_rodata"),
             (TEXT + 0x200, "D__start___bug_table"),
             (TEXT + 0x20c, "D__stop___bug_table"),
+            (TEXT + 0xc00, "D__start_ro_after_init"),
+            (TEXT + 0xc10, "D__end_ro_after_init"),
+            (TEXT + 0xe00, "R__end_rodata"),
             (TEXT + 0x1000, "D_sdata"),
             (TEXT + 0x1000, "Dcounter"),
             (TEXT + 0x1010, "D_edata"),
@@ -661,8 +669,10 @@ mod tests {
                 (TEXT, TEXT + 0x100, ".text", true, false),
                 (TEXT + 0x100, TEXT + 0x200, ".rodata", false, false),
                 (TEXT + 0x200, TEXT + 0x20c, "__bug_table", false, false),
-                (TEXT + 0x20c, TEXT + 0x1000, ".rodata", false, false),
-                (TEXT + 0x1000, TEXT + 0x1010, ".data", false, true),
+                (TEXT + 0x20c, TEXT + 0xc00, ".rodata", false, false),
+                (TEXT + 0xc00, TEXT + 0xc10, ".data", false, true),
+                (TEXT + 0xc10, TEXT + 0xe00, ".rodata", false, false),
+                (TEXT + 0xe00, TEXT + 0x1010, ".data", false, true),
             ]
         );
         assert_eq!((image.entry, image.zero_filled.as_slice(), image.kernel_image), (TEXT, &[(TEXT + 0x1010, TEXT + 0x2000)][..], true));
@@ -672,12 +682,12 @@ mod tests {
         let named: Vec<(u64, Option<&str>)> = analysis.functions.iter().map(|f| (f.addr, f.name.as_deref())).collect();
         assert!(named.contains(&(TEXT + 0x40, Some("first"))) && named.contains(&(TEXT + 0x48, Some("second"))), "{named:x?}");
 
-        // With a token table that is not whole, it loads at 0, all code, unnamed.
+        // With a token table that is not whole, it is read as any other file, which it is not.
         let mut broken = data;
         let digits = broken.windows(4).position(|window| window == b"0\x001\x00").unwrap();
         broken[digits + 2] = b'x';
-        let image = Image::parse("Image".into(), broken).unwrap();
-        assert_eq!((image.sections.len(), image.sections[0].addr, image.sections[0].executable, image.symbol_names.len()), (1, 0, true, 0));
+        let error = Image::parse("Image".into(), broken).err().unwrap().to_string();
+        assert!(error.contains("an arm64 Linux kernel `Image` with no kallsyms that holds together"), "{error}");
     }
 
     #[test]
