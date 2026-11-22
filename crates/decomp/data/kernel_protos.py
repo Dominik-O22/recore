@@ -21,8 +21,10 @@ whether they return a value.
 
 The newer two build mac80211, cfg80211, bluetooth and usbnet as modules, so their images export
 none of those names, and the 5.10 line is the only one a 6.x module's call to them gets. Against
-the DWARF of Debian's 6.12 arm64 modules, 9 of 354 such calls' lines have a parameter too few,
-all wireless names that 6.x gave a `link_id`, such as `ieee80211_nullfunc_get`.
+the DWARF of the modules that import them, 9 of the 354 (module, name) pairs that take a line the
+5.10 kernel added differ, all 9 among the 193 of Debian's 6.12 arm64 modules: 8 mac80211 and
+cfg80211 names that 6.x gave more parameters, six a `link_id`, such as `ieee80211_nullfunc_get`,
+one a channel context, and `cfg80211_port_authorized` two.
 
 Kernels before 5.2 carry no BTF. `--headers kernel_headers.txt` adds, after every kernel, the
 lines of that file, written by hand from the headers of the Pixel 5's 4.19 and the Pixel 2's 4.4
