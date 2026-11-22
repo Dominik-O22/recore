@@ -9,9 +9,18 @@
 //!   section, after the function, where they never run.
 //! - `__bug_table` lists the trap of each `BUG()` and `WARN()`. After a warning's, the kernel
 //!   goes on.
+//!
+//! Built with Clang's kCFI, a kernel or module also puts the hash of a function's type in the
+//! word before each function whose address it takes, where a call through a pointer checks it.
+//! A module's `$d` mapping symbols mark each as data. Where nothing marks them, as in a stripped
+//! `vmlinux` or a raw `Image`, [`kcfi_hashes`] finds them.
 
 use std::collections::HashSet;
 
+use rustc_hash::FxHashSet;
+
+use crate::arch::{Arch, Flow};
+use crate::arm64::{Arm64, Insn, State};
 use crate::image::{Image, Machine, Section};
 
 /// `struct jump_entry` with absolute pointers: the label's instruction, where it jumps, its key.
@@ -29,9 +38,11 @@ const BUG_ENTRIES: [(usize, usize); 2] = [(12, 10), (8, 4)];
 /// The flag of a `bug_entry` that a `WARN()` made.
 const BUGFLAG_WARNING: u16 = 1;
 
-/// Reads the tables an ELF `image` has into what the analysis reads: drops the pointers
+/// Reads the tables an ELF or raw `image` has into what the analysis reads: drops the pointers
 /// `__jump_table` relocates from `relative_targets`, and sets `replacement_code` and
-/// `resuming_traps`. A table whose layout the reader cannot establish is left unread.
+/// `resuming_traps`. A table whose layout the reader cannot establish is left unread. It says
+/// whether an arm64 image is a kernel's, `kernel_image`, and where no mapping symbol marks data
+/// among such a kernel's code, the kCFI hashes become `marked_data`.
 pub(crate) fn read(image: &mut Image) {
     if !matches!(image.machine, Machine::Aarch64 | Machine::X86_64) {
         return;
@@ -41,6 +52,10 @@ pub(crate) fn read(image: &mut Image) {
     }
     if image.machine == Machine::Aarch64 {
         image.replacement_code = replacements(image);
+        image.kernel_image = is_kernel(image);
+        if image.kernel_image && image.marked_data.is_empty() {
+            image.marked_data = kcfi_hashes(image);
+        }
     }
     image.resuming_traps = warnings(image);
 }
@@ -120,6 +135,109 @@ fn warnings(image: &Image) -> Vec<u64> {
     warnings
 }
 
+/// What arm64's Linux image header holds at 0x38: `ARM\x64`.
+const IMAGE_MAGIC: [u8; 4] = *b"ARMd";
+
+/// Whether `image` is an arm64 Linux kernel's, whose `.head.text`, and the raw `Image` made from
+/// it, open with the image header. Only a kernel has kCFI hashes that nothing marks, so only it
+/// pays to look for them, and only in it does a `nop` after a hash open a function.
+fn is_kernel(image: &Image) -> bool {
+    image.sections.iter().any(|section| section.data.get(0x38..0x3c) == Some(&IMAGE_MAGIC[..]))
+}
+
+/// kCFI's trap on arm64: `brk` with 0x8000 and up, the register that holds the hash the call
+/// expects at bit 5 and the one that holds the target at bit 0.
+const KCFI_TRAP: u32 = 0xD430_0000;
+const KCFI_TRAP_MASK: u32 = 0xFFFF_801F;
+
+/// `movk wN, #imm` and `movk wN, #imm, lsl #16`, without their operands.
+const MOVK_LOW: u32 = 0x7280_0000;
+const MOVK_HIGH: u32 = 0x72A0_0000;
+const MOVK_MASK: u32 = 0xFFE0_001F;
+
+/// The hashes kCFI's checks in arm64 code expect. Before a call through a pointer, Clang loads
+/// the hash before the target, the one the call expects, compares them, and traps if they differ:
+///
+/// ```text
+/// ldur wA, [xN, #-4]
+/// movk wB, #low
+/// movk wB, #high, lsl #16
+/// cmp  wA, wB
+/// b.eq 1f
+/// brk  #(0x8000 | B << 5 | N)
+/// ```
+fn checked_hashes(image: &Image) -> FxHashSet<u32> {
+    let mut hashes = FxHashSet::default();
+    for section in image.sections.iter().filter(|s| s.executable && s.addr.is_multiple_of(4)) {
+        let words = section.data.as_chunks::<4>().0;
+        let word = |index: usize| words.get(index).map(|bytes| u32::from_le_bytes(*bytes));
+        for at in memchr::memmem::find_iter(&section.data, &KCFI_TRAP.to_le_bytes()[2..]).filter(|at| at % 4 == 2) {
+            let index = at / 4;
+            let Some(trap) = word(index).filter(|trap| trap & KCFI_TRAP_MASK == KCFI_TRAP) else { continue };
+            let register = trap >> 10 & 31;
+            let (Some(low), Some(high)) = (index.checked_sub(4).and_then(word), index.checked_sub(3).and_then(word)) else { continue };
+            if low & MOVK_MASK == MOVK_LOW | register && high & MOVK_MASK == MOVK_HIGH | register {
+                hashes.insert(low >> 5 & 0xFFFF | (high >> 5 & 0xFFFF) << 16);
+            }
+        }
+    }
+    hashes
+}
+
+/// How far forward a function that tests an argument before `paciasp` jumps at most: in GKI
+/// 6.12, as far as 108 of 115 such tests, and 48 of 1,223 hashes read as a conditional branch.
+const ARGUMENT_TEST_REACH: u64 = 4096;
+
+/// `[start, end)` of each kCFI hash in arm64 code, sorted, for code no mapping symbol marks. Empty
+/// for code without kCFI's checks.
+///
+/// A word that holds a hash a check expects is one. A function that no call through a pointer
+/// in the image reaches has a hash no check expects, as an exported function only modules call
+/// does: there, a word that follows code that ends and comes before an entry marker such as
+/// `paciasp` is one, unless it may be code. Code that ends is a jump, a return, a trap, a call
+/// that may not return, or the replacement code of an alternative, which never runs where it
+/// lies. A word before the marker may be the end of such code, or the first instruction of a
+/// function that tests an argument before it saves its return address: a conditional branch a
+/// short way forward, past the marker. A hash read as a branch goes anywhere.
+fn kcfi_hashes(image: &Image) -> Vec<(u64, u64)> {
+    let checked = checked_hashes(image);
+    if checked.is_empty() {
+        return Vec::new();
+    }
+    let state = State::default();
+    let flow = |insn: &Insn| Arm64::flow(insn, &state, image);
+    let may_be_code = |insn: &Insn| match flow(insn) {
+        None => false,
+        Some(Flow::Branch(target)) => target > insn.addr && target - insn.addr <= ARGUMENT_TEST_REACH,
+        Some(_) => true,
+    };
+    let mut replacements = image.replacement_code.iter().peekable();
+    let mut hashes = Vec::new();
+    for section in image.sections.iter().filter(|s| s.executable && s.addr.is_multiple_of(4)) {
+        let words = section.data.as_chunks::<4>().0;
+        let insn = |index: usize, addr: u64| words.get(index).map(|bytes| Insn { word: u32::from_le_bytes(*bytes), addr });
+        // Whether what came last, padding aside, ends code.
+        let mut after_break = false;
+        for index in 0..words.len() {
+            let addr = section.addr.saturating_add(4 * index as u64);
+            while replacements.next_if(|&&(_, end)| end <= addr).is_some() {}
+            if replacements.peek().is_some_and(|&&(start, _)| start <= addr) {
+                after_break = true;
+                continue;
+            }
+            let Some(word) = insn(index, addr).filter(|word| !Arm64::is_padding(word)) else { continue };
+            let before_entry = || insn(index + 1, addr.saturating_add(4)).is_some_and(|next| Arm64::is_entry_marker(&next));
+            if checked.contains(&word.word) || after_break && !may_be_code(&word) && before_entry() {
+                hashes.push((addr, addr.saturating_add(4)));
+                after_break = false;
+            } else {
+                after_break = flow(&word).is_some_and(|flow| !matches!(flow, Flow::Branch(_)));
+            }
+        }
+    }
+    hashes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +313,86 @@ mod tests {
         let image = module(&code, ".altinstructions", entry, Vec::new());
         assert_eq!(image.replacement_code, vec![(replacement, replacement + 8)]);
         assert_eq!(starts(&image), vec![TEXT, first, second]);
+    }
+
+    /// A function that calls through a pointer checks the hash before the target, then a function
+    /// that opens with a `nop`, as a patch site does, then the hash a function no check expects,
+    /// then a function that opens with `paciasp`. Nothing calls either function, and neither hash
+    /// marks itself. Then a function without a hash that tests an argument before `paciasp`, one
+    /// without a hash or an entry marker, and an alternative's replacement for the check's first
+    /// word, after which another unchecked hash opens a function. A section opens with the image
+    /// header, as a kernel's does.
+    #[test]
+    fn kcfi_hashes_are_data_and_start_the_function_after_them() {
+        let (checked, unchecked, after_replacement) = (0x77bf_192du32, 0x5e0f_3a91u32, 0x3c7a_e5d1u32);
+        let movk = |base: u32, half: u32| base | (half & 0xFFFF) << 5 | 17;
+        let check = [
+            0xb85f_c030, // ldur w16, [x1, #-4]
+            movk(MOVK_LOW, checked),
+            movk(MOVK_HIGH, checked >> 16),
+            0x6b11_021f, // cmp w16, w17
+            0x5400_0040, // b.eq +8
+            0xd430_4420, // brk #0x8221
+            0xd63f_0020, // blr x1
+            RET,
+        ];
+        let (first, second, replacement, third) = (TEXT + 36, TEXT + 52, TEXT + 96, TEXT + 104);
+        let functions = [checked, NOP, MOV_X0_1, RET, unchecked, PACIASP, MOV_X0_0, AUTIASP, RET];
+        let tests_argument = [0xb400_0081 /* cbz x1, +16 */, PACIASP, MOV_X0_1, AUTIASP, RET];
+        let unmarked = [MOV_X0_1, RET];
+        let replaced = [MOV_X0_0, after_replacement, PACIASP, MOV_X0_0, AUTIASP, RET];
+        let code: Vec<u32> = [&check[..], &functions, &tests_argument, &unmarked, &replaced].concat();
+        // The alternative: the original at the check's first word, the replacement one word long.
+        let mut alternative = Vec::new();
+        alternative.extend((TEXT.wrapping_sub(DATA) as i32).to_le_bytes());
+        alternative.extend((replacement.wrapping_sub(DATA + 4) as i32).to_le_bytes());
+        alternative.extend([0, 0, 4, 4]);
+        let kernel = |code: &[u32], header: bool| {
+            let section = |name: &str, addr: u64, data: Vec<u8>, executable: bool| Section { name: name.into(), addr, data, file_offset: None, executable, writable: false };
+            let mut head = vec![0; 0x40];
+            head[0x38..0x3c].copy_from_slice(if header { &IMAGE_MAGIC } else { b"ELF!" });
+            let text = section(".text", TEXT, code.iter().flat_map(|word| word.to_le_bytes()).collect(), true);
+            let sections = vec![text, section(".head", TABLE, head, false), section(".altinstructions", DATA, alternative.clone(), false)];
+            let mut image = Image::bare("vmlinux".into(), Format::Elf, Machine::Aarch64, TEXT, sections);
+            read(&mut image);
+            image
+        };
+        let image = kernel(&code, true);
+        assert_eq!(image.replacement_code, vec![(replacement, replacement + 4)]);
+        assert_eq!(image.marked_data, vec![(first - 4, first), (second - 4, second), (third - 4, third)]);
+        assert_eq!(starts(&image), vec![TEXT, first, second, third]);
+        // Without a check, or in a file that is no kernel, nothing is taken for a hash.
+        let mut unchecked_code = code.clone();
+        unchecked_code[5] = NOP;
+        assert!(kernel(&unchecked_code, true).marked_data.is_empty());
+        assert!(kernel(&code, false).marked_data.is_empty());
+    }
+
+    /// A module marks its hashes with `$d`, and other data too: here an undefined instruction
+    /// that straight-line code runs into, after which no function starts. After the hash, which
+    /// follows a `ret`, ftrace's `nop` comes before the function.
+    #[test]
+    fn a_modules_mark_inside_a_function_starts_nothing() {
+        let (undefined, hash) = (TEXT + 4, TEXT + 16);
+        let code = [MOV_X0_0, 0xe7f0_01f2, MOV_X0_1, RET, 0x5e0f_3a91, NOP, MOV_X0_0, RET];
+        let text = Section { name: ".text".into(), addr: TEXT, data: code.iter().flat_map(|word| word.to_le_bytes()).collect(), file_offset: None, executable: true, writable: false };
+        let mut image = Image::bare("module".into(), Format::Elf, Machine::Aarch64, TEXT, vec![text]);
+        (image.kernel_module, image.marked_data) = (true, vec![(undefined, undefined + 4), (hash, hash + 4)]);
+        assert_eq!(starts(&image), vec![TEXT, hash + 8]);
+    }
+
+    /// Outside a kernel a marked word is not a hash for sure: here a literal, with the `nop` after
+    /// it that aligns the next function, which starts past that `nop`.
+    #[test]
+    fn a_literal_before_padding_starts_nothing_at_the_padding() {
+        // ldr w0, the literal; ret; the literal; nop; mov x0, #1; ret.
+        let code = [0x1800_0040, RET, 0x0000_002a, NOP, MOV_X0_1, RET];
+        let text = Section { name: ".text".into(), addr: TEXT, data: code.iter().flat_map(|word| word.to_le_bytes()).collect(), file_offset: None, executable: true, writable: false };
+        let mut image = Image::bare("program".into(), Format::Elf, Machine::Aarch64, TEXT, vec![text]);
+        image.marked_data = vec![(TEXT + 8, TEXT + 12)];
+        assert_eq!(starts(&image), vec![TEXT, TEXT + 16]);
+        image.kernel_image = true;
+        assert_eq!(starts(&image), vec![TEXT, TEXT + 12]);
     }
 
     /// `WARN()` calls a function that returns, then traps, and the kernel goes on after the trap.

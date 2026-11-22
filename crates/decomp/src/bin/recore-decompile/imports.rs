@@ -1,5 +1,5 @@
 //! Measurements of where the decompiler's types come from: the prototype tables for imports, the
-//! kCFI hashes of kernel modules, and debug information.
+//! kCFI hashes of kernels and modules, and debug information.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -44,8 +44,8 @@ pub fn coverage(bin_dir: &Path, list: usize) -> Result<()> {
     Ok(())
 }
 
-/// Prints, over the kernel modules in `bin_dir`, how many functions have a kCFI hash before them
-/// and how many take a prototype from it, and how many modules hash in each spelling.
+/// Prints, over the arm64 kernels and modules in `bin_dir`, how many functions have a kCFI hash
+/// before them and how many take a prototype from it, and how many binaries hash in each spelling.
 pub fn kcfi(bin_dir: &Path) -> Result<()> {
     let mut binaries: Vec<std::path::PathBuf> = std::fs::read_dir(bin_dir)?.map(|entry| Ok(entry?.path())).collect::<Result<_>>()?;
     binaries.sort();
@@ -53,7 +53,7 @@ pub fn kcfi(bin_dir: &Path) -> Result<()> {
     let mut spellings: BTreeMap<&str, usize> = BTreeMap::new();
     for binary in binaries {
         let Ok(image) = recore::Image::load(&binary) else { continue };
-        if !image.kernel_module {
+        if image.machine != recore::image::Machine::Aarch64 {
             continue;
         }
         let analysis = recore::analyze(&image);
@@ -73,8 +73,8 @@ pub fn kcfi(bin_dir: &Path) -> Result<()> {
         *spellings.entry(spelling).or_default() += 1;
     }
     println!("{functions} functions, {hashed} with a kCFI hash, {typed} with a prototype from it");
-    for (spelling, modules) in spellings {
-        println!("{spelling:10} {modules} modules");
+    for (spelling, binaries) in spellings {
+        println!("{spelling:10} {binaries} binaries");
     }
     Ok(())
 }

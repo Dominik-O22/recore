@@ -178,8 +178,8 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         list: usize,
     },
-    /// Prints how many functions of the kernel modules in a directory have a kCFI hash before
-    /// them, how many take a prototype from it, and how many modules hash in each spelling.
+    /// Prints how many functions of the arm64 kernels and modules in a directory have a kCFI hash
+    /// before them, how many take a prototype from it, and how many binaries hash in each spelling.
     Kcfi { bin_dir: PathBuf },
     /// Reads a binary's debug information and gives its types to a decompiler session, printing
     /// what was found and how long each step took, and how long a child takes to be ready with

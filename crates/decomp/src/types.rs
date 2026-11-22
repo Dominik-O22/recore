@@ -757,8 +757,8 @@ pub fn debug_file(path: &Path, image: &Image) -> Option<PathBuf> {
 }
 
 /// The types in the debug information of the image at `path`, if it has any that can be read,
-/// or else those of the managed program of an IL2CPP build, or else the prototypes a kernel
-/// module's kCFI hashes name. Why debug information could not be read goes to stderr: the
+/// or else those of the managed program of an IL2CPP build, or else the prototypes an arm64
+/// kernel's or module's kCFI hashes name. Why debug information could not be read goes to stderr: the
 /// decompiler works without. [`DEBUG_VAR`] set to `off` keeps all three out.
 pub fn load(path: &Path, image: &Image) -> Option<Types> {
     if std::env::var(DEBUG_VAR).is_ok_and(|setting| setting == "off") {

@@ -1,4 +1,4 @@
-//! A kernel module's functions take the prototypes their kCFI hashes name. The fixture is
+//! A kernel's or module's functions take the prototypes their kCFI hashes name. The fixture is
 //! `module-arm64.o` of the analysis's tests, which clang built as a kernel that does not
 //! normalize integers builds its modules: see `crates/core/tests/fixtures/build-module.sh`.
 
@@ -54,4 +54,17 @@ fn unnamed() -> recore::Image {
 #[test]
 fn a_hash_names_the_function_after_ftraces_nops_without_a_symbol() {
     assert!(kcfi::hashes(&unnamed()).contains(&(0xffff_8000_0000_0258, 0x63df_1691)));
+}
+
+/// A `vmlinux` is no module. The hash of `kernel_probe`'s type, found in its code where nothing
+/// marks it, names that prototype too.
+#[test]
+fn a_kernels_hash_names_the_function_after_it() {
+    let addr = 0xffff_ffc0_8000_0000;
+    let data = [0x63df_1691u32, 0xd65f_03c0].iter().flat_map(|word| word.to_le_bytes()).collect();
+    let text = recore::image::Section { name: ".text".into(), addr, data, file_offset: None, executable: true, writable: false };
+    let mut image = recore::Image::bare("vmlinux".into(), recore::image::Format::Elf, recore::image::Machine::Aarch64, addr, vec![text]);
+    image.marked_data = vec![(addr, addr + 4)];
+    let (_, types) = kcfi::types(&image).expect("the hash names a prototype");
+    assert_eq!(types.functions.iter().map(|function| function.addr).collect::<Vec<_>>(), vec![addr + 4]);
 }
