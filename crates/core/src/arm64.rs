@@ -391,6 +391,43 @@ fn sign_extend_64(value: u64, bits: u32) -> i64 {
     ((value << shift) as i64) >> shift
 }
 
+/// Whether the `adr` at `adr` forms the base a jump table's entries count from, which is no
+/// function: its code runs straight on into a `br` to that base plus an entry. Clang puts the
+/// base at the `adr` itself, GCC right after the `br` or at one of the cases.
+fn is_dispatch_base(adr: Insn, image: &Image) -> bool {
+    /// The most instructions from the `adr` to its `br`.
+    const REACH: usize = 16;
+    let Some(bytes) = image.bytes_from(adr.addr + 4) else { return false };
+    // One bit per register that holds the base plus something.
+    let mut sums = 0u32;
+    for &word in bytes.as_chunks::<4>().0.iter().take(REACH) {
+        let insn = Insn { word: u32::from_le_bytes(word), addr: 0 };
+        match Arm64::flow(&insn, &State::default(), image) {
+            // A 64-bit `add` of a shifted or an extended register.
+            None if insn.word >> 24 == 0x8B && insn.rn() == adr.rd() => sums |= 1 << insn.rd(),
+            None => {}
+            Some(flow) => return matches!(flow, Flow::JumpIndirect(_)) && sums >> insn.rn() & 1 != 0,
+        }
+    }
+    false
+}
+
+/// Whether the code at `target`, a little before the instruction at `at` that forms its address,
+/// runs on into that instruction with no branch but calls: then the address is the code's own
+/// position, as the Linux kernel's `_THIS_IP_` takes, and no function's.
+fn runs_into(target: u64, at: u64, image: &Image) -> bool {
+    /// The most bytes back such a label lies.
+    const REACH: u64 = 128;
+    if target >= at || at - target > REACH {
+        return false;
+    }
+    let Some(bytes) = image.bytes_from(target).and_then(|bytes| bytes.get(..(at - target) as usize)) else { return false };
+    bytes.as_chunks::<4>().0.iter().all(|&word| {
+        let insn = Insn { word: u32::from_le_bytes(word), addr: 0 };
+        matches!(Arm64::flow(&insn, &State::default(), image), None | Some(Flow::Call(_) | Flow::CallIndirect(_)))
+    })
+}
+
 pub struct Arm64;
 
 impl Arch for Arm64 {
@@ -468,6 +505,11 @@ impl Arch for Arm64 {
     /// `adr` forms the address of any byte, but only one on a word can be code.
     fn code_pointer(_: &Image, target: u64) -> bool {
         target.is_multiple_of(4)
+    }
+
+    /// A jump table's base, or the code's own position.
+    fn takes_label(insn: &Insn, target: u64, image: &Image) -> bool {
+        matches!(insn.pc_relative(), Some((false, _))) && is_dispatch_base(*insn, image) || runs_into(target, insn.addr, image)
     }
 
     fn memory_reference(insn: &Insn, state: &State) -> Option<u64> {
@@ -720,6 +762,61 @@ mod tests {
             Arm64::step(&mut state, &insn);
         }
         assert_eq!(referred, [None, Some(0x5010)]);
+    }
+
+    #[test]
+    fn a_jump_tables_base_starts_no_function() {
+        let words: [u32; 29] = [
+            // 0x4000, with the base after the `br`, as GCC may put it: cmp w0, #2; b.hi 0x4028;
+            // adr x1, 0x4018; ldrb w0, [x2, w0, uxtw]; add x0, x1, w0, sxtb #2; br x0; the cases.
+            0x7100_081F, 0x5400_0128, 0x1000_0081, 0x3860_4840, 0x8B20_8820, 0xD61F_0000,
+            0x5280_0020, 0xD65F_03C0, 0x5280_0040, 0xD65F_03C0, 0x5280_0060, 0xD65F_03C0,
+            // 0x4030, with the base at the `adr`, as clang puts it: mov w8, w0; adr x10, 0x4034;
+            // ldrsw x11, [x2, x8, lsl #2]; add x10, x10, x11, lsl #2; br x10; a case.
+            0x2A00_03E8, 0x1000_000A, 0xB8A8_784B, 0x8B0B_094A, 0xD61F_0140, 0x5280_0080, 0xD65F_03C0,
+            // 0x404c, with the base at a case, as GCC may put it: cbz w0, 0x4058; the case;
+            // adr x1, 0x4050; ldrb w0, [x2, w0, uxtw]; add x0, x1, w0, sxtb #2; br x0.
+            0x3400_0060, 0x5280_00A0, 0xD65F_03C0, 0x10FF_FFC1, 0x3860_4840, 0x8B20_8820, 0xD61F_0000,
+            // 0x4068, which passes a function on, and that function at 0x4070:
+            // adr x0, 0x4070; br x1; ret.
+            0x1000_0040, 0xD61F_0020, 0xD65F_03C0,
+        ];
+        let analysis = analyze(&words, &[0x4030, 0x404c, 0x4068]);
+        assert_eq!(starts(&analysis), [0x4000, 0x4030, 0x404c, 0x4068, 0x4070]);
+        // Each base is still an address its `adr` takes.
+        assert_eq!(references(&analysis), [(0x4008, 0x4018), (0x4034, 0x4034), (0x4058, 0x4050), (0x4068, 0x4070)]);
+    }
+
+    #[test]
+    fn the_address_of_code_that_runs_on_into_the_taker_starts_no_function() {
+        let words = [
+            // 0x4000, as clang builds `_THIS_IP_`: stp x29, x30, [sp, #-16]!; bl 0x4020;
+            // mov w1, #7; adrp x0, 0x4000; add x0, x0, #8; bl 0x4024; ldp x29, x30, [sp], #16; ret.
+            0xA9BF_7BFD, 0x9400_0007, 0x5280_00E1, 0x9000_0000, 0x9100_2000, 0x9400_0004, 0xA8C1_7BFD, 0xD65F_03C0,
+            // 0x4020 and 0x4024: ret.
+            0xD65F_03C0, 0xD65F_03C0,
+        ];
+        let analysis = analyze(&words, &[]);
+        assert_eq!(starts(&analysis), [0x4000, 0x4020, 0x4024]);
+        assert_eq!(references(&analysis), [(0x4010, 0x4008)]);
+    }
+
+    /// recore's analysis of `words` of code at 0x4000, entered there and at `exports`.
+    fn analyze(words: &[u32], exports: &[u64]) -> crate::report::Analysis {
+        let data = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let text = crate::image::Section { name: ".text".into(), addr: 0x4000, data, file_offset: None, executable: true, writable: false };
+        let mut image = Image::bare(String::new(), crate::image::Format::Elf, crate::image::Machine::Aarch64, 0x4000, vec![text]);
+        image.exports.extend(exports);
+        crate::analyze(&image)
+    }
+
+    fn starts(analysis: &crate::report::Analysis) -> Vec<u64> {
+        analysis.functions.iter().map(|function| function.addr).collect()
+    }
+
+    /// `(instruction, address)` of each address the code takes.
+    fn references(analysis: &crate::report::Analysis) -> Vec<(u64, u64)> {
+        analysis.data_refs.iter().map(|reference| (reference.from, reference.to)).collect()
     }
 
     #[test]
