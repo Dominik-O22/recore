@@ -291,6 +291,7 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
         banking: Default::default(),
         compiler: None,
         kernel_module: false,
+        kernel_image: false,
         instruction_sets: Vec::new(),
         marked_data: Vec::new(),
         replacement_code: Vec::new(),

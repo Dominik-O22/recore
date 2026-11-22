@@ -435,7 +435,7 @@ impl Layout {
             _ => Vec::new(),
         };
 
-        Ok(Image {
+        let mut image = Image {
             name,
             format: Format::Raw,
             machine: self.machine,
@@ -459,12 +459,17 @@ impl Layout {
             banking,
             compiler: self.compiler,
             kernel_module: false,
+            kernel_image: false,
             instruction_sets: Vec::new(),
             marked_data: Vec::new(),
             replacement_code: Vec::new(),
             resuming_traps: Vec::new(),
             il2cpp: None,
-        })
+        };
+        // A raw image may be a kernel's, which has no sections to name its tables, but whose
+        // code says where its kCFI hashes are.
+        crate::kernel::read(&mut image);
+        Ok(image)
     }
 }
 

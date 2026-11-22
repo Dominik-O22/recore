@@ -881,6 +881,36 @@ impl<'a, A: Arch> Explorer<'a, A> {
         tables
     }
 
+    /// Whether a kCFI hash ends at `addr` of region `index`: a word of data the file marks on its
+    /// own, which only a function follows. A module also marks data inside a function, such as an
+    /// undefined instruction a test executes, so there the code before the word, past padding and
+    /// other data, has to end: a jump, a return, a trap, or a call, which may not return. Only
+    /// arm64 marks data, and its instructions are words.
+    fn hash_before(&self, index: usize, addr: u64) -> bool {
+        let hash = addr.wrapping_sub(4);
+        if self.image.marked_data.binary_search(&(hash, addr)).is_err() {
+            return false;
+        }
+        if !self.image.kernel_module {
+            return true;
+        }
+        let region = &self.regions[index];
+        let Some(mut at) = hash.checked_sub(region.section.addr).map(|offset| offset as usize) else { return true };
+        while let Some(before) = at.checked_sub(4) {
+            at = before;
+            if region.flags[at] & IN_TABLE != 0 {
+                return true;
+            }
+            let Some(insn) = A::decode(self.image, &region.section.data[at..at + 4], region.section.addr + at as u64).next().and_then(|decoded| decoded.insn) else {
+                return true;
+            };
+            if !A::is_padding(&insn) {
+                return A::flow(&insn, &A::State::default(), self.image).is_some_and(|flow| !matches!(flow, Flow::Branch(_)));
+            }
+        }
+        true
+    }
+
     /// Whether execution cannot fall into `addr`: it sits right after a terminator, a jump
     /// table or a literal pool, or after one of those followed only by padding.
     fn starts_after_break(&self, addr: u64) -> bool {
@@ -1489,6 +1519,11 @@ impl<'a, A: Arch> Explorer<'a, A> {
     /// function before it, such as switch cases behind an unresolved indirect jump.
     fn fill_gaps(&mut self, decoders: &mut Decoders<'a, A>) -> bool {
         let mut found = false;
+        // In a kernel's image a function starts right after its kCFI hash, even at a `nop` the
+        // kernel patches. Elsewhere a marked word before a `nop` may be a literal before padding,
+        // and a module can be built with ftrace's `nop`s between the two, as this crate's module
+        // fixture is. Asked once here, since every byte of padding the scan steps over would ask.
+        let padding_opens_after_hash = self.image.kernel_image && !self.image.marked_data.is_empty();
         for index in 0..self.regions.len() {
             let section = self.regions[index].section;
             let mut offset = 0;
@@ -1555,7 +1590,8 @@ impl<'a, A: Arch> Explorer<'a, A> {
                         let before_table = || {
                             !A::LITERAL_POOLS && self.regions[index].flags.get((scanned_to - section.addr) as usize).is_some_and(|flags| flags & (IN_TABLE | MARKED_DATA) == IN_TABLE)
                         };
-                        if A::is_padding(insn) || before_table() {
+                        let opens_after_hash = || padding_opens_after_hash && self.hash_before(index, decoded.addr);
+                        if (A::is_padding(insn) && !opens_after_hash()) || before_table() {
                             skipped_padding = true;
                             continue;
                         }
@@ -1582,7 +1618,7 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     // An entry marker right after other code may open a landing pad at the end of a
                     // function.
                     let landing_pad = marked && !skipped_padding && next.as_ref().is_some_and(A::opens_landing_pad);
-                    let mut is_start = aligned && (skipped_padding || marked) && !landing_pad && !self.inside_frame(addr);
+                    let mut is_start = aligned && (skipped_padding || marked || self.hash_before(index, addr)) && !landing_pad && !self.inside_frame(addr);
                     if self.image.data_in_code {
                         // Where data sits among the code, unreached bytes are only trusted to be
                         // instructions when they look like a function: aligned behind padding, or
