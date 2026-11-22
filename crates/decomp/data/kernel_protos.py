@@ -19,6 +19,11 @@ An old module's call to a function whose prototype changed takes the newest kern
 4,244 names the 5.10 kernel shares with the newer two, 95 differ in their parameter count or in
 whether they return a value.
 
+The newer two build mac80211, cfg80211, bluetooth and usbnet as modules, so their images export
+none of those names, and the 5.10 line is the only one a 6.x module's call to them gets. Against
+the DWARF of Debian's 6.12 arm64 modules, 9 of 354 such calls' lines have a parameter too few,
+all wireless names that 6.x gave a `link_id`, such as `ieee80211_nullfunc_get`.
+
 Kernels before 5.2 carry no BTF. `--headers kernel_headers.txt` adds, after every kernel, the
 lines of that file, written by hand from the headers of the Pixel 5's 4.19 and the Pixel 2's 4.4
 in this table's spelling, each under the header it came from.
