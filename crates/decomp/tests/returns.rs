@@ -162,7 +162,7 @@ fn passing_on_returns(target: Target, import: &str, code: &[u8], tail: bool) -> 
     let mut session = importing_session(target, import, code);
     session.callers(0x1010, &[0x1000]);
     if tail {
-        session.returns_like(0x1010, recore::report::CallTarget::Import(0x1100));
+        session.returns_like(0x1010, recore::report::CallTarget::Import(0x1100), true);
     }
     let function = session.decompile(0x1010).unwrap();
     println!("{}", function.c_text);
@@ -213,10 +213,10 @@ fn a_declared_result_stands_whatever_the_callers_do() {
     let mut session = importing_session(Target::X86_64Gcc, "lseek", &code);
     session.name_function(0x1010, "jumper").unwrap();
     // Settled as returning what lseek returns before the callers are known, then declared.
-    assert!(session.returns_like(0x1010, recore::report::CallTarget::Import(0x1100)));
+    assert!(session.returns_like(0x1010, recore::report::CallTarget::Import(0x1100), true));
     session.declare("extern int8 jumper(void);").unwrap();
     session.callers(0x1010, &[0x1000]);
-    session.returns_like(0x1010, recore::report::CallTarget::Import(0x1100));
+    session.returns_like(0x1010, recore::report::CallTarget::Import(0x1100), true);
     let function = session.decompile(0x1010).unwrap();
     assert!(function.returns_value, "{}", function.c_text);
 }
@@ -228,19 +228,19 @@ fn a_value_of_a_functions_own_is_returned_whatever_its_callers_do() {
     assert!(passing_on_returns(Target::Aarch64, "close", &aarch64_calling(&[0x5280_0000, RET], &own), false));
 }
 
-/// A worker on raw x86-64 code where the function at 0x1010 jumps to the one at 0x1020, which
-/// returns 1, and the one at 0x1000 calls it and sets eax after: call 0x1010; xor eax, eax; ret.
-/// The function at 0x1008 calls 0x1020, which makes that a function of its own.
-fn jumping_worker(name: &str) -> (Worker, Program) {
+/// A worker on raw x86-64 code where the function at 0x1010, `jumper`, ends by jumping to the one
+/// at 0x1020, which returns an int, and the one at 0x1000 calls it and sets eax after: call 0x1010;
+/// xor eax, eax; ret. The function at 0x1008 calls 0x1020, which makes that a function of its
+/// own.
+fn jumping_worker(name: &str, jumper: &[u8]) -> (Worker, Program) {
     let mut code = vec![0xe8, 0x0b, 0x00, 0x00, 0x00, 0x31, 0xc0, 0xc3];
     // call 0x1020; ret
     code.extend([0xe8, 0x13, 0x00, 0x00, 0x00, 0xc3]);
     code.resize(0x10, 0xcc);
-    // jmp 0x1020
-    code.extend([0xe9, 0x0b, 0x00, 0x00, 0x00]);
+    code.extend(jumper);
     code.resize(0x20, 0xcc);
-    // mov eax, 1; ret
-    code.extend([0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3]);
+    // mov eax, edi; add eax, eax; ret
+    code.extend([0x89, 0xf8, 0x01, 0xc0, 0xc3]);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("code.bin"), &code).unwrap();
@@ -255,9 +255,12 @@ fn jumping_worker(name: &str) -> (Worker, Program) {
     (worker, Program::load(&dir.join("image.toml")).unwrap())
 }
 
+/// jmp 0x1020, at 0x1010.
+const JUMPS: [u8; 5] = [0xe9, 0x0b, 0x00, 0x00, 0x00];
+
 #[test]
 fn a_function_that_jumps_to_one_that_returns_a_value_returns_nothing_where_its_caller_overwrites_it() {
-    let (mut worker, program) = jumping_worker("jumps-overwritten");
+    let (mut worker, program) = jumping_worker("jumps-overwritten", &JUMPS);
     assert_eq!(returning_callers(&program, 0x1010), [0x1000]);
     worker.callers(0x1010, || returning_callers(&program, 0x1010));
     let (record, c_text) = worker.decompile(0x1010, Duration::from_secs(60));
@@ -266,11 +269,22 @@ fn a_function_that_jumps_to_one_that_returns_a_value_returns_nothing_where_its_c
 
 #[test]
 fn a_result_kept_from_before_the_callers_were_given_takes_what_they_overwrite() {
-    let (mut worker, program) = jumping_worker("jumps-kept");
+    let (mut worker, program) = jumping_worker("jumps-kept", &JUMPS);
     // Decompiled ahead of its caller, the function at 0x1010 returns what 0x1020 returns.
     let (record, _) = worker.decompile(0x1000, Duration::from_secs(60));
     assert_eq!(record.status, Status::Ok, "{:?}", record.message);
     worker.callers(0x1010, || returning_callers(&program, 0x1010));
     let (record, c_text) = worker.decompile(0x1010, Duration::from_secs(60));
     assert!(!record.returns_value, "{}", c_text.unwrap_or_default());
+}
+
+#[test]
+fn a_function_that_also_returns_by_itself_returns_what_it_jumps_to_whatever_its_callers_do() {
+    // test edi, edi; jne 0x101a; mov eax, 1; ret; jmp 0x1020: 0x1020 returns an int, and so
+    // does this.
+    let jumper = [0x85, 0xff, 0x75, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0xe9, 0x01, 0x00, 0x00, 0x00];
+    let (mut worker, program) = jumping_worker("jumps-or-returns", &jumper);
+    worker.callers(0x1010, || returning_callers(&program, 0x1010));
+    let (record, c_text) = worker.decompile(0x1010, Duration::from_secs(60));
+    assert_eq!(record.return_shape.map(|shape| shape.size), Some(4), "{}", c_text.unwrap_or_default());
 }

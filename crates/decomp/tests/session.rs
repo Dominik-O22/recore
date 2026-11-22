@@ -357,9 +357,9 @@ fn a_function_that_jumps_to_another_returns_what_that_one_returns() {
     // The engine sees a call and then a return, and does not hand the one's result to the other.
     assert!(!session.decompile(0x1000).unwrap().returns_value);
     // Nothing is known of the callee until it has been decompiled.
-    assert!(!session.returns_like(0x1000, CallTarget::Function(0x1010)));
+    assert!(!session.returns_like(0x1000, CallTarget::Function(0x1010), true));
     assert!(session.decompile(0x1010).unwrap().returns_value);
-    assert!(session.returns_like(0x1000, CallTarget::Function(0x1010)));
+    assert!(session.returns_like(0x1000, CallTarget::Function(0x1010), true));
     let function = session.decompile(0x1000).unwrap();
     assert!(function.returns_value);
     assert!(function.c_text.contains("= func_0x00001010();"), "{}", function.c_text);

@@ -119,7 +119,7 @@ fn a_call_to_a_function_that_returns_what_it_jumps_to_keeps_its_argument() {
     let facts = Facts { functions: vec![(0, false), (0x10, false), (0x20, false)], tail_calls: vec![(0x10, 0x10)], ..Facts::default() };
     session.add_functions(&facts).unwrap();
     assert!(session.decompile(0x20).unwrap().returns_value);
-    assert!(session.returns_like(0x10, recore::report::CallTarget::Function(0x20)));
+    assert!(session.returns_like(0x10, recore::report::CallTarget::Function(0x20), true));
     assert!(session.decompile(0x10).unwrap().returns_value);
     let c = session.decompile(0).unwrap().c_text;
     assert!(c.contains("func_0x000010(5)"), "{c}");

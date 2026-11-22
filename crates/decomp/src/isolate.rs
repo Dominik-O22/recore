@@ -518,8 +518,13 @@ pub fn serve(binary: &Path, options: &str) -> Result<()> {
         if let Some(calls) = calls {
             session.callers(entry, calls);
         }
-        for &callee in tail_callees.get(&entry).into_iter().flatten() {
-            if session.returns_like(entry, callee) {
+        let Some(callees) = tail_callees.get(&entry) else { return };
+        // One that also returns by itself passes on more than what its callees return.
+        let pieces = analysis.functions.binary_search_by_key(&entry, |function| function.addr).ok().into_iter().chain(fragments_of.get(&entry).into_iter().flatten().copied());
+        let body: Vec<(u64, u64)> = pieces.flat_map(|index| analysis.functions[index].ranges.iter().copied()).collect();
+        let jumps_only = !recore::cfg::cfg(&image, &analysis, &body).blocks.iter().any(|block| block.exit == Some(recore::cfg::Exit::Return));
+        for &callee in callees {
+            if session.returns_like(entry, callee, jumps_only) {
                 break;
             }
         }

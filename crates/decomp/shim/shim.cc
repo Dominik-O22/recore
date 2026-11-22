@@ -618,6 +618,9 @@ struct RdSession {
   set<uint64_t> returns_like;
   // Functions whose result is locked as rd_returns_like locked it, which only it may undo.
   set<uint64_t> settled;
+  // Of `returns_like`, those whose only way out is to jump to the callee, until they are next
+  // decompiled.
+  set<uint64_t> passes_on_settled;
   // The function rd_callers named and the calls to it it gave, for its next decompilation.
   pair<uint64_t, vector<uint64_t>> callers;
   // How many bytes of the result register the callers of each function read, of those whose
@@ -1940,10 +1943,11 @@ int rd_override_return(RdSession *session, uint64_t function, uint64_t jump, cha
 // does when it ends by jumping there: the engine sees a call followed by a return and does not
 // connect the two. `callee` must have been decompiled by this session, or be an import with a
 // declared prototype if `import_slot` is set, in which case `callee` is the slot. Answers 1 if
-// the callee returns a value, which `function` then returns too, and 0 if it does not or if the
+// the callee returns a value, which `function` then returns too, and 0 if it does not. With
+// `jumps_only`, jumps to callees are the function's only way out, and it answers 0 too where the
 // callers rd_callers gave overwrite the result: see returns_nothing_callers_read.
-int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int import_slot, char *err,
-                    size_t errlen) {
+int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int import_slot, int jumps_only,
+                    char *err, size_t errlen) {
   bool returns = false;
   bool ok = guarded(err, errlen, [&] {
     ParameterPieces piece;
@@ -1967,7 +1971,7 @@ int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int 
     if (proto.isOutputLocked() && !settled) return;  // the caller or an edit has said what it returns
     bool model_locked = proto.isModelLocked();
     // As for a call and then a return: see returns_nothing_callers_read.
-    if (callers_overwrite(session, function, piece.addr, piece.type->getSize())) {
+    if (jumps_only && callers_overwrite(session, function, piece.addr, piece.type->getSize())) {
       proto.setOutputLock(false);
       proto.setModelLock(model_locked);
       session->settled.erase(function);
@@ -1978,6 +1982,7 @@ int rd_returns_like(RdSession *session, uint64_t function, uint64_t callee, int 
     // Locking the output locks the calling convention with it, which is still to be recovered.
     proto.setModelLock(model_locked);
     session->returns_like.insert(function);
+    if (jumps_only) session->passes_on_settled.insert(function);
     session->settled.insert(function);
     returns = true;
   });
@@ -3358,8 +3363,8 @@ int rd_decompile(RdSession *session, uint64_t addr, RdDecompiled *out, char *err
     session->outputs.erase(addr);
     VarnodeData result;
     bool whole;
-    // A result rd_returns_like settled is what the callee returned.
-    if (session->returns_like.count(addr) != 0 && proto.getOutputType()->getMetatype() != TYPE_VOID && result_register(arch, result, whole) &&
+    // A result rd_returns_like settled where the function only jumps out is what the callee returned.
+    if (session->passes_on_settled.erase(addr) != 0 && proto.getOutputType()->getMetatype() != TYPE_VOID && result_register(arch, result, whole) &&
         low_end(proto.getOutput()->getAddress(), proto.getOutput()->getSize(), result))
       session->passed_on.insert(addr);
     // The size of a result only its callers show is a guess where a register also passes an

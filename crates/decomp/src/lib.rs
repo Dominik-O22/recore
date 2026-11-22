@@ -748,15 +748,16 @@ impl Session {
     /// States that `function` returns what `callee` returns, because it ends by jumping to it.
     /// `callee` is a function this session has decompiled, or an import, by its slot, whose
     /// prototype is declared. Says whether the callee returns a value; if it does, `function`
-    /// is from now on decompiled as returning one too. Not where the callers given with
-    /// [`Session::callers`] write the result register after their calls before they read it.
-    pub fn returns_like(&mut self, function: u64, callee: recore::report::CallTarget) -> bool {
+    /// is from now on decompiled as returning one too. With `jumps_only`, jumps to callees are
+    /// `function`'s only way out, and not where the callers given with [`Session::callers`]
+    /// write the result register after their calls before they read it.
+    pub fn returns_like(&mut self, function: u64, callee: recore::report::CallTarget, jumps_only: bool) -> bool {
         let (callee, import) = match callee {
             recore::report::CallTarget::Function(entry) => (entry, false),
             recore::report::CallTarget::Import(slot) => (slot, true),
         };
         let mut err = [0 as c_char; 64];
-        unsafe { ffi::rd_returns_like(self.raw.as_ptr(), function, callee, import.into(), err.as_mut_ptr(), err.len()) != 0 }
+        unsafe { ffi::rd_returns_like(self.raw.as_ptr(), function, callee, import.into(), jumps_only.into(), err.as_mut_ptr(), err.len()) != 0 }
     }
 
     /// Gives `calls`, calls to `function` from other functions that come back, for its next
