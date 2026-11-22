@@ -1,0 +1,22 @@
+# Prototypes of functions that kernels before 5.2, which carry no BTF, export to their modules,
+# written from those kernels' headers in kernel.protos's spelling. kernel_protos.py reads this
+# file after the kernels' BTF, so a kernel that describes a name wins.
+
+# The Pixel 5's 4.19, android-msm-redbull-4.19-android11-qpr3.
+# arch/arm64/include/asm/atomic_ll_sc.h, ATOMIC_OP
+- void __ll_sc_atomic_add(int4 i, void *v)
+- void __ll_sc_atomic_sub(int4 i, void *v)
+
+# The Pixel 2's 4.4, android-msm-wahoo-4.4-android11.
+# arch/arm64/include/asm/uaccess.h
+- ulong __arch_copy_from_user(void *to, void *from, ulong n)
+- ulong __arch_copy_to_user(void *to, void *from, ulong n)
+# arch/arm64/include/asm/bitops.h
+- void clear_bit(int4 nr, ulong *p)
+- void set_bit(int4 nr, ulong *p)
+# include/linux/device.h
+- void dev_err(void *dev, char *fmt, ...)
+# include/linux/timekeeping.h
+- void getnstimeofday64(void *tv)
+# include/linux/of.h
+- int4 of_property_read_u32_array(void *np, char *propname, uint4 *out_values, size_t sz)
