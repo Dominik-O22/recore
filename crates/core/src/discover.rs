@@ -1580,7 +1580,10 @@ impl<'a, A: Arch> Explorer<'a, A> {
                     // An entry marker right after other code may open a landing pad at the end of a
                     // function.
                     let landing_pad = marked && !skipped_padding && next.as_ref().is_some_and(A::opens_landing_pad);
-                    let mut is_start = aligned && (skipped_padding || marked) && !landing_pad && !self.inside_frame(addr);
+                    // A word of data on its own right before code is a kCFI hash, which only a
+                    // function follows.
+                    let after_hash = self.image.marked_data.binary_search(&(addr.wrapping_sub(4), addr)).is_ok();
+                    let mut is_start = aligned && (skipped_padding || marked || after_hash) && !landing_pad && !self.inside_frame(addr);
                     if self.image.data_in_code {
                         // Where data sits among the code, unreached bytes are only trusted to be
                         // instructions when they look like a function: aligned behind padding, or

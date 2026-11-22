@@ -200,6 +200,7 @@ pub struct Image {
     pub instruction_sets: Vec<(u64, InstructionSet)>,
     /// `[start, end)` of the data among the code that an AArch64 ELF file marks with `$d`
     /// mapping symbols, sorted: kCFI's type hash before each function, literal pools, tables.
+    /// Without such marks, the kCFI hashes [`crate::kernel`] finds in the code.
     pub marked_data: Vec<(u64, u64)>,
     /// `[start, end)` of the code a Linux kernel's alternatives keep among its code to write over
     /// other code, which never runs where it lies, sorted (see [`crate::kernel`]).
