@@ -14,7 +14,7 @@ vmlinux's loaded bytes as `objcopy -O binary` writes them: a region for each seg
 The debug file is vmlinux with its DWARF decompressed, which recore reads only so. The Image
 holds vmlinux's bytes at vmlinux's addresses, so vmlinux is its debug file too.
 The downloads are kept in the pkgs/ of corpus-kernel-android, and the held-out kernel's in that
-of corpus-kernel-android-holdout, so that no tuned corpus holds a held-out file. The large files
+of corpus-kernel-android-holdout, so that no tuned corpus holds the held-out kernel. The large files
 are hard links to them, and the corpus's truth/ is written last. A corpus that has truth/ is left as it is.
 """
 import os, struct, subprocess, sys
