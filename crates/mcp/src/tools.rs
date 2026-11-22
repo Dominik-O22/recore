@@ -198,7 +198,7 @@ static TOOLS: LazyLock<[Tool; 22]> = LazyLock::new(|| {
         on_binary("function", "One function: its extent, callers, the calls it makes (imports by name), and the strings and globals it refers to. Give `addr` or `name`.", function),
         on_binary(
             "xrefs",
-            "What refers to an address, or with `offset` what uses a field of a structure. For an address: call sites if it is a function or an import slot, and the instructions that read or write it or take its address, with the function each is in. If the address holds pointers, such as a vtable or a table of strings, lists what each entry points to.",
+            "What refers to an address, or with `offset` what uses a field of a structure. For an address: call sites if it is a function or an import slot, and the instructions that read or write it or take its address, with the function each is in. If the address holds pointers, such as a vtable or a table of strings, lists what each entry points to. In a Linux kernel with BTF, a table of functions whose prototypes say which struct it is, such as a `file_operations`, lists each by its member: `.unlocked_ioctl -> binder_ioctl`.",
             xrefs,
         ),
         on_binary("decompile", "Decompiles functions to C with Ghidra's decompiler. A function that crashes the decompiler or runs out of time is reported and the others still come back.", decompile),
@@ -698,8 +698,19 @@ fn describe_to(binary: &Binary, addr: u64, depth: usize) -> String {
     if let Some(text) = short_text(&binary.program.image, addr).filter(|_| pointed_to()) {
         return format!("text {text:?}");
     }
+    let object = binary.objects().at(addr);
+    if let Some((start, name, layout)) = object.filter(|object| object.0 != addr) {
+        return match layout.pointers.iter().find(|member| member.0 == addr - start) {
+            Some((_, path, _)) => format!("{name}.{path}, in {name}, a struct {}", layout.name),
+            None => format!("{name}+{:#x}, in a struct {}", addr - start, layout.name),
+        };
+    }
     if let Some(name) = binary.program.image.symbol_names.get(&addr).filter(|_| binary.program.function(addr).is_none()) {
         let image = &binary.program.image;
+        let name = match object {
+            Some((_, _, layout)) => format!("{name}, a struct {} by the prototypes of the functions it holds", layout.name),
+            None => name.clone(),
+        };
         // A raw image carries no names but a kernel's kallsyms: its layout gives them, with its
         // machine or in a names file.
         let source = if image.format == Format::Raw && image.kernel_image {
@@ -1092,7 +1103,19 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
     for line in lines.iter().take(limit) {
         writeln!(out, "{line}")?;
     }
-    let table = pointer_table(binary, addr, limit.min(64), 2);
+    if let Some((_, name, layout)) = binary.objects().at(addr).filter(|object| object.0 == addr) {
+        writeln!(out, "{name} is a struct {}, and its pointers hold:", layout.name)?;
+        let image = &program.image;
+        let size = image.machine.pointer_size() as usize;
+        for (offset, path, _) in &layout.pointers {
+            let Some(bytes) = image.bytes_from(addr + offset).and_then(|bytes| bytes.get(..size)) else { continue };
+            let target = bytes.iter().rev().fold(0, |value, &byte| value << 8 | u64::from(byte));
+            if target != 0 {
+                writeln!(out, "  {:#x} .{path} -> {target:#x} {}", addr + offset, describe(binary, target))?;
+            }
+        }
+    }
+    let table = if binary.objects().at(addr).is_some() { Vec::new() } else { pointer_table(binary, addr, limit.min(64), 2) };
     if !table.is_empty() {
         writeln!(out, "it holds, a slot at a time:")?;
         for (slot, held) in &table {

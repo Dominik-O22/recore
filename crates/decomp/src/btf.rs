@@ -263,8 +263,10 @@ pub fn read(blob: &[u8], pointer: u64, functions: impl IntoIterator<Item = (u64,
     }
     for (addr, name) in functions {
         // Clang's CFI before kCFI keeps the body of a function whose address is taken as
-        // `<name>.cfi`, and the name for its entry in a jump table.
-        let found = functions_by_name.get(name.as_str()).or_else(|| functions_by_name.get(name.strip_suffix(".cfi")?));
+        // `<name>.cfi`, and gives its entry in a jump table, which only jumps to the body and is
+        // what pointers to the function hold, `<name>.cfi_jt` or the name itself.
+        let plain = name.strip_suffix(".cfi").or_else(|| name.strip_suffix(".cfi_jt"));
+        let found = functions_by_name.get(name.as_str()).or_else(|| functions_by_name.get(plain?));
         if let Some(&prototype) = found {
             types.functions.push(Function { addr, name, prototype });
         }
@@ -285,7 +287,7 @@ fn member(blob: &Blob, entry: &Entry, index: usize, id: &impl Fn(u32) -> TypeId)
     {
         let encoding = blob.trailer(int, 0);
         let bits = encoding & 0xff;
-        if bits != 8 * int.size_or_type || encoding >> 16 & 0xff != 0 {
+        if u64::from(bits) != 8 * u64::from(int.size_or_type) || encoding >> 16 & 0xff != 0 {
             (first, width) = (first + u64::from(encoding >> 16 & 0xff), bits);
         }
     }
@@ -312,6 +314,157 @@ pub fn types(image: &Image) -> Option<Types> {
     let section = image.sections.iter().find(|section| section.name == ".BTF")?;
     let functions = image.symbol_names.iter().filter(|(addr, _)| image.is_code(**addr)).map(|(addr, name)| (*addr, name.clone()));
     read(&section.data, image.machine.pointer_size(), functions).map_err(|refused| eprintln!("BTF at {:#x}: {refused:?}", section.addr)).ok()
+}
+
+/// A struct whose members point to functions, as [`objects`] gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layout {
+    pub name: String,
+    pub size: u64,
+    /// Each member that is a pointer, through members that are structs, by offset: its path,
+    /// such as `driver.pm`, and whether it points to a function.
+    pub pointers: Vec<(u64, String, bool)>,
+}
+
+/// The objects of a kernel image that hold functions and the struct each is, sorted by address:
+/// see [`objects`].
+#[derive(Debug, Default)]
+pub struct Objects {
+    pub layouts: Vec<Layout>,
+    /// The address of each object, its name and its index in `layouts`.
+    pub objects: Vec<(u64, String, usize)>,
+}
+
+impl Objects {
+    /// The object that holds `addr`, with its layout.
+    pub fn at(&self, addr: u64) -> Option<(u64, &str, &Layout)> {
+        let index = self.objects.partition_point(|object| object.0 <= addr).checked_sub(1)?;
+        let (start, name, layout) = &self.objects[index];
+        let layout = &self.layouts[*layout];
+        (addr < start + layout.size).then_some((*start, name.as_str(), layout))
+    }
+}
+
+/// How far into an object [`objects`] reads.
+const OBJECT: u64 = 4096;
+/// How deep [`objects`] follows members that are structs, and how many pointers of one struct
+/// it takes, which keeps a crafted file's structs of thousands of structs from costing more.
+const NESTED: u32 = 4;
+const POINTERS: usize = 4096;
+
+/// A prototype as the types it takes and returns, without parameter names: two that are alike
+/// are one function type.
+type Signature = Vec<TypeId>;
+
+fn signature(types: &Types, id: TypeId) -> Option<Signature> {
+    let Type::Function(prototype) = types.get(id) else { return None };
+    let mut out = vec![types.resolve(prototype.returns), TypeId::from(prototype.variadic)];
+    out.extend(prototype.params.iter().map(|param| types.resolve(param.1)));
+    Some(out)
+}
+
+/// The type `id` stands for behind typedefs and qualifiers.
+fn underlying(types: &Types, mut id: TypeId) -> TypeId {
+    for _ in 0..CHAIN {
+        match types.get(id) {
+            Type::Typedef { target, .. } => id = *target,
+            _ => break,
+        }
+    }
+    types.resolve(id)
+}
+
+/// Each member of the struct `id` that is a pointer, at `base` and below `path`, with the
+/// signature of the function it points to if it points to one.
+fn pointers(types: &Types, id: TypeId, base: u64, path: &str, depth: u32, out: &mut Vec<(u64, String, Option<Signature>)>) {
+    let Type::Composite { union: false, fields, .. } = types.get(id) else { return };
+    for field in fields.iter().filter(|field| field.bits.is_none()) {
+        if out.len() >= POINTERS {
+            return;
+        }
+        let path = if path.is_empty() { field.name.clone() } else { format!("{path}.{}", field.name) };
+        let offset = base.saturating_add(field.offset);
+        let kind = underlying(types, field.kind);
+        match types.get(kind) {
+            Type::Pointer(target) => out.push((offset, path, signature(types, underlying(types, *target)))),
+            Type::Composite { union: false, .. } if depth > 0 => pointers(types, kind, offset, &path, depth - 1, out),
+            _ => {}
+        }
+    }
+}
+
+/// The objects the symbols of the kernel `image` name that hold functions, each with the struct
+/// it is. An object is that struct where the struct is the only one in `types` whose members
+/// point to functions of exactly the prototypes, but for parameter names, of the functions the
+/// object holds at those offsets, and that has a member that points to a function wherever the
+/// object holds one. An object that more than one struct fits, or that holds no function whose
+/// prototype `types` has, is left out: a kernel's BTF types none of its variables but its
+/// per-CPU ones, so the functions in an object are what says what it is.
+pub fn objects(image: &Image, types: &Types) -> Objects {
+    let prototypes: HashMap<u64, Signature> = types.functions.iter().filter_map(|function| Some((function.addr, signature(types, function.prototype)?))).collect();
+    // Each struct with members that point to functions, and by the offset and signature of
+    // each such member, the structs that have it.
+    let mut members: HashMap<TypeId, Vec<(u64, String, Option<Signature>)>> = HashMap::new();
+    let mut by_member: HashMap<(u64, &Signature), Vec<TypeId>> = HashMap::new();
+    for id in 0..types.types.len() as TypeId {
+        // A struct of one pointer is any word that holds the address of such a function.
+        if !matches!(&types.types[id as usize], Type::Composite { union: false, size, .. } if *size > types.pointer) {
+            continue;
+        }
+        let mut found = Vec::new();
+        pointers(types, id, 0, "", NESTED, &mut found);
+        if found.iter().any(|member| member.2.is_some()) {
+            members.insert(id, found);
+        }
+    }
+    for (id, found) in &members {
+        for (offset, _, signature) in found {
+            if let Some(signature) = signature {
+                by_member.entry((*offset, signature)).or_default().push(*id);
+            }
+        }
+    }
+    let mut symbols: Vec<u64> = image.symbol_names.keys().copied().collect();
+    symbols.sort_unstable();
+    let mut objects = Objects::default();
+    let mut layouts: HashMap<TypeId, usize> = HashMap::new();
+    let size = image.machine.pointer_size();
+    for (index, &addr) in symbols.iter().enumerate() {
+        let Some(section) = image.section_at(addr).filter(|section| !section.executable) else { continue };
+        let end = symbols.get(index + 1).map_or(u64::MAX, |&next| next).min(section.addr.saturating_add(section.data.len() as u64)).min(addr.saturating_add(OBJECT));
+        // Each slot that holds the address of code, with the signature of the function there.
+        let held: Vec<(u64, Option<&Signature>)> = (0..)
+            .map_while(|slot| addr.checked_add(slot * size).filter(|&at| at.checked_add(size).is_some_and(|stop| stop <= end)))
+            .filter_map(|at| {
+                let bytes = image.bytes_from(at)?.get(..size as usize)?;
+                let value = bytes.iter().rev().fold(0u64, |value, &byte| value << 8 | u64::from(byte));
+                image.is_code(value).then(|| (at - addr, prototypes.get(&value)))
+            })
+            .collect();
+        let Some(&(offset, Some(first))) = held.iter().find(|slot| slot.1.is_some()) else { continue };
+        // Every struct the object could be: one whose members take each function it holds, and
+        // that it has room for. A struct that holds another at its start fits where that one
+        // does, and two that fit say nothing.
+        let fits = |id: &&TypeId| {
+            let found = &members[*id];
+            types.size(**id) <= end - addr && held.iter().all(|&(offset, signature)| found.iter().any(|member| member.0 == offset && member.2.is_some() && signature.is_none_or(|signature| member.2.as_ref() == Some(signature))))
+        };
+        let mut fitting = by_member.get(&(offset, first)).into_iter().flatten().filter(fits);
+        let (Some(&kind), None) = (fitting.next(), fitting.next()) else { continue };
+        // Nor does one that leaves room for more than padding, as a word or a struct of
+        // another type that holds the function in a `void *` would.
+        if end - addr - types.size(kind) >= size {
+            continue;
+        }
+        let layout = *layouts.entry(kind).or_insert_with(|| {
+            let Type::Composite { name, size, .. } = types.get(kind) else { unreachable!("only structs have members") };
+            let pointers = members[&kind].iter().map(|(offset, path, signature)| (*offset, path.clone(), signature.is_some())).collect();
+            objects.layouts.push(Layout { name: name.clone(), size: *size, pointers });
+            objects.layouts.len() - 1
+        });
+        objects.objects.push((addr, image.symbol_names[&addr].clone(), layout));
+    }
+    objects
 }
 
 #[cfg(test)]
@@ -392,6 +545,63 @@ mod tests {
         let mut huge = file();
         huge[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(read(&huge, 8, []).err(), Some(Refused::Truncated));
+    }
+
+    /// `struct ops { void (*open)(struct ops *o); void (*close)(struct ops *o); long count; }`,
+    /// the functions `ops_open` and `ops_close` of that prototype, and with `twice` a second
+    /// struct `ops2` of the same members.
+    fn ops(twice: bool) -> Vec<u8> {
+        let strings = "long\0ops\0open\0close\0count\0o\0ops_open\0ops_close\0ops2\0";
+        let members = [10, 4, 0, 15, 4, 64, 21, 1, 128];
+        let mut types: Vec<Vec<u32>> = vec![
+            vec![1, info(INT, 0), 8, 1 << 24 | 64],
+            [&[6, info(STRUCT, 3), 24][..], &members].concat(),
+            vec![0, info(PTR, 0), 2],
+            vec![0, info(PTR, 0), 5],
+            vec![0, info(FUNC_PROTO, 1), 0, 27, 3],
+            vec![29, info(FUNC, 1), 5],
+            vec![38, info(FUNC, 1), 5],
+        ];
+        if twice {
+            types.push([&[48, info(STRUCT, 3), 24][..], &members].concat());
+        }
+        blob(&types.iter().map(Vec::as_slice).collect::<Vec<_>>(), strings)
+    }
+
+    /// An image whose code holds `ops_open` and `ops_close`, and whose data holds `table`, an
+    /// `ops` of the two, and after it `word`, which holds `ops_open` alone.
+    fn image() -> Image {
+        use recore::image::{Format, Machine, Section};
+        let data: Vec<u8> = [0x1000u64, 0x1008, 3, 0x1000].iter().flat_map(|word| word.to_le_bytes()).collect();
+        let sections = vec![
+            Section { name: ".text".into(), addr: 0x1000, data: vec![0; 16], file_offset: None, executable: true, writable: false },
+            Section { name: ".rodata".into(), addr: 0x2000, data, file_offset: None, executable: false, writable: false },
+        ];
+        let mut image = Image::bare("ops".into(), Format::Raw, Machine::Aarch64, 0x1000, sections);
+        for (addr, name) in [(0x1000, "ops_open"), (0x1008, "ops_close"), (0x2000, "table"), (0x2018, "word")] {
+            image.symbol_names.insert(addr, name.into());
+        }
+        image
+    }
+
+    fn functions() -> [(u64, String); 2] {
+        [(0x1000, "ops_open".into()), (0x1008, "ops_close".into())]
+    }
+
+    #[test]
+    fn an_object_is_the_one_struct_whose_members_take_its_functions() {
+        let objects = objects(&image(), &read(&ops(false), 8, functions()).unwrap());
+        assert_eq!(objects.objects.iter().map(|object| (object.0, object.1.as_str())).collect::<Vec<_>>(), [(0x2000, "table")]);
+        let (start, name, layout) = objects.at(0x2008).unwrap();
+        assert_eq!((start, name, layout.name.as_str(), layout.size), (0x2000, "table", "ops", 24));
+        assert_eq!(layout.pointers, [(0, "open".to_string(), true), (8, "close".to_string(), true)]);
+        // `word` holds a function too, and has no room for an `ops`.
+        assert!(objects.at(0x2018).is_none());
+    }
+
+    #[test]
+    fn an_object_two_structs_fit_is_left_out() {
+        assert!(objects(&image(), &read(&ops(true), 8, functions()).unwrap()).objects.is_empty());
     }
 
     #[test]
