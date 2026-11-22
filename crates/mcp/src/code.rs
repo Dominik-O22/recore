@@ -107,7 +107,8 @@ pub fn disassemble(binary: &mut Binary, args: Disassemble) -> Result<String> {
     };
     let mut instructions = Vec::new();
     for (from, end) in ranges {
-        let wanted = (count - instructions.len()) as u64;
+        // A range lists up to the bytes its instructions could take, so it may hold more than asked.
+        let wanted = count.saturating_sub(instructions.len()) as u64;
         if wanted == 0 {
             break;
         }
