@@ -1,22 +1,24 @@
-//! Prototypes from the kCFI hashes of a Linux kernel module.
+//! Prototypes from the kCFI hashes of a Linux kernel or module.
 //!
 //! Clang's kCFI puts a hash of a function's type before every function whose address may be
-//! taken, as a word an AArch64 file marks as data. The hash cannot be reversed, but it can be
+//! taken, as a word an AArch64 file marks as data, or that `recore::kernel` finds where nothing
+//! marks it. The hash cannot be reversed, but it can be
 //! looked up: `data/kcfi.protos`, which `data/kernel_protos.py --kcfi` makes from two Android
 //! kernels' BTF, holds the hash of every function type those kernels define and the prototype
-//! it names. A module's function whose hash is there takes that prototype, as a function with
+//! it names. A function whose hash is there takes that prototype, as a function with
 //! debug information takes the one DWARF gives it.
 
 use std::collections::HashMap;
 
 use recore::Image;
+use recore::image::Machine;
 
 use crate::types::{Base, Function, Named, Prototype, Type, TypeId, Types, VOID};
 
 /// `<hash> <spelling> <prototype>` a line, sorted by hash and then spelling.
 const TABLE: &str = include_str!("../data/kcfi.protos");
 
-/// How the kernel a module was built for spells the integers of the types it hashes.
+/// How a kernel, or the kernel a module was built for, spells the integers of the types it hashes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spelling {
     /// By width and sign, `u3i32` for `int`: a kernel built with
@@ -39,10 +41,10 @@ impl Spelling {
 /// AArch64's `nop`. A function patchable for ftrace has some between its hash and its entry.
 const NOP: [u8; 4] = 0xD503_201Fu32.to_le_bytes();
 
-/// The hash before each function of a kernel module, by the function's address: a word that a
-/// `$d` mapping symbol marks on its own. Empty for any other image.
+/// The hash before each function of an arm64 kernel or module, by the function's address: a
+/// word of [`Image::marked_data`] on its own. Empty for any other machine.
 pub fn hashes(image: &Image) -> Vec<(u64, u32)> {
-    if !image.kernel_module {
+    if image.machine != Machine::Aarch64 {
         return Vec::new();
     }
     // Where a module has no symbol for a function, the loader finds its start from ftrace's
@@ -64,7 +66,7 @@ pub fn hashes(image: &Image) -> Vec<(u64, u32)> {
 }
 
 /// The prototype the table gives `hash` in `spelling`, found by bisecting the text, so that a
-/// module pays for the hashes it has and not for an index of all of them.
+/// kernel pays for the hashes it has and not for an index of all of them.
 fn lookup(hash: u32, spelling: Spelling) -> Option<&'static str> {
     let wanted = (hash, spelling.letter());
     let bytes = TABLE.as_bytes();
@@ -84,9 +86,9 @@ fn lookup(hash: u32, spelling: Spelling) -> Option<&'static str> {
     None
 }
 
-/// The prototypes a kernel module's kCFI hashes name, in the spelling that finds more of them,
-/// and that spelling. `None` for an image that is no kernel module, and for a module none of
-/// whose hashes is found.
+/// The prototypes an arm64 kernel's or module's kCFI hashes name, in the spelling that finds more
+/// of them, and that spelling. `None` for any other image, and for one none of whose hashes is
+/// found.
 pub fn types(image: &Image) -> Option<(Spelling, Types)> {
     let hashes = hashes(image);
     let found = |spelling| -> Vec<(u64, &'static str)> { hashes.iter().filter_map(|&(addr, hash)| Some((addr, lookup(hash, spelling)?))).collect() };
