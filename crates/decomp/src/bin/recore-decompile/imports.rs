@@ -23,7 +23,7 @@ pub fn coverage(bin_dir: &Path, list: usize) -> Result<()> {
         let analysis = recore::analyze(&image);
         for import in &analysis.imports {
             let calls = analysis.calls.iter().filter(|call| call.target == CallTarget::Import(import.slot)).count();
-            let source = prototypes::source(image.format, &import.name).unwrap_or("none");
+            let source = prototypes::source(prototypes::Platform::of(&image), &import.name).unwrap_or("none");
             let entry = by_source.entry(source).or_default();
             *entry = (entry.0 + 1, entry.1 + calls);
             if source == "none" {

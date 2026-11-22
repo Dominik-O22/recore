@@ -15,10 +15,12 @@ from these, newest first:
 A kernel built with an older pahole, such as Debian's 6.12, gives its assembly functions, such as
 `__arch_copy_from_user`, the prototype `void (void)`, so it is not one of them.
 
-Types are reduced as ghidra/ExportPrototypes.java reduces an archive's: sized integers, `long`
-and `ulong` by name so that the table serves 32-bit kernels, strings, pointers to numbers, and
-every other pointer as `void *`. A function that takes or returns a struct by value has no such
-spelling and is left out. Lines read `- <return> <name>(<params>)`, sorted by name.
+Types are reduced as ghidra/ExportPrototypes.java reduces an archive's: numbers as both tables
+spell them, `long`, `ulong` and `size_t` by name, with `ssize_t` as `long`, pointers to numbers,
+and every other pointer as `void *`. Every other width is a 64-bit kernel's, such as the 8 bytes
+of `phys_addr_t`, so the table does not describe a 32-bit kernel. A function that takes or returns a
+struct by value has no such spelling and is left out. Lines read `- <return> <name>(<params>)`,
+sorted by name.
 
 With `--kcfi`, writes kcfi.protos instead: every function type a kernel's BTF holds, by its kCFI
 hash, so that the hash clang puts before a module's function names that function's type.
@@ -33,12 +35,15 @@ pointer in a kernel struct that no kernel function has. kcfi.protos is made from
 above: the GKI 6.12 normalizes and the Pixel's 6.1 does not.
 
 Lines read `<hash> <n|p> <return> (<params>)`, sorted, where `n` is the normalized spelling and
-`p` the plain one. A type is spelled with sized numbers, and a pointer to a struct or union keeps
-its name: `int4 (struct platform_device *)`. A normalized hash knows an integer's width and sign
-and nothing more, so only `p` lines say `bool`, and `n` lines say `uint1` for `_Bool`, `char` and
-`unsigned char` alike. Behind a pointer `n` lines guess `char`, so that strings print. An enum is the integer it is stored in, and a pointer to a
-function is `void *`. A type that passes a struct or union by value is left out, as is a hash two
-types share and one whose types the table would spell two ways.
+`p` the plain one. A pointer to a struct or union keeps its name: `int4 (struct platform_device
+*)`. A normalized hash knows an integer's width and sign and nothing more, so only `p` lines say
+`bool` and `char`, and `n` lines say `uint1` for `_Bool`, `char` and `unsigned char` alike. Behind
+a pointer `n` lines guess `char`, so that strings print. A pointer to a function is `void *`. A type that passes a struct or union by value is left
+out, as is a hash two types share and one whose types the table would spell two ways.
+
+Both tables spell `_Bool` as `bool`, `char` as `char`, any other integer by its width and sign,
+such as `uint4` for `unsigned int`, an enum as the integer it is stored in, and a float by its
+width.
 
 Both tables are made from Linux kernels, and Linux is licensed under the GPL-2.0.
 """
@@ -53,10 +58,11 @@ INT, PTR, ARRAY, STRUCT, UNION, ENUM, FWD, TYPEDEF, VOLATILE, CONST, RESTRICT, F
 # Bytes that follow a type's 12-byte header, by kind, as (fixed, per member).
 TRAILER = {INT: (4, 0), ARRAY: (12, 0), STRUCT: (0, 12), UNION: (0, 12), ENUM: (0, 8), FUNC_PROTO: (0, 8), VAR: (4, 0), DATASEC: (0, 12), DECL_TAG: (4, 0), ENUM64: (0, 12)}
 QUALIFIERS = (TYPEDEF, CONST, VOLATILE, RESTRICT, TYPE_TAG)
-INT_SIGNED, INT_BOOL = 1, 4
+INT_SIGNED = 1
 
-# Typedefs that are as wide as a pointer whatever they are built from.
-POINTER_SIZED = {"size_t", "ssize_t", "uintptr_t", "intptr_t", "ptrdiff_t"}
+# Typedefs that are as wide as a pointer whatever they are built from, and the name of that width
+# with their sign.
+POINTER_SIZED = {"size_t": "size_t", "uintptr_t": "size_t", "ssize_t": "long", "intptr_t": "long", "ptrdiff_t": "long"}
 RESERVED = {
     "int", "uint", "char", "void", "bool", "float", "double", "long", "short", "unsigned", "signed", "struct", "union", "enum",
     "const", "typedef", "extern", "code", "size_t", "DWORD", "BOOL", "HANDLE", "wstr", "ulong", "string", "this", "class",
@@ -117,32 +123,24 @@ class Btf:
         """The reduced spelling of a type, or None for one passed by value that has none."""
         while self.kind(id) in QUALIFIERS:
             if self.kind(id) == TYPEDEF and self.type_name(id) in POINTER_SIZED:
-                return "size_t"
+                return POINTER_SIZED[self.type_name(id)]
             id = self.types[id][2]
-        kind, _, size, trailer, _ = self.types[id]
+        kind, info, size, trailer, _ = self.types[id]
         if id == 0:
             return "void"
         if kind == PTR:
             target = self.strip(size)
-            if self.kind(target) == INT and self.type_name(target) in ("char", "signed char"):
-                return "char *"
             pointee = self.spell(target) if self.kind(target) in (INT, FLOAT, ENUM, ENUM64) else None
             return "void *" if pointee is None else pointee + " *"
         if kind in (ENUM, ENUM64):
-            return f"uint{max(size, 1)}"
+            return integer(max(size, 1), bool(info >> 31))
         if kind == FLOAT:
             return f"float{size}"
         if kind == INT:
-            encoding = struct.unpack("<I", trailer)[0] >> 24
-            name = self.type_name(id)
-            if encoding & INT_BOOL:
-                return "bool"
-            # GCC and Clang spell C's long differently.
-            if name in ("long", "long int"):
-                return "long"
-            if name in ("unsigned long", "long unsigned int"):
-                return "ulong"
-            return f"{'int' if encoding & INT_SIGNED else 'uint'}{size}"
+            code = BUILTIN.get(self.type_name(id))
+            if code in ("l", "m"):
+                return "long" if code == "l" else "ulong"
+            return integer(size, bool(struct.unpack("<I", trailer)[0] >> 24 & INT_SIGNED), code)
         return None
 
     def prototype(self, name, proto):
@@ -250,6 +248,12 @@ BUILTIN = {
     "long unsigned int": "m", "long long": "x", "long long int": "x", "unsigned long long": "y", "long long unsigned int": "y",
     "__int128": "n", "__int128 unsigned": "o", "unsigned __int128": "o", "float": "f", "double": "d", "long double": "e",
 }
+
+
+def integer(size, signed, code=None):
+    """How both tables spell an integer or an enum of `size` bytes: `_Bool` and `char` by name
+    where their builtin `code` is known, and any other by its width and sign."""
+    return {"b": "bool", "c": "char"}.get(code, f"{'int' if signed else 'uint'}{size}")
 
 
 class Canonical:
@@ -404,12 +408,11 @@ def spell(type, normalized, pointed_to=False):
         _, code, size, signed = type
         if normalized and pointed_to and size == 1 and not signed:
             return "char"
-        plain = {} if normalized else {"b": "bool", "c": "char"}
-        return plain.get(code, f"{'int' if signed else 'uint'}{size}")
+        return integer(size, signed, None if normalized else code)
     if kind == "float":
         return f"float{type[2]}"
     if kind == "enum":
-        return f"{'int' if type[3] else 'uint'}{type[2]}"
+        return integer(type[2], type[3])
     if kind in ("struct", "union"):
         return f"{kind} {type[1]}" if pointed_to else None
     if kind == "ptr":
