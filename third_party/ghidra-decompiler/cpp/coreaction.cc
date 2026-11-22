@@ -4046,12 +4046,18 @@ void ActionDeadCode::markConsumedParameters(FuncCallSpecs *fc,vector<Varnode *> 
 {
   PcodeOp *callOp = fc->getOp();
   pushConsumed(~((uintb)0),callOp->getIn(0),worklist);		// In all cases the first operand is fully consumed
+  int4 unlocked = 1;
   if (fc->isInputLocked() || fc->isInputActive()) {		// If the prototype is locked in, or in active recovery
-    for(int4 i=1;i<callOp->numInput();++i)
+    // recore: of a variadic prototype, only the fixed parameters. An argument past them is no
+    // parameter the prototype locks, and the loop below consumes it as it does an argument of
+    // an unlocked call. Upstream takes it as consumed whole, so an int passed through `...`
+    // kept the whole register it travels in alive, and every other use of the int took that
+    // width.
+    unlocked = fc->isDotdotdot() && !fc->isInputActive() ? min(fc->numParams() + 1, callOp->numInput()) : callOp->numInput();
+    for(int4 i=1;i<unlocked;++i)
       pushConsumed(~((uintb)0),callOp->getIn(i),worklist);	// Treat all parameters as fully consumed
-    return;
   }
-  for(int4 i=1;i<callOp->numInput();++i) {
+  for(int4 i=unlocked;i<callOp->numInput();++i) {
     Varnode *vn = callOp->getIn(i);
     uintb consumeVal;
     if (vn->isAutoLive())

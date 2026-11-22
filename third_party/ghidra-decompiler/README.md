@@ -70,6 +70,14 @@ SLEIGH compiler. The `.sla` format version must match the engine.
   that register's trial active, so the function returns a value in the same decompilation.
   Upstream has no way to take what the callers show. Marked with `recore:` comments.
 
+- `cpp/coreaction.cc`, `ActionDeadCode::markConsumedParameters`: of a call to a variadic
+  function, only the fixed parameters are taken as consumed whole. An argument past them is
+  consumed as an argument of a call without a prototype is, up to its highest bit that can be
+  set. Upstream takes every argument of a call with a locked prototype as consumed whole, so an
+  `int` passed through `...` kept the whole register it travels in alive, and the `int`, and what
+  the function returns where that is the same value, took the register's width. Marked with a
+  `recore:` comment.
+
 - `cpp/type.hh` and `cpp/type.cc`, `TypeFactory::setFieldName`: names a field of a struct the
   session already holds. Upstream builds a struct whole and never changes it; `crates/decomp`
   names a field of a struct an agent named while the session runs, without a new process.
