@@ -1780,6 +1780,14 @@ fn initial_flags(marked: &[(u64, u64)], symbols: &[(u64, u64)], section: &Sectio
 }
 
 fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], symbols: &'a [(u64, u64)], pointers: &'a Pointers, known_lengths: FxHashMap<u64, usize>, rejected: FxHashSet<u64>) -> Explorer<'a, A> {
+    // The replacement code a kernel keeps among its code never runs where it lies: it is data here.
+    let marked: std::borrow::Cow<[(u64, u64)]> = if image.replacement_code.is_empty() {
+        std::borrow::Cow::Borrowed(&image.marked_data)
+    } else {
+        let mut marked = [&image.marked_data[..], &image.replacement_code[..]].concat();
+        marked.sort_unstable();
+        std::borrow::Cow::Owned(marked)
+    };
     let regions = image
         .sections
         .iter()
@@ -1787,7 +1795,7 @@ fn explore<'a, A: Arch>(image: &'a Image, frames: &'a [(u64, u64)], symbols: &'a
         .map(|section| Region {
             section,
             insn_len: vec![0; section.data.len()],
-            flags: initial_flags(&image.marked_data, symbols, section),
+            flags: initial_flags(&marked, symbols, section),
             changed: vec![0; section.data.len() / PAGE + 1],
             scans: vec![None; section.data.len() / PAGE + 1],
             covered: vec![0; section.data.len() / 64 + 2],

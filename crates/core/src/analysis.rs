@@ -678,7 +678,8 @@ fn analyze_with<A: Arch>(image: &Image) -> Analysis {
             let Some(insn) = image.bytes_from(control.next).and_then(|bytes| A::decode(image, bytes, control.next).next()?.insn) else {
                 return After::Nothing;
             };
-            if A::flow(&insn, &A::State::default(), image) == Some(Flow::Halt) {
+            // A kernel goes on after the trap of a `WARN()`, which is code after the call.
+            if A::flow(&insn, &A::State::default(), image) == Some(Flow::Halt) && !image.resumes_after(control.next) {
                 After::Ends
             } else if control.next < f.end && !A::is_padding(&insn) {
                 After::Code

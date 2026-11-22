@@ -20,6 +20,7 @@ pub mod il2cpp;
 pub mod image;
 pub mod itanium;
 pub mod jumptable;
+pub mod kernel;
 pub mod layout;
 pub mod library;
 pub mod macho;
