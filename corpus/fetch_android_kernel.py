@@ -3,14 +3,15 @@
 raw Image a boot partition holds.
 
 Usage: python3 -I fetch_android_kernel.py <corpus>
-       corpus-kernel-android, corpus-kernel-android-stripped or corpus-kernel-android-image, or
-       any with -holdout
+       corpus-kernel-android, corpus-kernel-android-stripped, corpus-kernel-android-image or
+       corpus-kernel-android-raw, or any with -holdout
 The tuned corpora hold GKI build 17002073 of android16-6.12, whose modules fetch_android_kmod.py
 takes. A kernel cannot be split as a set of modules is, so the held-out corpora hold another one,
 GKI build 16969351 of android15-6.6.
 <corpus>/bin/vmlinux is the kernel as built, with its symbols and DWARF, and in -stripped the same
 after `llvm-strip --strip-all`. In -image, bin/Image.toml is the layout of image/Image, which is
 vmlinux's loaded bytes as `objcopy -O binary` writes them: a region for each segment it loads.
+In -raw, bin/Image is that Image by itself, which recore places by the kernel's own symbol table.
 The debug file is vmlinux with its DWARF decompressed, which recore reads only so. The Image
 holds vmlinux's bytes at vmlinux's addresses, so vmlinux is its debug file too.
 The downloads are kept in the pkgs/ of corpus-kernel-android, and the held-out kernel's in that
@@ -54,8 +55,8 @@ def main():
     corpus = CORPORA / sys.argv[1]
     held_out = corpus.name.endswith("-holdout")
     form = corpus.name.removesuffix("-holdout").removeprefix("corpus-kernel-android")
-    if form not in ("", "-stripped", "-image"):
-        sys.exit(f"no Android kernel for {corpus.name}: name corpus-kernel-android, its -stripped or its -image, or any with -holdout")
+    if form not in ("", "-stripped", "-image", "-raw"):
+        sys.exit(f"no Android kernel for {corpus.name}: name corpus-kernel-android, its -stripped, -image or -raw, or any with -holdout")
     if not fresh(corpus, "bin", "debug", *["image"] * (form == "-image")):
         return
 
@@ -82,8 +83,11 @@ def main():
         subprocess.run(["llvm-objcopy", "-O", "binary", "-R", ".note", "-R", ".note.gnu.build-id", "-R", ".comment", "-S", vmlinux, cut], check=True)
         if cut.read_bytes() != image.read_bytes():
             sys.exit(f"{image} is not vmlinux's loaded bytes")
-        os.link(image, corpus / "image" / name)
-        (corpus / "bin" / f"{name}.toml").write_text(layout(vmlinux))
+        if form == "-raw":
+            os.link(image, corpus / "bin" / name)
+        else:
+            os.link(image, corpus / "image" / name)
+            (corpus / "bin" / f"{name}.toml").write_text(layout(vmlinux))
     os.link(debug, corpus / "debug" / f"{name}.debug")
 
     write_truth(corpus)

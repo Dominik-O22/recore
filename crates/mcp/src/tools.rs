@@ -700,8 +700,11 @@ fn describe_to(binary: &Binary, addr: u64, depth: usize) -> String {
     }
     if let Some(name) = binary.program.image.symbol_names.get(&addr).filter(|_| binary.program.function(addr).is_none()) {
         let image = &binary.program.image;
-        // A raw image carries no names: its layout gives them, with its machine or in a names file.
-        let source = if image.format == Format::Raw {
+        // A raw image carries no names but a kernel's kallsyms: its layout gives them, with its
+        // machine or in a names file.
+        let source = if image.format == Format::Raw && image.kernel_image {
+            "a name the kernel's kallsyms gives"
+        } else if image.format == Format::Raw {
             "a name the layout gives"
         } else if image.il2cpp.as_ref().is_some_and(|il2cpp| il2cpp.is_usage(addr)) {
             "a usage slot the IL2CPP metadata names, which holds it once the runtime fills it in"

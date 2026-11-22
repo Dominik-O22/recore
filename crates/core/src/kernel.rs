@@ -138,6 +138,12 @@ fn warnings(image: &Image) -> Vec<u64> {
 /// What arm64's Linux image header holds at 0x38: `ARM\x64`.
 const IMAGE_MAGIC: [u8; 4] = *b"ARMd";
 
+/// Whether `data` is an arm64 Linux kernel's raw `Image`, as a boot partition holds it: the image
+/// header and no ELF around it.
+pub fn is_raw_image(data: &[u8]) -> bool {
+    data.get(0x38..0x3c) == Some(&IMAGE_MAGIC[..]) && !data.starts_with(b"\x7fELF")
+}
+
 /// Whether `image` is an arm64 Linux kernel's, whose `.head.text`, and the raw `Image` made from
 /// it, open with the image header. Only a kernel has kCFI hashes that nothing marks, so only it
 /// pays to look for them, and only in it does a `nop` after a hash open a function.
