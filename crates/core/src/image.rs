@@ -269,6 +269,11 @@ impl Image {
     /// Parses the ELF, PE or Mach-O executable in `data`, which needs no file around it: `load`
     /// reads one with this, and the fuzzer (fuzz/) feeds it bytes.
     pub fn parse(name: String, data: Vec<u8>) -> Result<Image> {
+        if crate::kernel::is_raw_image(&data)
+            && let Some(symbols) = crate::layout::kallsyms(&data)
+        {
+            return crate::layout::kernel(name, data, symbols);
+        }
         if crate::macho::is_macho(&data) {
             return crate::macho::load(name, &data);
         }
@@ -276,7 +281,10 @@ impl Image {
         let data = if crate::sectionless::is_sectionless(&data) { crate::sectionless::restore(&data).unwrap_or(data) } else { data };
         // A kernel module has no addresses until it is linked.
         let data = crate::relocatable::link(data);
-        let file = object::File::parse(&*data)?;
+        let file = object::File::parse(&*data).map_err(|error| match wrapped(&data, &error) {
+            Some(what) => anyhow::anyhow!("{name} is {what}"),
+            None => error.into(),
+        })?;
 
         // The sections at an address, but for one whose end the file puts past 2^64.
         let mapped = || file.sections().filter(|s| s.address() != 0 && s.address().checked_add(s.size()).is_some());
@@ -510,6 +518,22 @@ fn read_word(sections: &SectionFinder, addr: u64, size: usize) -> Option<u64> {
     Some(bytes.iter().rev().fold(0, |word, &byte| word << 8 | u64::from(byte)))
 }
 
+/// What a file is that recore reads no executable in, as a kernel's `Image` comes from a phone,
+/// wrapped, compressed or with nothing that says where it loads, and what to do with it. A raw
+/// `Image` says too what `object` found wrong with its EFI stub, the `error` it parsed with.
+fn wrapped(data: &[u8], error: &object::Error) -> Option<String> {
+    const COMPRESSED: [(&[u8], &str); 6] =
+        [(b"\x1f\x8b", "gzip"), (b"\x02\x21\x4c\x18", "LZ4"), (b"\x04\x22\x4d\x18", "LZ4"), (b"\x28\xb5\x2f\xfd", "Zstandard"), (b"\xfd7zXZ\x00", "XZ"), (b"BZh", "bzip2")];
+    if data.starts_with(b"ANDROID!") {
+        return Some("an Android boot image: take the kernel out of it, as `unpack_bootimg` from AOSP's mkbootimg does, decompress it if it is compressed, and load the raw `Image`".into());
+    }
+    if crate::kernel::is_raw_image(data) {
+        return Some(format!("an arm64 Linux kernel `Image` with no kallsyms that holds together and no EFI stub that parses ({error}): load it with a layout file, which says where it loads"));
+    }
+    let (_, compression) = COMPRESSED.iter().find(|(magic, _)| data.starts_with(magic))?;
+    Some(format!("compressed with {compression}: decompress it and load what it holds"))
+}
+
 /// Sections that are written only by the loader and protected afterwards (full RELRO).
 fn is_relro(name: &str) -> bool {
     name.starts_with(".data.rel.ro") || matches!(name, ".got" | ".got.plt" | ".init_array" | ".fini_array" | ".dynamic")
@@ -607,6 +631,14 @@ mod tests {
         for addr in [0, 0xfff, 0x1100, 0x5_0100, 0x3e_8100] {
             assert!(finder.find(addr).is_none());
         }
+    }
+
+    /// A kernel as a phone ships it, in a boot image or compressed, is refused with what to do.
+    #[test]
+    fn a_wrapped_kernel_says_what_it_is() {
+        let error = |data: &[u8]| Image::parse("Image".into(), data.to_vec()).err().unwrap().to_string();
+        assert!(error(b"ANDROID!\0\0\0\0").contains("an Android boot image"));
+        assert!(error(b"\x02\x21\x4c\x18\0\0\0\0").contains("compressed with LZ4"));
     }
 
     #[test]

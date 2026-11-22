@@ -305,7 +305,9 @@ fn classify(scans: impl Iterator<Item = Scan>, callees: &Callees) -> Classified 
 }
 
 pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
-    if recore::layout::is_layout(binary_path) {
+    let layout = recore::layout::is_layout(binary_path);
+    let binary_data = if layout { Vec::new() } else { std::fs::read(binary_path).with_context(|| format!("reading {binary_path:?}"))? };
+    if layout || recore::kernel::is_raw_image(&binary_data) {
         if !is_elf_of_raw(debug_path) {
             return sdcc::extract(binary_path, debug_path);
         }
@@ -315,11 +317,11 @@ pub fn extract(binary_path: &Path, debug_path: &Path) -> Result<Truth> {
             return thumb::extract(binary_path, debug_path);
         }
         // An arm64 kernel's `Image` is its vmlinux's loaded bytes at the same addresses, so it
-        // takes the vmlinux's truth.
+        // takes the vmlinux's truth, whether a layout places it or its kallsyms do.
         let name = binary_path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         return Ok(Truth { name, ..elf(binary_path, &debug, &debug)? });
     }
-    let binary_data = recore::relocatable::link(std::fs::read(binary_path).with_context(|| format!("reading {binary_path:?}"))?);
+    let binary_data = recore::relocatable::link(binary_data);
     let binary = object::File::parse(&*binary_data)?;
     if binary.format() == object::BinaryFormat::Pe {
         return pe::extract(binary_path, &binary_data, debug_path);

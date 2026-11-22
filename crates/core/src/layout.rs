@@ -56,6 +56,9 @@
 //! `vectors = "none"` says the image has none, and `entry` names where execution starts.
 //!
 //! [`Image::load`] takes a layout wherever it takes an executable.
+//!
+//! An arm64 Linux kernel's raw `Image` needs no layout: its own symbol table, kallsyms, says where
+//! it loads and which of it is code, see [`kernel`].
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -65,6 +68,7 @@ use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
 use crate::image::{Banking, Compiler, Format, Image, Machine, Section};
+use crate::kallsyms::Symbol;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -517,9 +521,230 @@ pub fn load(path: &Path) -> Result<Image> {
     Ok(image)
 }
 
+/// The pairs of symbols that bound an arm64 kernel's code: its text, the text it runs once while
+/// it boots, and its exit text. Each pair `__*_text_start` and `__*_text_end` bounds code too, as
+/// the trampolines and the identity-mapped code that 6.12 keeps among its read-only data.
+const KERNEL_CODE: [(&str, &str); 3] = [("_text", "_etext"), ("_sinittext", "_einittext"), ("__exittext_begin", "__exittext_end")];
+
+/// The data a kernel only reads, `.rodata`, by the symbols that bound it. All other data is
+/// taken as written, since a wrong constant is worse than a missed one.
+const KERNEL_READ_ONLY: (&str, &str) = ("__start_rodata", "__end_rodata");
+
+/// What the kernel writes while it boots and protects afterwards, among its `.rodata`.
+const KERNEL_RO_AFTER_INIT: (&str, &str) = ("__start_ro_after_init", "__end_ro_after_init");
+
+/// The tables [`crate::kernel`] reads, and the unwind tables that Android's 6.1 and 6.12 keep for
+/// the code that patches their shadow call stack, by the symbols that bound each and the section
+/// an ELF file keeps it in.
+const KERNEL_TABLES: [(&str, &str, &str); 5] = [
+    ("__alt_instructions", "__alt_instructions_end", ".altinstructions"),
+    ("__start___bug_table", "__stop___bug_table", "__bug_table"),
+    ("__start___jump_table", "__stop___jump_table", "__jump_table"),
+    ("__eh_frame_start", "__eh_frame_end", ".eh_frame"),
+    ("__pi___eh_frame_start", "__pi___eh_frame_end", ".eh_frame"),
+];
+
+/// The symbols of an arm64 Linux kernel's raw `Image`, which [`crate::kernel::is_raw_image`]
+/// tells, from its kallsyms, but for mapping symbols. None where it has no kallsyms that holds
+/// together, and the file is read as any other: by the PE header of its EFI stub, if it has one.
+pub(crate) fn kallsyms(data: &[u8]) -> Option<Vec<Symbol>> {
+    let _phase = crate::phase::scope("load/kallsyms");
+    let mut symbols = crate::kallsyms::read(data)?;
+    // A mapping symbol, such as `$x` or `$d` with the prefix of the kernel's code that runs at its
+    // physical address, `__pi_`, names no function.
+    symbols.retain(|symbol| !symbol.name.contains('$'));
+    Some(symbols)
+}
+
+/// Loads an arm64 Linux kernel's raw `Image` with no layout, by its kallsyms `symbols`, which
+/// say where it loads, which of it is code, and the name and start of each function.
+pub(crate) fn kernel(name: String, data: Vec<u8>, symbols: Vec<Symbol>) -> Result<Image> {
+    // The symbols start at `_text`, the image's first byte, and the image ends below 2^64.
+    let base = symbols[0].addr;
+    let end = base + data.len() as u64;
+    // The image's size, which takes in what the kernel zeroes past the end of the file.
+    let size = data.get(0x10..0x18).map_or(0, |bytes| u64::from_le_bytes(bytes.try_into().unwrap()));
+    let sections = kernel_sections(&data, base, &symbols);
+    let layout = Layout { machine: Machine::Aarch64, entry: vec![base], vectors: None, region: Vec::new(), banking: None, names: None, compiler: None };
+    let mut image = layout.image(name, sections, None)?;
+    if let Some(stop) = base.checked_add(size).filter(|&stop| stop > end) {
+        image.zero_filled = vec![(end, stop)];
+    }
+    if let Some(frames) = image.sections.iter().find(|section| section.name == ".eh_frame") {
+        image.frames = crate::image::parse_frames(&frames.data, frames.addr);
+    }
+    image.exports = symbols.iter().filter(|symbol| symbol.is_text() && image.is_code(symbol.addr)).map(|symbol| symbol.addr).collect();
+    image.exports.dedup();
+    // Of the names at an address, the kernel prints the first.
+    for Symbol { addr, name, .. } in symbols {
+        image.symbol_names.entry(addr).or_insert(name);
+    }
+    Ok(image)
+}
+
+/// The sections of a kernel's image that loads at `base`, cut where its `symbols` say its code,
+/// the data it only reads and the tables [`crate::kernel`] reads start and end.
+fn kernel_sections(data: &[u8], base: u64, symbols: &[Symbol]) -> Vec<Section> {
+    let mut at: FxHashMap<&str, u64> = FxHashMap::default();
+    for symbol in symbols {
+        at.entry(&symbol.name).or_insert(symbol.addr);
+    }
+    let range = |(start, stop): (&str, &str)| Some((*at.get(start)?, *at.get(stop)?)).filter(|(start, stop)| start < stop);
+    let marked = symbols.iter().filter_map(|symbol| {
+        let stem = symbol.name.strip_prefix("__")?.strip_suffix("_text_start")?;
+        range((&symbol.name, &format!("__{stem}_text_end")))
+    });
+    let code: Vec<(u64, u64)> = KERNEL_CODE.into_iter().filter_map(range).chain(marked).collect();
+    let (read_only, after_init) = (range(KERNEL_READ_ONLY), range(KERNEL_RO_AFTER_INIT));
+    let tables: Vec<((u64, u64), &str)> = KERNEL_TABLES.into_iter().filter_map(|(start, stop, name)| Some((range((start, stop))?, name))).collect();
+
+    let end = base + data.len() as u64;
+    let bounds = code.iter().chain(&read_only).chain(&after_init).chain(tables.iter().map(|(range, _)| range)).flat_map(|&(start, stop)| [start, stop]);
+    let mut cuts: Vec<u64> = [base, end].into_iter().chain(bounds).map(|addr| addr.clamp(base, end)).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    // Each piece between two cuts, with the piece before it where both are alike.
+    let mut pieces: Vec<(u64, u64, &str, bool, bool)> = Vec::new();
+    for pair in cuts.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let holds = |&(start, stop): &(u64, u64)| start <= from && from < stop;
+        let executable = code.iter().any(holds);
+        // With no `__start_rodata` and `__end_rodata` all data is taken as written, and the
+        // decompiler prints a string literal as its address. No kernel is known to lack them.
+        let writable = !executable && !(read_only.as_ref().is_some_and(holds) && !after_init.as_ref().is_some_and(holds));
+        let kind = if executable { ".text" } else if writable { ".data" } else { ".rodata" };
+        let name = tables.iter().find(|(range, _)| holds(range)).map_or(kind, |&(_, name)| name);
+        match pieces.last_mut() {
+            Some(last) if (last.2, last.3, last.4) == (name, executable, writable) => last.1 = to,
+            _ => pieces.push((from, to, name, executable, writable)),
+        }
+    }
+    pieces
+        .into_iter()
+        .map(|(from, to, name, executable, writable)| {
+            let (start, stop) = ((from - base) as usize, (to - base) as usize);
+            Section { name: name.into(), addr: from, data: data[start..stop].to_vec(), file_offset: Some(start as u64), executable, writable }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PE file of an arm64 kernel's EFI stub, as the kernel's build lays it out: its headers
+    /// in the first 4 KiB, then `code` as `.text` at the address of its offset in the file, which
+    /// is where execution starts. Also where its NT headers start.
+    fn efi_stub(code: &[u8]) -> (Vec<u8>, usize) {
+        use object::pe;
+        use object::write::pe::{NtHeaders, Writer};
+        let mut data = Vec::new();
+        let mut writer = Writer::new(true, 0x1000, 0x1000, &mut data);
+        writer.reserve_dos_header();
+        writer.reserve_nt_headers(0);
+        writer.reserve_section_headers(1);
+        let text = writer.reserve_text_section(code.len() as u32);
+        assert_eq!((text.file_offset, text.virtual_address), (0x1000, 0x1000));
+        let nt_headers = writer.nt_headers_offset() as usize;
+        writer.write_empty_dos_header().unwrap();
+        writer.write_nt_headers(NtHeaders {
+            machine: pe::IMAGE_FILE_MACHINE_ARM64,
+            time_date_stamp: 0,
+            characteristics: pe::IMAGE_FILE_EXECUTABLE_IMAGE,
+            major_linker_version: 0,
+            minor_linker_version: 0,
+            address_of_entry_point: text.virtual_address,
+            image_base: 0,
+            major_operating_system_version: 0,
+            minor_operating_system_version: 0,
+            major_image_version: 0,
+            minor_image_version: 0,
+            major_subsystem_version: 0,
+            minor_subsystem_version: 0,
+            subsystem: pe::IMAGE_SUBSYSTEM_EFI_APPLICATION,
+            dll_characteristics: pe::DllFlags::default(),
+            size_of_stack_reserve: 0,
+            size_of_stack_commit: 0,
+            size_of_heap_reserve: 0,
+            size_of_heap_commit: 0,
+        });
+        writer.write_section_headers();
+        writer.write_section(text.file_offset, code);
+        (data, nt_headers)
+    }
+
+    /// A kernel's raw image as a phone boots it: the image header among the EFI stub's DOS
+    /// header, the stub's PE header, two functions and kallsyms, which say where it loads, what
+    /// is code, what is data it only reads, and what the functions and a global are called.
+    #[test]
+    fn a_kernel_image_loads_where_its_kallsyms_say() {
+        use crate::kallsyms::tests::{Order, kallsyms};
+        const TEXT: u64 = 0xffff_ffc0_8000_0000;
+        let symbols = [
+            (TEXT, "T_text"),
+            (TEXT + 0x1040, "Tfirst"),
+            (TEXT + 0x1048, "tsecond"),
+            (TEXT + 0x1100, "T_etext"),
+            (TEXT + 0x1100, "D__start_rodata"),
+            (TEXT + 0x1200, "D__start___bug_table"),
+            (TEXT + 0x120c, "D__stop___bug_table"),
+            (TEXT + 0x1c00, "D__start_ro_after_init"),
+            (TEXT + 0x1c10, "D__end_ro_after_init"),
+            (TEXT + 0x1e00, "R__end_rodata"),
+            (TEXT + 0x2000, "D_sdata"),
+            (TEXT + 0x2000, "Dcounter"),
+            (TEXT + 0x2010, "D_edata"),
+        ];
+        // What follows the stub's headers, from 0x1000.
+        let mut code = vec![0; 0x2000];
+        // first: `ret`. second: `bl first`, `ret`.
+        for (at, word) in [(0x40, 0xd65f_03c0u32), (0x48, 0x97ff_fffe), (0x4c, 0xd65f_03c0)] {
+            code[at..at + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let table = kallsyms(&symbols, Order::OffsetsLast, 0);
+        code[0x300..0x300 + table.len()].copy_from_slice(&table);
+        let (mut data, nt_headers) = efi_stub(&code);
+        assert_eq!(data.len(), 0x3000);
+        // The image header shares the DOS header's bytes: its size, which takes in what the
+        // kernel zeroes past the end of the file, and its magic.
+        data[0x10..0x18].copy_from_slice(&0x4000u64.to_le_bytes());
+        data[0x38..0x3c].copy_from_slice(b"ARMd");
+
+        let image = Image::parse("Image".into(), data.clone()).unwrap();
+        let sections: Vec<(u64, u64, &str, bool, bool)> = image.sections.iter().map(|s| (s.addr, s.end(), s.name.as_str(), s.executable, s.writable)).collect();
+        assert_eq!(
+            sections,
+            [
+                (TEXT, TEXT + 0x1100, ".text", true, false),
+                (TEXT + 0x1100, TEXT + 0x1200, ".rodata", false, false),
+                (TEXT + 0x1200, TEXT + 0x120c, "__bug_table", false, false),
+                (TEXT + 0x120c, TEXT + 0x1c00, ".rodata", false, false),
+                (TEXT + 0x1c00, TEXT + 0x1c10, ".data", false, true),
+                (TEXT + 0x1c10, TEXT + 0x1e00, ".rodata", false, false),
+                (TEXT + 0x1e00, TEXT + 0x3000, ".data", false, true),
+            ]
+        );
+        assert_eq!((image.format, image.entry, image.zero_filled.as_slice(), image.kernel_image), (Format::Raw, TEXT, &[(TEXT + 0x3000, TEXT + 0x4000)][..], true));
+        assert_eq!(image.exports, [TEXT, TEXT + 0x1040, TEXT + 0x1048]);
+        assert_eq!(image.symbol_names.get(&(TEXT + 0x2000)).map(String::as_str), Some("_sdata"));
+        let analysis = crate::analyze(&image);
+        let named: Vec<(u64, Option<&str>)> = analysis.functions.iter().map(|f| (f.addr, f.name.as_deref())).collect();
+        assert!(named.contains(&(TEXT + 0x1040, Some("first"))) && named.contains(&(TEXT + 0x1048, Some("second"))), "{named:x?}");
+
+        // With a token table that is not whole, it loads by the stub's PE header, at 0.
+        let mut broken = data;
+        let digits = broken.windows(4).position(|window| window == b"0\x001\x00").unwrap();
+        broken[digits + 2] = b'x';
+        let image = Image::parse("Image".into(), broken.clone()).unwrap();
+        let sections: Vec<(u64, u64, &str)> = image.sections.iter().map(|s| (s.addr, s.end(), s.name.as_str())).collect();
+        assert_eq!((image.format, image.entry, sections), (Format::Pe, 0x1000, vec![(0x1000, 0x3000, ".text")]));
+
+        // With that header broken too, it fails with what to do, and with what `object` says of it.
+        broken[nt_headers] ^= 1;
+        let error = Image::parse("Image".into(), broken.clone()).err().unwrap().to_string();
+        let stub = object::File::parse(&*broken).err().unwrap().to_string();
+        assert!(error.contains("an arm64 Linux kernel `Image` with no kallsyms that holds together") && error.contains(&stub), "{error}");
+    }
 
     #[test]
     fn an_entry_reaches_its_target_in_the_bank_its_stub_selects() {
