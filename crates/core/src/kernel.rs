@@ -10,7 +10,12 @@
 //! - `__bug_table` lists the trap of each `BUG()` and `WARN()`. After a warning's, the kernel
 //!   goes on.
 
+use std::collections::HashSet;
+
 use crate::image::{Image, Machine, Section};
+
+/// `struct jump_entry` with absolute pointers: the label's instruction, where it jumps, its key.
+const JUMP_ENTRY: u64 = 24;
 
 /// arm64's `struct alt_instr`: the offsets of the original and of the replacement from their
 /// fields, the CPU feature, then the length of each in bytes.
@@ -31,10 +36,8 @@ pub(crate) fn read(image: &mut Image) {
     if !matches!(image.machine, Machine::Aarch64 | Machine::X86_64) {
         return;
     }
-    if let Some(table) = section(image, "__jump_table").map(|s| s.addr..s.end()) {
-        let mut targets = std::mem::take(&mut image.relative_targets);
-        targets.retain(|&(slot, target)| !(table.contains(&slot) && image.is_code(target)));
-        image.relative_targets = targets;
+    if let Some(labels) = jump_labels(image) {
+        image.relative_targets.retain(|(slot, _)| !labels.contains(slot));
     }
     if image.machine == Machine::Aarch64 {
         image.replacement_code = replacements(image);
@@ -46,21 +49,31 @@ fn section<'a>(image: &'a Image, name: &str) -> Option<&'a Section> {
     image.sections.iter().find(|s| s.name == name)
 }
 
+/// The slots of `__jump_table` that hold a jump label's instruction or where it jumps. The
+/// layout holds when the table is whole entries and both of those are pointers into code in each.
+fn jump_labels(image: &Image) -> Option<HashSet<u64>> {
+    let table = section(image, "__jump_table").map(|s| s.addr..s.end())?;
+    let into_code: HashSet<u64> = image.relative_targets.iter().filter(|&&(slot, target)| table.contains(&slot) && image.is_code(target)).map(|&(slot, _)| slot).collect();
+    let labels: HashSet<u64> = table.clone().step_by(JUMP_ENTRY as usize).flat_map(|entry| [entry, entry + 8]).collect();
+    ((table.end - table.start).is_multiple_of(JUMP_ENTRY) && labels.is_subset(&into_code)).then_some(labels)
+}
+
 /// Where the offset the tables store at `place`, 32 bits from that place, points.
 fn pointer(place: u64, offset: &[u8]) -> u64 {
     place.wrapping_add_signed(i64::from(i32::from_le_bytes(offset[..4].try_into().unwrap())))
 }
 
 /// `[start, end)` of each replacement arm64's `.altinstructions` places in code, sorted. The
-/// layout holds when every original is a word of code. A replacement elsewhere, as before 5.10
-/// in a section of its own that is not code, is left alone.
+/// layout holds when every original is a word of code and every replacement as long as its
+/// original, as the build makes it, or empty, where a function of the kernel writes the code. A
+/// replacement elsewhere, as before 5.10 in a section of its own that is not code, is left alone.
 fn replacements(image: &Image) -> Vec<(u64, u64)> {
     let Some(table) = section(image, ".altinstructions").filter(|s| s.data.len().is_multiple_of(ALT_INSTR)) else { return Vec::new() };
     let mut ranges = Vec::new();
     for (index, entry) in table.data.as_chunks::<ALT_INSTR>().0.iter().enumerate() {
         let at = table.addr + (index * ALT_INSTR) as u64;
         let (original, replacement, length) = (pointer(at, &entry[..4]), pointer(at + 4, &entry[4..8]), u64::from(entry[11]));
-        if !original.is_multiple_of(4) || !image.is_code(original) || !length.is_multiple_of(4) {
+        if !original.is_multiple_of(4) || !image.is_code(original) || !length.is_multiple_of(4) || (length > 0 && entry[10] != entry[11]) {
             return Vec::new();
         }
         if length > 0 && image.section_at(replacement).is_some_and(|s| s.executable && s.contains(replacement.saturating_add(length - 1))) {
@@ -158,6 +171,9 @@ mod tests {
         let image = module(&code, "__jump_table", table, vec![(TABLE, TEXT), (TABLE + 8, TEXT + 12), (TABLE + 16, DATA)]);
         assert_eq!(starts(&image), vec![TEXT]);
         assert_eq!(image.relative_targets, vec![(TABLE + 16, DATA)]);
+        // A section of that name whose entries are not of this layout keeps its pointers.
+        let pointers = vec![(TABLE, TEXT), (TABLE + 8, DATA), (TABLE + 16, TEXT + 12)];
+        assert_eq!(module(&code, "__jump_table", vec![0; 24], pointers.clone()).relative_targets, pointers);
     }
 
     /// The replacement for the first function's two words sits after it, and the function after
