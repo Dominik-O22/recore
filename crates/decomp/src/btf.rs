@@ -351,6 +351,8 @@ const OBJECT: u64 = 4096;
 /// it takes, which keeps a crafted file's structs of thousands of structs from costing more.
 const NESTED: u32 = 4;
 const POINTERS: usize = 4096;
+/// The most members [`objects`] looks at over all the structs of one BTF.
+const MEMBERS: u64 = 1 << 26;
 
 /// A prototype as the types it takes and returns, without parameter names: two that are alike
 /// are one function type.
@@ -376,18 +378,20 @@ fn underlying(types: &Types, mut id: TypeId) -> TypeId {
 
 /// Each member of the struct `id` that is a pointer, at `base` and below `path`, with the
 /// signature of the function it points to if it points to one.
-fn pointers(types: &Types, id: TypeId, base: u64, path: &str, depth: u32, out: &mut Vec<(u64, String, Option<Signature>)>) {
+fn pointers(types: &Types, id: TypeId, base: u64, path: &str, depth: u32, visits: &mut u64, out: &mut Vec<(u64, String, Option<Signature>)>) {
     let Type::Composite { union: false, fields, .. } = types.get(id) else { return };
     for field in fields.iter().filter(|field| field.bits.is_none()) {
-        if out.len() >= POINTERS {
+        // Nested structs of many members and no pointer would be walked without end otherwise.
+        if out.len() >= POINTERS || *visits == 0 {
             return;
         }
+        *visits -= 1;
         let path = if path.is_empty() { field.name.clone() } else { format!("{path}.{}", field.name) };
         let offset = base.saturating_add(field.offset);
         let kind = underlying(types, field.kind);
         match types.get(kind) {
             Type::Pointer(target) => out.push((offset, path, signature(types, underlying(types, *target)))),
-            Type::Composite { union: false, .. } if depth > 0 => pointers(types, kind, offset, &path, depth - 1, out),
+            Type::Composite { union: false, .. } if depth > 0 => pointers(types, kind, offset, &path, depth - 1, visits, out),
             _ => {}
         }
     }
@@ -406,13 +410,16 @@ pub fn objects(image: &Image, types: &Types) -> Objects {
     // each such member, the structs that have it.
     let mut members: HashMap<TypeId, Vec<(u64, String, Option<Signature>)>> = HashMap::new();
     let mut by_member: HashMap<(u64, &Signature), Vec<TypeId>> = HashMap::new();
+    // The members all the structs of a kernel's BTF may show between them: a real kernel shows
+    // a few million, and a crafted file stops here.
+    let mut visits = MEMBERS;
     for id in 0..types.types.len() as TypeId {
         // A struct of one pointer is any word that holds the address of such a function.
         if !matches!(&types.types[id as usize], Type::Composite { union: false, size, .. } if *size > types.pointer) {
             continue;
         }
         let mut found = Vec::new();
-        pointers(types, id, 0, "", NESTED, &mut found);
+        pointers(types, id, 0, "", NESTED, &mut visits, &mut found);
         if found.iter().any(|member| member.2.is_some()) {
             members.insert(id, found);
         }

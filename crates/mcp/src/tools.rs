@@ -1108,10 +1108,11 @@ fn xrefs(binary: &mut Binary, args: Xrefs) -> Result<String> {
         let image = &program.image;
         let size = image.machine.pointer_size() as usize;
         for (offset, path, _) in &layout.pointers {
-            let Some(bytes) = image.bytes_from(addr + offset).and_then(|bytes| bytes.get(..size)) else { continue };
+            let Some(slot) = addr.checked_add(*offset) else { continue };
+            let Some(bytes) = image.bytes_from(slot).and_then(|bytes| bytes.get(..size)) else { continue };
             let target = bytes.iter().rev().fold(0, |value, &byte| value << 8 | u64::from(byte));
             if target != 0 {
-                writeln!(out, "  {:#x} .{path} -> {target:#x} {}", addr + offset, describe(binary, target))?;
+                writeln!(out, "  {slot:#x} .{path} -> {target:#x} {}", describe(binary, target))?;
             }
         }
     }
