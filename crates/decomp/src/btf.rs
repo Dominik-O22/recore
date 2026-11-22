@@ -305,10 +305,10 @@ fn member(blob: &Blob, entry: &Entry, index: usize, id: &impl Fn(u32) -> TypeId)
 }
 
 /// The types the BTF of the kernel `image` describes, with the prototype of each function its
-/// symbols name. `None` for an image that is not a kernel's or has no BTF, and why its BTF could
-/// not be read goes to stderr.
+/// symbols name. `None` for an image that is not a kernel's or has no BTF, and with
+/// [`crate::types::DEBUG_VAR`] set to `off`. Why its BTF could not be read goes to stderr.
 pub fn types(image: &Image) -> Option<Types> {
-    if !image.kernel_image {
+    if !image.kernel_image || std::env::var(crate::types::DEBUG_VAR).is_ok_and(|setting| setting == "off") {
         return None;
     }
     let section = image.sections.iter().find(|section| section.name == ".BTF")?;
