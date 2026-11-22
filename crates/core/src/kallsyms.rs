@@ -84,38 +84,34 @@ struct Tokens<'a> {
 
 impl<'a> Tokens<'a> {
     /// The token table in which the digits at `digits` are the tokens 0x30 to 0x39, where the
-    /// token index after it says where each of its strings starts.
+    /// token index after it says where each of its strings starts. The index places token 0:
+    /// what comes before it may end in any byte, as `kallsyms_seqs_of_names` does when its 3
+    /// bytes a symbol fill their last 8 with no padding.
     fn around(data: &'a [u8], digits: usize) -> Option<Tokens<'a>> {
-        let mut start = digits;
-        for _ in 0..b'0' {
-            // The token before ends with the NUL before `start`.
-            let end = start.checked_sub(1).filter(|&end| data[end] == 0)?;
-            let from = end.saturating_sub(MAX_NAME);
-            start = match memchr::memrchr(0, &data[from..end]) {
-                Some(at) => from + at + 1,
-                None if from == 0 => 0,
-                None => return None,
-            };
-        }
+        let last = (b'0'..=u8::MAX).try_fold(digits, |at, _| Some(at + string(data, at)?.len() + 1))?;
+        let index = last.next_multiple_of(ALIGN);
+        let words = data.get(index..)?.get(..512)?.as_chunks::<2>().0;
+        let offset = |token: usize| usize::from(u16::from_le_bytes(words[token]));
+        let start = digits.checked_sub(offset(b'0'.into()))?;
         let mut strings = Vec::with_capacity(256);
         let mut at = start;
-        for _ in 0..256 {
-            let rest = data.get(at..)?;
-            let length = memchr::memchr(0, &rest[..rest.len().min(MAX_NAME)])?;
-            strings.push(&rest[..length]);
-            at += length + 1;
-        }
-        let index = at.next_multiple_of(ALIGN);
-        let words = data.get(index..)?.get(..512)?.as_chunks::<2>().0;
-        let mut offset = 0;
-        for (string, word) in strings.iter().zip(words) {
-            if usize::from(u16::from_le_bytes(*word)) != offset {
+        for token in 0..256 {
+            if at - start != offset(token) {
                 return None;
             }
-            offset += string.len() + 1;
+            let string = string(data, at)?;
+            strings.push(string);
+            at += string.len() + 1;
         }
         Some(Tokens { start, strings, index_end: index + 512 })
     }
+}
+
+/// The string at `at` up to its NUL, which comes within as many bytes as a name may expand to.
+fn string(data: &[u8], at: usize) -> Option<&[u8]> {
+    let rest = data.get(at..)?;
+    let length = memchr::memchr(0, &rest[..rest.len().min(MAX_NAME)])?;
+    Some(&rest[..length])
 }
 
 /// The little-endian word of `width` bytes at `at`.
@@ -224,10 +220,13 @@ fn names(data: &[u8], markers: &Markers) -> Option<(usize, usize)> {
 }
 
 /// Each of the `count` names from `names` as its kind and the name, expanded from its tokens.
+/// The names may expand to as many bytes as `data` holds, and no more: a kernel's expand to a
+/// tenth of its image, and a table that uses every name's 512 bytes is no kernel's.
 fn decode(data: &[u8], names: usize, count: usize, tokens: &Tokens) -> Option<Vec<(u8, String)>> {
     let mut symbols = Vec::with_capacity(count);
     let mut at = names;
     let mut expanded = Vec::new();
+    let mut total = 0usize;
     for _ in 0..count {
         let (length, said) = length(data, at)?;
         let compressed = data.get(at + said..)?.get(..length)?;
@@ -237,6 +236,10 @@ fn decode(data: &[u8], names: usize, count: usize, tokens: &Tokens) -> Option<Ve
             if expanded.len() > MAX_NAME {
                 return None;
             }
+        }
+        total += expanded.len();
+        if total > data.len() {
+            return None;
         }
         let (&kind, name) = expanded.split_first()?;
         symbols.push((kind, String::from_utf8_lossy(name).into_owned()));
@@ -425,6 +428,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// Where the names' order of 3 bytes a symbol fills its last 8, no padding and no NUL comes
+    /// before the token table's first string, and the token index alone says where it starts.
+    #[test]
+    fn a_names_order_with_no_padding_before_the_tokens_is_passed() {
+        for count in [5, 301] {
+            let symbols = functions(count, "tlast");
+            assert_eq!(symbols.len() * 3 % ALIGN, 0);
+            let symbols = borrowed(&symbols);
+            let data = kallsyms(&symbols, Order::SeqsOfNames, 0);
+            let table = token_table_at(&data);
+            assert_ne!(data[table - 1], 0, "{count} functions");
+            assert_eq!(read_back(&data), Some(expected(&symbols)), "{count} functions");
+        }
+    }
+
+    /// Where the names' order lies between the markers and the tokens, the count is the one its
+    /// size allows: 8 bytes more or fewer of it refuse the table, though the markers then stand
+    /// where they do for the true count.
+    #[test]
+    fn a_names_order_of_the_wrong_size_is_refused() {
+        let symbols = functions(300, "tlast");
+        let data = kallsyms(&borrowed(&symbols), Order::SeqsOfNames, 0);
+        assert!(read(&data).is_some());
+        let table = token_table_at(&data);
+        let mut longer = data.clone();
+        longer.splice(table..table, [0; ALIGN]);
+        assert!(read(&longer).is_none());
+        let mut shorter = data;
+        shorter.drain(table - ALIGN..table);
+        assert!(read(&shorter).is_none());
+    }
+
+    /// Where the test's token table starts: its first two strings, `\x7f` and `ab`.
+    fn token_table_at(data: &[u8]) -> usize {
+        data.windows(5).position(|window| window == b"\x7f\0ab\0").unwrap()
+    }
+
     /// A name may expand to `KSYM_NAME_LEN` bytes with its kind, and no more.
     #[test]
     fn a_name_longer_than_the_kernel_allows_is_refused() {
@@ -436,6 +476,22 @@ pub(crate) mod tests {
         assert!(read(&kallsyms(&borrowed(&symbols), Order::OffsetsLast, 0)).is_none());
     }
 
+    /// The names together may expand to as many bytes as the image holds, and no more, though
+    /// each is as long as a name may be.
+    #[test]
+    fn names_that_expand_past_the_image_are_refused() {
+        let longest = format!("t{}c", "ab".repeat(255));
+        for (count, holds) in [(2, true), (16, false)] {
+            let mut symbols = vec![(TEXT, "T_text")];
+            symbols.extend((1..=count).map(|index| (TEXT + 4 * index, longest.as_str())));
+            symbols.push((TEXT + 0x1000, "T_etext"));
+            let data = kallsyms(&symbols, Order::OffsetsLast, 0);
+            let expanded: usize = symbols.iter().map(|(_, name)| name.len()).sum();
+            assert_eq!(expanded <= data.len(), holds, "{count} names");
+            assert_eq!(read(&data).is_some(), holds, "{count} names");
+        }
+    }
+
     /// A marker that does not say where its name starts refuses the table, though every other
     /// marker and the last name's end agree.
     #[test]
@@ -444,8 +500,7 @@ pub(crate) mod tests {
         let mut data = kallsyms(&borrowed(&symbols), Order::OffsetsLast, 0);
         assert!(read(&data).is_some());
         // Three markers of 4 bytes and 4 of padding end against the token table.
-        let table = data.windows(5).position(|window| window == b"\x7f\0ab\0").unwrap();
-        let second = table - 16 + 4;
+        let second = token_table_at(&data) - 16 + 4;
         let marker = u32::from_le_bytes(data[second..second + 4].try_into().unwrap());
         data[second..second + 4].copy_from_slice(&(marker + 1).to_le_bytes());
         assert!(read(&data).is_none());

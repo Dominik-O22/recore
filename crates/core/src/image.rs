@@ -281,7 +281,7 @@ impl Image {
         let data = if crate::sectionless::is_sectionless(&data) { crate::sectionless::restore(&data).unwrap_or(data) } else { data };
         // A kernel module has no addresses until it is linked.
         let data = crate::relocatable::link(data);
-        let file = object::File::parse(&*data).map_err(|error| match wrapped(&data) {
+        let file = object::File::parse(&*data).map_err(|error| match wrapped(&data, &error) {
             Some(what) => anyhow::anyhow!("{name} is {what}"),
             None => error.into(),
         })?;
@@ -519,15 +519,16 @@ fn read_word(sections: &SectionFinder, addr: u64, size: usize) -> Option<u64> {
 }
 
 /// What a file is that recore reads no executable in, as a kernel's `Image` comes from a phone,
-/// wrapped, compressed or with nothing that says where it loads, and what to do with it.
-fn wrapped(data: &[u8]) -> Option<String> {
+/// wrapped, compressed or with nothing that says where it loads, and what to do with it. A raw
+/// `Image` says too what `object` found wrong with its EFI stub, the `error` it parsed with.
+fn wrapped(data: &[u8], error: &object::Error) -> Option<String> {
     const COMPRESSED: [(&[u8], &str); 6] =
         [(b"\x1f\x8b", "gzip"), (b"\x02\x21\x4c\x18", "LZ4"), (b"\x04\x22\x4d\x18", "LZ4"), (b"\x28\xb5\x2f\xfd", "Zstandard"), (b"\xfd7zXZ\x00", "XZ"), (b"BZh", "bzip2")];
     if data.starts_with(b"ANDROID!") {
         return Some("an Android boot image: take the kernel out of it, as `unpack_bootimg` from AOSP's mkbootimg does, decompress it if it is compressed, and load the raw `Image`".into());
     }
     if crate::kernel::is_raw_image(data) {
-        return Some("an arm64 Linux kernel `Image` with no kallsyms that holds together and no EFI stub: load it with a layout file, which says where it loads".into());
+        return Some(format!("an arm64 Linux kernel `Image` with no kallsyms that holds together and no EFI stub that parses ({error}): load it with a layout file, which says where it loads"));
     }
     let (_, compression) = COMPRESSED.iter().find(|(magic, _)| data.starts_with(magic))?;
     Some(format!("compressed with {compression}: decompress it and load what it holds"))

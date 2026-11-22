@@ -609,6 +609,8 @@ fn kernel_sections(data: &[u8], base: u64, symbols: &[Symbol]) -> Vec<Section> {
         let (from, to) = (pair[0], pair[1]);
         let holds = |&(start, stop): &(u64, u64)| start <= from && from < stop;
         let executable = code.iter().any(holds);
+        // With no `__start_rodata` and `__end_rodata` all data is taken as written, and the
+        // decompiler prints a string literal as its address. No kernel is known to lack them.
         let writable = !executable && !(read_only.as_ref().is_some_and(holds) && !after_init.as_ref().is_some_and(holds));
         let kind = if executable { ".text" } else if writable { ".data" } else { ".rodata" };
         let name = tables.iter().find(|(range, _)| holds(range)).map_or(kind, |&(_, name)| name);
@@ -630,64 +632,118 @@ fn kernel_sections(data: &[u8], base: u64, symbols: &[Symbol]) -> Vec<Section> {
 mod tests {
     use super::*;
 
-    /// A kernel's raw image: the header, two functions and kallsyms, which say where it loads,
-    /// what is code, what is data it only reads, and what the functions and a global are called.
+    /// The PE file of an arm64 kernel's EFI stub, as the kernel's build lays it out: its headers
+    /// in the first 4 KiB, then `code` as `.text` at the address of its offset in the file, which
+    /// is where execution starts. Also where its NT headers start.
+    fn efi_stub(code: &[u8]) -> (Vec<u8>, usize) {
+        use object::pe;
+        use object::write::pe::{NtHeaders, Writer};
+        let mut data = Vec::new();
+        let mut writer = Writer::new(true, 0x1000, 0x1000, &mut data);
+        writer.reserve_dos_header();
+        writer.reserve_nt_headers(0);
+        writer.reserve_section_headers(1);
+        let text = writer.reserve_text_section(code.len() as u32);
+        assert_eq!((text.file_offset, text.virtual_address), (0x1000, 0x1000));
+        let nt_headers = writer.nt_headers_offset() as usize;
+        writer.write_empty_dos_header().unwrap();
+        writer.write_nt_headers(NtHeaders {
+            machine: pe::IMAGE_FILE_MACHINE_ARM64,
+            time_date_stamp: 0,
+            characteristics: pe::IMAGE_FILE_EXECUTABLE_IMAGE,
+            major_linker_version: 0,
+            minor_linker_version: 0,
+            address_of_entry_point: text.virtual_address,
+            image_base: 0,
+            major_operating_system_version: 0,
+            minor_operating_system_version: 0,
+            major_image_version: 0,
+            minor_image_version: 0,
+            major_subsystem_version: 0,
+            minor_subsystem_version: 0,
+            subsystem: pe::IMAGE_SUBSYSTEM_EFI_APPLICATION,
+            dll_characteristics: pe::DllFlags::default(),
+            size_of_stack_reserve: 0,
+            size_of_stack_commit: 0,
+            size_of_heap_reserve: 0,
+            size_of_heap_commit: 0,
+        });
+        writer.write_section_headers();
+        writer.write_section(text.file_offset, code);
+        (data, nt_headers)
+    }
+
+    /// A kernel's raw image as a phone boots it: the image header among the EFI stub's DOS
+    /// header, the stub's PE header, two functions and kallsyms, which say where it loads, what
+    /// is code, what is data it only reads, and what the functions and a global are called.
     #[test]
     fn a_kernel_image_loads_where_its_kallsyms_say() {
         use crate::kallsyms::tests::{Order, kallsyms};
         const TEXT: u64 = 0xffff_ffc0_8000_0000;
         let symbols = [
             (TEXT, "T_text"),
-            (TEXT + 0x40, "Tfirst"),
-            (TEXT + 0x48, "tsecond"),
-            (TEXT + 0x100, "T_etext"),
-            (TEXT + 0x100, "D__start_rodata"),
-            (TEXT + 0x200, "D__start___bug_table"),
-            (TEXT + 0x20c, "D__stop___bug_table"),
-            (TEXT + 0xc00, "D__start_ro_after_init"),
-            (TEXT + 0xc10, "D__end_ro_after_init"),
-            (TEXT + 0xe00, "R__end_rodata"),
-            (TEXT + 0x1000, "D_sdata"),
-            (TEXT + 0x1000, "Dcounter"),
-            (TEXT + 0x1010, "D_edata"),
+            (TEXT + 0x1040, "Tfirst"),
+            (TEXT + 0x1048, "tsecond"),
+            (TEXT + 0x1100, "T_etext"),
+            (TEXT + 0x1100, "D__start_rodata"),
+            (TEXT + 0x1200, "D__start___bug_table"),
+            (TEXT + 0x120c, "D__stop___bug_table"),
+            (TEXT + 0x1c00, "D__start_ro_after_init"),
+            (TEXT + 0x1c10, "D__end_ro_after_init"),
+            (TEXT + 0x1e00, "R__end_rodata"),
+            (TEXT + 0x2000, "D_sdata"),
+            (TEXT + 0x2000, "Dcounter"),
+            (TEXT + 0x2010, "D_edata"),
         ];
-        let mut data = vec![0; 0x1010];
-        data[0x10..0x18].copy_from_slice(&0x2000u64.to_le_bytes());
-        data[0x38..0x3c].copy_from_slice(b"ARMd");
+        // What follows the stub's headers, from 0x1000.
+        let mut code = vec![0; 0x2000];
         // first: `ret`. second: `bl first`, `ret`.
         for (at, word) in [(0x40, 0xd65f_03c0u32), (0x48, 0x97ff_fffe), (0x4c, 0xd65f_03c0)] {
-            data[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            code[at..at + 4].copy_from_slice(&word.to_le_bytes());
         }
         let table = kallsyms(&symbols, Order::OffsetsLast, 0);
-        data[0x300..0x300 + table.len()].copy_from_slice(&table);
+        code[0x300..0x300 + table.len()].copy_from_slice(&table);
+        let (mut data, nt_headers) = efi_stub(&code);
+        assert_eq!(data.len(), 0x3000);
+        // The image header shares the DOS header's bytes: its size, which takes in what the
+        // kernel zeroes past the end of the file, and its magic.
+        data[0x10..0x18].copy_from_slice(&0x4000u64.to_le_bytes());
+        data[0x38..0x3c].copy_from_slice(b"ARMd");
 
         let image = Image::parse("Image".into(), data.clone()).unwrap();
         let sections: Vec<(u64, u64, &str, bool, bool)> = image.sections.iter().map(|s| (s.addr, s.end(), s.name.as_str(), s.executable, s.writable)).collect();
         assert_eq!(
             sections,
             [
-                (TEXT, TEXT + 0x100, ".text", true, false),
-                (TEXT + 0x100, TEXT + 0x200, ".rodata", false, false),
-                (TEXT + 0x200, TEXT + 0x20c, "__bug_table", false, false),
-                (TEXT + 0x20c, TEXT + 0xc00, ".rodata", false, false),
-                (TEXT + 0xc00, TEXT + 0xc10, ".data", false, true),
-                (TEXT + 0xc10, TEXT + 0xe00, ".rodata", false, false),
-                (TEXT + 0xe00, TEXT + 0x1010, ".data", false, true),
+                (TEXT, TEXT + 0x1100, ".text", true, false),
+                (TEXT + 0x1100, TEXT + 0x1200, ".rodata", false, false),
+                (TEXT + 0x1200, TEXT + 0x120c, "__bug_table", false, false),
+                (TEXT + 0x120c, TEXT + 0x1c00, ".rodata", false, false),
+                (TEXT + 0x1c00, TEXT + 0x1c10, ".data", false, true),
+                (TEXT + 0x1c10, TEXT + 0x1e00, ".rodata", false, false),
+                (TEXT + 0x1e00, TEXT + 0x3000, ".data", false, true),
             ]
         );
-        assert_eq!((image.entry, image.zero_filled.as_slice(), image.kernel_image), (TEXT, &[(TEXT + 0x1010, TEXT + 0x2000)][..], true));
-        assert_eq!(image.exports, [TEXT, TEXT + 0x40, TEXT + 0x48]);
-        assert_eq!(image.symbol_names.get(&(TEXT + 0x1000)).map(String::as_str), Some("_sdata"));
+        assert_eq!((image.format, image.entry, image.zero_filled.as_slice(), image.kernel_image), (Format::Raw, TEXT, &[(TEXT + 0x3000, TEXT + 0x4000)][..], true));
+        assert_eq!(image.exports, [TEXT, TEXT + 0x1040, TEXT + 0x1048]);
+        assert_eq!(image.symbol_names.get(&(TEXT + 0x2000)).map(String::as_str), Some("_sdata"));
         let analysis = crate::analyze(&image);
         let named: Vec<(u64, Option<&str>)> = analysis.functions.iter().map(|f| (f.addr, f.name.as_deref())).collect();
-        assert!(named.contains(&(TEXT + 0x40, Some("first"))) && named.contains(&(TEXT + 0x48, Some("second"))), "{named:x?}");
+        assert!(named.contains(&(TEXT + 0x1040, Some("first"))) && named.contains(&(TEXT + 0x1048, Some("second"))), "{named:x?}");
 
-        // With a token table that is not whole, it is read as any other file, which it is not.
+        // With a token table that is not whole, it loads by the stub's PE header, at 0.
         let mut broken = data;
         let digits = broken.windows(4).position(|window| window == b"0\x001\x00").unwrap();
         broken[digits + 2] = b'x';
-        let error = Image::parse("Image".into(), broken).err().unwrap().to_string();
-        assert!(error.contains("an arm64 Linux kernel `Image` with no kallsyms that holds together"), "{error}");
+        let image = Image::parse("Image".into(), broken.clone()).unwrap();
+        let sections: Vec<(u64, u64, &str)> = image.sections.iter().map(|s| (s.addr, s.end(), s.name.as_str())).collect();
+        assert_eq!((image.format, image.entry, sections), (Format::Pe, 0x1000, vec![(0x1000, 0x3000, ".text")]));
+
+        // With that header broken too, it fails with what to do, and with what `object` says of it.
+        broken[nt_headers] ^= 1;
+        let error = Image::parse("Image".into(), broken.clone()).err().unwrap().to_string();
+        let stub = object::File::parse(&*broken).err().unwrap().to_string();
+        assert!(error.contains("an arm64 Linux kernel `Image` with no kallsyms that holds together") && error.contains(&stub), "{error}");
     }
 
     #[test]
