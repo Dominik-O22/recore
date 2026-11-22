@@ -293,6 +293,8 @@ pub fn load(name: String, file: &[u8]) -> Result<Image> {
         kernel_module: false,
         instruction_sets: Vec::new(),
         marked_data: Vec::new(),
+        replacement_code: Vec::new(),
+        resuming_traps: Vec::new(),
         il2cpp: None,
     };
     // A method list of 32-bit offsets is no pointer the loader rebases, so nothing else says

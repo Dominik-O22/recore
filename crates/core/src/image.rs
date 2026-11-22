@@ -176,7 +176,8 @@ pub struct Image {
     /// names an entry inside a routine.
     pub symbol_extents: Vec<(u64, u64)>,
     /// Pointers stored in data by relative relocations, as `(slot address, target)`. Targets in
-    /// code are function pointers or, in computed-goto tables, labels.
+    /// code are function pointers or, in computed-goto tables, labels. Not those of a Linux
+    /// kernel's jump labels, which point inside functions (see [`crate::kernel`]).
     pub relative_targets: Vec<(u64, u64)>,
     /// Whether a PE image that holds absolute addresses keeps no record of where: linked to
     /// load only at its base. `relative_targets` is then the words of its data that land in
@@ -200,6 +201,13 @@ pub struct Image {
     /// `[start, end)` of the data among the code that an AArch64 ELF file marks with `$d`
     /// mapping symbols, sorted: kCFI's type hash before each function, literal pools, tables.
     pub marked_data: Vec<(u64, u64)>,
+    /// `[start, end)` of the code a Linux kernel's alternatives keep among its code to write over
+    /// other code, which never runs where it lies, sorted (see [`crate::kernel`]).
+    pub replacement_code: Vec<(u64, u64)>,
+    /// The traps that execution goes on after, sorted: the `WARN()`s of a Linux kernel or
+    /// module, which its `__bug_table` lists. Such a trap after a call does not say that the call
+    /// never returns, as other traps do.
+    pub resuming_traps: Vec<u64>,
     /// The managed program of a Unity IL2CPP build, read from the `global-metadata.dat` that
     /// ships with it.
     pub il2cpp: Option<std::sync::Arc<crate::il2cpp::Il2Cpp>>,
@@ -233,6 +241,8 @@ impl Image {
             kernel_module: false,
             instruction_sets: Vec::new(),
             marked_data: Vec::new(),
+            replacement_code: Vec::new(),
+            resuming_traps: Vec::new(),
             il2cpp: None,
         }
     }
@@ -354,12 +364,17 @@ impl Image {
             compiler: None,
             instruction_sets: Vec::new(),
             marked_data: Vec::new(),
+            replacement_code: Vec::new(),
+            resuming_traps: Vec::new(),
             il2cpp: None,
         };
         match machine {
             Machine::Arm => crate::arm::load(&file, &mut image),
             Machine::Aarch64 => image.marked_data = crate::arm64::marked_data(&file),
             _ => {}
+        }
+        if !is_pe {
+            crate::kernel::read(&mut image);
         }
         Ok(image)
     }
@@ -373,6 +388,11 @@ impl Image {
     pub fn is_zero_filled(&self, addr: u64) -> bool {
         let index = self.zero_filled.partition_point(|&(start, _)| start <= addr);
         index > 0 && addr < self.zero_filled[index - 1].1
+    }
+
+    /// Whether the trap at `addr` is one that execution goes on after.
+    pub fn resumes_after(&self, addr: u64) -> bool {
+        self.resuming_traps.binary_search(&addr).is_ok()
     }
 
     pub fn is_code(&self, addr: u64) -> bool {

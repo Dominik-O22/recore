@@ -461,6 +461,8 @@ impl Layout {
             kernel_module: false,
             instruction_sets: Vec::new(),
             marked_data: Vec::new(),
+            replacement_code: Vec::new(),
+            resuming_traps: Vec::new(),
             il2cpp: None,
         })
     }
