@@ -519,7 +519,7 @@ mod tests {
         let Type::Pointer(file) = types.get(prototype.params[0].1) else { panic!("not a pointer") };
         let Type::Composite { name, size, fields, .. } = types.get(*file) else { panic!("not a struct") };
         assert_eq!((name.as_str(), *size), ("file", 16));
-        let members: Vec<(&str, u64, Option<(u32, u32)>)> = fields.iter().map(|field| (field.name.as_str(), field.offset, field.bits)).collect();
+        let members: Vec<_> = fields.iter().map(|field| (field.name.as_str(), field.offset, field.bits)).collect();
         assert_eq!(members, [("f_flags", 0, None), ("f_mode", 4, Some((0, 3))), ("next", 8, None)]);
     }
 
