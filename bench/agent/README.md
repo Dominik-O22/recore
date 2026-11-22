@@ -50,6 +50,20 @@ KEY=bench/agent/game/key.md bench/agent/judge.py ~/agent-runs/sonnet-game
 
 Haiku 5.5 scored 18 of 22 in each of two sessions, two weeks and 155 commits of recore apart, and failed the same four items both times: A4, B1, B2 and F1. Sonnet 5.5 scored 22 of 22 in one session, with 247 `disassemble` calls and 5.8 M tokens read. So Haiku's score has four points to gain, and Sonnet's sessions are scored by their calls and tokens.
 
+## Android tasks
+
+[`android/`](android) holds six tasks on an Android phone's kernel: a raw arm64 `Image` with no symbols but its own kallsyms, and three stripped modules. They ask for a driver's ioctl commands, where a value from user space ends up, what a module registers, how long a write handler reads, and what a named kernel function does and who calls it. The `Image` is GKI build 16924931 of android13-5.15 and the modules are from GKI build 16958505 of android14-6.1, neither of which any corpus holds. [`android/key.md`](android/key.md) has 23 items.
+
+```
+cargo build --release -p recore-mcp
+bench/agent/android/run.sh claude-haiku-5-5 ~/agent-runs/haiku-android
+KEY=bench/agent/android/key.md bench/agent/judge.py ~/agent-runs/haiku-android
+```
+
+- **`fetch.py`** downloads the builds by pinned URL and sha256, strips the modules, and keeps vmlinux, System.map and the modules with DWARF apart from what a session gets. `run.sh` puts only the four inputs in the session's folder, and `run.sh <model> <dir> --setup` lays the folder out without starting a session.
+- **`derive.sh`**, **`callers.py`** and **`words.py`** write what the key's derivations read: disassembly of the debug files, direct callers of a kernel function, and entries of the kernel's tables.
+- The `Image` tasks need recore to name the image from its kallsyms. A recore that cannot loads it as unnamed code, and those tasks are then out of reach.
+
 ## What to keep in mind
 
 - One session is an illustration and not a benchmark. Run several before trusting a difference.
