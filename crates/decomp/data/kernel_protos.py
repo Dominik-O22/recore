@@ -1,14 +1,18 @@
 """Writes kernel.protos: the prototypes of the functions Linux kernels export to their modules.
 
-    python3 -I kernel_protos.py <kernel> <exports> [<kernel> <exports> ...] [--headers <file>] > kernel.protos
+    python3 -I kernel_protos.py <kernel> <exports> [--modules <dir>] [<kernel> <exports> ...] [--headers <file>] > kernel.protos
 
 Each kernel is a raw `Image` or a `vmlinux`, both of which carry the kernel's BTF. Its exports
 are a `vmlinux.symvers`, or a `System.map` or `nm vmlinux` listing, whose `__ksymtab_` symbols
-name them. Where kernels disagree on a function, the first listed wins. kernel.protos is made
-from these, newest first:
+name them. `--modules` after a kernel adds every `.ko` in a directory: modules built with that
+kernel, whose `.BTF` is split BTF on top of the kernel's own, and whose `__ksymtab_` symbols name
+what they export. Where sources disagree on a function, the first listed wins. kernel.protos is
+made from these, newest first:
 
 1. Android's GKI android16-6.12, build 17002073: `Image` and `vmlinux.symvers` from
-   https://ci.android.com/builds/submitted/17002073/kernel_aarch64/latest/raw/<name>.
+   https://ci.android.com/builds/submitted/17002073/kernel_aarch64/latest/raw/<name>, and with
+   `--modules` the 112 modules of `unstripped_modules.tar.gz` from the same place, such as
+   bluetooth, usbnet and can-dev.
 2. The Pixel 9's android14-6.1 kernel of 25Q1: `Image.lz4`, decompressed, and `System.map` from
    https://android.googlesource.com/device/google/caimito-kernels/6.1/+archive/refs/heads/main/25Q1-12919773.tar.gz.
 3. The Pixel 7's android13-5.10 kernel: `Image.lz4`, decompressed, and `System.map` from the
@@ -19,12 +23,13 @@ An old module's call to a function whose prototype changed takes the newest kern
 4,244 names the 5.10 kernel shares with the newer two, 95 differ in their parameter count or in
 whether they return a value.
 
-The newer two build mac80211, cfg80211, bluetooth and usbnet as modules, so their images export
-none of those names, and the 5.10 line is the only one a 6.x module's call to them gets. Against
-the DWARF of the modules that import them, 9 of the 354 (module, name) pairs that take a line the
-5.10 kernel added differ, all 9 among the 193 of Debian's 6.12 arm64 modules: 8 mac80211 and
-cfg80211 names that 6.x gave more parameters, six a `link_id`, such as `ieee80211_nullfunc_get`,
-one a channel context, and `cfg80211_port_authorized` two.
+GKI's modules add 416 names and change 5 lines the 5.10 kernel gave, such as `can_put_echo_skb`,
+which gained a frame length. GKI builds no mac80211 or cfg80211 and the Pixel 9's modules have no
+BTF, so the 5.10 line is still the only one a 6.x module's call to those gets. Against the DWARF
+of the modules that import them, 9 of the 130 (module, name) pairs of Debian's 6.12 arm64 modules
+that take a line only the 5.10 kernel gives differ: 8 mac80211 and cfg80211 names that 6.x gave
+more parameters, six a `link_id`, such as `ieee80211_nullfunc_get`, one a channel context, and
+`cfg80211_port_authorized` two.
 
 Kernels before 5.2 carry no BTF. `--headers kernel_headers.txt` adds, after every kernel, the
 lines of that file, written by hand from the headers of the Pixel 5's 4.19 and the Pixel 2's 4.4
@@ -63,11 +68,12 @@ Both tables spell `_Bool` as `bool`, `char` as `char`, any other integer by its 
 such as `uint4` for `unsigned int`, an enum as the integer it is stored in, and a float by its
 width.
 
-Both tables are made from Linux kernels, their BTF and their headers, and Linux is licensed under
-the GPL-2.0.
+Both tables are made from Linux kernels and their modules, their BTF and their headers, and Linux
+is licensed under the GPL-2.0.
 """
 
 import collections
+import os
 import re
 import struct
 import sys
@@ -94,22 +100,34 @@ IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 class Btf:
     """The types of a little-endian BTF blob as (kind, info, size or type, trailer, name offset),
-    indexed by type id. Id 0 is `void`."""
+    indexed by type id. Id 0 is `void`. A module's BTF is split: its type ids and string offsets
+    go on from the end of its kernel's, the `base`, so its types and strings follow the base's."""
 
-    def __init__(self, blob):
+    def __init__(self, blob, base=None):
         magic, version, _flags, header, type_off, type_len, str_off, str_len = struct.unpack_from("<HBBIIIII", blob)
         if magic != MAGIC or version != 1:
             raise ValueError("not little-endian BTF")
-        self.strings = blob[header + str_off : header + str_off + str_len]
-        self.types = [(0, 0, 0, b"", 0)]
+        self.strings = (base.strings if base else b"") + blob[header + str_off : header + str_off + str_len]
+        self.types = list(base.types) if base else [(0, 0, 0, b"", 0)]
+        # The first id this blob defines, so that a module lists its own functions only.
+        self.first = len(self.types)
         at, end = header + type_off, header + type_off + type_len
         while at < end:
             name_off, info, size_or_type = struct.unpack_from("<III", blob, at)
             kind, vlen = (info >> 24) & 0x1F, info & 0xFFFF
+            # A kind this reader does not know has a trailer of a size it does not know either,
+            # and every type after it would be read from the wrong place.
+            if not INT <= kind <= ENUM64:
+                raise ValueError(f"BTF kind {kind} is newer than this reader")
             fixed, member = TRAILER.get(kind, (0, 0))
             trailer = blob[at + 12 : at + 12 + fixed + member * vlen]
             self.types.append((kind, info, size_or_type, trailer, name_off))
             at += 12 + fixed + member * vlen
+        if at != end:
+            raise ValueError("the BTF's types do not end where its header says")
+        # Split BTF names no base. Read on another kernel's, its ids point at other types.
+        if any(kind == FUNC and (proto >= len(self.types) or self.types[proto][0] != FUNC_PROTO) for kind, _, proto, _, _ in self.types[self.first :]):
+            raise ValueError("a function's type is no prototype: this BTF is split from another base")
 
     def name(self, offset):
         return self.strings[offset : self.strings.index(b"\0", offset)].decode()
@@ -122,7 +140,7 @@ class Btf:
 
     def functions(self):
         """Every function as (name, prototype id, global): a static one may share a name."""
-        for kind, info, proto, _, name_off in self.types:
+        for kind, info, proto, _, name_off in self.types[self.first :]:
             if kind == FUNC:
                 yield self.name(name_off), proto, (info & 0xFFFF) != 0
 
@@ -209,6 +227,32 @@ def exports(path):
             elif len(fields) == 3 and fields[2].startswith("__ksymtab_"):
                 names.add(fields[2][len("__ksymtab_") :])
     return names
+
+
+def module(path, kernel):
+    """A module's BTF, read on top of its kernel's, and the names it exports: its `__ksymtab_`
+    symbols."""
+    with open(path, "rb") as file:
+        data = file.read()
+    if data[:6] != b"\x7fELF\x02\x01":
+        raise ValueError(f"{path}: not a little-endian 64-bit ELF")
+    sections_at, = struct.unpack_from("<Q", data, 0x28)
+    size, count, names_index = struct.unpack_from("<HHH", data, 0x3A)
+    sections = [struct.unpack_from("<IIQQQQIIQQ", data, sections_at + index * size) for index in range(count)]
+    contents = [data[offset : offset + length] for _, _, _, _, offset, length, *_ in sections]
+
+    def string(table, at):
+        return table[at : table.index(b"\0", at)].decode()
+
+    by_name = {string(contents[names_index], section[0]): index for index, section in enumerate(sections)}
+    symbols = by_name[".symtab"]
+    names = contents[sections[symbols][6]]
+    exported = set()
+    for name, *_ in struct.iter_unpack("<IBBHQQ", contents[symbols]):
+        symbol = string(names, name)
+        if symbol.startswith("__ksymtab_"):
+            exported.add(symbol[len("__ksymtab_") :])
+    return Btf(contents[by_name[".BTF"]], kernel), exported
 
 
 def table(btf, exported):
@@ -494,11 +538,17 @@ def main():
     if args[-2:-1] == ["--headers"]:
         args, headers = args[:-2], args[-1]
     lines = {}
-    for kernel, exported in zip(args[::2], args[1::2]):
-        with open(kernel, "rb") as file:
-            btf = Btf(find_btf(file.read()))
-        for name, line in table(btf, exports(exported)).items():
-            lines.setdefault(name, line)
+    while args:
+        if args[0] == "--modules":
+            modules = sorted(os.path.join(args[1], name) for name in os.listdir(args[1]) if name.endswith(".ko"))
+            sources, args = [module(path, btf) for path in modules], args[2:]
+        else:
+            with open(args[0], "rb") as file:
+                btf = Btf(find_btf(file.read()))
+            sources, args = [(btf, exports(args[1]))], args[2:]
+        for source, exported in sources:
+            for name, line in table(source, exported).items():
+                lines.setdefault(name, line)
     for name, line in (written(headers) if headers else {}).items():
         lines.setdefault(name, line)
     for name in sorted(lines):
